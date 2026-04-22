@@ -2204,13 +2204,21 @@ void fragment_shader(in SceneData scene_data) {
 #else
 		// Base Layer
 		float NdotV = clamp(dot(normal, view), 0.0001, 1.0);
-		vec2 envBRDF = prefiltered_dfg(roughness, NdotV).xy;
+		vec3 envBRDF3 = prefiltered_dfg(roughness, NdotV);
+		vec2 envBRDF = envBRDF3.xy;
+		
 		// Multiscattering
 		energy_compensation = get_energy_compensation(f0, envBRDF.y);
 
 		// cheap luminance approximation
 		float f90 = clamp(50.0 * f0.g, metallic, 1.0);
 		indirect_specular_light *= energy_compensation * ((f90 - f0) * envBRDF.x + f0 * envBRDF.y);
+
+		// Kulla & Conty 2017 multi-scatter compensation
+		vec3 f_avg = (20.0 * f0 + vec3(1.0)) / 21.0;
+		float E_ms = envBRDF3.z;
+		indirect_specular_light += indirect_specular_light *
+		    (f_avg * f_avg * E_ms / max(vec3(1.0) - f_avg * (1.0 - E_ms), vec3(1e-4)));
 #endif
 	}
 
