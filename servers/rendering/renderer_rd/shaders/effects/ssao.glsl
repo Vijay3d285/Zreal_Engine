@@ -37,7 +37,7 @@ const vec4 sample_pattern[INTELSSAO_MAIN_DISK_SAMPLE_COUNT] = {
 
 // these values can be changed (up to SSAO_MAX_TAPS) with no changes required elsewhere; values for 4th and 5th preset are ignored but array needed to avoid compilation errors
 // the actual number of texture samples is two times this value (each "tap" has two symmetrical depth texture samples)
-const int num_taps[5] = { 3, 5, 12, 0, 0 };
+const int num_taps[5] = { 3, 8, 16, 0, 0 };
 
 #define SSAO_TILT_SAMPLES_ENABLE_AT_QUALITY_PRESET (99) // to disable simply set to 99 or similar
 #define SSAO_TILT_SAMPLES_AMOUNT (0.4)

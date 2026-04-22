@@ -76,12 +76,18 @@ void main() {
 				if (ndotl > 0.0) {
 					vec3 L_world = T * s.xyz;
 					vec2 sample_uv = vec3_to_oct_with_border(L_world, params.border_size);
-					sum.rgb += textureLod(source_oct, sample_uv, s.w).rgb * ndotl;
+					vec3 samp = textureLod(source_oct, sample_uv, s.w).rgb;
+					// Reinhard firefly rejection: suppress HDR spikes before weighted accumulation
+					samp /= (1.0 + dot(samp, vec3(0.2126, 0.7152, 0.0722)));
+					sum.rgb += samp * ndotl;
 					sum.a += ndotl;
 				}
 			}
 
-			imageStore(dest_octmap, ivec2(id), vec4(sum.rgb / sum.a, 1.0));
+			vec3 result = sum.rgb / sum.a;
+			// Inverse Reinhard: restore HDR range after accumulation
+			result /= max(1.0 - dot(result, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+			imageStore(dest_octmap, ivec2(id), vec4(result, 1.0));
 		}
 	}
 }

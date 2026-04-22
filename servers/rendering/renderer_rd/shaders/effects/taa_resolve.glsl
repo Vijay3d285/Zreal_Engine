@@ -85,6 +85,19 @@ vec3 reinhard_inverse(vec3 sdr) {
 	return sdr / (1.0 - sdr);
 }
 
+// YCoCg colour space: better variance-clip axis-alignment for fabric highlights
+vec3 rgb_to_ycocg(vec3 c) {
+	return vec3(
+		 0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+		 0.5  * c.r              - 0.5 * c.b,
+		-0.25 * c.r + 0.5 * c.g - 0.25 * c.b
+	);
+}
+vec3 ycocg_to_rgb(vec3 c) {
+	float t = c.x - c.z;
+	return clamp(vec3(t + c.y, c.x + c.z, t - c.y), 0.0, FLT_MAX);
+}
+
 float get_depth(ivec2 thread_id) {
 	return texelFetch(depth_buffer, thread_id, 0).r;
 }
@@ -262,16 +275,16 @@ vec3 clip_aabb(vec3 aabb_min, vec3 aabb_max, vec3 p, vec3 q) {
 
 // Clip history to the neighbourhood of the current sample
 vec3 clip_history_3x3(uvec2 group_pos, vec3 color_history, vec2 velocity_closest) {
-	// Sample a 3x3 neighbourhood
-	vec3 s1 = load_color(group_pos + kOffsets3x3[0]);
-	vec3 s2 = load_color(group_pos + kOffsets3x3[1]);
-	vec3 s3 = load_color(group_pos + kOffsets3x3[2]);
-	vec3 s4 = load_color(group_pos + kOffsets3x3[3]);
-	vec3 s5 = load_color(group_pos + kOffsets3x3[4]);
-	vec3 s6 = load_color(group_pos + kOffsets3x3[5]);
-	vec3 s7 = load_color(group_pos + kOffsets3x3[6]);
-	vec3 s8 = load_color(group_pos + kOffsets3x3[7]);
-	vec3 s9 = load_color(group_pos + kOffsets3x3[8]);
+	// Sample a 3x3 neighbourhood in YCoCg space for perceptually-uniform variance clipping
+	vec3 s1 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[0]));
+	vec3 s2 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[1]));
+	vec3 s3 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[2]));
+	vec3 s4 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[3]));
+	vec3 s5 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[4]));
+	vec3 s6 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[5]));
+	vec3 s7 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[6]));
+	vec3 s8 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[7]));
+	vec3 s9 = rgb_to_ycocg(load_color(group_pos + kOffsets3x3[8]));
 
 	// Compute min and max (with an adaptive box size, which greatly reduces ghosting)
 	vec3 color_avg = (s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9) * RPC_9;
@@ -282,8 +295,10 @@ vec3 clip_history_3x3(uvec2 group_pos, vec3 color_history, vec2 velocity_closest
 	vec3 color_min = color_avg - dev;
 	vec3 color_max = color_avg + dev;
 
-	// Variance clipping
-	vec3 color = clip_aabb(color_min, color_max, clamp(color_avg, color_min, color_max), color_history);
+	// Variance clipping in YCoCg, then convert back to RGB
+	vec3 history_ycocg = rgb_to_ycocg(color_history);
+	vec3 color = clip_aabb(color_min, color_max, clamp(color_avg, color_min, color_max), history_ycocg);
+	color = ycocg_to_rgb(color);
 
 	// Clamp to prevent NaNs
 	color = clamp(color, FLT_MIN, FLT_MAX);
