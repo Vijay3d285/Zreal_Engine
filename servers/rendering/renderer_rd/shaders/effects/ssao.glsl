@@ -1,4 +1,4 @@
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+﻿///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Copyright (c) 2016, Intel Corporation
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 // documentation files (the "Software"), to deal in the Software without restriction, including without limitation
@@ -137,22 +137,6 @@ vec3 NDC_to_view_space(vec2 p_pos, float p_viewspace_depth) {
 	}
 }
 
-// calculate effect radius and fit our screen sampling pattern inside it
-void calculate_radius_parameters(const float p_pix_center_length, const vec2 p_pixel_size_at_center, out float r_lookup_radius, out float r_radius, out float r_fallof_sq) {
-	r_radius = params.radius;
-
-	// when too close, on-screen sampling disk will grow beyond screen size; limit this to avoid closeup temporal artifacts
-	const float too_close_limit = clamp(p_pix_center_length * params.inv_radius_near_limit, 0.0, 1.0) * 0.8 + 0.2;
-
-	r_radius *= too_close_limit;
-
-	// 0.85 is to reduce the radius to allow for more samples on a slope to still stay within influence
-	r_lookup_radius = (0.85 * r_radius) / p_pixel_size_at_center.x;
-
-	// used to calculate falloff (both for AO samples and per-sample weights)
-	r_fallof_sq = -1.0 / (r_radius * r_radius);
-}
-
 vec4 calculate_edges(const float p_center_z, const float p_left_z, const float p_right_z, const float p_top_z, const float p_bottom_z) {
 	// slope-sensitive depth-based edge detection
 	vec4 edgesLRTB = vec4(p_left_z, p_right_z, p_top_z, p_bottom_z) - p_center_z;
@@ -173,91 +157,35 @@ vec3 load_normal(ivec2 p_pos, ivec2 p_offset) {
 	return encoded_normal;
 }
 
-// all vectors in viewspace
-float calculate_pixel_obscurance(vec3 p_pixel_normal, vec3 p_hit_delta, float p_fallof_sq) {
-	float length_sq = dot(p_hit_delta, p_hit_delta);
-	float NdotD = dot(p_pixel_normal, p_hit_delta) / sqrt(length_sq);
+// ---- GTAO: Ground-Truth Ambient Occlusion (Jimenez 2016) ----
+// Replaces Intel ASSAO hemisphere-point sampling with horizon-based sweeping.
 
-	float falloff_mult = max(0.0, length_sq * p_fallof_sq + 1.0);
+#define GTAO_PI 3.14159265
+#define GTAO_PI_HALF 1.5707963
 
-	return max(0, NdotD - params.horizon_angle_threshold) * falloff_mult;
+const int gtao_directions[5] = { 2, 3, 4, 6, 6 };
+const int gtao_steps[5] = { 4, 6, 8, 10, 10 };
+
+float interleaved_gradient_noise(vec2 p_pos) {
+	return fract(52.9829189 * fract(dot(p_pos, vec2(0.06711056, 0.00583715))));
 }
 
-void SSAO_tap_inner(const int p_quality_level, inout float r_obscurance_sum, inout float r_weight_sum, const vec2 p_sampling_uv, const float p_mip_level, const vec3 p_pix_center_pos, vec3 p_pixel_normal, const float p_fallof_sq, const float p_weight_mod) {
-	// get depth at sample
-	float viewspace_sample_z = textureLod(source_depth_mipmaps, vec3(p_sampling_uv, params.pass), p_mip_level).x;
-
-	// convert to viewspace
-	vec3 hit_pos = NDC_to_view_space(p_sampling_uv.xy, viewspace_sample_z).xyz;
-	vec3 hit_delta = hit_pos - p_pix_center_pos;
-
-	float obscurance = calculate_pixel_obscurance(p_pixel_normal, hit_delta, p_fallof_sq);
-	float weight = 1.0;
-
-	if (p_quality_level >= SSAO_HALOING_REDUCTION_ENABLE_AT_QUALITY_PRESET) {
-		float reduce = max(0, -hit_delta.z);
-		reduce = clamp(reduce * params.neg_inv_radius + 2.0, 0.0, 1.0);
-		weight = SSAO_HALOING_REDUCTION_AMOUNT * reduce + (1.0 - SSAO_HALOING_REDUCTION_AMOUNT);
-	}
-	weight *= p_weight_mod;
-	r_obscurance_sum += obscurance * weight;
-	r_weight_sum += weight;
-}
-
-void SSAOTap(const int p_quality_level, inout float r_obscurance_sum, inout float r_weight_sum, const int p_tap_index, const mat2 p_rot_scale, const vec3 p_pix_center_pos, vec3 p_pixel_normal, const vec2 p_normalized_screen_pos, const float p_mip_offset, const float p_fallof_sq, float p_weight_mod, vec2 p_norm_xy, float p_norm_xy_length) {
-	vec2 sample_offset;
-	float sample_pow_2_len;
-
-	// patterns
-	{
-		vec4 new_sample = sample_pattern[p_tap_index];
-		sample_offset = new_sample.xy * p_rot_scale;
-		sample_pow_2_len = new_sample.w; // precalculated, same as: sample_pow_2_len = log2( length( new_sample.xy ) );
-		p_weight_mod *= new_sample.z;
-	}
-
-	// snap to pixel center (more correct obscurance math, avoids artifacts)
-	sample_offset = round(sample_offset);
-
-	// calculate MIP based on the sample distance from the center, similar to as described
-	// in http://graphics.cs.williams.edu/papers/SAOHPG12/.
-	float mip_level = (p_quality_level < SSAO_DEPTH_MIPS_ENABLE_AT_QUALITY_PRESET) ? (0) : (sample_pow_2_len + p_mip_offset);
-
-	vec2 sampling_uv = sample_offset * params.half_screen_pixel_size + p_normalized_screen_pos;
-
-	SSAO_tap_inner(p_quality_level, r_obscurance_sum, r_weight_sum, sampling_uv, mip_level, p_pix_center_pos, p_pixel_normal, p_fallof_sq, p_weight_mod);
-
-	// for the second tap, just use the mirrored offset
-	vec2 sample_offset_mirrored_uv = -sample_offset;
-
-	// tilt the second set of samples so that the disk is effectively rotated by the normal
-	// effective at removing one set of artifacts, but too expensive for lower quality settings
-	if (p_quality_level >= SSAO_TILT_SAMPLES_ENABLE_AT_QUALITY_PRESET) {
-		float dot_norm = dot(sample_offset_mirrored_uv, p_norm_xy);
-		sample_offset_mirrored_uv -= dot_norm * p_norm_xy_length * p_norm_xy;
-		sample_offset_mirrored_uv = round(sample_offset_mirrored_uv);
-	}
-
-	// snap to pixel center (more correct obscurance math, avoids artifacts)
-	vec2 sampling_mirrored_uv = sample_offset_mirrored_uv * params.half_screen_pixel_size + p_normalized_screen_pos;
-
-	SSAO_tap_inner(p_quality_level, r_obscurance_sum, r_weight_sum, sampling_mirrored_uv, mip_level, p_pix_center_pos, p_pixel_normal, p_fallof_sq, p_weight_mod);
+float gtao_integrate_arc(float p_h1, float p_h2, float p_n_angle) {
+	float cos_n = cos(p_n_angle);
+	float sin_n = sin(p_n_angle);
+	return 0.25 * (-cos(2.0 * p_h1 - p_n_angle) + cos_n + 2.0 * p_h1 * sin_n
+	             + (-cos(2.0 * p_h2 - p_n_angle) + cos_n + 2.0 * p_h2 * sin_n));
 }
 
 void generate_SSAO_shadows_internal(out float r_shadow_term, out vec4 r_edges, out float r_weight, const vec2 p_pos, int p_quality_level, bool p_adaptive_base) {
 	vec2 pos_rounded = trunc(p_pos);
 	uvec2 upos = uvec2(pos_rounded);
-
-	const int number_of_taps = (p_adaptive_base) ? (SSAO_ADAPTIVE_TAP_BASE_COUNT) : (num_taps[p_quality_level]);
 	float pix_z, pix_left_z, pix_top_z, pix_right_z, pix_bottom_z;
 
 	vec4 valuesUL = textureGather(source_depth_mipmaps, vec3(pos_rounded * params.half_screen_pixel_size, params.pass));
 	vec4 valuesBR = textureGather(source_depth_mipmaps, vec3((pos_rounded + vec2(1.0)) * params.half_screen_pixel_size, params.pass));
 
-	// get this pixel's viewspace depth
 	pix_z = valuesUL.y;
-
-	// get left right top bottom neighboring pixels for edge detection (gets compiled out on quality_level == 0)
 	pix_left_z = valuesUL.x;
 	pix_top_z = valuesUL.z;
 	pix_right_z = valuesBR.z;
@@ -266,194 +194,129 @@ void generate_SSAO_shadows_internal(out float r_shadow_term, out vec4 r_edges, o
 	vec2 normalized_screen_pos = pos_rounded * params.half_screen_pixel_size + params.half_screen_pixel_size_x025;
 	vec3 pix_center_pos = NDC_to_view_space(normalized_screen_pos, pix_z);
 
-	// Load this pixel's viewspace normal
 	uvec2 full_res_coord = upos * 2 * params.size_multiplier + params.pass_coord_offset.xy;
 	vec3 pixel_normal = load_normal(ivec2(full_res_coord));
 
 	const vec2 pixel_size_at_center = NDC_to_view_space(normalized_screen_pos.xy + params.half_screen_pixel_size, pix_center_pos.z).xy - pix_center_pos.xy;
 
-	float pixel_lookup_radius;
-	float fallof_sq;
-
-	// calculate effect radius and fit our screen sampling pattern inside it
-	float viewspace_radius;
-	calculate_radius_parameters(length(pix_center_pos), pixel_size_at_center, pixel_lookup_radius, viewspace_radius, fallof_sq);
-
-	// calculate samples rotation/scaling
-	mat2 rot_scale_matrix;
-	uint pseudo_random_index;
-
-	{
-		vec4 rotation_scale;
-		// reduce effect radius near the screen edges slightly; ideally, one would render a larger depth buffer (5% on each side) instead
-		if (!p_adaptive_base && (p_quality_level >= SSAO_REDUCE_RADIUS_NEAR_SCREEN_BORDER_ENABLE_AT_QUALITY_PRESET)) {
-			float near_screen_border = min(min(normalized_screen_pos.x, 1.0 - normalized_screen_pos.x), min(normalized_screen_pos.y, 1.0 - normalized_screen_pos.y));
-			near_screen_border = clamp(10.0 * near_screen_border + 0.6, 0.0, 1.0);
-			pixel_lookup_radius *= near_screen_border;
-		}
-
-		// load & update pseudo-random rotation matrix
-		pseudo_random_index = uint(pos_rounded.y * 2 + pos_rounded.x) % 5;
-		rotation_scale = constants.rotation_matrices[params.pass * 5 + pseudo_random_index];
-		rot_scale_matrix = mat2(rotation_scale.x * pixel_lookup_radius, rotation_scale.y * pixel_lookup_radius, rotation_scale.z * pixel_lookup_radius, rotation_scale.w * pixel_lookup_radius);
-	}
-
-	// the main obscurance & sample weight storage
-	float obscurance_sum = 0.0;
-	float weight_sum = 0.0;
-
-	// edge mask for between this and left/right/top/bottom neighbor pixels - not used in quality level 0 so initialize to "no edge" (1 is no edge, 0 is edge)
 	vec4 edgesLRTB = vec4(1.0, 1.0, 1.0, 1.0);
-
-	// Move center pixel slightly towards camera to avoid imprecision artifacts due to using of 16bit depth buffer.
-	pix_center_pos *= 0.99;
-
 	if (!p_adaptive_base && (p_quality_level >= SSAO_DEPTH_BASED_EDGES_ENABLE_AT_QUALITY_PRESET)) {
 		edgesLRTB = calculate_edges(pix_z, pix_left_z, pix_right_z, pix_top_z, pix_bottom_z);
 	}
 
-	// adds a more high definition sharp effect, which gets blurred out (reuses left/right/top/bottom samples that we used for edge detection)
-	if (!p_adaptive_base && (p_quality_level >= SSAO_DETAIL_AO_ENABLE_AT_QUALITY_PRESET)) {
-		// disable in case of quality level 4 (reference)
-		if (p_quality_level != 4) {
-			//approximate neighboring pixels positions (actually just deltas or "positions - pix_center_pos" )
-			vec3 normalized_viewspace_dir = vec3(pix_center_pos.xy / pix_center_pos.zz, 1.0);
-			vec3 pixel_left_delta = vec3(-pixel_size_at_center.x, 0.0, 0.0) + normalized_viewspace_dir * (pix_left_z - pix_center_pos.z);
-			vec3 pixel_right_delta = vec3(+pixel_size_at_center.x, 0.0, 0.0) + normalized_viewspace_dir * (pix_right_z - pix_center_pos.z);
-			vec3 pixel_top_delta = vec3(0.0, -pixel_size_at_center.y, 0.0) + normalized_viewspace_dir * (pix_top_z - pix_center_pos.z);
-			vec3 pixel_bottom_delta = vec3(0.0, +pixel_size_at_center.y, 0.0) + normalized_viewspace_dir * (pix_bottom_z - pix_center_pos.z);
-
-			const float range_reduction = 4.0f; // this is to avoid various artifacts
-			const float modified_fallof_sq = range_reduction * fallof_sq;
-
-			vec4 additional_obscurance;
-			additional_obscurance.x = calculate_pixel_obscurance(pixel_normal, pixel_left_delta, modified_fallof_sq);
-			additional_obscurance.y = calculate_pixel_obscurance(pixel_normal, pixel_right_delta, modified_fallof_sq);
-			additional_obscurance.z = calculate_pixel_obscurance(pixel_normal, pixel_top_delta, modified_fallof_sq);
-			additional_obscurance.w = calculate_pixel_obscurance(pixel_normal, pixel_bottom_delta, modified_fallof_sq);
-
-			obscurance_sum += params.detail_intensity * dot(additional_obscurance, edgesLRTB);
-		}
-	}
-
-	// Sharp normals also create edges - but this adds to the cost as well
 	if (!p_adaptive_base && (p_quality_level >= SSAO_NORMAL_BASED_EDGES_ENABLE_AT_QUALITY_PRESET)) {
-		vec3 neighbour_normal_left = load_normal(ivec2(full_res_coord), ivec2(-2, 0));
-		vec3 neighbour_normal_right = load_normal(ivec2(full_res_coord), ivec2(2, 0));
-		vec3 neighbour_normal_top = load_normal(ivec2(full_res_coord), ivec2(0, -2));
-		vec3 neighbour_normal_bottom = load_normal(ivec2(full_res_coord), ivec2(0, 2));
-
-		const float dot_threshold = SSAO_NORMAL_BASED_EDGES_DOT_THRESHOLD;
-
-		vec4 normal_edgesLRTB;
-		normal_edgesLRTB.x = clamp((dot(pixel_normal, neighbour_normal_left) + dot_threshold), 0.0, 1.0);
-		normal_edgesLRTB.y = clamp((dot(pixel_normal, neighbour_normal_right) + dot_threshold), 0.0, 1.0);
-		normal_edgesLRTB.z = clamp((dot(pixel_normal, neighbour_normal_top) + dot_threshold), 0.0, 1.0);
-		normal_edgesLRTB.w = clamp((dot(pixel_normal, neighbour_normal_bottom) + dot_threshold), 0.0, 1.0);
-
-		edgesLRTB *= normal_edgesLRTB;
+		vec3 nl = load_normal(ivec2(full_res_coord), ivec2(-2, 0));
+		vec3 nr = load_normal(ivec2(full_res_coord), ivec2(2, 0));
+		vec3 nt = load_normal(ivec2(full_res_coord), ivec2(0, -2));
+		vec3 nb = load_normal(ivec2(full_res_coord), ivec2(0, 2));
+		const float dt = SSAO_NORMAL_BASED_EDGES_DOT_THRESHOLD;
+		vec4 ne;
+		ne.x = clamp((dot(pixel_normal, nl) + dt), 0.0, 1.0);
+		ne.y = clamp((dot(pixel_normal, nr) + dt), 0.0, 1.0);
+		ne.z = clamp((dot(pixel_normal, nt) + dt), 0.0, 1.0);
+		ne.w = clamp((dot(pixel_normal, nb) + dt), 0.0, 1.0);
+		edgesLRTB *= ne;
 	}
 
-	const float global_mip_offset = SSAO_DEPTH_MIPS_GLOBAL_OFFSET;
-	float mip_offset = (p_quality_level < SSAO_DEPTH_MIPS_ENABLE_AT_QUALITY_PRESET) ? (0) : (log2(pixel_lookup_radius) + global_mip_offset);
+	// --- GTAO core ---
+	vec3 view_dir = params.is_orthogonal ? vec3(0.0, 0.0, 1.0) : normalize(pix_center_pos);
 
-	// Used to tilt the second set of samples so that the disk is effectively rotated by the normal
-	// effective at removing one set of artifacts, but too expensive for lower quality settings
-	vec2 norm_xy = vec2(pixel_normal.x, pixel_normal.y);
-	float norm_xy_length = length(norm_xy);
-	norm_xy /= vec2(norm_xy_length, -norm_xy_length);
-	norm_xy_length *= SSAO_TILT_SAMPLES_AMOUNT;
+	float world_radius = params.radius;
+	float too_close_limit = clamp(length(pix_center_pos) * params.inv_radius_near_limit, 0.0, 1.0) * 0.8 + 0.2;
+	world_radius *= too_close_limit;
+	float screen_radius = (0.85 * world_radius) / pixel_size_at_center.x;
 
-	// standard, non-adaptive approach
-	if ((p_quality_level != 3) || p_adaptive_base) {
-		for (int i = 0; i < number_of_taps; i++) {
-			SSAOTap(p_quality_level, obscurance_sum, weight_sum, i, rot_scale_matrix, pix_center_pos, pixel_normal, normalized_screen_pos, mip_offset, fallof_sq, 1.0, norm_xy, norm_xy_length);
+	if (!p_adaptive_base && (p_quality_level >= SSAO_REDUCE_RADIUS_NEAR_SCREEN_BORDER_ENABLE_AT_QUALITY_PRESET)) {
+		float near_border = min(min(normalized_screen_pos.x, 1.0 - normalized_screen_pos.x), min(normalized_screen_pos.y, 1.0 - normalized_screen_pos.y));
+		screen_radius *= clamp(10.0 * near_border + 0.6, 0.0, 1.0);
+	}
+
+	screen_radius = max(screen_radius, 2.0);
+	float falloff_radius_sq = world_radius * world_radius;
+
+	int num_directions = gtao_directions[p_quality_level];
+	int num_steps = gtao_steps[p_quality_level];
+
+	float noise_rotation = interleaved_gradient_noise(pos_rounded + vec2(params.pass * 5)) * GTAO_PI;
+	float noise_offset = interleaved_gradient_noise(pos_rounded * 3.73 + vec2(params.pass * 7 + 11)) * 0.3 + 0.15;
+
+	float ao_sum = 0.0;
+	float dir_step = GTAO_PI / float(num_directions);
+
+	for (int dir_idx = 0; dir_idx < num_directions; dir_idx++) {
+		float phi = dir_step * (float(dir_idx) + 0.5) + noise_rotation;
+		vec2 dir_screen = vec2(cos(phi), sin(phi));
+		vec2 step_uv = dir_screen * screen_radius * params.half_screen_pixel_size / float(num_steps);
+
+		vec3 slice_dir_vs = normalize(vec3(dir_screen * pixel_size_at_center, 0.0));
+		vec3 slice_plane_normal = normalize(cross(slice_dir_vs, view_dir));
+		vec3 proj_normal = pixel_normal - slice_plane_normal * dot(pixel_normal, slice_plane_normal);
+		float pnl = max(length(proj_normal), 1e-6);
+		float cos_n = clamp(dot(proj_normal / pnl, view_dir), -1.0, 1.0);
+		float n_angle = -sign(dot(proj_normal, slice_dir_vs)) * acos(cos_n);
+
+		float h_front = params.horizon_angle_threshold - GTAO_PI_HALF;
+		float h_back = params.horizon_angle_threshold - GTAO_PI_HALF;
+
+		for (int s = 0; s < num_steps; s++) {
+			float t = (float(s) + noise_offset) / float(num_steps);
+			float mip_level = (p_quality_level >= SSAO_DEPTH_MIPS_ENABLE_AT_QUALITY_PRESET) ? clamp(log2(t * screen_radius * 0.25), 0.0, float(SSAO_DEPTH_MIP_LEVELS - 1)) : 0.0;
+
+			// Forward sample
+			vec2 uv_f = normalized_screen_pos + step_uv * (t * float(num_steps));
+			float z_f = textureLod(source_depth_mipmaps, vec3(uv_f, params.pass), mip_level).x;
+			vec3 df = NDC_to_view_space(uv_f, z_f) - pix_center_pos;
+			float dsq_f = dot(df, df);
+			float comb_f = clamp(1.0 - dsq_f / falloff_radius_sq, 0.0, 1.0) * clamp(df.z * params.neg_inv_radius + 1.0, 0.0, 1.0);
+			if (dsq_f > 1e-6) {
+				vec3 dn_f = df * inversesqrt(dsq_f);
+				float hf = acos(clamp(dot(dn_f, view_dir), -1.0, 1.0)) * sign(dot(dn_f, slice_dir_vs));
+				h_front = max(h_front, mix(h_front, hf, comb_f));
+			}
+
+			// Backward sample
+			vec2 uv_b = normalized_screen_pos - step_uv * (t * float(num_steps));
+			float z_b = textureLod(source_depth_mipmaps, vec3(uv_b, params.pass), mip_level).x;
+			vec3 db = NDC_to_view_space(uv_b, z_b) - pix_center_pos;
+			float dsq_b = dot(db, db);
+			float comb_b = clamp(1.0 - dsq_b / falloff_radius_sq, 0.0, 1.0) * clamp(db.z * params.neg_inv_radius + 1.0, 0.0, 1.0);
+			if (dsq_b > 1e-6) {
+				vec3 dn_b = db * inversesqrt(dsq_b);
+				float hb = acos(clamp(dot(dn_b, view_dir), -1.0, 1.0)) * -sign(dot(dn_b, slice_dir_vs));
+				h_back = max(h_back, mix(h_back, hb, comb_b));
+			}
 		}
+
+		float h1c = max(-h_back, n_angle - GTAO_PI_HALF);
+		float h2c = min(h_front, n_angle + GTAO_PI_HALF);
+		ao_sum += clamp(gtao_integrate_arc(h1c, h2c, n_angle), 0.0, 1.0);
 	}
-#ifdef ADAPTIVE
-	else {
-		// add new ones if needed
-		vec2 full_res_uv = normalized_screen_pos + params.pass_uv_offset.xy;
-		float importance = textureLod(source_importance, full_res_uv, 0.0).x;
 
-		// this is to normalize SSAO_DETAIL_AO_AMOUNT across all pixel regardless of importance
-		obscurance_sum *= (SSAO_ADAPTIVE_TAP_BASE_COUNT / float(SSAO_MAX_TAPS)) + (importance * SSAO_ADAPTIVE_TAP_FLEXIBLE_COUNT / float(SSAO_MAX_TAPS));
+	float visibility = ao_sum / float(num_directions);
 
-		// load existing base values
-		vec2 base_values = imageLoad(source_ssao, ivec3(upos, params.pass)).xy;
-		weight_sum += base_values.y * float(SSAO_ADAPTIVE_TAP_BASE_COUNT * 4.0);
-		obscurance_sum += (base_values.x) * weight_sum;
-
-		// increase importance around edges
-		float edge_count = dot(1.0 - edgesLRTB, vec4(1.0, 1.0, 1.0, 1.0));
-
-		float avg_total_importance = float(counter.sum) * params.load_counter_avg_div;
-
-		float importance_limiter = clamp(params.adaptive_sample_limit / avg_total_importance, 0.0, 1.0);
-		importance *= importance_limiter;
-
-		float additional_sample_count = SSAO_ADAPTIVE_TAP_FLEXIBLE_COUNT * importance;
-
-		const float blend_range = 3.0;
-		const float blend_range_inv = 1.0 / blend_range;
-
-		additional_sample_count += 0.5;
-		uint additional_samples = uint(additional_sample_count);
-		uint additional_samples_to = min(SSAO_MAX_TAPS, additional_samples + SSAO_ADAPTIVE_TAP_BASE_COUNT);
-
-		for (uint i = SSAO_ADAPTIVE_TAP_BASE_COUNT; i < additional_samples_to; i++) {
-			additional_sample_count -= 1.0f;
-			float weight_mod = clamp(additional_sample_count * blend_range_inv, 0.0, 1.0);
-			SSAOTap(p_quality_level, obscurance_sum, weight_sum, int(i), rot_scale_matrix, pix_center_pos, pixel_normal, normalized_screen_pos, mip_offset, fallof_sq, weight_mod, norm_xy, norm_xy_length);
-		}
-	}
-#endif
-
-	// early out for adaptive base - just output weight (used for the next pass)
 	if (p_adaptive_base) {
-		float obscurance = obscurance_sum / weight_sum;
-
-		r_shadow_term = obscurance;
+		r_shadow_term = visibility;
 		r_edges = vec4(0.0);
-		r_weight = weight_sum;
+		r_weight = float(num_directions * num_steps * 2);
 		return;
 	}
 
-	// calculate weighted average
-	float obscurance = obscurance_sum / weight_sum;
-
-	// calculate fadeout (1 close, gradient, 0 far)
 	float fade_out = clamp(pix_center_pos.z * params.fade_out_mul + params.fade_out_add, 0.0, 1.0);
-
-	// Reduce the SSAO shadowing if we're on the edge to remove artifacts on edges (we don't care for the lower quality one)
 	if (!p_adaptive_base && (p_quality_level >= SSAO_DEPTH_BASED_EDGES_ENABLE_AT_QUALITY_PRESET)) {
-		// when there's more than 2 opposite edges, start fading out the occlusion to reduce aliasing artifacts
-		float edge_fadeout_factor = clamp((1.0 - edgesLRTB.x - edgesLRTB.y) * 0.35, 0.0, 1.0) + clamp((1.0 - edgesLRTB.z - edgesLRTB.w) * 0.35, 0.0, 1.0);
-
-		fade_out *= clamp(1.0 - edge_fadeout_factor, 0.0, 1.0);
+		float ef = clamp((1.0 - edgesLRTB.x - edgesLRTB.y) * 0.35, 0.0, 1.0) + clamp((1.0 - edgesLRTB.z - edgesLRTB.w) * 0.35, 0.0, 1.0);
+		fade_out *= clamp(1.0 - ef, 0.0, 1.0);
 	}
 
-	// strength
-	obscurance = params.intensity * obscurance;
-
-	// clamp
+	float obscurance = params.intensity * (1.0 - visibility);
 	obscurance = min(obscurance, params.shadow_clamp);
-
-	// fadeout
 	obscurance *= fade_out;
 
-	// conceptually switch to occlusion with the meaning being visibility (grows with visibility, occlusion == 1 implies full visibility),
-	// to be in line with what is more commonly used.
 	float occlusion = 1.0 - obscurance;
-
-	// modify the gradient
-	// note: this cannot be moved to a later pass because of loss of precision after storing in the render target
 	occlusion = pow(clamp(occlusion, 0.0, 1.0), params.shadow_power);
 
-	// outputs!
-	r_shadow_term = occlusion; // Our final 'occlusion' term (0 means fully occluded, 1 means fully lit)
-	r_edges = edgesLRTB; // These are used to prevent blurring across edges, 1 means no edge, 0 means edge, 0.5 means half way there, etc.
-	r_weight = weight_sum;
+	r_shadow_term = occlusion;
+	r_edges = edgesLRTB;
+	r_weight = float(num_directions * num_steps * 2);
 }
 
 void main() {
