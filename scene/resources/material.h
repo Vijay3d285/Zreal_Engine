@@ -221,6 +221,9 @@ public:
 		FEATURE_REFRACTION,
 		FEATURE_DETAIL,
 		FEATURE_BENT_NORMAL_MAPPING,
+		FEATURE_SHEEN,
+		FEATURE_IRIDESCENCE,
+		FEATURE_PHYSICAL_IOR,
 		FEATURE_MAX
 	};
 
@@ -564,6 +567,12 @@ private:
 	bool grow_enabled = false;
 	float ao_light_affect = 0.0f;
 	float grow = 0.0f;
+	// Substrate-style material properties
+	Color sheen_color = Color(1, 1, 1);
+	float sheen_roughness = 0.5f;
+	float iridescence_ior = 1.5f;
+	float iridescence_thickness = 400.0f;
+	float material_ior = 1.5f;
 	int particles_anim_h_frames = 0;
 	int particles_anim_v_frames = 0;
 	bool particles_anim_loop = false;

@@ -59,6 +59,52 @@ hvec3 F0(half metallic, half specular, hvec3 albedo) {
 	return mix(hvec3(dielectric), albedo, hvec3(metallic));
 }
 
+// ── Physical F0/F90 Fresnel (Substrate-style) ─────────────────────────────────
+hvec3 F_Schlick_F90(hvec3 f0, hvec3 f90, half cosTheta) {
+	return f0 + (f90 - f0) * pow(clamp(half(1.0) - cosTheta, half(0.0), half(1.0)), half(5.0));
+}
+
+hvec3 ior_to_f0_rgb(half ior) {
+	half f = (ior - half(1.0)) / (ior + half(1.0));
+	return hvec3(f * f);
+}
+
+hvec3 metal_f90(hvec3 f0) {
+	return clamp(f0 * half(50.0), hvec3(0.0), hvec3(1.0));
+}
+
+// ── Charlie Sheen BRDF (Estevez & Kulla, SIGGRAPH 2017) ───────────────────────
+half D_Charlie(half roughness, half NdotH) {
+	half alpha = roughness * roughness;
+	half inv_r = half(1.0) / max(alpha, half(1e-4));
+	half cos2h = NdotH * NdotH;
+	half sin2h = max(half(1.0) - cos2h, half(0.0078125));
+	return (half(2.0) + inv_r) * pow(sin2h, inv_r * half(0.5)) * half(1.0 / M_PI) * half(0.5);
+}
+
+half V_Ashikhmin(half NdotL, half NdotV) {
+	return clamp(half(1.0) / (half(4.0) * (NdotL + NdotV - NdotL * NdotV)), half(0.0), half(1.0));
+}
+
+hvec3 sheen_brdf(hvec3 sheen_color, half sheen_roughness, half NdotL, half NdotV, half NdotH) {
+	half D = D_Charlie(sheen_roughness, NdotH);
+	half V = V_Ashikhmin(NdotL, NdotV);
+	return sheen_color * D * V;
+}
+
+// ── Thin-film iridescence (Belcour 2017, RGB approximation) ───────────────────
+hvec3 iridescence_fresnel(half film_thickness, half film_ior, hvec3 base_f0, half cosTheta) {
+	const hvec3 lambda = hvec3(680.0, 550.0, 440.0);
+	half sinTheta2 = half(1.0) - cosTheta * cosTheta;
+	half cosTheta2 = sqrt(max(half(0.0), film_ior * film_ior - sinTheta2)) / film_ior;
+	half OPD = half(2.0) * film_ior * film_thickness * cosTheta2;
+	hvec3 phi = hvec3(2.0 * M_PI) * OPD / lambda;
+	hvec3 T = hvec3(0.5) + hvec3(0.5) * hvec3(cos(phi.x), cos(phi.y), cos(phi.z));
+	hvec3 F_film = F_Schlick_F90(hvec3(film_ior - half(1.0)) / hvec3(film_ior + half(1.0)), hvec3(1.0), cosTheta2);
+	F_film *= F_film; // square to get reflectance
+	return mix(base_f0, F_film * T + base_f0 * (hvec3(1.0) - T), hvec3(1.0));
+}
+
 void light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is_directional, half attenuation, hvec3 f0, half roughness, half metallic, half specular_amount, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
 		hvec3 backlight,
@@ -259,8 +305,25 @@ void light_compute(hvec3 N, hvec3 L, hvec3 V, half A, hvec3 light_color, bool is
 			// https://google.github.io/filament/Filament.html#lighting/occlusion/specularocclusion
 			half f90 = clamp(dot(f0, hvec3(50.0 * 0.33)), metallic, half(1.0));
 			hvec3 F = f0 + (f90 - f0) * cLdotH5;
+#ifdef IRIDESCENCE_USED
+			// Modulate f0 with thin-film interference before specular evaluation
+			half irid_cosTheta = clamp(cLdotH, half(0.0), half(1.0));
+			hvec3 irid_f0 = iridescence_fresnel(half(IRIDESCENCE_THICKNESS), half(IRIDESCENCE_IOR), f0, irid_cosTheta);
+			F = irid_f0 + (f90 - irid_f0) * cLdotH5;
+#endif
 			hvec3 specular_brdf_NL = energy_compensation * cNdotL * D * F * G;
 			specular_light += specular_brdf_NL * light_color * attenuation * specular_amount;
+#ifdef SHEEN_USED
+			// Charlie Sheen BRDF layered on top — for fabric, velvet, microfiber
+			half NdotH_s = clamp(A + dot(N, normalize(L + V)), half(0.0), half(1.0));
+			half sheenE_V = half(1.0) - half(0.6) * pow(max(half(0.0), half(1.0) - cNdotV), half(4.0));
+			half sheenE_L = half(1.0) - half(0.6) * pow(max(half(0.0), half(1.0) - cNdotL), half(4.0));
+			half sheen_mx = max(max(SHEEN_COLOR.r, SHEEN_COLOR.g), SHEEN_COLOR.b);
+			half sheen_scale = min(half(1.0) - sheen_mx * sheenE_V, half(1.0) - sheen_mx * sheenE_L);
+			hvec3 sheen = sheen_brdf(SHEEN_COLOR, SHEEN_ROUGHNESS, cNdotL, cNdotV, NdotH_s);
+			specular_light = specular_light * sheen_scale + sheen * light_color * attenuation * cNdotL;
+			diffuse_light = diffuse_light * sheen_scale;
+#endif
 #endif
 		}
 

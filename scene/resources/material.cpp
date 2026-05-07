@@ -1116,6 +1116,25 @@ uniform sampler2D texture_clearcoat : hint_default_white, %s;
 )",
 				texfilter_str);
 	}
+	if (features[FEATURE_SHEEN]) {
+		code += R"(
+#define SHEEN_USED
+uniform vec3 SHEEN_COLOR : source_color = vec3(1.0);
+uniform float SHEEN_ROUGHNESS : hint_range(0.0, 1.0, 0.01) = 0.5;
+)";
+	}
+	if (features[FEATURE_IRIDESCENCE]) {
+		code += R"(
+#define IRIDESCENCE_USED
+uniform float IRIDESCENCE_IOR : hint_range(1.0, 3.0, 0.01) = 1.5;
+uniform float IRIDESCENCE_THICKNESS : hint_range(0.0, 1000.0, 1.0) = 400.0;
+)";
+	}
+	if (features[FEATURE_PHYSICAL_IOR]) {
+		code += R"(
+uniform float MATERIAL_IOR : hint_range(1.0, 3.0, 0.01) = 1.5;
+)";
+	}
 	if (features[FEATURE_ANISOTROPY]) {
 		code += vformat(R"(
 uniform float anisotropy_ratio : hint_range(0.0, 1.0, 0.01);
