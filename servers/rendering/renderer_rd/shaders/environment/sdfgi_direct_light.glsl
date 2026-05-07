@@ -160,7 +160,10 @@ void main() {
 	// Add indirect light first, in order to save computation resources
 #ifdef MODE_PROCESS_DYNAMIC
 	if (params.bounce_feedback > 0.001) {
-		vec3 feedback = (params.bounce_feedback < 1.0) ? (albedo * params.bounce_feedback) : mix(albedo, vec3(1.0), params.bounce_feedback - 1.0);
+		// Saturate albedo before bounce feedback for richer colour bleeding (Lumen-like)
+		float luma = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
+		vec3 saturated_albedo = clamp(mix(vec3(luma), albedo, 1.3), 0.0, 1.0);
+		vec3 feedback = (params.bounce_feedback < 1.0) ? (saturated_albedo * params.bounce_feedback) : mix(saturated_albedo, vec3(1.0), params.bounce_feedback - 1.0);
 		vec3 pos = (vec3(positioni) + vec3(0.5)) * float(params.probe_axis_size - 1) / params.grid_size;
 		ivec3 probe_base_pos = ivec3(pos);
 

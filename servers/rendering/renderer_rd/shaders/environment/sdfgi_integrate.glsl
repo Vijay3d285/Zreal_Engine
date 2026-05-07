@@ -225,7 +225,7 @@ void main() {
 				uvw = (pos + ray_dir * advance) * pos_to_uvw;
 
 				float distance = texture(sampler3D(sdf_cascades[j], linear_sampler), uvw).r * 255.0 - 1.0;
-				if (distance < 0.05) {
+				if (distance < 0.01) { // Tighter threshold for sharper GI contact shadows
 					//consider hit
 					hit = true;
 					break;
@@ -275,9 +275,9 @@ void main() {
 			vec3 sky_dir = cross(sky_quat.xyz, ray_dir);
 			sky_dir = ray_dir + ((sky_dir * sky_quat.w) + cross(sky_quat.xyz, sky_dir)) * 2.0;
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
-			light.rgb = textureLod(sampler2DArray(sky_irradiance, linear_sampler_mipmaps), vec3(vec3_to_oct_with_border(sky_dir, params.sky_irradiance_border_size), 0.0), 2.0).rgb; // Use second mipmap because we don't usually throw a lot of rays, so this compensates.
+			light.rgb = textureLod(sampler2DArray(sky_irradiance, linear_sampler_mipmaps), vec3(vec3_to_oct_with_border(sky_dir, params.sky_irradiance_border_size), 0.0), 1.0).rgb; // Use first mipmap for higher-fidelity sky GI (offline rendering)
 #else
-			light.rgb = textureLod(sampler2D(sky_irradiance, linear_sampler_mipmaps), vec3_to_oct_with_border(sky_dir, params.sky_irradiance_border_size), 2.0).rgb; // Use second mipmap because we don't usually throw a lot of rays, so this compensates.
+			light.rgb = textureLod(sampler2D(sky_irradiance, linear_sampler_mipmaps), vec3_to_oct_with_border(sky_dir, params.sky_irradiance_border_size), 1.0).rgb; // Use first mipmap for higher-fidelity sky GI (offline rendering)
 #endif
 			light.rgb *= params.sky_energy;
 			light.a = 0.0;

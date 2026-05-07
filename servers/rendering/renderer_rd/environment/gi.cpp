@@ -1265,7 +1265,7 @@ void GI::SDFGI::update_light() {
 		push_constant.light_count = cascade_dynamic_light_count[i];
 		push_constant.cascade = i;
 
-		if (cascades[i].all_dynamic_lights_dirty || gi->sdfgi_frames_to_update_light == RS::ENV_SDFGI_UPDATE_LIGHT_IN_1_FRAME) {
+		if (true) { // Force full GI convergence every frame (offline rendering)
 			push_constant.process_offset = 0;
 			push_constant.process_increment = 1;
 		} else {
