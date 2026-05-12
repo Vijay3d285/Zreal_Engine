@@ -4987,6 +4987,260 @@ void RenderForwardClustered::_update_shader_quality_settings() {
 	base_uniforms_changed(); //also need this
 }
 
+
+/* ── GPU-Driven Indirect Rendering ────────────────────────────────────── */
+
+void RenderForwardClustered::_init_gpu_driven() {
+	RenderingDevice *rd = RD::get_singleton();
+	use_gpu_driven = GLOBAL_GET("rendering/gpu_driven/enable");
+	gpu_max_instances_per_batch = GLOBAL_GET("rendering/gpu_driven/max_instances_per_batch");
+
+	if (!use_gpu_driven) {
+		return;
+	}
+
+	// The cull and HZB shaders are compiled by SCons into .gen.h headers.
+	// We create shader RIDs and compute pipelines from them at engine init.
+	// For now, the pipelines are created lazily on first use since the
+	// generated shader classes (GpuCullShaderRD, HzbReduceShaderRD) need
+	// to be initialized with mode strings first.
+
+	print_line("[GPU-Driven] Initialized. max_instances_per_batch = " + itos(gpu_max_instances_per_batch));
+}
+
+void RenderForwardClustered::_cleanup_gpu_driven() {
+	RenderingDevice *rd = RD::get_singleton();
+
+	gpu_instance_buffer.free_buffer(rd);
+
+	if (gpu_draw_indirect_buffer.is_valid()) {
+		rd->free_rid(gpu_draw_indirect_buffer);
+		gpu_draw_indirect_buffer = RID();
+	}
+	if (gpu_draw_count_buffer.is_valid()) {
+		rd->free_rid(gpu_draw_count_buffer);
+		gpu_draw_count_buffer = RID();
+	}
+	if (gpu_cull_pipeline.is_valid()) {
+		rd->free_rid(gpu_cull_pipeline);
+		gpu_cull_pipeline = RID();
+	}
+	if (gpu_cull_shader_rd_shader.is_valid()) {
+		rd->free_rid(gpu_cull_shader_rd_shader);
+		gpu_cull_shader_rd_shader = RID();
+	}
+	if (gpu_hzb_pipeline.is_valid()) {
+		rd->free_rid(gpu_hzb_pipeline);
+		gpu_hzb_pipeline = RID();
+	}
+	if (gpu_hzb_shader_rd_shader.is_valid()) {
+		rd->free_rid(gpu_hzb_shader_rd_shader);
+		gpu_hzb_shader_rd_shader = RID();
+	}
+	if (hzb_texture.is_valid()) {
+		rd->free_rid(hzb_texture);
+		hzb_texture = RID();
+	}
+	if (gpu_cull_uniform_set.is_valid()) {
+		rd->free_rid(gpu_cull_uniform_set);
+		gpu_cull_uniform_set = RID();
+	}
+}
+
+void RenderForwardClustered::_rebuild_gpu_instance_buffer(const RenderDataRD *p_render_data) {
+	// Collect all opaque render list elements into GPUInstanceData structs.
+	RenderList *rl = &render_list[RENDER_LIST_OPAQUE];
+	uint32_t element_count = rl->elements.size();
+
+	if (element_count == 0) {
+		gpu_instance_count = 0;
+		gpu_instance_buffer.dirty = false;
+		return;
+	}
+
+	Vector<GPUInstanceData> instances;
+	instances.resize(element_count);
+
+	// Track unique material batches.
+	HashMap<uint64_t, uint32_t> material_batch_map;
+	gpu_batch_count = 0;
+
+	for (uint32_t i = 0; i < element_count; i++) {
+		GeometryInstanceSurfaceDataCache *element = rl->elements[i];
+		GeometryInstanceForwardClustered *ginstance = element->owner;
+
+		GPUInstanceData &inst = instances.ptrw()[i];
+
+		// Copy AABB from the geometry instance.
+		AABB aabb = ginstance->transformed_aabb;
+		inst.aabb_min[0] = aabb.position.x;
+		inst.aabb_min[1] = aabb.position.y;
+		inst.aabb_min[2] = aabb.position.z;
+		inst.aabb_max[0] = aabb.position.x + aabb.size.x;
+		inst.aabb_max[1] = aabb.position.y + aabb.size.y;
+		inst.aabb_max[2] = aabb.position.z + aabb.size.z;
+
+		// LOD distances — use sensible defaults for now.
+		inst.lod_distance_0 = 50.0f;
+		inst.lod_distance_1 = 100.0f;
+
+		// Mesh and material indices.
+		inst.mesh_index = i; // 1:1 mapping for now
+		inst.flags = 0x3; // visible + force draw
+
+		// Map material to batch.
+		uint64_t mat_key = element->sort.sort_key2;
+		if (!material_batch_map.has(mat_key)) {
+			material_batch_map[mat_key] = gpu_batch_count++;
+		}
+		inst.material_batch = material_batch_map[mat_key];
+
+		inst.lod_level = 0;
+	}
+
+	// Cap batch count.
+	gpu_batch_count = MAX(gpu_batch_count, 1u);
+
+	RenderingDevice *rd = RD::get_singleton();
+	gpu_instance_buffer.upload(rd, instances);
+	gpu_instance_count = element_count;
+
+	// Ensure draw command and count buffers are large enough.
+	uint32_t draw_cmd_size = gpu_instance_count * 20; // sizeof(DrawIndexedIndirectCommand) = 20 bytes
+	if (!gpu_draw_indirect_buffer.is_valid() || draw_cmd_size > 0) {
+		if (gpu_draw_indirect_buffer.is_valid()) {
+			rd->free_rid(gpu_draw_indirect_buffer);
+		}
+		gpu_draw_indirect_buffer = rd->storage_buffer_create(MAX(draw_cmd_size, 256u));
+	}
+
+	uint32_t count_size = gpu_batch_count * sizeof(uint32_t);
+	if (!gpu_draw_count_buffer.is_valid()) {
+		gpu_draw_count_buffer = rd->storage_buffer_create(MAX(count_size, 256u));
+	}
+
+	gpu_instance_buffer.dirty = false;
+}
+
+void RenderForwardClustered::_build_hzb(Ref<RenderSceneBuffersRD> p_render_buffers) {
+	// HZB build stub — creates the hierarchical Z-buffer from previous frame depth.
+	// Full implementation requires binding the depth texture and dispatching
+	// hzb_reduce.glsl for each mip level. For the initial compile-verification
+	// pass, this is a no-op.
+	// TODO: Implement full HZB mip chain dispatch.
+}
+
+void RenderForwardClustered::_prefill_draw_commands() {
+	// Pre-fill the indirect draw buffer with mesh vertex/index data.
+	// The cull shader only sets instance_count = 1 for surviving instances;
+	// the rest of the DrawIndexedIndirectCommand fields are pre-filled here.
+	// TODO: Fill from mesh storage data.
+}
+
+void RenderForwardClustered::_fill_cull_push_constant(const RenderDataRD *p_render_data, GPUCullPushConstant &r_pc) {
+	// Extract VP matrix.
+	Projection vp = p_render_data->scene_data->cam_projection * Projection(p_render_data->scene_data->cam_transform.affine_inverse());
+	for (int i = 0; i < 4; i++) {
+		for (int j = 0; j < 4; j++) {
+			r_pc.view_proj[i * 4 + j] = vp.columns[i][j];
+		}
+	}
+
+	// Extract frustum planes using Gribb-Hartmann method from VP matrix.
+	// Each plane: row-add or row-subtract of VP rows.
+	Projection::Planes planes_enum[6] = {
+		Projection::PLANE_LEFT,
+		Projection::PLANE_RIGHT,
+		Projection::PLANE_BOTTOM,
+		Projection::PLANE_TOP,
+		Projection::PLANE_NEAR,
+		Projection::PLANE_FAR
+	};
+
+	for (int i = 0; i < 6; i++) {
+		Plane plane = vp.get_projection_plane(planes_enum[i]);
+		r_pc.frustum_planes[i * 4 + 0] = plane.normal.x;
+		r_pc.frustum_planes[i * 4 + 1] = plane.normal.y;
+		r_pc.frustum_planes[i * 4 + 2] = plane.normal.z;
+		r_pc.frustum_planes[i * 4 + 3] = plane.d;
+	}
+
+	// Camera position.
+	Vector3 cam_pos = p_render_data->scene_data->cam_transform.origin;
+	r_pc.camera_pos[0] = cam_pos.x;
+	r_pc.camera_pos[1] = cam_pos.y;
+	r_pc.camera_pos[2] = cam_pos.z;
+	r_pc._pad0 = 0.0f;
+
+	// HZB size (mip 0).
+	Size2i vp_size = p_render_data->render_buffers->get_internal_size();
+	r_pc.hzb_size[0] = (float)(vp_size.x / 2);
+	r_pc.hzb_size[1] = (float)(vp_size.y / 2);
+
+	r_pc.instance_count = gpu_instance_count;
+	r_pc._pad1 = 0;
+}
+
+void RenderForwardClustered::_gpu_cull_and_draw(
+		RenderDataRD *p_render_data,
+		const RenderListParameters *p_params,
+		RID p_framebuffer) {
+	RenderingDevice *rd = RD::get_singleton();
+
+	// 1. Update instance buffer if scene changed.
+	if (gpu_instance_buffer.dirty || gpu_instance_count == 0) {
+		_rebuild_gpu_instance_buffer(p_render_data);
+	}
+
+	if (gpu_instance_count == 0) {
+		return; // Nothing to draw.
+	}
+
+	// 2. Build HZB from previous frame depth.
+	_build_hzb(p_render_data->render_buffers);
+
+	// 3. Reset draw counts to 0.
+	rd->buffer_clear(gpu_draw_count_buffer, 0, gpu_batch_count * sizeof(uint32_t));
+
+	// 4. Reset instance_count to 0 in all draw command slots.
+	rd->buffer_clear(gpu_draw_indirect_buffer, 0, gpu_instance_count * 20);
+
+	// Re-fill index_count, first_index, vertex_offset from mesh data.
+	_prefill_draw_commands();
+
+	// 5. Fill push constant.
+	_fill_cull_push_constant(p_render_data, gpu_cull_pc);
+
+	// 6. Dispatch cull compute shader (when pipeline is ready).
+	if (gpu_cull_pipeline.is_valid() && gpu_cull_uniform_set.is_valid()) {
+		RD::ComputeListID cl = rd->compute_list_begin();
+		rd->compute_list_bind_compute_pipeline(cl, gpu_cull_pipeline);
+		rd->compute_list_bind_uniform_set(cl, gpu_cull_uniform_set, 0);
+		rd->compute_list_set_push_constant(cl, &gpu_cull_pc, sizeof(gpu_cull_pc));
+		rd->compute_list_dispatch(cl, (gpu_instance_count + 63) / 64, 1, 1);
+		rd->compute_list_end();
+
+		// 7. Barrier: wait for cull writes before draw reads.
+		rd->barrier(RD::BARRIER_MASK_COMPUTE, RD::BARRIER_MASK_VERTEX);
+
+		// 8. Issue indirect draw — one call per material batch.
+		RD::DrawListID dl = rd->draw_list_begin(p_framebuffer);
+
+		for (uint32_t batch = 0; batch < gpu_batch_count; batch++) {
+			uint32_t batch_offset = batch * gpu_max_instances_per_batch;
+			rd->draw_list_draw_indirect(dl,
+					true, // use indices
+					gpu_draw_indirect_buffer,
+					batch_offset * 20, // offset in bytes
+					MIN(gpu_max_instances_per_batch, gpu_instance_count),
+					20); // stride = sizeof(DrawIndexedIndirectCommand)
+		}
+		rd->draw_list_end();
+	}
+
+	// If pipeline not yet ready, fall through to CPU path.
+}
+
 RenderForwardClustered::RenderForwardClustered() {
 	singleton = this;
 
@@ -5130,9 +5384,16 @@ RenderForwardClustered::RenderForwardClustered() {
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
 #endif
+
+	/* GPU-Driven Rendering */
+	GLOBAL_DEF("rendering/gpu_driven/enable", false);
+	GLOBAL_DEF("rendering/gpu_driven/max_instances_per_batch", 4096);
+	_init_gpu_driven();
 }
 
 RenderForwardClustered::~RenderForwardClustered() {
+	_cleanup_gpu_driven();
+
 	if (ss_effects != nullptr) {
 		memdelete(ss_effects);
 		ss_effects = nullptr;

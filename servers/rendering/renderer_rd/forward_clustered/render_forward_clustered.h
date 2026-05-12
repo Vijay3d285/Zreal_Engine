@@ -42,6 +42,9 @@
 #include "servers/rendering/renderer_rd/effects/taa.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_forward_clustered.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
+#include "servers/rendering/renderer_rd/gpu_instance_buffer.h"
+#include "servers/rendering/renderer_rd/shaders/effects/gpu_cull.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/hzb_reduce.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/integrate_dfg.glsl.gen.h"
 
@@ -736,6 +739,49 @@ private:
 	RendererRD::MFXTemporalEffect *mfx_temporal_effect = nullptr;
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
+
+	/* GPU-Driven Indirect Rendering */
+
+	GPUInstanceBuffer gpu_instance_buffer;
+	RID gpu_draw_indirect_buffer; // DrawIndexedIndirectCommand[]
+	RID gpu_draw_count_buffer; // uint32_t[batch_count]
+	RID gpu_cull_shader_rd_shader; // RID of the compiled cull shader
+	RID gpu_cull_pipeline; // Compute pipeline for cull pass
+	RID gpu_cull_uniform_set;
+	RID gpu_hzb_shader_rd_shader; // RID of the compiled HZB reduce shader
+	RID gpu_hzb_pipeline; // Compute pipeline for HZB build
+	RID hzb_texture; // R32F mip chain
+	uint32_t gpu_instance_count = 0;
+	uint32_t gpu_batch_count = 0;
+	uint32_t gpu_max_instances_per_batch = 4096;
+	bool use_gpu_driven = false; // Toggled by project setting
+
+	struct GPUCullPushConstant {
+		float view_proj[16];
+		float frustum_planes[24]; // 6 x vec4
+		float camera_pos[3];
+		float _pad0;
+		float hzb_size[2];
+		uint32_t instance_count;
+		uint32_t _pad1;
+	};
+
+	GPUCullPushConstant gpu_cull_pc;
+
+	struct HZBPushConstant {
+		float source_size[2];
+		float dest_size[2];
+		int32_t source_mip;
+		int32_t _pad[3];
+	};
+
+	void _init_gpu_driven();
+	void _cleanup_gpu_driven();
+	void _rebuild_gpu_instance_buffer(const RenderDataRD *p_render_data);
+	void _build_hzb(Ref<RenderSceneBuffersRD> p_render_buffers);
+	void _prefill_draw_commands();
+	void _fill_cull_push_constant(const RenderDataRD *p_render_data, GPUCullPushConstant &r_pc);
+	void _gpu_cull_and_draw(RenderDataRD *p_render_data, const RenderListParameters *p_params, RID p_framebuffer);
 
 	/* Cluster builder */
 
