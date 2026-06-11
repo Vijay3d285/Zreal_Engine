@@ -48,7 +48,6 @@ public:
 	float taa_frame_count = 0.0f;
 	uint32_t camera_visible_layers;
 	bool cam_orthogonal = false;
-	bool cam_frustum = false;
 	bool flip_y = false;
 
 	// For billboards to cast correct shadows.
@@ -95,7 +94,7 @@ public:
 	virtual Projection get_view_projection(uint32_t p_view) const override;
 
 	RID create_uniform_buffer();
-	void update_ubo(RID p_uniform_buffer, RS::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier);
+	void update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier);
 	virtual RID get_uniform_buffer() const override;
 
 	static uint32_t get_uniform_buffer_size_bytes() { return sizeof(UBODATA); }
@@ -112,6 +111,7 @@ private:
 		SCENE_DATA_FLAGS_USE_UV2_MATERIAL = 1 << 5,
 		SCENE_DATA_FLAGS_USE_PANCAKE_SHADOWS = 1 << 6,
 		SCENE_DATA_FLAGS_IN_SHADOW_PASS = 1 << 7, // Only used by Forward+ renderer.
+		SCENE_DATA_FLAGS_USE_DEPTH_FOG = 1 << 8,
 		SCENE_DATA_FLAGS_MAX
 	};
 
@@ -182,6 +182,9 @@ private:
 		float IBL_exposure_normalization; // Adjusts for baked exposure.
 		uint32_t camera_visible_layers;
 		float pass_alpha_multiplier;
+
+		float fog_sky_affect;
+		float _pad_std140[3];
 	};
 
 	struct UBODATA {

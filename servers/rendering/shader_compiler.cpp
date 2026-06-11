@@ -30,6 +30,7 @@
 
 #include "shader_compiler.h"
 
+#include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/shader_types.h"
 
@@ -527,7 +528,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 				if (SL::is_sampler_type(E.value.type)) {
 					if (E.value.hint == SL::ShaderNode::Uniform::HINT_SCREEN_TEXTURE ||
 							E.value.hint == SL::ShaderNode::Uniform::HINT_NORMAL_ROUGHNESS_TEXTURE ||
-							E.value.hint == SL::ShaderNode::Uniform::HINT_DEPTH_TEXTURE) {
+							E.value.hint == SL::ShaderNode::Uniform::HINT_DEPTH_TEXTURE ||
+							E.value.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE0 ||
+							E.value.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE1 ||
+							E.value.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE2 ||
+							E.value.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE3) {
 						continue; // Don't create uniforms in the generated code for these.
 					}
 					max_texture_uniforms++;
@@ -572,7 +577,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 
 				if (uniform.hint == SL::ShaderNode::Uniform::HINT_SCREEN_TEXTURE ||
 						uniform.hint == SL::ShaderNode::Uniform::HINT_NORMAL_ROUGHNESS_TEXTURE ||
-						uniform.hint == SL::ShaderNode::Uniform::HINT_DEPTH_TEXTURE) {
+						uniform.hint == SL::ShaderNode::Uniform::HINT_DEPTH_TEXTURE ||
+						uniform.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE0 ||
+						uniform.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE1 ||
+						uniform.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE2 ||
+						uniform.hint == SL::ShaderNode::Uniform::HINT_BLIT_SOURCE3) {
 					continue; // Don't create uniforms in the generated code for these.
 				}
 
@@ -689,7 +698,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 				const StringName &varying_name = varying_names[k];
 				const SL::ShaderNode::Varying &varying = pnode->varyings[varying_name];
 
-				if (varying.stage == SL::ShaderNode::Varying::STAGE_FRAGMENT) {
+				if (varying.stage == SL::ShaderNode::Varying::STAGE_FRAGMENT && !p_default_actions.suppress_varying_io) {
 					var_frag_to_light.push_back(Pair<StringName, SL::ShaderNode::Varying>(varying_name, varying));
 					fragment_varyings.insert(varying_name);
 					continue;
@@ -698,32 +707,46 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					continue; // Ignore boolean types to prevent crashing (if varying is just declared).
 				}
 
-				String vcode;
-				String interp_mode = _interpstr(varying.interpolation);
-				vcode += _prestr(varying.precision, ShaderLanguage::is_float_type(varying.type));
-				vcode += _typestr(varying.type);
-				vcode += " " + _mkid(varying_name);
+				String type_str = _prestr(varying.precision, ShaderLanguage::is_float_type(varying.type)) + _typestr(varying.type);
+				String name_str = _mkid(varying_name);
 				uint32_t inc = varying.get_size();
 
-				if (varying.array_size > 0) {
-					vcode += "[";
-					vcode += itos(varying.array_size);
-					vcode += "]";
-				}
+				if (p_default_actions.suppress_varying_io) {
+					// No vertex stage (e.g. RT shaders): emit zero-initialized
+					// globals instead of in/out IO declarations.
+					String decl = type_str + " " + name_str;
+					if (varying.array_size > 0) {
+						decl += "[" + itos(varying.array_size) + "];\n";
+					} else {
+						decl += " = " + _typestr(varying.type) + "(0);\n";
+					}
+					r_gen_code.stage_globals[STAGE_FRAGMENT] += decl;
+				} else {
+					String vcode;
+					String interp_mode = _interpstr(varying.interpolation);
+					vcode += type_str;
+					vcode += " " + name_str;
 
-				vcode += ";\n";
-				// GLSL ES 3.0 does not allow layout qualifiers for varyings
-				if (!RS::get_singleton()->is_low_end()) {
-					r_gen_code.stage_globals[STAGE_VERTEX] += "layout(location=" + itos(index) + ") ";
-					r_gen_code.stage_globals[STAGE_FRAGMENT] += "layout(location=" + itos(index) + ") ";
+					if (varying.array_size > 0) {
+						vcode += "[";
+						vcode += itos(varying.array_size);
+						vcode += "]";
+					}
+
+					vcode += ";\n";
+					// GLSL ES 3.0 does not allow layout qualifiers for varyings
+					if (!RS::get_singleton()->is_low_end()) {
+						r_gen_code.stage_globals[STAGE_VERTEX] += "layout(location=" + itos(index) + ") ";
+						r_gen_code.stage_globals[STAGE_FRAGMENT] += "layout(location=" + itos(index) + ") ";
+					}
+					r_gen_code.stage_globals[STAGE_VERTEX] += interp_mode + "out " + vcode;
+					r_gen_code.stage_globals[STAGE_FRAGMENT] += interp_mode + "in " + vcode;
 				}
-				r_gen_code.stage_globals[STAGE_VERTEX] += interp_mode + "out " + vcode;
-				r_gen_code.stage_globals[STAGE_FRAGMENT] += interp_mode + "in " + vcode;
 
 				index += inc;
 			}
 
-			if (var_frag_to_light.size() > 0) {
+			if (!p_default_actions.suppress_varying_io && var_frag_to_light.size() > 0) {
 				String gcode = "\n\nstruct {\n";
 				for (const Pair<StringName, SL::ShaderNode::Varying> &E : var_frag_to_light) {
 					gcode += "\t" + _prestr(E.second.precision) + _typestr(E.second.type) + " " + _mkid(E.first);
@@ -786,7 +809,17 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 
 				if (p_actions.entry_point_stages.has(fnode->name)) {
 					Stage stage = p_actions.entry_point_stages[fnode->name];
-					_dump_function_deps(pnode, fnode->name, function_code, r_gen_code.stage_globals[stage], added_funcs_per_stage[stage]);
+					// In RT (suppress_varying_io) the vertex entry point has
+					// no separate shader stage -- its body and transitive
+					// helper deps are inlined into the fragment-equivalent
+					// closest_hit / any_hit shaders, so redirect them to
+					// STAGE_FRAGMENT. Other stages (fragment, intersection)
+					// still have their own shader translation units and must
+					// keep their deps in their own globals bucket so the
+					// generated code for that stage can actually reference
+					// those helpers.
+					Stage dep_stage = (p_default_actions.suppress_varying_io && stage == STAGE_VERTEX) ? STAGE_FRAGMENT : stage;
+					_dump_function_deps(pnode, fnode->name, function_code, r_gen_code.stage_globals[dep_stage], added_funcs_per_stage[dep_stage]);
 					r_gen_code.code[fnode->name] = function_code[fnode->name];
 				}
 
@@ -920,7 +953,16 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 			if (p_default_actions.renames.has(vnode->name)) {
 				code = p_default_actions.renames[vnode->name];
 			} else {
-				if (shader->uniforms.has(vnode->name)) {
+				bool param_found = false;
+				if (function) {
+					for (const SL::FunctionNode::Argument &argument : function->arguments) {
+						if (argument.name == vnode->name) {
+							param_found = true;
+							break;
+						}
+					}
+				}
+				if (!param_found && shader->uniforms.has(vnode->name)) {
 					//its a uniform!
 					const ShaderLanguage::ShaderNode::Uniform &u = shader->uniforms[vnode->name];
 					if (u.is_texture()) {
@@ -937,6 +979,14 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						} else if (u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_DEPTH_TEXTURE) {
 							name = "depth_buffer";
 							r_gen_code.uses_depth_texture = true;
+						} else if (u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_BLIT_SOURCE0) {
+							name = "source0";
+						} else if (u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_BLIT_SOURCE1) {
+							name = "source1";
+						} else if (u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_BLIT_SOURCE2) {
+							name = "source2";
+						} else if (u.hint == ShaderLanguage::ShaderNode::Uniform::HINT_BLIT_SOURCE3) {
+							name = "source3";
 						} else {
 							name = _mkid(vnode->name); //texture, use as is
 						}
@@ -1037,7 +1087,16 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 			if (p_default_actions.renames.has(anode->name)) {
 				code = p_default_actions.renames[anode->name];
 			} else {
-				if (shader->uniforms.has(anode->name)) {
+				bool param_found = false;
+				if (function) {
+					for (const SL::FunctionNode::Argument &argument : function->arguments) {
+						if (argument.name == anode->name) {
+							param_found = true;
+							break;
+						}
+					}
+				}
+				if (!param_found && shader->uniforms.has(anode->name)) {
 					//its a uniform!
 					const ShaderLanguage::ShaderNode::Uniform &u = shader->uniforms[anode->name];
 					if (u.is_texture()) {
@@ -1171,6 +1230,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					bool is_radiance_texture = false;
 					bool texture_func_no_uv = false;
 					bool texture_func_returns_data = false;
+					bool texture_func_simple = false;
 
 					if (onode->op == SL::OP_STRUCT) {
 						code += _mkid(vnode->name);
@@ -1187,6 +1247,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 							is_texture_func = texture_functions.has(vnode->name);
 							texture_func_no_uv = (vnode->name == "textureSize" || vnode->name == "textureQueryLevels");
 							texture_func_returns_data = texture_func_no_uv || vnode->name == "textureQueryLod";
+							texture_func_simple = vnode->name == "texture";
 						} else if (p_default_actions.renames.has(vnode->name)) {
 							code += p_default_actions.renames[vnode->name];
 						} else {
@@ -1324,6 +1385,10 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 									data_type_name = "multiviewSampler";
 									multiview_uv_needed = true;
 								} else if (is_radiance_texture) {
+									// We need to use an explicit level of detail to avoid mip mapping artifacts caused by the octahedral discontinuity.
+									if (texture_func_simple) {
+										code = code.replace("texture(", "textureLod(");
+									}
 									data_type_name = "sampler2D";
 								} else {
 									data_type_name = ShaderLanguage::get_datatype_name(onode->arguments[i]->get_datatype());
@@ -1360,6 +1425,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 							code += node_code;
 						} else if (is_radiance_texture && !texture_func_no_uv && i == 2) {
 							node_code = "vec3_to_oct_with_border(" + node_code + ", params.border_size)";
+
+							// Need an explicit level of detail if one isn't provided by the user.
+							if (texture_func_simple && onode->arguments.size() == 3) {
+								node_code += ", 0.0";
+							}
 
 							code += node_code;
 						} else {
@@ -1491,11 +1561,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 }
 
 ShaderLanguage::DataType ShaderCompiler::_get_global_shader_uniform_type(const StringName &p_name) {
-	RS::GlobalShaderParameterType gvt = RSG::material_storage->global_shader_parameter_get_type(p_name);
+	RSE::GlobalShaderParameterType gvt = RSG::material_storage->global_shader_parameter_get_type(p_name);
 	return (ShaderLanguage::DataType)RS::global_shader_uniform_type_get_shader_datatype(gvt);
 }
 
-Error ShaderCompiler::compile(RS::ShaderMode p_mode, const String &p_code, IdentifierActions *p_actions, const String &p_path, GeneratedCode &r_gen_code) {
+Error ShaderCompiler::compile(RSE::ShaderMode p_mode, const String &p_code, IdentifierActions *p_actions, const String &p_path, GeneratedCode &r_gen_code) {
 	SL::ShaderCompileInfo info;
 	info.functions = ShaderTypes::get_singleton()->get_functions(p_mode);
 	info.render_modes = ShaderTypes::get_singleton()->get_modes(p_mode);

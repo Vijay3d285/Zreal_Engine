@@ -29,7 +29,10 @@
 /**************************************************************************/
 
 #include "shader_preprocessor.h"
-#include "core/math/expression.h"
+
+#include "core/io/resource_loader.h"
+#include "core/os/os.h"
+#include "servers/rendering/shader_expression.h"
 
 const char32_t CURSOR = 0xFFFF;
 
@@ -491,7 +494,7 @@ void ShaderPreprocessor::process_elif(Tokenizer *p_tokenizer) {
 		return;
 	}
 
-	Expression expression;
+	ShaderExpression expression;
 	Vector<String> names;
 	error = expression.parse(body, names);
 	if (error != OK) {
@@ -612,7 +615,7 @@ void ShaderPreprocessor::process_if(Tokenizer *p_tokenizer) {
 		return;
 	}
 
-	Expression expression;
+	ShaderExpression expression;
 	Vector<String> names;
 	error = expression.parse(body, names);
 	if (error != OK) {
@@ -636,11 +639,16 @@ void ShaderPreprocessor::process_if(Tokenizer *p_tokenizer) {
 
 void ShaderPreprocessor::process_ifdef(Tokenizer *p_tokenizer) {
 	const int line = p_tokenizer->get_line();
+	bool is_cursor = false;
 
-	String label = p_tokenizer->get_identifier();
+	String label = p_tokenizer->get_identifier(&is_cursor);
 	if (label.is_empty()) {
 		set_error(RTR("Invalid macro name."), line);
 		return;
+	}
+
+	if (is_cursor) {
+		state->completion_show_defines = true;
 	}
 
 	if (!p_tokenizer->consume_empty_line()) {
@@ -876,6 +884,7 @@ Error ShaderPreprocessor::expand_condition(const String &p_string, int p_line, S
 			switch (p_string[i]) {
 				case CURSOR:
 					state->completion_type = COMPLETION_TYPE_CONDITION;
+					state->completion_show_defines = true;
 					break;
 				case '(':
 					bracket_start_count++;
@@ -1245,6 +1254,10 @@ void ShaderPreprocessor::insert_builtin_define(String p_name, String p_value, St
 	p_state.defines[p_name] = define;
 }
 
+void ShaderPreprocessor::add_define(const String &p_name, const String &p_value) {
+	custom_defines.push_back({ p_name, p_value });
+}
+
 void ShaderPreprocessor::clear_state() {
 	if (state != nullptr) {
 		for (const RBMap<String, Define *>::Element *E = state->defines.front(); E; E = E->next()) {
@@ -1356,6 +1369,10 @@ Error ShaderPreprocessor::preprocess(const String &p_code, const String &p_filen
 		insert_builtin_define("RENDERER_FORWARD_PLUS", _MKSTR(2), pp_state);
 	}
 
+	for (const Pair<String, String> &def : custom_defines) {
+		insert_builtin_define(def.first, def.second, pp_state);
+	}
+
 	Error err = preprocess(&pp_state, p_code, r_result);
 	if (err != OK) {
 		if (r_error_text) {
@@ -1414,6 +1431,13 @@ Error ShaderPreprocessor::preprocess(const String &p_code, const String &p_filen
 			} break;
 			default: {
 			}
+		}
+	}
+
+	if (state->completion_show_defines) {
+		for (const KeyValue<String, Define *> &E : state->defines) {
+			ScriptLanguage::CodeCompletionOption option(E.key, ScriptLanguage::CODE_COMPLETION_KIND_CONSTANT);
+			r_completion_options->push_back(option);
 		}
 	}
 

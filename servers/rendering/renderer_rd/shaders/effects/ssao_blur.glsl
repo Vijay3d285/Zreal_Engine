@@ -57,10 +57,10 @@ void add_sample(float p_ssao_value, float p_edge_value, inout float r_sum, inout
 #ifdef MODE_WIDE
 vec2 sample_blurred_wide(vec2 p_coord) {
 	vec2 vC = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(0, 0)).xy;
-	vec2 vL = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(-3, 0)).xy;
-	vec2 vT = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(0, -3)).xy;
-	vec2 vR = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(3, 0)).xy;
-	vec2 vB = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(0, 3)).xy;
+	vec2 vL = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(-2, 0)).xy;
+	vec2 vT = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(0, -2)).xy;
+	vec2 vR = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(2, 0)).xy;
+	vec2 vB = textureLodOffset(source_ssao, vec2(p_coord), 0.0, ivec2(0, 2)).xy;
 
 	float packed_edges = vC.y;
 	vec4 edgesLRTB = unpack_edges(packed_edges);

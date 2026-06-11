@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" ?>
-<class name="Viewport" inherits="Node" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+<class name="Viewport" inherits="Node" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
 	<brief_description>
 		Abstract base class for viewports. Encapsulates drawing and interaction with a game world.
 	</brief_description>
@@ -344,6 +344,9 @@
 		<member name="disable_3d" type="bool" setter="set_disable_3d" getter="is_3d_disabled" default="false">
 			Disable 3D rendering (but keep 2D rendering).
 		</member>
+		<member name="frame_generation" type="bool" setter="set_frame_generation" getter="get_frame_generation" default="false">
+			Enables Frame Generation technology on this viewport, if available. (currently DLSS 3.0 is supported - NVIDIA only)
+		</member>
 		<member name="fsr_sharpness" type="float" setter="set_fsr_sharpness" getter="get_fsr_sharpness" default="0.2">
 			Determines how sharp the upscaled image will be when using the FSR upscaling mode. Sharpness halves with every whole number. Values go from 0.0 (sharpest) to 2.0. Values above 2.0 won't make a visible difference.
 			To control this property on the root viewport, set the [member ProjectSettings.rendering/scaling_3d/fsr_sharpness] project setting.
@@ -371,6 +374,7 @@
 		<member name="mesh_lod_threshold" type="float" setter="set_mesh_lod_threshold" getter="get_mesh_lod_threshold" default="1.0">
 			The automatic LOD bias to use for meshes rendered within the [Viewport] (this is analogous to [member ReflectionProbe.mesh_lod_threshold]). Higher values will use less detailed versions of meshes that have LOD variations generated. If set to [code]0.0[/code], automatic LOD is disabled. Increase [member mesh_lod_threshold] to improve performance at the cost of geometry detail.
 			To control this property on the root viewport, set the [member ProjectSettings.rendering/mesh_lod/lod_change/threshold_pixels] project setting.
+			[b]Note:[/b] Depending on the mesh's attributes (vertex colors, blend shapes, ...), a mesh may have fewer levels of LOD generated to avoid visible distortion of the mesh once it is affected by vertex colors or blend shapes. Meshes with a very low vertex count will also not have any LODs generated, which means this setting will not affect them at all. In general, this setting makes the largest impact on static meshes with a high vertex count.
 			[b]Note:[/b] [member mesh_lod_threshold] does not affect [GeometryInstance3D] visibility ranges (also known as "manual" LOD or hierarchical LOD).
 		</member>
 		<member name="msaa_2d" type="int" setter="set_msaa_2d" getter="get_msaa_2d" enum="Viewport.MSAA" default="0">
@@ -453,8 +457,9 @@
 		<member name="texture_mipmap_bias" type="float" setter="set_texture_mipmap_bias" getter="get_texture_mipmap_bias" default="0.0">
 			Affects the final texture sharpness by reading from a lower or higher mipmap (also called "texture LOD bias"). Negative values make mipmapped textures sharper but grainier when viewed at a distance, while positive values make mipmapped textures blurrier (even when up close).
 			Enabling temporal antialiasing ([member use_taa]) will automatically apply a [code]-0.5[/code] offset to this value, while enabling FXAA ([member screen_space_aa]) will automatically apply a [code]-0.25[/code] offset to this value. If both TAA and FXAA are enabled at the same time, an offset of [code]-0.75[/code] is applied to this value.
-			[b]Note:[/b] If [member scaling_3d_scale] is lower than [code]1.0[/code] (exclusive), [member texture_mipmap_bias] is used to adjust the automatic mipmap bias which is calculated internally based on the scale factor. The formula for this is [code]log2(scaling_3d_scale) + mipmap_bias[/code].
 			To control this property on the root viewport, set the [member ProjectSettings.rendering/textures/default_filters/texture_mipmap_bias] project setting.
+			[b]Note:[/b] If [member scaling_3d_scale] is lower than [code]1.0[/code] (exclusive), [member texture_mipmap_bias] is used to adjust the automatic mipmap bias which is calculated internally based on the scale factor. The formula for this is [code]log2(scaling_3d_scale) + mipmap_bias[/code].
+			[b]Note:[/b] This property is only supported in the Forward+ and Mobile renderers, not Compatibility. In Compatibility, this property is always treated as if it was set to [code]0.0[/code].
 		</member>
 		<member name="transparent_bg" type="bool" setter="set_transparent_background" getter="has_transparent_background" default="false">
 			If [code]true[/code], the viewport should render its background as transparent.
@@ -573,7 +578,14 @@
 			More information: [url=https://developer.apple.com/documentation/metalfx]MetalFX[/url].
 			[b]Note:[/b] Only supported when the Metal rendering driver is in use, which limits this scaling mode to macOS and iOS.
 		</constant>
-		<constant name="SCALING_3D_MODE_MAX" value="5" enum="Scaling3DMode">
+		<constant name="SCALING_3D_MODE_DLSS" value="5" enum="Scaling3DMode">
+			Use NVIDIA DLSS upscaling for the viewport's 3D buffer. The amount of scaling can be set using [member Viewport.scaling_3d_scale]. Values less than [code]1.0[/code] will result in the viewport being upscaled using DLSS Super Resolution or DLSS Ray Regeneration, depending on raytracing mode ON/OFF. Values greater than [code]1.0[/code] are not supported and bilinear downsampling will be used instead. Scaling values: 0.5 - Performance, 0.58 - Balanced, 0.66 - Quality, 1.0 - DLAA
+		</constant>
+		<constant name="SCALING_3D_MODE_NEAREST" value="6" enum="Scaling3DMode">
+			Use nearest-neighbor filtering for the viewport's 3D buffer. This looks crisper than [constant SCALING_3D_MODE_BILINEAR] and has no additional rendering cost. The amount of scaling can be set using [member scaling_3d_scale]. Values greater than [code]1.0[/code] are not supported and bilinear downsampling will be used instead. A value of [code]1.0[/code] disables scaling.
+			[b]Note:[/b] When using the [b]Nearest[/b] scaling mode, to avoid uneven pixel scaling, it's highly recommended to use a value equal to an integer divisor with a dividend of [code]1[/code]. For example, it's best to use a scale of [code]0.5[/code] (1/2), [code]0.3333[/code] (1/3), [code]0.25[/code] (1/4), [code]0.2[/code] (1/5), and so on.
+		</constant>
+		<constant name="SCALING_3D_MODE_MAX" value="7" enum="Scaling3DMode">
 			Represents the size of the [enum Scaling3DMode] enum.
 		</constant>
 		<constant name="MSAA_DISABLED" value="0" enum="MSAA">
@@ -630,7 +642,22 @@
 		<constant name="RENDER_INFO_DRAW_CALLS_IN_FRAME" value="2" enum="RenderInfo">
 			Amount of draw calls in frame.
 		</constant>
-		<constant name="RENDER_INFO_MAX" value="3" enum="RenderInfo">
+		<constant name="RENDER_INFO_RT_TLAS_INSTANCES" value="3" enum="RenderInfo">
+			Number of TLAS instances submitted this frame (ray tracing only).
+		</constant>
+		<constant name="RENDER_INFO_RT_BLAS_BUILDS" value="4" enum="RenderInfo">
+			Number of full BLAS builds performed this frame (ray tracing only).
+		</constant>
+		<constant name="RENDER_INFO_RT_BLAS_REFITS" value="5" enum="RenderInfo">
+			Number of BLAS refits performed this frame (ray tracing only).
+		</constant>
+		<constant name="RENDER_INFO_RT_TRIANGLES_BUILT" value="6" enum="RenderInfo">
+			Total triangles processed by full BLAS builds this frame (ray tracing only).
+		</constant>
+		<constant name="RENDER_INFO_RT_TRIANGLES_REFIT" value="7" enum="RenderInfo">
+			Total triangles processed by BLAS refits this frame (ray tracing only).
+		</constant>
+		<constant name="RENDER_INFO_MAX" value="8" enum="RenderInfo">
 			Represents the size of the [enum RenderInfo] enum.
 		</constant>
 		<constant name="RENDER_INFO_TYPE_VISIBLE" value="0" enum="RenderInfoType">
@@ -662,6 +689,7 @@
 		<constant name="DEBUG_DRAW_WIREFRAME" value="4" enum="DebugDraw">
 			Objects are displayed as wireframe models.
 			[b]Note:[/b] [method RenderingServer.set_debug_generate_wireframes] must be called before loading any meshes for wireframes to be visible when using the Compatibility renderer.
+			[b]Note:[/b] In the Compatibility renderer, backfaces are always visible when using wireframe rendering. In the Forward+ and Mobile renderers, wireframes follow the material's backface culling properties instead.
 		</constant>
 		<constant name="DEBUG_DRAW_NORMAL_BUFFER" value="5" enum="DebugDraw">
 			Objects are displayed without lighting information and their textures replaced by normal mapping.
@@ -752,6 +780,29 @@
 			Draws the internal resolution buffer of the scene in linear colorspace before tonemapping or post-processing is applied.
 			[b]Note:[/b] Only supported when using the Forward+ or Mobile rendering methods.
 		</constant>
+		<constant name="DEBUG_DRAW_CLUSTER_AREA_LIGHTS" value="27" enum="DebugDraw">
+			Draws the cluster used by [AreaLight3D] nodes to optimize light rendering.
+			[b]Note:[/b] Only supported when using the Forward+ rendering method.
+		</constant>
+		<constant name="DEBUG_DRAW_AREA_LIGHT_ATLAS" value="28" enum="DebugDraw">
+			Draws the atlas used by [AreaLight3D] nodes in the upper left quadrant of the [Viewport].
+			[b]Note:[/b] Only supported when using the Forward+ or Mobile rendering method.
+		</constant>
+		<constant name="DEBUG_DRAW_DLSS_RR_DIFFUSE_ALBEDO" value="29" enum="DebugDraw">
+			Displays the diffuse albedo input buffer provided to NVIDIA DLSS Ray Reconstruction. Only has an effect when DLSS Ray Reconstruction is active.
+		</constant>
+		<constant name="DEBUG_DRAW_DLSS_RR_SPECULAR_ALBEDO" value="30" enum="DebugDraw">
+			Displays the specular albedo input buffer provided to NVIDIA DLSS Ray Reconstruction. Only has an effect when DLSS Ray Reconstruction is active.
+		</constant>
+		<constant name="DEBUG_DRAW_DLSS_RR_NORMAL_ROUGHNESS" value="31" enum="DebugDraw">
+			Displays the packed normal and roughness input buffer provided to NVIDIA DLSS Ray Reconstruction. Only has an effect when DLSS Ray Reconstruction is active.
+		</constant>
+		<constant name="DEBUG_DRAW_DLSS_RR_SPECULAR_HIT_DIST" value="32" enum="DebugDraw">
+			Displays the specular ray hit distance input buffer provided to NVIDIA DLSS Ray Reconstruction. Only has an effect when DLSS Ray Reconstruction is active.
+		</constant>
+		<constant name="DEBUG_DRAW_RECONSTRUCTED_DEPTH" value="33" enum="DebugDraw">
+			Displays the depth buffer reconstructed by NVIDIA DLSS Ray Reconstruction after denoising. Only has an effect when DLSS Ray Reconstruction is active.
+		</constant>
 		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_FILTER_NEAREST" value="0" enum="DefaultCanvasItemTextureFilter">
 			The texture filter reads from the nearest pixel only. This makes the texture look pixelated from up close, and grainy from a distance (due to mipmaps not being sampled).
 		</constant>
@@ -766,7 +817,10 @@
 			The texture filter reads from the nearest pixel and blends between the nearest 2 mipmaps (or uses the nearest mipmap if [member ProjectSettings.rendering/textures/default_filters/use_nearest_mipmap_filter] is [code]true[/code]). This makes the texture look pixelated from up close, and smooth from a distance.
 			Use this for non-pixel art textures that may be viewed at a low scale (e.g. due to [Camera2D] zoom or sprite scaling), as mipmaps are important to smooth out pixels that are smaller than on-screen pixels.
 		</constant>
-		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_FILTER_MAX" value="4" enum="DefaultCanvasItemTextureFilter">
+		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_FILTER_PARENT_NODE" value="4" enum="DefaultCanvasItemTextureFilter">
+			The [Viewport] will inherit the filter from its parent [CanvasItem] or [Viewport].
+		</constant>
+		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_FILTER_MAX" value="5" enum="DefaultCanvasItemTextureFilter">
 			Represents the size of the [enum DefaultCanvasItemTextureFilter] enum.
 		</constant>
 		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_REPEAT_DISABLED" value="0" enum="DefaultCanvasItemTextureRepeat">
@@ -778,7 +832,10 @@
 		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_REPEAT_MIRROR" value="2" enum="DefaultCanvasItemTextureRepeat">
 			Flip the texture when repeating so that the edge lines up instead of abruptly changing.
 		</constant>
-		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_REPEAT_MAX" value="3" enum="DefaultCanvasItemTextureRepeat">
+		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_REPEAT_PARENT_NODE" value="3" enum="DefaultCanvasItemTextureRepeat">
+			The [Viewport] will inherit the repeat mode from its parent [CanvasItem] or [Viewport].
+		</constant>
+		<constant name="DEFAULT_CANVAS_ITEM_TEXTURE_REPEAT_MAX" value="4" enum="DefaultCanvasItemTextureRepeat">
 			Represents the size of the [enum DefaultCanvasItemTextureRepeat] enum.
 		</constant>
 		<constant name="SDF_OVERSIZE_100_PERCENT" value="0" enum="SDFOversize">

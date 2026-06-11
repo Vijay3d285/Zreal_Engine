@@ -30,16 +30,16 @@
 
 #pragma once
 
-#ifdef METAL_ENABLED
-#include "../effects/metal_fx.h"
-#endif
-#include "../effects/vrs.h"
 #include "core/templates/hash_map.h"
-#include "material_storage.h"
-#include "render_buffer_custom_data_rd.h"
+#include "servers/rendering/renderer_rd/effects/vrs.h"
+#include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/render_buffer_custom_data_rd.h"
 #include "servers/rendering/rendering_device.h"
-#include "servers/rendering/rendering_device_binds.h"
 #include "servers/rendering/storage/render_scene_buffers.h"
+
+#ifdef METAL_ENABLED
+#include "servers/rendering/renderer_rd/effects/metal_fx.h"
+#endif
 
 #define RB_SCOPE_BUFFERS SNAME("render_buffers")
 #define RB_SCOPE_VRS SNAME("VRS")
@@ -48,8 +48,12 @@
 #define RB_TEX_COLOR SNAME("color")
 #define RB_TEX_COLOR_MSAA SNAME("color_msaa")
 #define RB_TEX_COLOR_UPSCALED SNAME("color_upscaled")
+#define RB_TEX_COLOR_SUBSAMPLED SNAME("color_subsampled")
+#define RB_TEX_COLOR_MSAA_SUBSAMPLED SNAME("color_msaa_subsampled")
 #define RB_TEX_DEPTH SNAME("depth")
 #define RB_TEX_DEPTH_MSAA SNAME("depth_msaa")
+#define RB_TEX_DEPTH_SUBSAMPLED SNAME("depth_subsampled")
+#define RB_TEX_DEPTH_MSAA_SUBSAMPLED SNAME("depth_msaa_subsampled")
 #define RB_TEX_VELOCITY SNAME("velocity")
 #define RB_TEX_VELOCITY_MSAA SNAME("velocity_msaa")
 
@@ -58,18 +62,21 @@
 
 #define RB_TEX_BACK_COLOR SNAME("back_color")
 #define RB_TEX_BACK_DEPTH SNAME("back_depth")
+#define RB_TEX_RECONSTRUCTED_DEPTH SNAME("reconstructed_depth")
 
 class RenderSceneBuffersRD : public RenderSceneBuffers {
 	GDCLASS(RenderSceneBuffersRD, RenderSceneBuffers);
 
 private:
+	bool upscaler_ready = false;
+	bool depth_reconstruct_requested = false;
 	bool can_be_storage = true;
 	bool force_hdr = false;
 	uint32_t max_cluster_elements = 512;
 	RD::DataFormat preferred_data_format = RD::DATA_FORMAT_MAX;
 	RendererRD::VRS *vrs = nullptr;
 	uint64_t auto_exposure_version = 1;
-	RS::ViewportVRSMode vrs_mode = RS::VIEWPORT_VRS_DISABLED;
+	RSE::ViewportVRSMode vrs_mode = RSE::VIEWPORT_VRS_DISABLED;
 
 	// Our render target represents our final destination that we display on screen.
 	RID render_target;
@@ -78,18 +85,19 @@ private:
 
 	// The internal size of the textures we render 3D to in case we render at a lower resolution and upscale
 	Size2i internal_size = Size2i(0, 0);
-	RS::ViewportScaling3DMode scaling_3d_mode = RS::VIEWPORT_SCALING_3D_MODE_OFF;
+	RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_OFF;
+	bool frame_generation = false;
 	float fsr_sharpness = 0.2f;
 	float texture_mipmap_bias = 0.0f;
-	RS::ViewportAnisotropicFiltering anisotropic_filtering_level = RS::VIEWPORT_ANISOTROPY_4X;
+	RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
 
 #ifdef METAL_ENABLED
 	RendererRD::MFXSpatialContext *mfx_spatial_context = nullptr;
 #endif
 
 	// Aliasing settings
-	RS::ViewportMSAA msaa_3d = RS::VIEWPORT_MSAA_DISABLED;
-	RS::ViewportScreenSpaceAA screen_space_aa = RS::VIEWPORT_SCREEN_SPACE_AA_DISABLED;
+	RSE::ViewportMSAA msaa_3d = RSE::VIEWPORT_MSAA_DISABLED;
+	RSE::ViewportScreenSpaceAA screen_space_aa = RSE::VIEWPORT_SCREEN_SPACE_AA_DISABLED;
 	bool use_taa = false;
 	bool use_debanding = false;
 	RD::TextureSamples texture_samples = RD::TEXTURE_SAMPLES_1;
@@ -191,14 +199,14 @@ public:
 	RD::DataFormat get_base_data_format() const { return force_hdr ? RD::DATA_FORMAT_R16G16B16A16_SFLOAT : preferred_data_format; }
 	float get_luminance_multiplier() const;
 	void set_vrs(RendererRD::VRS *p_vrs) { vrs = p_vrs; }
-	RS::ViewportVRSMode get_vrs_mode() { return vrs_mode; }
+	RSE::ViewportVRSMode get_vrs_mode() { return vrs_mode; }
 
 	void cleanup();
 	virtual void configure(const RenderSceneBuffersConfiguration *p_config) override;
 	void configure_for_reflections(const Size2i p_reflection_size);
 	virtual void set_fsr_sharpness(float p_fsr_sharpness) override;
 	virtual void set_texture_mipmap_bias(float p_texture_mipmap_bias) override;
-	virtual void set_anisotropic_filtering_level(RS::ViewportAnisotropicFiltering p_anisotropic_filtering_level) override;
+	virtual void set_anisotropic_filtering_level(RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) override;
 	virtual void set_use_debanding(bool p_use_debanding) override;
 
 #ifdef METAL_ENABLED
@@ -234,11 +242,12 @@ public:
 	_FORCE_INLINE_ uint32_t get_view_count() const { return view_count; }
 	_FORCE_INLINE_ Size2i get_internal_size() const { return internal_size; }
 	_FORCE_INLINE_ Size2i get_target_size() const { return target_size; }
-	_FORCE_INLINE_ RS::ViewportScaling3DMode get_scaling_3d_mode() const { return scaling_3d_mode; }
+	_FORCE_INLINE_ RSE::ViewportScaling3DMode get_scaling_3d_mode() const { return scaling_3d_mode; }
 	_FORCE_INLINE_ float get_fsr_sharpness() const { return fsr_sharpness; }
-	_FORCE_INLINE_ RS::ViewportMSAA get_msaa_3d() const { return msaa_3d; }
+	_FORCE_INLINE_ bool get_frame_generation() const { return frame_generation; }
+	_FORCE_INLINE_ RSE::ViewportMSAA get_msaa_3d() const { return msaa_3d; }
 	_FORCE_INLINE_ RD::TextureSamples get_texture_samples() const { return texture_samples; }
-	_FORCE_INLINE_ RS::ViewportScreenSpaceAA get_screen_space_aa() const { return screen_space_aa; }
+	_FORCE_INLINE_ RSE::ViewportScreenSpaceAA get_screen_space_aa() const { return screen_space_aa; }
 	_FORCE_INLINE_ bool get_use_taa() const { return use_taa; }
 	_FORCE_INLINE_ bool get_use_debanding() const { return use_debanding; }
 
@@ -282,6 +291,11 @@ public:
 		return get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_DEPTH_MSAA, p_layer, 0);
 	}
 
+	RID get_color_subsampled();
+	RID get_color_msaa_subsampled();
+	RID get_depth_subsampled();
+	RID get_depth_msaa_subsampled();
+
 	// back buffer (color)
 	RID get_back_buffer_texture() const {
 		// Prefer returning the dedicated backbuffer color texture if it was created. Return the reused blur texture otherwise.
@@ -297,8 +311,14 @@ public:
 	// Upscaled.
 	void ensure_upscaled();
 
+	_FORCE_INLINE_ bool get_upscaler_ready() const { return upscaler_ready; }
+	_FORCE_INLINE_ void set_upscaler_ready(bool ready) { upscaler_ready = ready; }
+
+	_FORCE_INLINE_ bool get_depth_reconstruct_requested() const { return depth_reconstruct_requested; }
+	_FORCE_INLINE_ void set_depth_reconstruct_requested(bool p_requested) { depth_reconstruct_requested = p_requested; }
+
 	_FORCE_INLINE_ bool has_upscaled_texture() const {
-		return has_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED);
+		return get_upscaler_ready() && has_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED);
 	}
 	_FORCE_INLINE_ RID get_upscaled_texture() const {
 		return get_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED);
@@ -322,15 +342,15 @@ public:
 		return samplers;
 	}
 
-	_FORCE_INLINE_ static RD::TextureSamples msaa_to_samples(RS::ViewportMSAA p_msaa) {
+	_FORCE_INLINE_ static RD::TextureSamples msaa_to_samples(RSE::ViewportMSAA p_msaa) {
 		switch (p_msaa) {
-			case RS::VIEWPORT_MSAA_DISABLED:
+			case RSE::VIEWPORT_MSAA_DISABLED:
 				return RD::TEXTURE_SAMPLES_1;
-			case RS::VIEWPORT_MSAA_2X:
+			case RSE::VIEWPORT_MSAA_2X:
 				return RD::TEXTURE_SAMPLES_2;
-			case RS::VIEWPORT_MSAA_4X:
+			case RSE::VIEWPORT_MSAA_4X:
 				return RD::TEXTURE_SAMPLES_4;
-			case RS::VIEWPORT_MSAA_8X:
+			case RSE::VIEWPORT_MSAA_8X:
 				return RD::TEXTURE_SAMPLES_8;
 			default:
 				DEV_ASSERT(false && "Unknown MSAA option.");

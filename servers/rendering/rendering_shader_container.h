@@ -42,7 +42,7 @@ class RenderingShaderContainer : public RefCounted {
 
 public:
 	static const uint32_t CONTAINER_MAGIC_NUMBER = 0x43535247;
-	static const uint32_t CONTAINER_VERSION = 2;
+	static const uint32_t CONTAINER_VERSION = 3; // Bumped for unbounded uniform support
 
 protected:
 	using RDC = RenderingDeviceCommons;
@@ -59,7 +59,7 @@ protected:
 		uint64_t vertex_input_mask = 0;
 		uint32_t fragment_output_mask = 0;
 		uint32_t specialization_constants_count = 0;
-		uint32_t is_compute = 0;
+		RDC::PipelineType pipeline_type = RDC::PIPELINE_TYPE_RASTERIZATION;
 		uint32_t has_multiview = 0;
 		uint32_t has_dynamic_buffers = 0;
 		uint32_t compute_local_size[3] = {};
@@ -74,8 +74,9 @@ protected:
 		uint32_t type = 0;
 		uint32_t binding = 0;
 		uint32_t stages = 0;
-		uint32_t length = 0; // Size of arrays (in total elements), or UBOs (in bytes * total elements).
+		uint32_t length = 0; // Size of arrays (in total elements), or UBOs (in bytes * total elements). 0 if unbounded.
 		uint32_t writable = 0;
+		uint32_t unbounded = 0; // 1 if runtime-sized array (e.g., sampler2D textures[])
 
 		bool operator<(const ReflectionBindingData &p_other) const {
 			return binding < p_other.binding;
@@ -172,8 +173,9 @@ protected:
 
 		ReflectImageTraits image;
 
-		uint32_t length = 0; // Size of arrays (in total elements), or ubos (in bytes * total elements).
+		uint32_t length = 0; // Size of arrays (in total elements), or ubos (in bytes * total elements). 0 if unbounded.
 		bool writable = false;
+		bool unbounded = false; // True for runtime-sized arrays (e.g., sampler2D textures[])
 
 		bool operator<(const ReflectUniform &p_other) const {
 			if (binding != p_other.binding) {
@@ -184,6 +186,9 @@ protected:
 			}
 			if (writable != p_other.writable) {
 				return writable < p_other.writable;
+			}
+			if (unbounded != p_other.unbounded) {
+				return unbounded < p_other.unbounded;
 			}
 			if (stages != p_other.stages) {
 				return stages < p_other.stages;
@@ -232,6 +237,7 @@ protected:
 		uint32_t push_constant_size = 0;
 		bool has_multiview = false;
 		bool has_dynamic_buffers = false;
+		RDC::PipelineType pipeline_type = RDC::PIPELINE_TYPE_RASTERIZATION;
 
 		LocalVector<ReflectShaderStage> shader_stages;
 		LocalVector<ReflectDescriptorSet> uniform_sets;

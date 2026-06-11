@@ -32,13 +32,22 @@
 
 #include "rendering_context_driver_vulkan.h"
 
-#include "vk_enum_string_helper.h"
+#include "core/config/engine.h"
+
+#if defined(USE_VOLK) && defined(STREAMLINE_ENABLED) && defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include "core/config/project_settings.h"
 #include "core/version.h"
+#include "drivers/vulkan/rendering_device_driver_vulkan.h"
+#include "drivers/vulkan/vulkan_hooks.h"
 
-#include "rendering_device_driver_vulkan.h"
-#include "vulkan_hooks.h"
+#ifndef DEV_ENABLED
+#include "core/os/os.h"
+#endif
+
+#include <vk_enum_string_helper.h>
 
 #if defined(VK_TRACK_DRIVER_MEMORY)
 /*************************************************/
@@ -436,6 +445,9 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
 	// This extension allows us to use the properties2 features to query additional device capabilities.
 	_register_requested_instance_extension(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, false);
 
+	// This extension allows us to use colorspaces other than SRGB.
+	_register_requested_instance_extension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME, false);
+
 #if defined(USE_VOLK) && (defined(MACOS_ENABLED) || defined(IOS_ENABLED))
 	_register_requested_instance_extension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME, true);
 #endif
@@ -468,7 +480,7 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
 
 #ifdef DEV_ENABLED
 	for (uint32_t i = 0; i < instance_extension_count; i++) {
-		print_verbose(String("VULKAN: Found instance extension ") + String::utf8(instance_extensions[i].extensionName) + String("."));
+		print_verbose(String("Vulkan: Found instance extension ") + String::utf8(instance_extensions[i].extensionName) + String("."));
 	}
 #endif
 
@@ -484,9 +496,9 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
 	for (KeyValue<CharString, bool> &requested_extension : requested_instance_extensions) {
 		if (!enabled_instance_extension_names.has(requested_extension.key)) {
 			if (requested_extension.value) {
-				ERR_FAIL_V_MSG(ERR_BUG, String("Required extension ") + String::utf8(requested_extension.key) + String(" not found."));
+				ERR_FAIL_V_MSG(ERR_BUG, String("Required Vulkan instance extension ") + String::utf8(requested_extension.key) + String(" not found."));
 			} else {
-				print_verbose(String("Optional extension ") + String::utf8(requested_extension.key) + String(" not found."));
+				print_verbose(String("Optional Vulkan instance extension ") + String::utf8(requested_extension.key) + String(" not found."));
 			}
 		}
 	}
@@ -570,6 +582,12 @@ VKAPI_ATTR VkBool32 VKAPI_CALL RenderingContextDriverVulkan::_debug_messenger_ca
 		return VK_FALSE;
 	}
 
+	// glslang emits DebugGlobalVariable referencing gl_WorkGroupSize as OpSpecConstantComposite, which is invalid per
+	// the NonSemantic.Shader.DebugInfo.100 spec. Nothing we can do about it from the shader side.
+	if (strstr(p_callback_data->pMessage, "DebugGlobalVariable: expected operand Variable must be a result id of OpVariable or OpConstant or DebugInfoNone") != nullptr) {
+		return VK_FALSE;
+	}
+
 	String type_string;
 	switch (p_message_type) {
 		case (VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT):
@@ -627,42 +645,47 @@ VKAPI_ATTR VkBool32 VKAPI_CALL RenderingContextDriverVulkan::_debug_messenger_ca
 			"\n\t" + p_callback_data->pMessage +
 			objects_string + labels_string);
 
-	// Convert VK severity to our own log macros.
+	// Use fprintf to stderr directly to avoid re-entering the rendering device via EditorLog.
 	switch (p_message_severity) {
 		case VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT:
-			print_verbose(error_message);
+			fprintf(stderr, "VERBOSE: %s\n", error_message.utf8().get_data());
 			break;
 		case VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT:
-			print_line(error_message);
+			fprintf(stderr, "INFO: %s\n", error_message.utf8().get_data());
 			break;
 		case VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT:
-			WARN_PRINT(error_message);
+			fprintf(stderr, "WARNING: %s\n", error_message.utf8().get_data());
 			break;
 		case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
-			ERR_PRINT(error_message);
+			fprintf(stderr, "ERROR: %s\n", error_message.utf8().get_data());
 			CRASH_COND_MSG(Engine::get_singleton()->is_abort_on_gpu_errors_enabled(), "Crashing, because abort on GPU errors is enabled.");
 			break;
 		case VK_DEBUG_UTILS_MESSAGE_SEVERITY_FLAG_BITS_MAX_ENUM_EXT:
-			break; // Shouldn't happen, only handling to make compilers happy.
+			break;
 	}
 
 	return VK_FALSE;
 }
 
 VKAPI_ATTR VkBool32 VKAPI_CALL RenderingContextDriverVulkan::_debug_report_callback(VkDebugReportFlagsEXT p_flags, VkDebugReportObjectTypeEXT p_object_type, uint64_t p_object, size_t p_location, int32_t p_message_code, const char *p_layer_prefix, const char *p_message, void *p_user_data) {
+	// Same glslang debug-info bug as filtered in _debug_messenger_callback.
+	if (strstr(p_message, "DebugGlobalVariable: expected operand Variable must be a result id of OpVariable or OpConstant or DebugInfoNone") != nullptr) {
+		return VK_FALSE;
+	}
+
 	String debug_message = String("Vulkan Debug Report: object - ") + String::num_int64(p_object) + "\n" + p_message;
 
 	switch (p_flags) {
 		case VK_DEBUG_REPORT_DEBUG_BIT_EXT:
 		case VK_DEBUG_REPORT_INFORMATION_BIT_EXT:
-			print_line(debug_message);
+			fprintf(stderr, "INFO: %s\n", debug_message.utf8().get_data());
 			break;
 		case VK_DEBUG_REPORT_WARNING_BIT_EXT:
 		case VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT:
-			WARN_PRINT(debug_message);
+			fprintf(stderr, "WARNING: %s\n", debug_message.utf8().get_data());
 			break;
 		case VK_DEBUG_REPORT_ERROR_BIT_EXT:
-			ERR_PRINT(debug_message);
+			fprintf(stderr, "ERROR: %s\n", debug_message.utf8().get_data());
 			break;
 	}
 
@@ -915,7 +938,19 @@ Error RenderingContextDriverVulkan::_create_vulkan_instance(const VkInstanceCrea
 Error RenderingContextDriverVulkan::initialize() {
 	Error err;
 
-#ifdef USE_VOLK
+#if defined(USE_VOLK) && defined(STREAMLINE_ENABLED) && defined(_WIN32)
+	HMODULE module;
+	module = LoadLibraryA("sl.interposer.dll");
+	if (module != nullptr) {
+		// note: function pointer is cast through void function pointer to silence cast-function-type warning on gcc8
+		PFN_vkGetInstanceProcAddr vk_getInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void (*)())GetProcAddress(module, "vkGetInstanceProcAddr");
+		volkInitializeCustom(vk_getInstanceProcAddr);
+	} else {
+		if (volkInitialize() != VK_SUCCESS) {
+			return FAILED;
+		}
+	}
+#elif defined(USE_VOLK)
 	if (volkInitialize() != VK_SUCCESS) {
 		return FAILED;
 	}
@@ -980,15 +1015,61 @@ void RenderingContextDriverVulkan::surface_set_size(SurfaceID p_surface, uint32_
 	surface->needs_resize = true;
 }
 
-void RenderingContextDriverVulkan::surface_set_vsync_mode(SurfaceID p_surface, DisplayServer::VSyncMode p_vsync_mode) {
+void RenderingContextDriverVulkan::surface_set_vsync_mode(SurfaceID p_surface, DisplayServerEnums::VSyncMode p_vsync_mode) {
 	Surface *surface = (Surface *)(p_surface);
 	surface->vsync_mode = p_vsync_mode;
 	surface->needs_resize = true;
 }
 
-DisplayServer::VSyncMode RenderingContextDriverVulkan::surface_get_vsync_mode(SurfaceID p_surface) const {
+DisplayServerEnums::VSyncMode RenderingContextDriverVulkan::surface_get_vsync_mode(SurfaceID p_surface) const {
 	Surface *surface = (Surface *)(p_surface);
 	return surface->vsync_mode;
+}
+
+void RenderingContextDriverVulkan::surface_set_hdr_output_enabled(SurfaceID p_surface, bool p_enabled) {
+	Surface *surface = (Surface *)(p_surface);
+	surface->hdr_output = p_enabled;
+	surface->needs_resize = true;
+}
+
+bool RenderingContextDriverVulkan::surface_get_hdr_output_enabled(SurfaceID p_surface) const {
+	Surface *surface = (Surface *)(p_surface);
+	return surface->hdr_output;
+}
+
+void RenderingContextDriverVulkan::surface_set_hdr_output_reference_luminance(SurfaceID p_surface, float p_reference_luminance) {
+	Surface *surface = (Surface *)(p_surface);
+	surface->hdr_reference_luminance = p_reference_luminance;
+}
+
+float RenderingContextDriverVulkan::surface_get_hdr_output_reference_luminance(SurfaceID p_surface) const {
+	Surface *surface = (Surface *)(p_surface);
+	return surface->hdr_reference_luminance;
+}
+
+void RenderingContextDriverVulkan::surface_set_hdr_output_max_luminance(SurfaceID p_surface, float p_max_luminance) {
+	Surface *surface = (Surface *)(p_surface);
+	surface->hdr_max_luminance = p_max_luminance;
+}
+
+float RenderingContextDriverVulkan::surface_get_hdr_output_max_luminance(SurfaceID p_surface) const {
+	Surface *surface = (Surface *)(p_surface);
+	return surface->hdr_max_luminance;
+}
+
+void RenderingContextDriverVulkan::surface_set_hdr_output_linear_luminance_scale(SurfaceID p_surface, float p_linear_luminance_scale) {
+	Surface *surface = (Surface *)(p_surface);
+	surface->hdr_linear_luminance_scale = p_linear_luminance_scale;
+}
+
+float RenderingContextDriverVulkan::surface_get_hdr_output_linear_luminance_scale(SurfaceID p_surface) const {
+	Surface *surface = (Surface *)(p_surface);
+	return surface->hdr_linear_luminance_scale;
+}
+
+float RenderingContextDriverVulkan::surface_get_hdr_output_max_value(SurfaceID p_surface) const {
+	Surface *surface = (Surface *)(p_surface);
+	return MAX(surface->hdr_max_luminance / MAX(surface->hdr_reference_luminance, 1.0f), 1.0f);
 }
 
 uint32_t RenderingContextDriverVulkan::surface_get_width(SurfaceID p_surface) const {
@@ -1019,6 +1100,10 @@ void RenderingContextDriverVulkan::surface_destroy(SurfaceID p_surface) {
 
 bool RenderingContextDriverVulkan::is_debug_utils_enabled() const {
 	return enabled_instance_extension_names.has(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+}
+
+bool RenderingContextDriverVulkan::is_colorspace_supported() const {
+	return enabled_instance_extension_names.has(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
 }
 
 VkInstance RenderingContextDriverVulkan::instance_get() const {

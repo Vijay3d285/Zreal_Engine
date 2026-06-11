@@ -31,7 +31,7 @@
 #pragma once
 
 #include "core/templates/pair.h"
-#include "servers/rendering/rendering_server.h"
+#include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/shader_language.h"
 
 class ShaderCompiler {
@@ -40,6 +40,11 @@ public:
 		STAGE_VERTEX,
 		STAGE_FRAGMENT,
 		STAGE_COMPUTE,
+		STAGE_RAYGEN,
+		STAGE_ANY_HIT,
+		STAGE_CLOSEST_HIT,
+		STAGE_MISS,
+		STAGE_INTERSECTION,
 		STAGE_MAX
 	};
 
@@ -100,6 +105,7 @@ public:
 		String global_buffer_array_variable;
 		String instance_uniform_index_variable;
 		uint32_t base_varying_index = 0;
+		bool suppress_varying_io = false;
 		bool apply_luminance_multiplier = false;
 		bool check_multiview_samplers = false;
 	};
@@ -129,7 +135,7 @@ private:
 	static ShaderLanguage::DataType _get_global_shader_uniform_type(const StringName &p_name);
 
 public:
-	Error compile(RS::ShaderMode p_mode, const String &p_code, IdentifierActions *p_actions, const String &p_path, GeneratedCode &r_gen_code);
+	Error compile(RSE::ShaderMode p_mode, const String &p_code, IdentifierActions *p_actions, const String &p_path, GeneratedCode &r_gen_code);
 
 	void initialize(DefaultIdentifierActions p_actions);
 	ShaderCompiler();

@@ -30,10 +30,11 @@
 
 #include "cylinder_shape_3d.h"
 
+#include "core/object/class_db.h"
 #include "scene/resources/3d/primitive_meshes.h"
 #include "servers/physics_3d/physics_server_3d.h"
 
-Vector<Vector3> CylinderShape3D::get_debug_mesh_lines() const {
+Vector<Vector3> CylinderShape3D::_build_debug_mesh_lines() const {
 	float c_radius = get_radius();
 	float c_height = get_height();
 
@@ -61,20 +62,20 @@ Vector<Vector3> CylinderShape3D::get_debug_mesh_lines() const {
 	return points;
 }
 
-Ref<ArrayMesh> CylinderShape3D::get_debug_arraymesh_faces(const Color &p_modulate) const {
+Ref<ArrayMesh> CylinderShape3D::_build_debug_arraymesh_faces(const Color &p_modulate) const {
 	Array cylinder_array;
-	cylinder_array.resize(RS::ARRAY_MAX);
+	cylinder_array.resize(RSE::ARRAY_MAX);
 	CylinderMesh::create_mesh_array(cylinder_array, radius, radius, height, 32);
 
 	Vector<Color> colors;
-	const PackedVector3Array &verts = cylinder_array[RS::ARRAY_VERTEX];
+	const PackedVector3Array &verts = cylinder_array[RSE::ARRAY_VERTEX];
 	const int32_t verts_size = verts.size();
 	for (int i = 0; i < verts_size; i++) {
 		colors.append(p_modulate);
 	}
 
 	Ref<ArrayMesh> cylinder_mesh = memnew(ArrayMesh);
-	cylinder_array[RS::ARRAY_COLOR] = colors;
+	cylinder_array[RSE::ARRAY_COLOR] = colors;
 	cylinder_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, cylinder_array);
 	return cylinder_mesh;
 }

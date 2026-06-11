@@ -1,0 +1,246 @@
+{
+	"assets_used": [
+		{
+			"id": "edc49bf6-b89a-4dac-8590-8a2d514649c8",
+			"name": "Modern Minimalist Window",
+			"path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\c4403974_ModernMinimalist_Window_HP_high.glb",
+			"type": "hole_asset"
+		},
+		{
+			"id": "0c9189f2-87a8-483f-9cec-44353f652cf4",
+			"name": "Single Door",
+			"path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\d1311ffb_DoorClosed_HP.glb",
+			"type": "hole_asset"
+		},
+		{
+			"id": "cf5f6392-1789-44b4-bae6-bdfaa4eb8f84",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Modern Arc Floor Lamp",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/cd30c64d_ModernOffice_StandingLamp_HP_high.glb",
+			"position": 10609.3,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\cd30c64d_ModernOffice_StandingLamp_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "5bec1eb0-cf86-4476-b253-cc83737c859e",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Modern Minimalist Bed",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/98d6dc5f_ModernMinimalist_Bed_HP_high.glb",
+			"position": 21191.05,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\98d6dc5f_ModernMinimalist_Bed_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "7cb286f0-4cf9-4f7c-ac9a-96b1dcf74730",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Modern Minimalist WallPannel",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/4b500080_ModernMinimalist_WallPannel_HP_high.glb",
+			"position": 20164.7802631579,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\4b500080_ModernMinimalist_WallPannel_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "e088c950-7db1-4caa-85c6-23e4c39a0312",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Modern Minimalist Sidetable",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/304c871c_ModernMinimalist_Sidetable_HP_high.glb",
+			"position": 20591.05,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\304c871c_ModernMinimalist_Sidetable_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "e3d51f27-a1df-40fc-8090-0a664204c90d",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Modern Minimalist Sidetable",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/304c871c_ModernMinimalist_Sidetable_HP_high.glb",
+			"position": 20591.05,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\304c871c_ModernMinimalist_Sidetable_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "e7712c90-d25c-400d-acfd-f4ddc0838404",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Minimal Fabric Rug",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/b4770777_ModernMinimalist_Rug_HP_high.glb",
+			"position": 21991.05,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\b4770777_ModernMinimalist_Rug_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "8f33938d-5e3a-4df9-809c-8ee5e4aefce6",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Premium Metallic Ceiling Fan",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/bde890f5_MetalFan_HP_high.glb",
+			"position": 21491.05,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\bde890f5_MetalFan_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "a1000d50-cda5-4164-8742-5000cb5c5576",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Soft Lounge ottoman",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/bbe8411f_ModernMinimalist_ottoman_HP_high.glb",
+			"position": 21491.05,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\bbe8411f_ModernMinimalist_ottoman_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "43e2b10a-e7a0-456f-8eb1-01ef3db63c13",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Modern Minimalist Wardrobe",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/1b6ae403_ModernMinimalist_Wardrobe_HP_high.glb",
+			"position": 21431.0504981279,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\1b6ae403_ModernMinimalist_Wardrobe_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "d3e581fc-5feb-48c3-8941-537c586413f4",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Vertical LED Panel Light",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/93e4b1dd_ModernMinimalist_WallLamp_HP_high.glb",
+			"position": 20188.5105263158,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\93e4b1dd_ModernMinimalist_WallLamp_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "a690009c-0654-45c6-9b84-be9046209fc3",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Vertical LED Panel Light",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/93e4b1dd_ModernMinimalist_WallLamp_HP_high.glb",
+			"position": 20188.5105263158,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\93e4b1dd_ModernMinimalist_WallLamp_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "a7e784a6-1cee-4cfa-825a-c7c02f548b81",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Modern Walnut Grid Bookshelf",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/c095c383_Bookshelf_HP_high.glb",
+			"position": 23781.9871142064,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\c095c383_Bookshelf_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "a2655af2-f268-44fb-ba3a-85d74597bb36",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Minimalistic_CeilingLight",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/85e846ea_MinimalistCeilingLight_HP.glb",
+			"position": 21096.35,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\85e846ea_MinimalistCeilingLight_HP.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "89e96818-53fb-4332-98a8-49869d84fe27",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Minimalistic_CeilingLight",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/85e846ea_MinimalistCeilingLight_HP.glb",
+			"position": 21096.35,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\85e846ea_MinimalistCeilingLight_HP.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "7acfe0c5-3cdf-4137-bc37-d29e6981f019",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Minimalist Frame",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/0fbcdb47_MinimalistFrame_HP.glb",
+			"position": 20246.123044208,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\0fbcdb47_MinimalistFrame_HP.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "6bac5a51-c1e8-48a6-9f61-b417ee60ec17",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Elevation Decor",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/8bc9eb05_ElevationDecor_HP_high.glb",
+			"position": 33759.565,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\8bc9eb05_ElevationDecor_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "892fc7e4-b2f7-4d6f-bee0-87cda121fbc3",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Elevation Decor",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/8bc9eb05_ElevationDecor_HP_high.glb",
+			"position": 32209.565,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\8bc9eb05_ElevationDecor_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "d089ac5b-4581-4e84-bec2-a4fd87beda95",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Elevation Decor",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/8bc9eb05_ElevationDecor_HP_high.glb",
+			"position": 35234.565,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\8bc9eb05_ElevationDecor_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "33840d6a-987e-4216-9848-308d763190a8",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Minimal Globe Floor Lamp",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/968ddf83_Standinglamp_HP_high.glb",
+			"position": 30583.25,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\968ddf83_Standinglamp_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		},
+		{
+			"id": "7396b687-d943-468a-8de3-3db8fe9cb2cb",
+			"layer_id": "6b90b8ff-34a7-4bc7-867b-13d403f68229",
+			"name": "Minimal Globe Floor Lamp",
+			"path": "C:/Zlendo2026/ZlenderRender_stage_copy/asset_downloads/968ddf83_Standinglamp_HP_high.glb",
+			"position": 45573.09,
+			"reason": "",
+			"requested_path": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\asset_downloads\\968ddf83_Standinglamp_HP_high.glb",
+			"status": "loaded",
+			"type": "item_asset"
+		}
+	],
+	"camera_actual": {
+		"fov": 60.0,
+		"position": {
+			"x": 25.3266372680664,
+			"y": 1.24916279315948,
+			"z": 5.38639211654663
+		}
+	},
+	"output_image": "C:\\Zlendo2026\\ZlenderRender_stage_copy\\output_renders\\urbantest134_render.png",
+	"timestamp": "1780703723.304"
+}

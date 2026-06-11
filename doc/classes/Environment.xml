@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" ?>
-<class name="Environment" inherits="Resource" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+<class name="Environment" inherits="Resource" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
 	<brief_description>
 		Resource for environment nodes (like [WorldEnvironment]) that define multiple rendering options.
 	</brief_description>
@@ -40,6 +40,7 @@
 		</member>
 		<member name="adjustment_color_correction" type="Texture" setter="set_adjustment_color_correction" getter="get_adjustment_color_correction">
 			The [Texture2D] or [Texture3D] lookup table (LUT) to use for the built-in post-process color grading. Can use a [GradientTexture1D] for a 1-dimensional LUT, or a [Texture3D] for a more complex LUT. Effective only if [member adjustment_enabled] is [code]true[/code].
+			[b]Note:[/b] Color correction does not currently support HDR output due to only supporting values in the SDR (0.0 to 1.0) range.
 		</member>
 		<member name="adjustment_contrast" type="float" setter="set_adjustment_contrast" getter="get_adjustment_contrast" default="1.0">
 			Increasing [member adjustment_contrast] will make dark values darker and bright values brighter. This simple adjustment is applied to the rendered image after tonemaping. When set to a value greater than [code]1.0[/code], [member adjustment_contrast] is prone to clipping colors that become too bright or too dark. Effective only if [member adjustment_enabled] is [code]true[/code].
@@ -199,6 +200,26 @@
 			The strength that is used when blurring across the screen to generate the glow effect. This affects the distance and intensity of the blur. When using the Mobile rendering method, this should be increased to compensate for the lower dynamic range.
 			[b]Note:[/b] [member glow_strength] has no effect when using the Compatibility rendering method, due to this rendering method using a simpler glow implementation optimized for low-end devices.
 		</member>
+		<member name="pathtracing_debug_mode" type="int" setter="set_pathtracing_debug_mode" getter="get_pathtracing_debug_mode" enum="Environment.PathtracingDebugMode" default="0">
+			Selects a debug visualization channel to display instead of the final path-traced image. Useful for inspecting individual G-buffer inputs and intermediate shading data. Set to [constant RT_DEBUG_DISABLED] to show the normal rendered result.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_denoiser" type="int" setter="set_pathtracing_denoiser" getter="get_pathtracing_denoiser" enum="RenderingServer.PathtracingDenoiser" default="1">
+			The denoiser used to reduce noise in the path-traced image. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] uses NVIDIA DLSS Ray Reconstruction for high-quality temporal denoising and requires an NVIDIA RTX GPU. Use [constant RenderingServer.PT_DENOISER_NONE] to disable denoising.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_enabled" type="bool" setter="set_pathtracing_enabled" getter="is_pathtracing_enabled" default="false">
+			If [code]true[/code], enables hardware-accelerated path tracing for this environment. Path tracing produces physically accurate global illumination, reflections, and shadows by simulating light rays bouncing through the scene. Requires a GPU with ray tracing support.
+			[b]Note:[/b] Path tracing is mutually exclusive with rasterization-based rendering. When enabled, features such as SDFGI, screen-space reflections, and shadow maps are bypassed.
+		</member>
+		<member name="pathtracing_max_bounces" type="int" setter="set_pathtracing_max_bounces" getter="get_pathtracing_max_bounces" default="3">
+			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_samples_per_pixel" type="int" setter="set_pathtracing_samples_per_pixel" getter="get_pathtracing_samples_per_pixel" default="1">
+			Number of ray samples cast per pixel per frame. Higher values reduce noise but increase GPU cost proportionally. When using a temporal denoiser such as DLSS Ray Reconstruction, a low sample count (1-2) is typically sufficient since the denoiser accumulates information across frames.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
 		<member name="reflected_light_source" type="int" setter="set_reflection_source" getter="get_reflection_source" enum="Environment.ReflectionSource" default="0">
 			The reflected (specular) light source.
 		</member>
@@ -320,7 +341,7 @@
 		</member>
 		<member name="tonemap_agx_white" type="float" setter="set_tonemap_agx_white" getter="get_tonemap_agx_white" default="16.29">
 			The white reference value for tonemapping, which indicates where bright white is located in the scale of values provided to the tonemapper. For photorealistic lighting, it is recommended to set [member tonemap_agx_white] to at least [code]6.0[/code]. Higher values result in less blown out highlights, but may make the scene appear lower contrast. [member tonemap_agx_white] is the same as [member tonemap_white], but is only effective with the [constant TONE_MAPPER_AGX] tonemapper. See also [member tonemap_exposure].
-			[b]Note:[/b] When using the Mobile renderer with [member Viewport.use_hdr_2d] disabled, [member tonemap_agx_white] is ignored and a white value of [code]2.0[/code] will always be used instead.
+			[b]Note:[/b] When using the Mobile renderer with [member Viewport.use_hdr_2d] disabled, [member tonemap_agx_white] is ignored and a white value of [code]2.0[/code] will always be used instead. Otherwise, [member tonemap_agx_white] will be dynamically adjusted at runtime by multiplying it by the parent window's [method Window.get_output_max_linear_value] when using [member Viewport.use_hdr_2d] to ensure good behavior with both SDR and HDR output.
 		</member>
 		<member name="tonemap_exposure" type="float" setter="set_tonemap_exposure" getter="get_tonemap_exposure" default="1.0">
 			Adjusts the brightness of values before they are provided to the tonemapper. Higher [member tonemap_exposure] values result in a brighter image. See also [member tonemap_white].
@@ -332,6 +353,7 @@
 		<member name="tonemap_white" type="float" setter="set_tonemap_white" getter="get_tonemap_white" default="1.0">
 			The white reference value for tonemapping, which indicates where bright white is located in the scale of values provided to the tonemapper. For photorealistic lighting, it is recommended to set [member tonemap_white] to at least [code]6.0[/code]. Higher values result in less blown out highlights, but may make the scene appear lower contrast. [member tonemap_agx_white] will be used instead when using the [constant TONE_MAPPER_AGX] tonemapper. See also [member tonemap_exposure].
 			[b]Note:[/b] [member tonemap_white] must be set to [code]2.0[/code] or lower on the Mobile renderer to produce bright images.
+			[b]Note:[/b] [member tonemap_white] is ignored when using [constant TONE_MAPPER_LINEAR] and will be dynamically adjusted at runtime to never be less than the parent window's [method Window.get_output_max_linear_value] when using [constant TONE_MAPPER_REINHARDT] with [member Viewport.use_hdr_2d].
 		</member>
 		<member name="volumetric_fog_albedo" type="Color" setter="set_volumetric_fog_albedo" getter="get_volumetric_fog_albedo" default="Color(1, 1, 1, 1)">
 			The [Color] of the volumetric fog when interacting with lights. Mist and fog have an albedo close to [code]Color(1, 1, 1, 1)[/code] while smoke has a darker albedo.
@@ -432,10 +454,12 @@
 		</constant>
 		<constant name="TONE_MAPPER_FILMIC" value="2" enum="ToneMapper">
 			Uses a film-like tonemapping curve to prevent clipping of bright values and provide better contrast than [constant TONE_MAPPER_REINHARDT]. Slightly slower than [constant TONE_MAPPER_REINHARDT].
+			[b]Note:[/b] This tonemapper does not support HDR output because it produces output in the SDR range. It is recommended to use a different tonemapper when rendering to an HDR screen.
 		</constant>
 		<constant name="TONE_MAPPER_ACES" value="3" enum="ToneMapper">
 			Uses a high-contrast film-like tonemapping curve and desaturates bright values for a more realistic appearance. Slightly slower than [constant TONE_MAPPER_FILMIC].
 			[b]Note:[/b] This tonemapping operator is called "ACES Fitted" in Godot 3.x.
+			[b]Note:[/b] This tonemapper does not support HDR output because it produces output in the SDR range. It is recommended to use a different tonemapper when rendering to an HDR screen.
 		</constant>
 		<constant name="TONE_MAPPER_AGX" value="4" enum="ToneMapper">
 			Uses an adjustable film-like tonemapping curve and desaturates bright values for a more realistic appearance. Better than other tonemappers at maintaining the hue of colors as they become brighter. The slowest tonemapping option.
@@ -444,16 +468,86 @@
 			Adds the glow effect to the scene.
 		</constant>
 		<constant name="GLOW_BLEND_MODE_SCREEN" value="1" enum="GlowBlendMode">
-			Adds the glow effect to the scene after modifying the glow influence based on the scene value; dark values will be highly influenced by glow and bright values will not be influenced by glow. This approach avoids bright values becoming overly bright from the glow effect. [member tonemap_white] is used to determine the maximum scene value where the glow should have no influence. When [member tonemap_mode] is set to [constant TONE_MAPPER_LINEAR], a value of [code]1.0[/code] will be used as the maximum scene value.
+			Adds the glow effect to the scene after modifying the glow influence based on the scene value; dark values will be highly influenced by glow and bright values will not be influenced by glow. This approach avoids bright values becoming overly bright from the glow effect. [member tonemap_white] is used to determine the maximum scene value where the glow should have no influence. When [member tonemap_mode] is set to [constant TONE_MAPPER_LINEAR] and [member Viewport.use_hdr_2d] is [code]true[/code], the parent window's [method Window.get_output_max_linear_value] will be used as the maximum scene value.
 		</constant>
 		<constant name="GLOW_BLEND_MODE_SOFTLIGHT" value="2" enum="GlowBlendMode">
 			Adds the glow effect to the tonemapped image after modifying the glow influence based on the image value; dark values and bright values will not be influenced by glow and mid-range values will be highly influenced by glow. This approach avoids bright values becoming overly bright from the glow effect. The glow will have the largest influence on image values of [code]0.25[/code] and will have no influence when applied to image values greater than [code]1.0[/code].
+			[b]Note:[/b] This blend mode does not support HDR output because expects a maximum output value of [code]1.0[/code]. It is recommended to use a different blend mode when rendering to an HDR screen.
 		</constant>
 		<constant name="GLOW_BLEND_MODE_REPLACE" value="3" enum="GlowBlendMode">
 			Replaces all pixels' color by the glow effect. This can be used to simulate a full-screen blur effect by tweaking the glow parameters to match the original image's brightness or to preview glow configuration in the editor.
 		</constant>
 		<constant name="GLOW_BLEND_MODE_MIX" value="4" enum="GlowBlendMode">
 			Mixes the glow image with the scene image. Best used with [member glow_bloom] to avoid darkening the scene.
+		</constant>
+		<constant name="RT_DEBUG_DISABLED" value="0" enum="PathtracingDebugMode">
+			No debug visualization. Displays the final path-traced and denoised image.
+		</constant>
+		<constant name="RT_DEBUG_MIRROR_REFLECTION" value="1" enum="PathtracingDebugMode">
+			Displays the mirror (specular) reflection contribution only.
+		</constant>
+		<constant name="RT_DEBUG_GEOMETRY_NORMALS" value="2" enum="PathtracingDebugMode">
+			Displays the raw per-triangle geometric normals, without any normal map applied.
+		</constant>
+		<constant name="RT_DEBUG_FINAL_NORMALS" value="3" enum="PathtracingDebugMode">
+			Displays the final shading normals after applying normal maps and tangent-space transforms.
+		</constant>
+		<constant name="RT_DEBUG_NORMAL_MAP" value="4" enum="PathtracingDebugMode">
+			Displays the normal map texture sample in tangent space.
+		</constant>
+		<constant name="RT_DEBUG_TANGENT" value="5" enum="PathtracingDebugMode">
+			Displays the surface tangent vector at each hit point.
+		</constant>
+		<constant name="RT_DEBUG_BITANGENT" value="6" enum="PathtracingDebugMode">
+			Displays the surface bitangent vector at each hit point.
+		</constant>
+		<constant name="RT_DEBUG_UV" value="7" enum="PathtracingDebugMode">
+			Displays the primary UV texture coordinates as a color (red = U, green = V).
+		</constant>
+		<constant name="RT_DEBUG_ALBEDO" value="8" enum="PathtracingDebugMode">
+			Displays the combined albedo (base color) of each surface.
+		</constant>
+		<constant name="RT_DEBUG_ORM" value="9" enum="PathtracingDebugMode">
+			Displays the packed ORM texture (Occlusion, Roughness, Metalness in RGB channels).
+		</constant>
+		<constant name="RT_DEBUG_DIFFUSE_ALBEDO" value="10" enum="PathtracingDebugMode">
+			Displays only the diffuse albedo contribution, excluding specular.
+		</constant>
+		<constant name="RT_DEBUG_SPECULAR_ALBEDO" value="11" enum="PathtracingDebugMode">
+			Displays only the specular albedo (F0) contribution.
+		</constant>
+		<constant name="RT_DEBUG_NORMAL_ROUGHNESS" value="12" enum="PathtracingDebugMode">
+			Displays the shading normal and roughness packed together (normal in RGB, roughness in alpha visualized as intensity).
+		</constant>
+		<constant name="RT_DEBUG_SPECULAR_HIT_DISTANCE" value="13" enum="PathtracingDebugMode">
+			Displays the distance to the first specular ray hit, encoded as a grayscale value.
+		</constant>
+		<constant name="RT_DEBUG_METALNESS" value="14" enum="PathtracingDebugMode">
+			Displays the metalness value of each surface as a grayscale image.
+		</constant>
+		<constant name="RT_DEBUG_ROUGHNESS" value="15" enum="PathtracingDebugMode">
+			Displays the roughness value of each surface as a grayscale image.
+		</constant>
+		<constant name="RT_DEBUG_VIEW_NORMALS" value="16" enum="PathtracingDebugMode">
+			Displays the shading normals transformed into view (camera) space.
+		</constant>
+		<constant name="RT_DEBUG_DIFFUSE_SPECULAR_SPLIT" value="17" enum="PathtracingDebugMode">
+			Displays diffuse lighting on the left half and specular lighting on the right half of the screen.
+		</constant>
+		<constant name="RT_DEBUG_FRESNEL_F0" value="18" enum="PathtracingDebugMode">
+			Displays the Fresnel F0 reflectance value for each surface.
+		</constant>
+		<constant name="RT_DEBUG_FRONT_BACK_FACE" value="19" enum="PathtracingDebugMode">
+			Displays front-facing geometry in green and back-facing geometry in red. Useful for identifying incorrect face winding or double-sided materials.
+		</constant>
+		<constant name="RT_DEBUG_DEPTH" value="20" enum="PathtracingDebugMode">
+			Displays the primary ray hit depth (distance from camera) as a grayscale image.
+		</constant>
+		<constant name="RT_DEBUG_EMISSIVE" value="21" enum="PathtracingDebugMode">
+			Displays the emissive light contribution of each surface.
+		</constant>
+		<constant name="RT_DEBUG_BRDF_REJECTION" value="22" enum="PathtracingDebugMode">
+			Displays rays that were rejected by the BRDF sampling process, useful for debugging importance sampling issues.
 		</constant>
 		<constant name="FOG_MODE_EXPONENTIAL" value="0" enum="FogMode">
 			Use a physically-based fog model defined primarily by fog density.

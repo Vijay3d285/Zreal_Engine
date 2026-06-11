@@ -32,11 +32,14 @@
 
 #include "core/math/geometry_2d.h"
 #include "core/math/geometry_3d.h"
+#include "core/object/class_db.h"
 #include "editor/editor_node.h"
 #include "editor/editor_string_names.h"
 #include "editor/scene/3d/node_3d_editor_plugin.h"
 #include "editor/settings/editor_settings.h"
+#include "scene/main/scene_tree.h"
 #include "scene/resources/3d/primitive_meshes.h"
+#include "servers/rendering/rendering_server.h"
 
 #define HANDLE_HALF_SIZE 9.5
 
@@ -68,6 +71,9 @@ void EditorNode3DGizmo::clear() {
 	billboard_handle = false;
 	collision_segments.clear();
 	collision_meshes.clear();
+	collision_meshes_are_snap_source = false;
+	collision_aabb = AABB();
+	collision_aabb_has_points = false;
 	instances.clear();
 	handles.clear();
 	handle_ids.clear();
@@ -75,7 +81,19 @@ void EditorNode3DGizmo::clear() {
 	secondary_handle_ids.clear();
 }
 
+void EditorNode3DGizmo::_expand_collision_aabb_to(const Vector3 &p_point) {
+	if (collision_aabb_has_points) {
+		collision_aabb.expand_to(p_point);
+	} else {
+		collision_aabb = AABB(p_point, Vector3());
+		collision_aabb_has_points = true;
+	}
+}
+
 void EditorNode3DGizmo::redraw() {
+	const Node3DEditor *editor = Node3DEditor::get_singleton();
+	visual_suppressed = editor && editor->is_visual_suppressed_for(gizmo_plugin);
+
 	if (!GDVIRTUAL_CALL(_redraw)) {
 		ERR_FAIL_NULL(gizmo_plugin);
 		gizmo_plugin->redraw(this);
@@ -218,14 +236,17 @@ void EditorNode3DGizmo::Instance::create_instance(Node3D *p_base, bool p_hidden)
 	if (extra_margin) {
 		RS::get_singleton()->instance_set_extra_visibility_margin(instance, 1);
 	}
-	RS::get_singleton()->instance_geometry_set_cast_shadows_setting(instance, RS::SHADOW_CASTING_SETTING_OFF);
+	RS::get_singleton()->instance_geometry_set_cast_shadows_setting(instance, RSE::SHADOW_CASTING_SETTING_OFF);
 	int layer = p_hidden ? 0 : 1 << Node3DEditorViewport::GIZMO_EDIT_LAYER;
 	RS::get_singleton()->instance_set_layer_mask(instance, layer); //gizmos are 26
-	RS::get_singleton()->instance_geometry_set_flag(instance, RS::INSTANCE_FLAG_IGNORE_OCCLUSION_CULLING, true);
-	RS::get_singleton()->instance_geometry_set_flag(instance, RS::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
+	RS::get_singleton()->instance_geometry_set_flag(instance, RSE::INSTANCE_FLAG_IGNORE_OCCLUSION_CULLING, true);
+	RS::get_singleton()->instance_geometry_set_flag(instance, RSE::INSTANCE_FLAG_USE_BAKED_LIGHT, false);
 }
 
 void EditorNode3DGizmo::add_mesh(const Ref<Mesh> &p_mesh, const Ref<Material> &p_material, const Transform3D &p_xform, const Ref<SkinReference> &p_skin_reference) {
+	if (visual_suppressed) {
+		return;
+	}
 	ERR_FAIL_NULL(spatial_node);
 	ERR_FAIL_COND_MSG(p_mesh.is_null(), "EditorNode3DGizmo.add_mesh() requires a valid Mesh resource.");
 
@@ -255,20 +276,8 @@ void EditorNode3DGizmo::_update_bvh() {
 	Vector3 icon_size_vector3 = Vector3(effective_icon_size, effective_icon_size, effective_icon_size);
 	AABB aabb(transform.origin - icon_size_vector3 * 100.0f, icon_size_vector3 * 200.0f);
 
-	for (const Vector3 &segment_end : collision_segments) {
-		aabb.expand_to(transform.xform(segment_end));
-	}
-
-	if (!collision_meshes.is_empty()) {
-		for (Ref<TriangleMesh> collision_mesh : collision_meshes) {
-			if (collision_mesh.is_valid()) {
-				for (const Face3 &face : collision_mesh->get_faces()) {
-					aabb.expand_to(transform.xform(face.vertex[0]));
-					aabb.expand_to(transform.xform(face.vertex[1]));
-					aabb.expand_to(transform.xform(face.vertex[2]));
-				}
-			}
-		}
+	if (collision_aabb_has_points) {
+		aabb.merge_with(transform.xform(collision_aabb));
 	}
 
 	Node3DEditor::get_singleton()->update_gizmo_bvh_node(
@@ -281,7 +290,7 @@ void EditorNode3DGizmo::add_lines(const Vector<Vector3> &p_lines, const Ref<Mate
 }
 
 void EditorNode3DGizmo::add_vertices(const Vector<Vector3> &p_vertices, const Ref<Material> &p_material, Mesh::PrimitiveType p_primitive_type, bool p_billboard, const Color &p_modulate) {
-	if (p_vertices.is_empty()) {
+	if (visual_suppressed || p_vertices.is_empty()) {
 		return;
 	}
 
@@ -330,6 +339,10 @@ void EditorNode3DGizmo::add_vertices(const Vector<Vector3> &p_vertices, const Re
 
 void EditorNode3DGizmo::add_unscaled_billboard(const Ref<Material> &p_material, real_t p_scale, const Color &p_modulate) {
 	ERR_FAIL_NULL(spatial_node);
+	selectable_icon_size = p_scale;
+	if (visual_suppressed) {
+		return;
+	}
 	Instance ins;
 
 	Vector<Vector3> vs = {
@@ -365,14 +378,6 @@ void EditorNode3DGizmo::add_unscaled_billboard(const Ref<Material> &p_material, 
 	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, a);
 	mesh->surface_set_material(0, p_material);
 
-	float md = 0;
-	for (int i = 0; i < vs.size(); i++) {
-		md = MAX(0, vs[i].length());
-	}
-	if (md) {
-		mesh->set_custom_aabb(AABB(Vector3(-md, -md, -md), Vector3(md, md, md) * 2.0));
-	}
-
 	selectable_icon_size = p_scale;
 	mesh->set_custom_aabb(AABB(Vector3(-selectable_icon_size, -selectable_icon_size, -selectable_icon_size) * 100.0f, Vector3(selectable_icon_size, selectable_icon_size, selectable_icon_size) * 200.0f));
 
@@ -389,20 +394,32 @@ void EditorNode3DGizmo::add_unscaled_billboard(const Ref<Material> &p_material, 
 
 void EditorNode3DGizmo::add_collision_triangles(const Ref<TriangleMesh> &p_tmesh) {
 	collision_meshes.push_back(p_tmesh);
+	if (p_tmesh.is_valid()) {
+		const Vector<Vector3> &verts = p_tmesh->get_vertices();
+		const Vector3 *src = verts.ptr();
+		const int count = verts.size();
+		for (int i = 0; i < count; i++) {
+			_expand_collision_aabb_to(src[i]);
+		}
+	}
 }
 
 void EditorNode3DGizmo::add_collision_segments(const Vector<Vector3> &p_lines) {
-	int from = collision_segments.size();
-	collision_segments.resize(from + p_lines.size());
-	for (int i = 0; i < p_lines.size(); i++) {
-		collision_segments.write[from + i] = p_lines[i];
+	const int count = p_lines.size();
+	const int from = collision_segments.size();
+	collision_segments.resize(from + count);
+	const Vector3 *src = p_lines.ptr();
+	Vector3 *dst = collision_segments.ptrw() + from;
+	for (int i = 0; i < count; i++) {
+		dst[i] = src[i];
+		_expand_collision_aabb_to(src[i]);
 	}
 }
 
 void EditorNode3DGizmo::add_handles(const Vector<Vector3> &p_handles, const Ref<Material> &p_material, const Vector<int> &p_ids, bool p_billboard, bool p_secondary) {
 	billboard_handle = p_billboard;
 
-	if (!is_selected() || !is_editable()) {
+	if (visual_suppressed || !is_selected() || !is_editable()) {
 		return;
 	}
 
@@ -425,8 +442,8 @@ void EditorNode3DGizmo::add_handles(const Vector<Vector3> &p_handles, const Ref<
 	Ref<ArrayMesh> mesh = memnew(ArrayMesh);
 
 	Array a;
-	a.resize(RS::ARRAY_MAX);
-	a[RS::ARRAY_VERTEX] = p_handles;
+	a.resize(RSE::ARRAY_MAX);
+	a[RSE::ARRAY_VERTEX] = p_handles;
 	Vector<Color> colors;
 	{
 		colors.resize(p_handles.size());
@@ -446,7 +463,7 @@ void EditorNode3DGizmo::add_handles(const Vector<Vector3> &p_handles, const Ref<
 			w[i] = col;
 		}
 	}
-	a[RS::ARRAY_COLOR] = colors;
+	a[RSE::ARRAY_COLOR] = colors;
 	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_POINTS, a);
 	mesh->surface_set_material(0, p_material);
 
@@ -486,18 +503,22 @@ void EditorNode3DGizmo::add_handles(const Vector<Vector3> &p_handles, const Ref<
 void EditorNode3DGizmo::add_solid_box(const Ref<Material> &p_material, Vector3 p_size, Vector3 p_position, const Transform3D &p_xform) {
 	ERR_FAIL_NULL(spatial_node);
 
+	if (visual_suppressed) {
+		return;
+	}
+
 	Array arrays;
-	arrays.resize(RS::ARRAY_MAX);
+	arrays.resize(RSE::ARRAY_MAX);
 	BoxMesh::create_mesh_array(arrays, p_size);
 
-	PackedVector3Array vertex = arrays[RS::ARRAY_VERTEX];
+	PackedVector3Array vertex = arrays[RSE::ARRAY_VERTEX];
 	Vector3 *w = vertex.ptrw();
 
 	for (int i = 0; i < vertex.size(); ++i) {
 		w[i] += p_position;
 	}
 
-	arrays[RS::ARRAY_VERTEX] = vertex;
+	arrays[RSE::ARRAY_VERTEX] = vertex;
 
 	Ref<ArrayMesh> m;
 	m.instantiate();
@@ -835,7 +856,9 @@ void EditorNode3DGizmo::free() {
 
 	clear();
 
-	Node3DEditor::get_singleton()->remove_gizmo_bvh_node(bvh_node_id);
+	if (Node3DEditor::get_singleton()) {
+		Node3DEditor::get_singleton()->remove_gizmo_bvh_node(bvh_node_id);
+	}
 	bvh_node_id = DynamicBVH::ID();
 
 	valid = false;
@@ -900,8 +923,6 @@ EditorNode3DGizmo::~EditorNode3DGizmo() {
 	}
 	clear();
 }
-
-/////
 
 void EditorNode3DGizmoPlugin::create_material(const String &p_name, const Color &p_color, bool p_billboard, bool p_on_top, bool p_use_vertex_color) {
 	Color instantiated_color = EDITOR_GET("editors/3d_gizmos/gizmo_colors/instantiated");
@@ -1090,6 +1111,7 @@ void EditorNode3DGizmoPlugin::_bind_methods() {
 	GDVIRTUAL_BIND(_get_priority);
 	GDVIRTUAL_BIND(_can_be_hidden);
 	GDVIRTUAL_BIND(_is_selectable_when_hidden);
+	GDVIRTUAL_BIND(_can_commit_handle_on_click);
 
 	GDVIRTUAL_BIND(_redraw, "gizmo");
 	GDVIRTUAL_BIND(_get_handle_name, "gizmo", "handle_id", "secondary");
@@ -1139,7 +1161,9 @@ bool EditorNode3DGizmoPlugin::is_selectable_when_hidden() const {
 }
 
 bool EditorNode3DGizmoPlugin::can_commit_handle_on_click() const {
-	return false;
+	bool ret = false;
+	GDVIRTUAL_CALL(_can_commit_handle_on_click, ret);
+	return ret;
 }
 
 void EditorNode3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
@@ -1241,5 +1265,3 @@ EditorNode3DGizmoPlugin::~EditorNode3DGizmoPlugin() {
 		Node3DEditor::get_singleton()->update_all_gizmos();
 	}
 }
-
-//////

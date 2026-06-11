@@ -29,11 +29,13 @@
 /**************************************************************************/
 
 #include "copy_effects.h"
+
 #include "core/config/project_settings.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
-#include "thirdparty/misc/cubemap_coeffs.h"
+
+#include <thirdparty/misc/cubemap_coeffs.h>
 
 using namespace RendererRD;
 
@@ -117,6 +119,7 @@ CopyEffects::CopyEffects(BitField<RasterEffects> p_raster_effects) {
 		copy_modes.push_back("\n#define MODE_PANORAMA_TO_DP\n"); // COPY_TO_FB_COPY_PANORAMA_TO_DP
 		copy_modes.push_back("\n#define MODE_TWO_SOURCES\n"); // COPY_TO_FB_COPY2
 		copy_modes.push_back("\n#define MODE_SET_COLOR\n"); // COPY_TO_FB_SET_COLOR
+		copy_modes.push_back("\n#define MODE_COPY_DEPTH\n"); // COPY_TO_FB_COPY_DEPTH
 		copy_modes.push_back("\n#define USE_MULTIVIEW\n"); // COPY_TO_FB_MULTIVIEW
 		copy_modes.push_back("\n#define USE_MULTIVIEW\n#define MODE_TWO_SOURCES\n"); // COPY_TO_FB_MULTIVIEW_WITH_DEPTH
 
@@ -133,7 +136,16 @@ CopyEffects::CopyEffects(BitField<RasterEffects> p_raster_effects) {
 
 		for (int i = 0; i < COPY_TO_FB_MAX; i++) {
 			if (copy_to_fb.shader.is_variant_enabled(i)) {
-				copy_to_fb.pipelines[i].setup(copy_to_fb.shader.version_get_shader(copy_to_fb.shader_version, i), RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(), 0);
+				if (i == COPY_TO_FB_COPY_DEPTH) {
+					// Depth-only pipeline: always-pass depth test, depth write, no color attachments.
+					RD::PipelineDepthStencilState dss;
+					dss.enable_depth_test = true;
+					dss.depth_compare_operator = RD::COMPARE_OP_ALWAYS;
+					dss.enable_depth_write = true;
+					copy_to_fb.pipelines[i].setup(copy_to_fb.shader.version_get_shader(copy_to_fb.shader_version, i), RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), dss, RD::PipelineColorBlendState::create_disabled(0), 0);
+				} else {
+					copy_to_fb.pipelines[i].setup(copy_to_fb.shader.version_get_shader(copy_to_fb.shader_version, i), RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), RD::PipelineDepthStencilState(), RD::PipelineColorBlendState::create_disabled(), 0);
+				}
 			} else {
 				copy_to_fb.pipelines[i].clear();
 			}
@@ -434,7 +446,7 @@ void CopyEffects::copy_to_rect(RID p_source_rd_texture, RID p_dest_texture, cons
 	copy.push_constant.target[1] = p_rect.position.y;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 	RD::Uniform u_dest_texture(RD::UNIFORM_TYPE_IMAGE, 0, p_dest_texture);
@@ -474,7 +486,7 @@ void CopyEffects::copy_octmap_to_panorama(RID p_source_octmap, RID p_dest_panora
 	copy.push_constant.luminance_multiplier = raster_effects.has_flag(RASTER_EFFECT_COPY) ? 2.0 : 1.0;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_octmap(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_octmap }));
 	RD::Uniform u_dest_panorama(RD::UNIFORM_TYPE_IMAGE, 0, p_dest_panorama);
@@ -511,7 +523,7 @@ void CopyEffects::copy_depth_to_rect(RID p_source_rd_texture, RID p_dest_texture
 	copy.push_constant.target[1] = p_rect.position.y;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 	RD::Uniform u_dest_texture(RD::UNIFORM_TYPE_IMAGE, 0, p_dest_texture);
@@ -550,7 +562,7 @@ void CopyEffects::copy_depth_to_rect_and_linearize(RID p_source_rd_texture, RID 
 	copy.push_constant.camera_z_near = p_z_near;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 	RD::Uniform u_dest_texture(RD::UNIFORM_TYPE_IMAGE, 0, p_dest_texture);
@@ -566,6 +578,31 @@ void CopyEffects::copy_depth_to_rect_and_linearize(RID p_source_rd_texture, RID 
 	RD::get_singleton()->compute_list_set_push_constant(compute_list, &copy.push_constant, sizeof(CopyPushConstant));
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, p_rect.size.width, p_rect.size.height, 1);
 	RD::get_singleton()->compute_list_end();
+}
+
+void CopyEffects::copy_r32f_to_depth_fb(RID p_source_r32f, RID p_dest_depth_framebuffer, const Rect2i &p_rect) {
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	ERR_FAIL_NULL(uniform_set_cache);
+	MaterialStorage *material_storage = MaterialStorage::get_singleton();
+	ERR_FAIL_NULL(material_storage);
+
+	memset(&copy_to_fb.push_constant, 0, sizeof(CopyToFbPushConstant));
+	copy_to_fb.push_constant.luminance_multiplier = 1.0;
+
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_r32f }));
+
+	CopyToFBMode mode = COPY_TO_FB_COPY_DEPTH;
+	RID shader = copy_to_fb.shader.version_get_shader(copy_to_fb.shader_version, mode);
+	ERR_FAIL_COND(shader.is_null());
+
+	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(p_dest_depth_framebuffer, RD::DRAW_CLEAR_ALL, Vector<Color>(), 0.0f, 0, p_rect);
+	RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, copy_to_fb.pipelines[mode].get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(p_dest_depth_framebuffer)));
+	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set_cache->get_cache(shader, 0, u_source), 0);
+	RD::get_singleton()->draw_list_bind_index_array(draw_list, material_storage->get_quad_index_array());
+	RD::get_singleton()->draw_list_set_push_constant(draw_list, &copy_to_fb.push_constant, sizeof(CopyToFbPushConstant));
+	RD::get_singleton()->draw_list_draw(draw_list, true);
+	RD::get_singleton()->draw_list_end();
 }
 
 void CopyEffects::copy_to_atlas_fb(RID p_source_rd_texture, RID p_dest_framebuffer, const Rect2 &p_uv_rect, RD::DrawListID p_draw_list, bool p_flip_y, bool p_panorama) {
@@ -589,7 +626,7 @@ void CopyEffects::copy_to_atlas_fb(RID p_source_rd_texture, RID p_dest_framebuff
 	copy_to_fb.push_constant.luminance_multiplier = 1.0;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
@@ -605,7 +642,7 @@ void CopyEffects::copy_to_atlas_fb(RID p_source_rd_texture, RID p_dest_framebuff
 	RD::get_singleton()->draw_list_draw(draw_list, true);
 }
 
-void CopyEffects::copy_to_fb_rect(RID p_source_rd_texture, RID p_dest_framebuffer, const Rect2i &p_rect, bool p_flip_y, bool p_force_luminance, bool p_alpha_to_zero, bool p_srgb, RID p_secondary, bool p_multiview, bool p_alpha_to_one, bool p_linear, bool p_normal, const Rect2 &p_src_rect, float p_linear_luminance_multiplier) {
+void CopyEffects::copy_to_fb_rect(RID p_source_rd_texture, RID p_dest_framebuffer, const Rect2i &p_rect, bool p_flip_y, bool p_force_luminance, bool p_alpha_to_zero, bool p_srgb, RID p_secondary, bool p_multiview, bool p_alpha_to_one, bool p_linear, bool p_normal, const Rect2 &p_src_rect, float p_linear_luminance_multiplier, bool p_bilinear_filtering, CopyToFbFlagMode p_flag_mode) {
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	ERR_FAIL_NULL(uniform_set_cache);
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
@@ -637,6 +674,7 @@ void CopyEffects::copy_to_fb_rect(RID p_source_rd_texture, RID p_dest_framebuffe
 	if (p_normal) {
 		copy_to_fb.push_constant.flags |= COPY_TO_FB_FLAG_NORMAL;
 	}
+	copy_to_fb.push_constant.flags |= (uint32_t(p_flag_mode) & COPY_TO_FB_FLAG_MODE_MASK) << COPY_TO_FB_FLAG_MODE_SHIFT;
 
 	if (p_src_rect != Rect2()) {
 		copy_to_fb.push_constant.section[0] = p_src_rect.position.x;
@@ -647,7 +685,7 @@ void CopyEffects::copy_to_fb_rect(RID p_source_rd_texture, RID p_dest_framebuffe
 	}
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(p_bilinear_filtering ? RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR : RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
@@ -690,7 +728,7 @@ void CopyEffects::copy_to_drawlist(RD::DrawListID p_draw_list, RD::FramebufferFo
 	}
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
@@ -718,7 +756,7 @@ void CopyEffects::copy_raster(RID p_source_texture, RID p_dest_framebuffer) {
 	memset(&blur_raster.push_constant, 0, sizeof(BlurRasterPushConstant));
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_texture }));
 
@@ -753,7 +791,7 @@ void CopyEffects::gaussian_blur(RID p_source_rd_texture, RID p_texture, const Re
 	copy.push_constant.section[3] = p_size.height;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 	RD::Uniform u_texture(RD::UNIFORM_TYPE_IMAGE, 0, p_texture);
@@ -792,7 +830,7 @@ void CopyEffects::gaussian_blur_raster(RID p_source_rd_texture, RID p_dest_textu
 	blur_raster.push_constant.dest_pixel_size[1] = 1.0 / float(p_size.y);
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
@@ -836,7 +874,7 @@ void CopyEffects::gaussian_glow(RID p_source_rd_texture, RID p_back_texture, con
 	copy.push_constant.glow_auto_exposure_scale = p_auto_exposure_scale; //unused also
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 	RD::Uniform u_back_texture(RD::UNIFORM_TYPE_IMAGE, 0, p_back_texture);
@@ -929,7 +967,7 @@ void CopyEffects::gaussian_glow_upsample_raster(RID p_source_rd_texture, RID p_d
 	spec_constant |= p_level > 0.01 ? 2 : 0;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 	RD::Uniform u_blend_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_blend_texture }));
 
@@ -963,7 +1001,7 @@ void CopyEffects::make_mipmap(RID p_source_rd_texture, RID p_dest_texture, const
 	copy.push_constant.section[3] = p_size.height;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 	RD::Uniform u_dest_texture(RD::UNIFORM_TYPE_IMAGE, 0, p_dest_texture);
@@ -999,7 +1037,7 @@ void CopyEffects::make_mipmap_raster(RID p_source_rd_texture, RID p_dest_texture
 	blur_raster.push_constant.dest_pixel_size[1] = 1.0 / float(p_size.y);
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
@@ -1101,7 +1139,7 @@ void CopyEffects::copy_cubemap_to_dp(RID p_source_rd_texture, RID p_dst_framebuf
 	push_constant.texel_size[0] *= p_dp_flip ? -1.0f : 1.0f; // Encode dp flip as x size sign
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
@@ -1128,7 +1166,7 @@ void CopyEffects::copy_cubemap_to_octmap(RID p_source_rd_texture, RID p_dst_fram
 
 	cube_to_octmap.push_constant.border_size = 1.0f - p_border_size * 2.0f;
 
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
 	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(p_dst_framebuffer);
@@ -1152,7 +1190,7 @@ void CopyEffects::octmap_downsample(RID p_source_octmap, RID p_dest_octmap, cons
 	octmap_downsampler.push_constant.border_size = 1.0f - p_border_size * 2.0f;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_octmap(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_octmap }));
 	RD::Uniform u_dest_octmap(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ p_dest_octmap }));
@@ -1202,7 +1240,7 @@ void CopyEffects::octmap_downsample_raster(RID p_source_octmap, RID p_dest_frame
 	octmap_downsampler.push_constant.border_size = 1.0f - p_border_size * 2.0f;
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_cubemap(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_octmap }));
 
@@ -1249,7 +1287,6 @@ void CopyEffects::octmap_filter(RID p_source_octmap, const Vector<RID> &p_dest_o
 	OctmapFilterPushConstant push_constant;
 	push_constant.border_size[0] = p_border_size;
 	push_constant.border_size[1] = 1.0f - p_border_size * 2.0f;
-	push_constant.size = 320;
 
 	Vector<RD::Uniform> uniforms;
 	for (int i = 0; i < p_dest_octmap.size(); i++) {
@@ -1265,7 +1302,7 @@ void CopyEffects::octmap_filter(RID p_source_octmap, const Vector<RID> &p_dest_o
 	filter.image_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, filter.compute_shader.version_get_shader(filter.shader_version, 0), 2);
 
 	// setup our uniforms
-	RID default_mipmap_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_mipmap_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_octmap(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_mipmap_sampler, p_source_octmap }));
 
@@ -1320,7 +1357,7 @@ void CopyEffects::octmap_filter_raster(RID p_source_octmap, RID p_dest_framebuff
 	push_constant.mip_level = p_mip_level;
 
 	// setup our uniforms
-	RID default_mipmap_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_mipmap_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_octmap(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_mipmap_sampler, p_source_octmap }));
 
@@ -1355,7 +1392,7 @@ void CopyEffects::octmap_roughness(RID p_source_rd_texture, RID p_dest_texture, 
 
 	// Remap to perceptual-roughness^2 to create more detail in lower mips and match the mapping of octmap_filter.
 	roughness.push_constant.roughness = p_roughness * p_roughness;
-	roughness.push_constant.sample_count = MIN(p_sample_count, 256u);
+	roughness.push_constant.sample_count = MIN(p_sample_count, 64u);
 	roughness.push_constant.source_size = p_source_size;
 	roughness.push_constant.dest_size = p_dest_size;
 	roughness.push_constant.use_direct_write = p_roughness == 0.0;
@@ -1363,7 +1400,7 @@ void CopyEffects::octmap_roughness(RID p_source_rd_texture, RID p_dest_texture, 
 	roughness.push_constant.border_size[1] = 1.0f - p_border_size * 2.0;
 
 	// setup our uniforms
-	RID default_mipmap_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_mipmap_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_mipmap_sampler, p_source_rd_texture }));
 	RD::Uniform u_dest_texture(RD::UNIFORM_TYPE_IMAGE, 0, Vector<RID>({ p_dest_texture }));
@@ -1420,7 +1457,7 @@ void CopyEffects::octmap_roughness_raster(RID p_source_rd_texture, RID p_dest_fr
 	roughness.push_constant.border_size[1] = 1.0f - p_border_size * 2.0;
 
 	// Setup our uniforms.
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
@@ -1443,7 +1480,7 @@ void CopyEffects::merge_specular(RID p_dest_framebuffer, RID p_specular, RID p_b
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
 	ERR_FAIL_NULL(material_storage);
 
-	RID default_sampler = material_storage->sampler_rd_get_default(RS::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RS::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::get_singleton()->draw_command_begin_label("Merge Specular");
 

@@ -33,8 +33,7 @@
 #include "core/io/resource.h"
 #include "core/templates/self_list.h"
 #include "scene/resources/shader.h"
-#include "scene/resources/texture.h"
-#include "servers/rendering/rendering_server.h"
+#include "servers/rendering/rendering_server_enums.h"
 
 class Material : public Resource {
 	GDCLASS(Material, Resource);
@@ -71,8 +70,8 @@ protected:
 	GDVIRTUAL0RC(bool, _can_use_render_priority)
 public:
 	enum {
-		RENDER_PRIORITY_MAX = RS::MATERIAL_RENDER_PRIORITY_MAX,
-		RENDER_PRIORITY_MIN = RS::MATERIAL_RENDER_PRIORITY_MIN,
+		RENDER_PRIORITY_MAX = RSE::MATERIAL_RENDER_PRIORITY_MAX,
+		RENDER_PRIORITY_MIN = RSE::MATERIAL_RENDER_PRIORITY_MIN,
 	};
 
 	bool _is_initialized() { return init_state == INIT_STATE_READY; }
@@ -221,9 +220,6 @@ public:
 		FEATURE_REFRACTION,
 		FEATURE_DETAIL,
 		FEATURE_BENT_NORMAL_MAPPING,
-		FEATURE_SHEEN,
-		FEATURE_IRIDESCENCE,
-		FEATURE_PHYSICAL_IOR,
 		FEATURE_MAX
 	};
 
@@ -361,27 +357,27 @@ public:
 private:
 	struct MaterialKey {
 		// enum values
-		uint64_t texture_filter : get_num_bits(TEXTURE_FILTER_MAX - 1);
-		uint64_t detail_uv : get_num_bits(DETAIL_UV_MAX - 1);
-		uint64_t transparency : get_num_bits(TRANSPARENCY_MAX - 1);
-		uint64_t alpha_antialiasing_mode : get_num_bits(ALPHA_ANTIALIASING_MAX - 1);
-		uint64_t shading_mode : get_num_bits(SHADING_MODE_MAX - 1);
-		uint64_t blend_mode : get_num_bits(BLEND_MODE_MAX - 1);
-		uint64_t depth_draw_mode : get_num_bits(DEPTH_DRAW_MAX - 1);
-		uint64_t depth_test : get_num_bits(DEPTH_TEST_MAX - 1);
-		uint64_t cull_mode : get_num_bits(CULL_MAX - 1);
-		uint64_t diffuse_mode : get_num_bits(DIFFUSE_MAX - 1);
-		uint64_t specular_mode : get_num_bits(SPECULAR_MAX - 1);
-		uint64_t billboard_mode : get_num_bits(BILLBOARD_MAX - 1);
-		uint64_t detail_blend_mode : get_num_bits(BLEND_MODE_MAX - 1);
-		uint64_t roughness_channel : get_num_bits(TEXTURE_CHANNEL_MAX - 1);
-		uint64_t emission_op : get_num_bits(EMISSION_OP_MAX - 1);
-		uint64_t distance_fade : get_num_bits(DISTANCE_FADE_MAX - 1);
+		uint64_t texture_filter : Math::get_num_bits(TEXTURE_FILTER_MAX - 1);
+		uint64_t detail_uv : Math::get_num_bits(DETAIL_UV_MAX - 1);
+		uint64_t transparency : Math::get_num_bits(TRANSPARENCY_MAX - 1);
+		uint64_t alpha_antialiasing_mode : Math::get_num_bits(ALPHA_ANTIALIASING_MAX - 1);
+		uint64_t shading_mode : Math::get_num_bits(SHADING_MODE_MAX - 1);
+		uint64_t blend_mode : Math::get_num_bits(BLEND_MODE_MAX - 1);
+		uint64_t depth_draw_mode : Math::get_num_bits(DEPTH_DRAW_MAX - 1);
+		uint64_t depth_test : Math::get_num_bits(DEPTH_TEST_MAX - 1);
+		uint64_t cull_mode : Math::get_num_bits(CULL_MAX - 1);
+		uint64_t diffuse_mode : Math::get_num_bits(DIFFUSE_MAX - 1);
+		uint64_t specular_mode : Math::get_num_bits(SPECULAR_MAX - 1);
+		uint64_t billboard_mode : Math::get_num_bits(BILLBOARD_MAX - 1);
+		uint64_t detail_blend_mode : Math::get_num_bits(BLEND_MODE_MAX - 1);
+		uint64_t roughness_channel : Math::get_num_bits(TEXTURE_CHANNEL_MAX - 1);
+		uint64_t emission_op : Math::get_num_bits(EMISSION_OP_MAX - 1);
+		uint64_t distance_fade : Math::get_num_bits(DISTANCE_FADE_MAX - 1);
 
 		// stencil
-		uint64_t stencil_mode : get_num_bits(STENCIL_MODE_MAX - 1);
+		uint64_t stencil_mode : Math::get_num_bits(STENCIL_MODE_MAX - 1);
 		uint64_t stencil_flags : STENCIL_FLAG_NUM_BITS;
-		uint64_t stencil_compare : get_num_bits(STENCIL_COMPARE_MAX - 1);
+		uint64_t stencil_compare : Math::get_num_bits(STENCIL_COMPARE_MAX - 1);
 		uint64_t stencil_reference : 8;
 
 		// booleans
@@ -567,19 +563,13 @@ private:
 	bool grow_enabled = false;
 	float ao_light_affect = 0.0f;
 	float grow = 0.0f;
-	// Substrate-style material properties
-	Color sheen_color = Color(1, 1, 1);
-	float sheen_roughness = 0.5f;
-	float iridescence_ior = 1.5f;
-	float iridescence_thickness = 400.0f;
-	float material_ior = 1.5f;
 	int particles_anim_h_frames = 0;
 	int particles_anim_v_frames = 0;
 	bool particles_anim_loop = false;
 	Transparency transparency = TRANSPARENCY_DISABLED;
 	ShadingMode shading_mode = SHADING_MODE_PER_PIXEL;
 
-	TextureFilter texture_filter = TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC;
+	TextureFilter texture_filter = TEXTURE_FILTER_LINEAR_WITH_MIPMAPS;
 
 	Vector3 uv1_scale;
 	Vector3 uv1_offset;

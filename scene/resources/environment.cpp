@@ -30,8 +30,13 @@
 
 #include "environment.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
+#include "core/os/os.h"
 #include "scene/resources/gradient_texture.h"
+#include "scene/resources/sky.h"
 #include "servers/rendering/rendering_server.h"
 
 RID Environment::get_rid() const {
@@ -42,7 +47,7 @@ RID Environment::get_rid() const {
 
 void Environment::set_background(BGMode p_bg) {
 	bg_mode = p_bg;
-	RS::get_singleton()->environment_set_background(environment, RS::EnvironmentBG(p_bg));
+	RS::get_singleton()->environment_set_background(environment, RSE::EnvironmentBG(p_bg));
 	notify_property_list_changed();
 	if (bg_mode != BG_SKY) {
 		set_fog_aerial_perspective(0.0);
@@ -192,9 +197,9 @@ void Environment::_update_ambient_light() {
 	RS::get_singleton()->environment_set_ambient_light(
 			environment,
 			ambient_color,
-			RS::EnvironmentAmbientSource(ambient_source),
+			RSE::EnvironmentAmbientSource(ambient_source),
 			ambient_energy,
-			ambient_sky_contribution, RS::EnvironmentReflectionSource(reflection_source));
+			ambient_sky_contribution, RSE::EnvironmentReflectionSource(reflection_source));
 }
 
 // Tonemap
@@ -248,7 +253,7 @@ float Environment::get_tonemap_agx_contrast() const {
 void Environment::_update_tonemap() {
 	RS::get_singleton()->environment_set_tonemap(
 			environment,
-			RS::EnvironmentToneMapper(tone_mapper),
+			RSE::EnvironmentToneMapper(tone_mapper),
 			tonemap_exposure,
 			tone_mapper == TONE_MAPPER_AGX ? tonemap_agx_white : tonemap_white);
 }
@@ -589,13 +594,72 @@ void Environment::_update_sdfgi() {
 			sdfgi_enabled,
 			sdfgi_cascades,
 			sdfgi_min_cell_size,
-			RS::EnvironmentSDFGIYScale(sdfgi_y_scale),
+			RSE::EnvironmentSDFGIYScale(sdfgi_y_scale),
 			sdfgi_use_occlusion,
 			sdfgi_bounce_feedback,
 			sdfgi_read_sky_light,
 			sdfgi_energy,
 			sdfgi_normal_bias,
 			sdfgi_probe_bias);
+}
+
+// Pathtracing
+
+void Environment::set_pathtracing_enabled(bool p_enabled) {
+	pathtracing_enabled = p_enabled;
+	_update_pathtracing();
+}
+
+bool Environment::is_pathtracing_enabled() const {
+	return pathtracing_enabled;
+}
+
+void Environment::set_pathtracing_debug_mode(PathtracingDebugMode p_mode) {
+	pathtracing_debug_mode = p_mode;
+	_update_pathtracing();
+}
+
+Environment::PathtracingDebugMode Environment::get_pathtracing_debug_mode() const {
+	return pathtracing_debug_mode;
+}
+
+void Environment::set_pathtracing_samples_per_pixel(int p_samples) {
+	pathtracing_samples_per_pixel = MAX(1, p_samples);
+	_update_pathtracing();
+}
+
+int Environment::get_pathtracing_samples_per_pixel() const {
+	return pathtracing_samples_per_pixel;
+}
+
+void Environment::set_pathtracing_max_bounces(int p_bounces) {
+	pathtracing_max_bounces = CLAMP(p_bounces, 1, 8);
+	_update_pathtracing();
+}
+
+int Environment::get_pathtracing_max_bounces() const {
+	return pathtracing_max_bounces;
+}
+
+void Environment::set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser) {
+	pathtracing_denoiser = p_denoiser;
+	_update_pathtracing();
+}
+
+RSE::PathtracingDenoiser Environment::get_pathtracing_denoiser() const {
+	return pathtracing_denoiser;
+}
+
+void Environment::_update_pathtracing() {
+	RS::get_singleton()->environment_set_pathtracing(environment, pathtracing_enabled);
+
+	PackedFloat32Array params;
+	params.resize(16);
+	params.write[RSE::PT_PARAM_VIS_MODE] = (float)pathtracing_debug_mode;
+	params.write[RSE::PT_PARAM_SAMPLE_COUNT] = (float)pathtracing_samples_per_pixel;
+	params.write[RSE::PT_PARAM_MAX_BOUNCES] = (float)pathtracing_max_bounces;
+	params.write[RSE::PT_PARAM_DENOISER] = (float)(int)pathtracing_denoiser;
+	RS::get_singleton()->environment_set_pathtracing_params(environment, params);
 }
 
 // Glow
@@ -610,7 +674,7 @@ bool Environment::is_glow_enabled() const {
 }
 
 void Environment::set_glow_level(int p_level, float p_intensity) {
-	ERR_FAIL_INDEX(p_level, RS::MAX_GLOW_LEVELS);
+	ERR_FAIL_INDEX(p_level, RSE::MAX_GLOW_LEVELS);
 
 	glow_levels.write[p_level] = p_intensity;
 
@@ -618,7 +682,7 @@ void Environment::set_glow_level(int p_level, float p_intensity) {
 }
 
 float Environment::get_glow_level(int p_level) const {
-	ERR_FAIL_INDEX_V(p_level, RS::MAX_GLOW_LEVELS, 0.0);
+	ERR_FAIL_INDEX_V(p_level, RSE::MAX_GLOW_LEVELS, 0.0);
 
 	return glow_levels[p_level];
 }
@@ -756,7 +820,7 @@ void Environment::_update_glow() {
 			glow_strength,
 			glow_mix,
 			glow_bloom,
-			RS::EnvironmentGlowBlendMode(glow_blend_mode),
+			RSE::EnvironmentGlowBlendMode(glow_blend_mode),
 			glow_hdr_bleed_threshold,
 			glow_hdr_bleed_scale,
 			glow_hdr_luminance_cap,
@@ -862,7 +926,7 @@ void Environment::_update_fog() {
 			fog_height_density,
 			fog_aerial_perspective,
 			fog_sky_affect,
-			RS::EnvironmentFogMode(fog_mode));
+			RSE::EnvironmentFogMode(fog_mode));
 }
 
 // Depth Fog
@@ -1107,56 +1171,75 @@ void Environment::_validate_property(PropertyInfo &p_property) const {
 		if (bg_mode != BG_SKY && ambient_source != AMBIENT_SOURCE_SKY && reflection_source != REFLECTION_SOURCE_SKY) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
 	if (p_property.name == "fog_depth_curve" || p_property.name == "fog_depth_begin" || p_property.name == "fog_depth_end") {
 		if (fog_mode == FOG_MODE_EXPONENTIAL) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
 	if (p_property.name == "ambient_light_color" || p_property.name == "ambient_light_energy") {
 		if (ambient_source == AMBIENT_SOURCE_DISABLED) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
 	if (p_property.name == "ambient_light_sky_contribution") {
 		if (ambient_source == AMBIENT_SOURCE_DISABLED || ambient_source == AMBIENT_SOURCE_COLOR) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
 	if (p_property.name == "fog_aerial_perspective") {
 		if (bg_mode != BG_SKY) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
-	if (p_property.name == "tonemap_white" && (tone_mapper == TONE_MAPPER_LINEAR || tone_mapper == TONE_MAPPER_AGX)) {
-		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+	if (p_property.name == "tonemap_white") {
+		if (tone_mapper == TONE_MAPPER_LINEAR || tone_mapper == TONE_MAPPER_AGX) {
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+		return;
 	}
 
-	if (p_property.name == "tonemap_agx_white" && tone_mapper != TONE_MAPPER_AGX) {
-		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+	if (p_property.name == "tonemap_agx_white") {
+		if (tone_mapper != TONE_MAPPER_AGX) {
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+		return;
 	}
 
-	if (p_property.name == "tonemap_agx_contrast" && tone_mapper != TONE_MAPPER_AGX) {
-		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+	if (p_property.name == "tonemap_agx_contrast") {
+		if (tone_mapper != TONE_MAPPER_AGX) {
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+		return;
 	}
 
-	if (p_property.name == "glow_intensity" && glow_blend_mode == GLOW_BLEND_MODE_MIX && OS::get_singleton()->get_current_rendering_method() != "gl_compatibility") {
-		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+	if (p_property.name == "glow_intensity") {
+		if (glow_blend_mode == GLOW_BLEND_MODE_MIX && OS::get_singleton()->get_current_rendering_method() != "gl_compatibility") {
+			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+		}
+		return;
 	}
 
 	if (OS::get_singleton()->get_current_rendering_method() == "gl_compatibility") {
 		// Hide glow properties we do not support in GL Compatibility.
 		if (p_property.name.begins_with("glow_levels") || p_property.name == "glow_normalized" || p_property.name == "glow_strength" || p_property.name == "glow_mix" || p_property.name == "glow_blend_mode" || p_property.name == "glow_map_strength" || p_property.name == "glow_map") {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+			return;
 		}
 	} else {
 		if (p_property.name == "glow_mix" && glow_blend_mode != GLOW_BLEND_MODE_MIX) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+			return;
 		}
 	}
 
@@ -1166,6 +1249,7 @@ void Environment::_validate_property(PropertyInfo &p_property) const {
 			if ((p_property.name != "ssao_enabled") && (p_property.name != "ssao_radius") && (p_property.name != "ssao_intensity")) {
 				p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 			}
+			return;
 		}
 	}
 
@@ -1173,18 +1257,21 @@ void Environment::_validate_property(PropertyInfo &p_property) const {
 		if (bg_mode != BG_COLOR && ambient_source != AMBIENT_SOURCE_COLOR) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
 	if (p_property.name == "background_canvas_max_layer") {
 		if (bg_mode != BG_CANVAS) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
 	if (p_property.name == "background_camera_feed_id") {
 		if (bg_mode != BG_CAMERA_FEED) {
 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
 		}
+		return;
 	}
 
 	if (p_property.name == "background_intensity" && !GLOBAL_GET_CACHED(bool, "rendering/lights_and_shadows/use_physical_light_units")) {
@@ -1243,7 +1330,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "background_camera_feed_id", PROPERTY_HINT_RANGE, "1,10,1"), "set_camera_feed_id", "get_camera_feed_id");
 
 	ADD_GROUP("Sky", "sky_");
-	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "sky", PROPERTY_HINT_RESOURCE_TYPE, "Sky"), "set_sky", "get_sky");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "sky", PROPERTY_HINT_RESOURCE_TYPE, Sky::get_class_static()), "set_sky", "get_sky");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sky_custom_fov", PROPERTY_HINT_RANGE, "0,180,0.1,degrees"), "set_sky_custom_fov", "get_sky_custom_fov");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "sky_rotation", PROPERTY_HINT_RANGE, "-360,360,0.1,or_less,or_greater,radians_as_degrees"), "set_sky_rotation", "get_sky_rotation");
 
@@ -1402,6 +1489,26 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_normal_bias"), "set_sdfgi_normal_bias", "get_sdfgi_normal_bias");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sdfgi_probe_bias"), "set_sdfgi_probe_bias", "get_sdfgi_probe_bias");
 
+	// Pathtracing
+
+	ClassDB::bind_method(D_METHOD("set_pathtracing_enabled", "enabled"), &Environment::set_pathtracing_enabled);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_enabled"), &Environment::is_pathtracing_enabled);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_debug_mode", "mode"), &Environment::set_pathtracing_debug_mode);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_debug_mode"), &Environment::get_pathtracing_debug_mode);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_samples_per_pixel", "samples"), &Environment::set_pathtracing_samples_per_pixel);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_samples_per_pixel"), &Environment::get_pathtracing_samples_per_pixel);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_max_bounces", "bounces"), &Environment::set_pathtracing_max_bounces);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_max_bounces"), &Environment::get_pathtracing_max_bounces);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_denoiser", "denoiser"), &Environment::set_pathtracing_denoiser);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_denoiser"), &Environment::get_pathtracing_denoiser);
+
+	ADD_GROUP("Pathtracing", "pathtracing_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_pathtracing_enabled", "is_pathtracing_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_debug_mode", PROPERTY_HINT_ENUM, "Disabled,Mirror Reflection,Geometry Normals,Final Normals,Normal Map,Tangent,Bitangent,UV,Albedo,ORM,Diffuse Albedo,Specular Albedo,Normal+Roughness,Specular Hit Dist,Metalness,Roughness,View Normals,Diffuse+Specular,Fresnel F0,Front/Back Face,Depth,Emissive,BRDF Rejection"), "set_pathtracing_debug_mode", "get_pathtracing_debug_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_samples_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_samples_per_pixel", "get_pathtracing_samples_per_pixel");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
+
 	// Glow
 
 	ClassDB::bind_method(D_METHOD("set_glow_enabled", "enabled"), &Environment::set_glow_enabled);
@@ -1450,7 +1557,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "glow_hdr_scale", PROPERTY_HINT_RANGE, "0.0,4.0,0.01"), "set_glow_hdr_bleed_scale", "get_glow_hdr_bleed_scale");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "glow_hdr_luminance_cap", PROPERTY_HINT_RANGE, "0.0,256.0,0.01"), "set_glow_hdr_luminance_cap", "get_glow_hdr_luminance_cap");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "glow_map_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), "set_glow_map_strength", "get_glow_map_strength");
-	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "glow_map", PROPERTY_HINT_RESOURCE_TYPE, "Texture2D"), "set_glow_map", "get_glow_map");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "glow_map", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_glow_map", "get_glow_map");
 
 	// Fog
 
@@ -1598,6 +1705,30 @@ void Environment::_bind_methods() {
 	BIND_ENUM_CONSTANT(GLOW_BLEND_MODE_REPLACE);
 	BIND_ENUM_CONSTANT(GLOW_BLEND_MODE_MIX);
 
+	BIND_ENUM_CONSTANT(RT_DEBUG_DISABLED);
+	BIND_ENUM_CONSTANT(RT_DEBUG_MIRROR_REFLECTION);
+	BIND_ENUM_CONSTANT(RT_DEBUG_GEOMETRY_NORMALS);
+	BIND_ENUM_CONSTANT(RT_DEBUG_FINAL_NORMALS);
+	BIND_ENUM_CONSTANT(RT_DEBUG_NORMAL_MAP);
+	BIND_ENUM_CONSTANT(RT_DEBUG_TANGENT);
+	BIND_ENUM_CONSTANT(RT_DEBUG_BITANGENT);
+	BIND_ENUM_CONSTANT(RT_DEBUG_UV);
+	BIND_ENUM_CONSTANT(RT_DEBUG_ALBEDO);
+	BIND_ENUM_CONSTANT(RT_DEBUG_ORM);
+	BIND_ENUM_CONSTANT(RT_DEBUG_DIFFUSE_ALBEDO);
+	BIND_ENUM_CONSTANT(RT_DEBUG_SPECULAR_ALBEDO);
+	BIND_ENUM_CONSTANT(RT_DEBUG_NORMAL_ROUGHNESS);
+	BIND_ENUM_CONSTANT(RT_DEBUG_SPECULAR_HIT_DISTANCE);
+	BIND_ENUM_CONSTANT(RT_DEBUG_METALNESS);
+	BIND_ENUM_CONSTANT(RT_DEBUG_ROUGHNESS);
+	BIND_ENUM_CONSTANT(RT_DEBUG_VIEW_NORMALS);
+	BIND_ENUM_CONSTANT(RT_DEBUG_DIFFUSE_SPECULAR_SPLIT);
+	BIND_ENUM_CONSTANT(RT_DEBUG_FRESNEL_F0);
+	BIND_ENUM_CONSTANT(RT_DEBUG_FRONT_BACK_FACE);
+	BIND_ENUM_CONSTANT(RT_DEBUG_DEPTH);
+	BIND_ENUM_CONSTANT(RT_DEBUG_EMISSIVE);
+	BIND_ENUM_CONSTANT(RT_DEBUG_BRDF_REJECTION);
+
 	BIND_ENUM_CONSTANT(FOG_MODE_EXPONENTIAL);
 	BIND_ENUM_CONSTANT(FOG_MODE_DEPTH);
 
@@ -1626,6 +1757,7 @@ Environment::Environment() {
 	_update_ssao();
 	_update_ssil();
 	_update_sdfgi();
+	_update_pathtracing();
 	_update_glow();
 	_update_fog();
 	_update_adjustment();
