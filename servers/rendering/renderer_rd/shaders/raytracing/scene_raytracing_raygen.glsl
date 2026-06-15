@@ -376,7 +376,12 @@ void main() {
 
 	vec3 emissive = vec3(0.0);
 	if ((mat.flags & 2u) != 0u) {
+		// Emission texture present: sample texture * color * strength.
 		emissive = sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb * mat.emission_color * mat.emission_strength;
+		emissive *= scene_data_block.data.emissive_exposure_normalization;
+	} else if (mat.emission_strength > 0.0) {
+		// Color-only emission (no texture): evaluate color * strength directly.
+		emissive = mat.emission_color * mat.emission_strength;
 		emissive *= scene_data_block.data.emissive_exposure_normalization;
 	}
 
