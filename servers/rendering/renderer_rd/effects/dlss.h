@@ -70,7 +70,9 @@ public:
 	} last_parameters;
 	DLSSEffect *last_effect = nullptr;
 	bool is_d3d12 = false;
-	int delay = 4; // Warmup frames before DLSS evaluates (Vulkan stability workaround).
+	int delay = 8; // Warmup frames before DLSS evaluates. Increased from 4 to 8 for MovieWriter
+	                // compatibility — gives Streamline more time to establish its frame token
+	                // lifecycle before the first slEvaluateFeature call.
 
 	virtual ~DLSSContext() {}
 };

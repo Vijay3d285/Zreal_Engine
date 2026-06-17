@@ -445,7 +445,11 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		context->constants.reset = p_params.reset_accumulation ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		sl::Result result = StreamlineContext::get().slSetConstants(context->constants, *StreamlineContext::get().last_token, context->viewport);
 		if (result != sl::Result::eOk) {
-			ERR_FAIL_MSG("Failed to call streamline slSetConstants. Result: " + String(StreamlineContext::result_to_string(result)));
+			// Non-fatal: warn once and continue to slEvaluateFeature.
+			// ERR_FAIL_MSG here caused an early return every frame the token had a transient
+			// conflict (eErrorDuplicatedConstants), leaving the upscaled texture stale and
+			// producing only 2 unique frames in MovieWriter video output.
+			WARN_PRINT_ONCE("slSetConstants returned " + String(StreamlineContext::result_to_string(result)) + " — DLSS will use stale constants this frame.");
 		}
 	}
 
@@ -472,7 +476,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 
 		sl::Result result = StreamlineContext::get().slSetTag(context->viewport, resourceTags, numResources, nativeCmdlist);
 		if (result != sl::Result::eOk) {
-			ERR_FAIL_MSG("Failed to call streamline slSetTag. Result: " + String(StreamlineContext::result_to_string(result)));
+			// Non-fatal: warn once and continue. Same rationale as slSetConstants above.
+			WARN_PRINT_ONCE("slSetTag returned " + String(StreamlineContext::result_to_string(result)) + " — DLSS may produce artifacts this frame.");
 		}
 	}
 
