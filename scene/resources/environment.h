@@ -196,6 +196,18 @@ private:
 	int pathtracing_samples_per_pixel = 1;
 	int pathtracing_max_bounces = 3;
 	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
+	// When true, the RT driver accumulates 1-SPP renders across frames into a
+	// persistent buffer so a still image converges (noise ~1/sqrt(N)). Off = the
+	// original one-shot per-launch path. See PATH_TRACER_QUALITY_ROADMAP.md Phase A.
+	bool pathtracing_accumulate = false;
+	// Target number of accumulation frames the capture loop drives before grabbing.
+	int pathtracing_accumulation_target = 64;
+	// When true (and accumulate is on), the RT render path runs a one-shot in-process
+	// OIDN `RT` filter on the converged accumulator before tonemap — the Cycles-style
+	// "accumulate raw, denoise final" final-denoise for still capture. Requires the
+	// raycaster_oidn module to be built (`oidn=yes`) and the OIDN runtime DLLs present
+	// next to the editor binary. Default off so the raw-converge path is unchanged.
+	bool pathtracing_oidn_denoise = false;
 	void _update_pathtracing();
 
 	// Glow
@@ -396,6 +408,12 @@ public:
 	int get_pathtracing_max_bounces() const;
 	void set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser);
 	RSE::PathtracingDenoiser get_pathtracing_denoiser() const;
+	void set_pathtracing_accumulate(bool p_accumulate);
+	bool is_pathtracing_accumulate() const;
+	void set_pathtracing_accumulation_target(int p_target);
+	int get_pathtracing_accumulation_target() const;
+	void set_pathtracing_oidn_denoise(bool p_oidn);
+	bool is_pathtracing_oidn_denoise() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

@@ -1,0 +1,38 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+Import("env")
+Import("env_modules")
+
+env_oidn = env_modules.Clone()
+
+# Prebuilt OIDN 2.5.0 Windows x64 binary distribution lives at #thirdparty/oidn/.
+# Layout: include/OpenImageDenoise/{oidn.h,config.h}, lib/{OpenImageDenoise.lib,
+# OpenImageDenoise_core.lib}, bin/{OpenImageDenoise.dll, _core.dll, _device_cpu.dll, ...}.
+# We link against the import lib at build time and ship the runtime DLLs (see README.oidn)
+# next to the editor binary at runtime.
+
+thirdparty_dir = "#thirdparty/oidn/"
+thirdparty_include = thirdparty_dir + "include"
+thirdparty_lib_uri = Dir(thirdparty_dir + "lib").abspath
+
+# The module's own sources compile against the OIDN headers (include path on env_oidn).
+env_oidn.Prepend(CPPPATH=[thirdparty_include])
+
+# The OIDN import libraries must resolve at the FINAL executable link, not the module
+# static-archive step. Godot modules are archived into module_*.lib and their per-module
+# env LIB/LIBPATH settings are NOT propagated to the top-level link line (that is how the
+# raycast/Embree module ships its psapi link too — see modules/raycast/SCsub appending to
+# `env`, not `env_raycast`). So add the lib path + import libs to the main `env`, ahead of
+# engine libs (Prepend), so the __imp_oidn* symbols the module references resolve.
+env.Prepend(LIBPATH=[thirdparty_lib_uri])
+if env.msvc:
+    # MSVC: name the import lib explicitly on the link line (mirrors raycast's psapi.lib).
+    env.Prepend(LINKFLAGS=["OpenImageDenoise.lib", "OpenImageDenoise_core.lib", "/LIBPATH:" + thirdparty_lib_uri])
+else:
+    env.Prepend(LIBS=["OpenImageDenoise", "OpenImageDenoise_core"])
+
+module_obj = []
+
+env_oidn.add_source_files(module_obj, "*.cpp")
+env.modules_sources += module_obj

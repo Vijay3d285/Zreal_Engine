@@ -96,6 +96,10 @@ public:
 	static constexpr int RT_PARAM_SAMPLE_COUNT = RSE::PT_PARAM_SAMPLE_COUNT;
 	static constexpr int RT_PARAM_MAX_BOUNCES = RSE::PT_PARAM_MAX_BOUNCES;
 	static constexpr int RT_PARAM_DENOISER = RSE::PT_PARAM_DENOISER;
+	static constexpr int RT_PARAM_ACCUM_FLAG = RSE::PT_PARAM_ACCUM_FLAG;
+	static constexpr int RT_PARAM_ACCUM_FRAMES = RSE::PT_PARAM_ACCUM_FRAMES;
+	static constexpr int RT_PARAM_OIDN_FLAG = RSE::PT_PARAM_OIDN_FLAG;
+	static constexpr int RT_PARAM_ACCUM_TARGET = RSE::PT_PARAM_ACCUM_TARGET;
 	static constexpr int RT_PARAM_LIGHT_COUNT = RSE::PT_PARAM_LIGHT_COUNT;
 	static constexpr int RT_PARAM_FRAME_INDEX = RSE::PT_PARAM_FRAME_INDEX;
 

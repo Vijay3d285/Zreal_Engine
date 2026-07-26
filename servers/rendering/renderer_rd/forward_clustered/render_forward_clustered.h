@@ -171,6 +171,12 @@ public:
 		bool rt_has_depth_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH); }
 		RID rt_get_depth_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH); }
 
+		// Phase A: persistent accumulation buffers for still-image convergence.
+		bool rt_has_accum_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM); }
+		RID rt_get_accum_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM); }
+		bool rt_has_accum_n_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_N); }
+		RID rt_get_accum_n_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_N); }
+
 		// DLSS Ray Reconstruction output buffers
 		void dlss_rr_ensure_buffers();
 		void dlss_rr_free_buffers();

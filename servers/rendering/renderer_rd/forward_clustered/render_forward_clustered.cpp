@@ -38,6 +38,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/particles_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/pathtrace_oidn_denoiser.h"
 #include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -92,12 +93,21 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 			RD::TEXTURE_USAGE_SAMPLING_BIT |
 			RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
 
+	// Phase F: the raytracing color + accumulator textures also need CAN_COPY_TO + CAN_UPDATE
+	// for the in-process OIDN final-denoise round trip (texture_clear on accum reset, and
+	// texture_update to write the denoised result back into the RT color image before re-blit
+	// to internal_texture). Without these bits, texture_clear/texture_update are no-ops and
+	// the denoise silently fails to land — the captured still is the raw Monte-Carlo average.
+	uint32_t usage_bits_oidn = usage_bits |
+			RD::TEXTURE_USAGE_CAN_COPY_TO_BIT |
+			RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+
 	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING)) {
 		render_buffers->create_texture(
 				RB_SCOPE_FORWARD_CLUSTERED,
 				RB_TEX_RAYTRACING,
 				RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
-				usage_bits,
+				usage_bits_oidn,
 				RD::TEXTURE_SAMPLES_1);
 	}
 
@@ -107,6 +117,27 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 				RB_TEX_RT_DEPTH,
 				RD::DATA_FORMAT_R32_SFLOAT,
 				usage_bits,
+				RD::TEXTURE_SAMPLES_1);
+	}
+
+	// Phase A: persistent accumulation image (running-average radiance) + a
+	// per-pixel sample counter used to compute the 1/(n+1) blend weight in the
+	// raygen shader. Allocated lazily and on-demand; storage+sampleable like the
+	// raytracing color image.
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM)) {
+		render_buffers->create_texture(
+				RB_SCOPE_FORWARD_CLUSTERED,
+				RB_TEX_RAYTRACING_ACCUM,
+				RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				usage_bits_oidn,
+				RD::TEXTURE_SAMPLES_1);
+	}
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_N)) {
+		render_buffers->create_texture(
+				RB_SCOPE_FORWARD_CLUSTERED,
+				RB_TEX_RAYTRACING_ACCUM_N,
+				RD::DATA_FORMAT_R32_SFLOAT,
+				usage_bits_oidn, // CAN_COPY_TO_BIT: accum_reset_pending clears this counter too.
 				RD::TEXTURE_SAMPLES_1);
 	}
 }
@@ -1860,6 +1891,190 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
+// Phase F: one-shot OIDN final-denoise of the converged accumulator, for still capture.
+//
+// This is a best-effort CPU round trip: download the converged accumulator + the diffuse
+// albedo and normal AOVs (already produced by the RT shaders and consumed by DLSS-RR when
+// it runs), run the OIDN `RT` filter in-process on the host, and upload the denoised color
+// back into `internal_texture` in place — which is exactly what the standard tonemap path
+// reads under accumulate's SCALE_NONE (see base class renderer_scene_render_rd.cpp). The
+// accumulator itself (`rt_accum`) is never overwritten, so a camera-move reset stays clean.
+//
+// File-scope: the inner RenderBufferDataForwardClustered type and the
+// RendererSceneRenderImplementation::RTViewportState struct are both available from the
+// included headers, so this helper doesn't need a class-member declaration.
+static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBufferDataForwardClustered *p_rb_data,
+		Ref<RenderSceneBuffersRD> p_rb,
+		RendererSceneRenderImplementation::RTViewportState *p_rt_state,
+		bool p_oidn_active, uint32_t p_accum_target) {
+	using RTViewportState = RendererSceneRenderImplementation::RTViewportState;
+	ERR_FAIL_NULL(p_rb_data);
+	ERR_FAIL_NULL(p_rt_state);
+	ERR_FAIL_COND(!p_oidn_active); // caller must gate.
+
+	// One-shot per convergence cycle: don't re-denoise once done, and don't fire while the
+	// accumulator is still actively converging (accumulate ON, but not enough frames yet).
+	if (p_rt_state->oidn_denoise_done ||
+			p_rt_state->accum_frame < p_accum_target ||
+			!p_rt_state->accum_enabled) {
+		return;
+	}
+
+	// The factory returns a null Ref when the raycaster_oidn module isn't linked; in that
+	// case we just keep the raw converged image (no denoise).
+	Ref<PathtraceOIDNDenoiser> denoiser = PathtraceOIDNDenoiser::create();
+	if (denoiser.is_null()) {
+		return; // no OIDN backend linked → silently keep raw converged result.
+	}
+	if (!denoiser->is_available()) {
+		return; // device probing said no usable CPU device.
+	}
+
+	const Size2i internal_size = p_rb->get_internal_size();
+	const int width = internal_size.width;
+	const int height = internal_size.height;
+	ERR_FAIL_COND(width <= 0 || height <= 0);
+
+	const uint32_t view_count = p_rb->get_view_count();
+	ERR_FAIL_COND(view_count == 0);
+
+	// Single-view still capture is the supported case. Denoise the (stereo, if present) views
+	// independently; the AOV layout is per-view in each RB scope texture.
+	for (uint32_t v = 0; v < view_count; v++) {
+		// --- accumulator: R16G16B16A16_SFLOAT scene-linear radiance (8 bytes/pixel) ---
+		const RID accum_rid = p_rb_data->rt_get_accum_texture();
+		if (!RD::get_singleton()->texture_is_valid(accum_rid)) {
+			WARN_PRINT_ONCE("OIDN final-denoise: accumulator texture invalid, skipping.");
+			return;
+		}
+		Vector<uint8_t> accum_bytes = RD::get_singleton()->texture_get_data(accum_rid, v);
+		ERR_CONTINUE(accum_bytes.size() != (int64_t)width * height * 8);
+
+		// --- diffuse albedo AOV: R8G8B8A8_UNORM (4 bytes/pixel), optional ---
+		Vector<uint8_t> albedo_bytes;
+		bool has_albedo = p_rb->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO);
+		if (has_albedo) {
+			const RID albedo_rid = p_rb->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO);
+			if (RD::get_singleton()->texture_is_valid(albedo_rid)) {
+				albedo_bytes = RD::get_singleton()->texture_get_data(albedo_rid, v);
+				if (albedo_bytes.size() != (int64_t)width * height * 4) {
+					has_albedo = false;
+				}
+			}
+		}
+
+		// --- normal AOV: R8G8B8A8_SNORM (4 bytes/pixel, RGB length-normalized world normal), optional ---
+		Vector<uint8_t> normal_bytes;
+		bool has_normal = p_rb->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS);
+		if (has_normal) {
+			const RID normal_rid = p_rb->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS);
+			if (RD::get_singleton()->texture_is_valid(normal_rid)) {
+				normal_bytes = RD::get_singleton()->texture_get_data(normal_rid, v);
+				if (normal_bytes.size() != (int64_t)width * height * 4) {
+					has_normal = false;
+				}
+			}
+		}
+
+		const size_t pixel_count = (size_t)width * (size_t)height;
+		Vector<float> color_f;
+		Vector<float> albedo_f;
+		Vector<float> normal_f;
+		color_f.resize((int)pixel_count * 3);
+		if (has_albedo) {
+			albedo_f.resize((int)pixel_count * 3);
+		}
+		if (has_normal) {
+			normal_f.resize((int)pixel_count * 3);
+		}
+
+		// Convert accum R16G16B16A16_SFLOAT -> RGB float3.
+		{
+			const uint16_t *src16 = reinterpret_cast<const uint16_t *>(accum_bytes.ptr());
+			float *dst = color_f.ptrw();
+			for (size_t i = 0; i < pixel_count; i++) {
+				dst[i * 3 + 0] = Math::half_to_float(src16[i * 4 + 0]);
+				dst[i * 3 + 1] = Math::half_to_float(src16[i * 4 + 1]);
+				dst[i * 3 + 2] = Math::half_to_float(src16[i * 4 + 2]);
+				// alpha (src16[i*4+3]) unused by OIDN color (RGB only).
+			}
+		}
+		// Convert albedo R8G8B8A8_UNORM -> RGB float3 in [0,1].
+		if (has_albedo) {
+			const uint8_t *s = reinterpret_cast<const uint8_t *>(albedo_bytes.ptr());
+			float *d = albedo_f.ptrw();
+			for (size_t i = 0; i < pixel_count; i++) {
+				const float inv = 1.0f / 255.0f;
+				d[i * 3 + 0] = float(s[i * 4 + 0]) * inv;
+				d[i * 3 + 1] = float(s[i * 4 + 1]) * inv;
+				d[i * 3 + 2] = float(s[i * 4 + 2]) * inv;
+			}
+		}
+		// Convert normal R8G8B8A8_SNORM -> RGB float3 length-normalized.
+		if (has_normal) {
+			const int8_t *s = reinterpret_cast<const int8_t *>(normal_bytes.ptr());
+			float *d = normal_f.ptrw();
+			const float inv = 1.0f / 127.0f;
+			for (size_t i = 0; i < pixel_count; i++) {
+				d[i * 3 + 0] = float(s[i * 4 + 0]) * inv;
+				d[i * 3 + 1] = float(s[i * 4 + 1]) * inv;
+				d[i * 3 + 2] = float(s[i * 4 + 2]) * inv;
+			}
+		}
+
+		// Run the RT filter in place on color_f.
+		bool ok = denoiser->denoise_rt(width, height,
+				color_f.ptrw(),
+				has_albedo ? albedo_f.ptr() : nullptr,
+				has_normal ? normal_f.ptr() : nullptr,
+				(int)p_accum_target);
+
+		ERR_CONTINUE_MSG(!ok, "OIDN final-denoise failed; keeping raw converged image for this view.");
+
+		// Convert denoised RGB float3 back into the internal_texture format (R16G16B16A16_SFLOAT),
+		// preserving the original alpha channel from the accumulator (so transparency/coverage
+		// metadata tonemap may read survives the denoise).
+		Vector<uint8_t> out_bytes;
+		out_bytes.resize((int)pixel_count * 8);
+		{
+			const uint16_t *src16 = reinterpret_cast<const uint16_t *>(accum_bytes.ptr());
+			uint16_t *dst16 = reinterpret_cast<uint16_t *>(out_bytes.ptrw());
+			const float *src = color_f.ptr();
+			for (size_t i = 0; i < pixel_count; i++) {
+				dst16[i * 4 + 0] = Math::make_half_float(src[i * 3 + 0]);
+				dst16[i * 4 + 1] = Math::make_half_float(src[i * 3 + 1]);
+				dst16[i * 4 + 2] = Math::make_half_float(src[i * 3 + 2]);
+				dst16[i * 4 + 3] = src16[i * 4 + 3]; // keep original alpha.
+			}
+		}
+
+		// Upload denoised color into the RT color image (RB_TEX_RAYTRACING, R16G16B16A16_SFLOAT,
+		// now created with CAN_UPDATE_BIT). We write back into the RT color rather than
+		// internal_texture because internal_texture is NOT updatable (no CAN_UPDATE_BIT) —
+		// texture_update on it silently no-ops (see Godot log error TEXTURE_USAGE_CAN_UPDATE_BIT).
+		// The call site then re-runs copy_output_texture to blit this denoised RT color into
+		// internal_texture via the existing render-pass copy (which doesn't need CAN_UPDATE).
+		const RID rt_color_rid = p_rb_data->rt_get_texture();
+		if (RD::get_singleton()->texture_is_valid(rt_color_rid)) {
+			RD::get_singleton()->texture_update(rt_color_rid, v, out_bytes);
+		} else {
+			ERR_PRINT_ONCE("OIDN final-denoise: RT color texture invalid; denoised result not uploaded.");
+			// Denoise computed but unusable: leave done=false? We set done below regardless so
+			// we don't re-spin; the raw RT color (raw running average) is what gets blitted.
+		}
+
+		// Free per-view scratch before next iteration.
+		accum_bytes = Vector<uint8_t>();
+		albedo_bytes = Vector<uint8_t>();
+		normal_bytes = Vector<uint8_t>();
+		out_bytes = Vector<uint8_t>();
+	}
+
+	// Mark this convergence cycle denoised so we don't re-fire on subsequent still frames
+	// until the camera moves / viewport resizes / accumulate toggles (which reset the flag).
+	p_rt_state->oidn_denoise_done = true;
+}
+
 void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) {
 	scene_state.used_uniform_buffer_count = 0;
 
@@ -1971,6 +2186,41 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			break;
 		default:
 			break;
+	}
+
+	// Phase A: when path-tracer accumulation is enabled, the running-average
+	// buffer (scene_raytracing_raygen.glsl rt_accum) IS the temporal integrator.
+	// Letting DLSS-RR / FSR2 / MetalFX / TAA run on top of it double-accumulates
+	// temporally, and DLSS-RR's history is never reset (reset_accumulation=false
+	// hardcoded below) so a camera-move clear smears the old view. That produced
+	// the blur + low-frequency grain seen with accumulate ON. So while
+	// accumulating, force a plain (non-temporal) upscale path: the converged raw
+	// RT image is just blitted into the upscaled texture for tonemap, with no
+	// temporal reconstruction. The accumulate-OFF path keeps the full upscaler.
+	bool rt_accumulate_active = false;
+	bool rt_oidn_active = false;
+	uint32_t rt_accum_target = 0;
+	if (scene_features.rt && p_render_data && p_render_data->environment.is_valid()) {
+		const float *env_params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
+		if (env_params && env_params[RSE::PT_PARAM_ACCUM_FLAG] >= 0.5f) {
+			rt_accumulate_active = true;
+			scale_type = SCALE_NONE;
+			using_taa = false;
+			// Phase F: OIDN one-shot final-denoise only makes sense on the converged
+			// accumulator (requires accumulate ON). Capture the target frame count so the
+			// denoise fires once after convergence rather than every converging frame.
+			if (env_params[RSE::PT_PARAM_OIDN_FLAG] >= 0.5f) {
+				rt_oidn_active = true;
+				// Accumulation target is environment-authored into the params buffer
+				// (PT_PARAM_ACCUM_TARGET, pack at scene/resources/environment.cpp), so the RT
+				// render path knows when the running-average accumulator has converged enough to
+				// fire the one-shot OIDN final-denoise once.
+				rt_accum_target = (uint32_t)env_params[RSE::PT_PARAM_ACCUM_TARGET];
+				if (rt_accum_target == 0) {
+					rt_accum_target = 64; // safe default if the Environment left it unset.
+				}
+			}
+		}
 	}
 
 	bool using_upscaling = scale_type != SCALE_NONE;
@@ -2518,6 +2768,33 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// Ensure raytracing output textures exist
 		rb_data->rt_ensure_textures();
 
+		// Fetch this viewport's RT state (the same one update_uniform_set built
+		// earlier; no rebuild). May be null if TLAS build produced nothing.
+		RTViewportState *rt_state = raytracing->_get_viewport_state(p_render_data);
+
+		// Phase A: clear the accumulation buffers when a reset was requested
+		// (camera moved / accumulation just enabled / viewport resized). The
+		// running-average accum image and its per-pixel sample count are reset
+		// to zero so the next trace seeds a fresh running average. Done before
+		// the raytracing list so the dispatched shader sees a cleared buffer.
+		if (rt_state && rt_state->accum_reset_pending) {
+			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
+			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_n_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
+			rt_state->accum_reset_pending = false;
+		}
+
+		// Phase F: once the one-shot OIDN final-denoise has already run this convergence
+		// cycle (oidn_denoise_done), SKIP the per-frame trace + copy_output_texture. The
+		// denoised color that the OIDN pass wrote into internal_texture on the denoise
+		// frame must NOT be overwritten by a fresh raw running-average on subsequent frames
+		// — otherwise every still capture would grab a grainy raw image instead of the clean
+		// denoised one. The denoised internal_texture then flows through the Phase A blit +
+		// standard tonemap unchanged until the camera/scene/view moves (which resets the
+		// cycle by clearing oidn_denoise_done in update_uniform_set). The "Raytracing"
+		// draw_label opened above is closed here so the GPU command stream stays balanced.
+		if (rt_oidn_active && rt_state && rt_state->oidn_denoise_done) {
+			RD::get_singleton()->draw_command_end_label(); // balance the "Raytracing" label opened at block entry
+		} else {
 		RENDER_TIMESTAMP("Pathtracer");
 
 		// rt_flags was computed at TLAS-build time above and matches what
@@ -2548,6 +2825,13 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RD::get_singleton()->raytracing_list_trace_rays(raytracing_list, 0, raytracing->get_shader()->get_hit_sbt(rt_flags), rt_size.width, rt_size.height, 1);
 		RD::get_singleton()->raytracing_list_end();
 
+		// Phase A: this launch blended one accumulator sample into the
+		// running-average buffer; advance the per-viewport index so the next
+		// launch uses a smaller mix weight (1/(n+1)). Cap to avoid float drift.
+		if (rt_state && rt_state->accum_enabled && rt_state->accum_frame < 0xFFFFFFu) {
+			rt_state->accum_frame++;
+		}
+
 		RD::get_singleton()->draw_command_end_label();
 
 		// Copy RT depth (R32F storage image) to D32F depth buffer after tracing.
@@ -2562,6 +2846,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// (written to rt_velocity_image). No raster motion pass needed.
 
 		raytracing->copy_output_texture(p_render_data);
+		}
 	}
 
 	{
@@ -2781,6 +3066,56 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	if (rb_data.is_valid()) {
 		rb->set_depth_reconstruct_requested(scene_features.has(SCENE_FEATURE_DEPTH_RECONSTRUCT));
+	}
+
+	// Phase F: one-shot in-process OIDN `RT` final-denoise of the converged accumulator.
+	// Runs once after the running-average accumulator has converged enough frames
+	// (accum_frame >= rt_accum_target) and writes the denoised color back into
+	// `internal_texture` in place — which is what tonemap reads under accumulate's
+	// SCALE_NONE, and what the Phase A blit below then mirrors into any persistent
+	// upscaled_texture. Best-effort: if OIDN isn't linked or fails, the raw converged
+	// image survives untouched (the off path is byte-unchanged).
+	if (rb_data.is_valid() && rt_oidn_active && raytracing) {
+		RendererSceneRenderImplementation::RTViewportState *rt_state =
+				raytracing->_get_viewport_state(p_render_data);
+		// Capture done-state BEFORE the denoise so we can detect the transition (the helper
+		// sets oidn_denoise_done=true once it actually denoises + uploads to the RT color image).
+		const bool was_done = rt_state && rt_state->oidn_denoise_done;
+		RD::get_singleton()->draw_command_begin_label("RT OIDN Final Denoise");
+		_oidn_final_denoise_accumulator(rb_data.ptr(), rb, rt_state, rt_oidn_active, rt_accum_target);
+		RD::get_singleton()->draw_command_end_label();
+		// The helper wrote the denoised color into the RT color image (RB_TEX_RAYTRACING), NOT
+		// internal_texture (internal_texture isn't updatable — texture_update is a no-op on it).
+		// Now re-blit the denoised RT color -> internal_texture using the same render-pass copy
+		// copy_output_texture uses, so tonemap + the Phase A blit + the captured PNG see the
+		// clean denoised image instead of the raw pre-denoise running average.
+		if (rt_state && !was_done && rt_state->oidn_denoise_done) {
+			RD::get_singleton()->draw_command_begin_label("RT OIDN Re-blit Denoised -> Internal");
+			raytracing->copy_output_texture(p_render_data);
+			RD::get_singleton()->draw_command_end_label();
+		}
+	}
+
+	// Phase A: with accumulation active we skip every temporal upscaler (see the
+	// scale_type/using_taa override above), and the converged raw RT result lives
+	// in `internal_texture` (written by copy_output_texture). But a previously
+	// allocated `upscaled_texture` (from an earlier accumulate-OFF frame in this
+	// viewport's lifetime) can persist, and the tonemap path reads it whenever the
+	// viewport scaling mode is DLSS/FSR2/MFX — regardless of this frame's scale_type.
+	// A stale upscaled texture would feed smear/garbage to tonemap. So if the
+	// accumulator is active but an upscaled texture exists, blit the fresh frame
+	// into it 1:1 so tonemap at worst reads a copy of the converged image (and if
+	// no upscaled texture exists, tonemap already reads internal_texture).
+	if (rb_data.is_valid() && rt_accumulate_active && rb->has_upscaled_texture()) {
+		RD::get_singleton()->draw_command_begin_label("RT Accumulate (blit to upscaled)");
+		const Size2i internal_size = rb->get_internal_size();
+		for (uint32_t v = 0; v < rb->get_view_count(); v++) {
+			RD::get_singleton()->texture_copy(rb->get_internal_texture(v), rb->get_upscaled_texture(v),
+					Vector3(), Vector3(),
+					Vector3(internal_size.width, internal_size.height, 1),
+					0, 0, 0, 0);
+		}
+		RD::get_singleton()->draw_command_end_label();
 	}
 
 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {

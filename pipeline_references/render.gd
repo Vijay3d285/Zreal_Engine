@@ -27,8 +27,8 @@ func _ready():
 			output_path = arg
 			
 	if (input_json_path == "" or output_path == "") and args.size() >= 2:
-		input_json_path = args[args.size() - 2]
-		output_path = args[args.size() - 1]
+		input_json_path = args[args.size()-2]
+		output_path = args[args.size()-1]
 	
 	if input_json_path == "" or output_path == "":
 		print("Error: Missing arguments.")
@@ -122,9 +122,17 @@ func set_resolution(data):
 
 	_apply_render_resolution(w, h)
 
-	get_viewport().msaa_3d = Viewport.MSAA_8X
-	get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA
-	get_viewport().use_taa = true
+	# MSAA must be DISABLED when Path Tracing is active.
+	# With PT + MSAA_8X, transparent objects (glass, alpha materials) are rasterized
+	# into RB_TEX_COLOR_MSAA, but the MSAA resolve is skipped by the engine because RT
+	# already wrote the final color to internal_texture
+	# (render_forward_clustered.cpp:2757 — `if (!scene_features.rt)`).
+	# The MSAA buffer is never resolved → glass/transparency silently disappears.
+	# PT fires rays per pixel at native resolution, so MSAA provides no quality benefit.
+	# DLSS RR handles denoising + sub-pixel reconstruction instead.
+	get_viewport().msaa_3d = Viewport.MSAA_DISABLED
+	get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	get_viewport().use_taa = false   # DLSS RR handles temporal stability; TAA auto-disabled anyway
 	get_viewport().use_debanding = true
 	get_viewport().mesh_lod_threshold = 0.0
 
@@ -274,30 +282,43 @@ func setup_camera(data):
 					post_fx.contrast = 1.20
 					if is_warm_night:
 						# Warm night: amber CDL push, softer shadows, richer saturation
-						post_fx.exposure = 1.65 # brighter to reveal warm corners
-						post_fx.saturation = 1.05 # richer warmth without oversaturation
-						post_fx.lift = Color(0.06, 0.02, -0.01) # amber shadow lift
-						post_fx.gain = Color(1.28, 1.08, 0.82) # warm highlight push
-						post_fx.gamma_grade = Color(1.04, 0.98, 0.94) # amber midtone bias
-						post_fx.vignette_strength = 0.52 # softer vignette: corners stay visible
-						post_fx.chromatic_aberration = 0.0008 # subtle lens warmth
+						post_fx.exposure          = 1.65  # brighter to reveal warm corners
+						post_fx.saturation        = 1.05  # richer warmth without oversaturation
+						post_fx.lift              = Color(0.06, 0.02, -0.01)  # amber shadow lift
+						post_fx.gain              = Color(1.28, 1.08, 0.82)  # warm highlight push
+						post_fx.gamma_grade       = Color(1.04, 0.98, 0.94)  # amber midtone bias
+						post_fx.vignette_strength = 0.52  # softer vignette: corners stay visible
+						post_fx.chromatic_aberration = 0.0008  # subtle lens warmth
 						print("  [PostFX] Applied Warm-Night CDL (amber lift, golden gain, AgX)")
 					else:
-						post_fx.exposure = 1.5
-						post_fx.saturation = 0.85
-						post_fx.lift = Color(0.02, 0.01, 0.05)
-						post_fx.gain = Color(1.2, 1.1, 0.9)
+						post_fx.exposure          = 1.5
+						post_fx.saturation        = 0.85
+						post_fx.lift              = Color(0.02, 0.01, 0.05)
+						post_fx.gain              = Color(1.2, 1.1, 0.9)
 						post_fx.vignette_strength = 0.6
 						post_fx.chromatic_aberration = 0.001
 						print("  [PostFX] Applied Night S-Curve tuning (AgX, Contrast 1.20)")
+				# CHANGE 8: Day render warm golden CDL — this is the key to Render 2's look.
+				# Lifts shadows to warm amber, pushes highlights to golden, subtle vignette.
+				elif day_render:
+					post_fx.tonemap_mode      = 0  # ACES — punchy, handles sun highlights
+					post_fx.exposure          = 1.05
+					post_fx.contrast          = 1.12
+					post_fx.saturation        = 1.08  # slightly richer for warm interior
+					post_fx.lift              = Color(0.02, 0.01, -0.01)   # warm shadow lift
+					post_fx.gain              = Color(1.10, 1.02, 0.88)    # golden highlight push
+					post_fx.gamma_grade       = Color(1.02, 0.99, 0.96)   # warm midtone bias
+					post_fx.vignette_strength = 0.28   # subtle — Render 2 has mild vignette
+					post_fx.chromatic_aberration = 0.0003  # barely perceptible lens depth
+					print("  [PostFX] Applied Day-Sun CDL (ACES, warm golden gain)")
 				elif str(_lighting_color_mood).to_lower() == "warm":
 					# Day-warm: subtle amber grade without dramatic night look
-					post_fx.tonemap_mode = 1 # AgX
-					post_fx.exposure = 1.0
-					post_fx.contrast = 1.15
-					post_fx.saturation = 1.12
-					post_fx.lift = Color(0.03, 0.01, -0.01)
-					post_fx.gain = Color(1.12, 1.04, 0.90)
+					post_fx.tonemap_mode      = 1  # AgX
+					post_fx.exposure          = 1.0
+					post_fx.contrast          = 1.15
+					post_fx.saturation        = 1.12
+					post_fx.lift              = Color(0.03, 0.01, -0.01)
+					post_fx.gain              = Color(1.12, 1.04, 0.90)
 					post_fx.vignette_strength = 0.35
 					post_fx.chromatic_aberration = 0.0005
 					print("  [PostFX] Applied Day-Warm CDL tuning (AgX, amber grade)")
@@ -318,29 +339,76 @@ func render_image(data, output_path):
 	print("Rendering Single Image...")
 	await _wait_frames(2)
 	var cam = get_node_or_null("MainCamera")
+	var env = _get_world_environment()
+	var accumulate_enabled = env != null and env.environment != null and env.environment.pathtracing_accumulate
+	var accum_target = env.environment.pathtracing_accumulation_target if accumulate_enabled else 0
+	var oidn_enabled = env != null and env.environment != null and env.environment.pathtracing_oidn_denoise
+	# OIDN final-denoise only runs on the converged accumulator, so it implies accumulate-on.
+	# If the user enabled OIDN without accumulate, force accumulate on so the running-average
+	# accumulator converges and OIDN has something stable to denoise.
+	if oidn_enabled and not accumulate_enabled:
+		env.environment.pathtracing_accumulate = true
+		accumulate_enabled = true
+		accum_target = env.environment.pathtracing_accumulation_target
+
 	if cam:
 		setup_fixed_fill_lights()
 		_apply_no_authored_light_boost()
 		_apply_color_mood_to_scene()
 		if day_render:
 			if _dir_light:
-				_dir_light.light_energy *= 1.30
-				print("[Render] Boosted directional light energy by 30% for day render.")
-			print("[Render] Waiting 80 frames for SDFGI and TAA warm-up...")
-			await _wait_frames(100)
+				# Sun energy is calibrated at 2.8 — no boost needed.
+				# Previous 1.30x and 1.10x boosts were causing floor blowout.
+				print("[Render] Day render: sun energy is calibrated (no boost applied).")
+			if accumulate_enabled:
+				# Phase A: drive the path-tracer accumulator. Each process_frame
+				# blends one 1-SPP sample into the running average, so waiting N
+				# frames yields ~N effective samples (noise ~1/sqrt(N)). Give the
+				# denoiser its warm-up too.
+				# Phase F: if OIDN final-denoise is on, drive one extra frame past
+				# the target so the in-process OIDN `RT` filter (which fires in the
+				# C++ render path once accum_frame >= target) has actually rendered
+				# once before we grab the PNG.
+				var drive_frames = accum_target + (1 if oidn_enabled else 0)
+				print("[Render] Accumulating %d frames for path-tracer convergence%s..." %
+						[accum_target, " (+1 for OIDN final-denoise)" if oidn_enabled else ""])
+				await _wait_frames(drive_frames)
+			else:
+				print("[Render] Waiting 80 frames for SDFGI and TAA warm-up...")
+				await _wait_frames(80)
 		else:
 			# Night renders need more frames for SDFGI GI to converge and propagate
 			# bounce light from spotlights up to the ceiling. 5 frames is too few.
-			await _wait_frames(60)
-	
+			if accumulate_enabled:
+				var drive_frames_n = accum_target + (1 if oidn_enabled else 0)
+				print("[Render] Accumulating %d frames for path-tracer convergence%s..." %
+						[accum_target, " (+1 for OIDN final-denoise)" if oidn_enabled else ""])
+				await _wait_frames(drive_frames_n)
+			else:
+				await _wait_frames(40)
+
 	var img = await _capture_viewport_image(6)
 	if img:
 		img.save_png(output_path)
 		print("Image saved to: ", output_path)
 		_save_thumbnail_webp(img, output_path)
-	
+		# Phase A HDR: linear pre-tonemap EXR capture is a deferred follow-up
+		# (task: pre-tonemap linear EXR C++ readback hook). The converged
+		# accumulator already holds scene-linear radiance in RB_TEX_RAYTRACING_ACCUM;
+		# once the readback is exposed this is where it would be emitted alongside
+		# the PNG. See PATH_TRACER_QUALITY_ROADMAP.md Phase A.
+		if accumulate_enabled:
+			var denoise_note = " with in-process OIDN final-denoise" if oidn_enabled else ""
+			print("[Render] Accumulated still captured%s (PNG, tonemapped). Linear EXR export pending C++ readback hook." % denoise_note)
+
 	save_logs(data, output_path)
 	get_tree().quit(0)
+
+func _get_world_environment():
+	for child in get_children():
+		if child is WorldEnvironment:
+			return child
+	return null
 
 func _apply_color_mood_to_scene() -> void:
 	var directional_tint = _get_color_mood_light_color("directional")
@@ -354,9 +422,12 @@ func _apply_color_mood_to_scene() -> void:
 			if world_env.environment != null:
 				world_env.environment.ambient_light_color = ambient_tint
 
-	for node in _get_all_children_recursive(self ):
+	for node in _get_all_children_recursive(self):
 		if node is DirectionalLight3D:
-			(node as DirectionalLight3D).light_color = directional_tint
+			# DAY RENDER: Do NOT override — sun color is hardcoded golden warm in setup_lighting().
+			# Overriding here with day mood tint (near-white) was killing the golden sun color.
+			if not day_render:
+				(node as DirectionalLight3D).light_color = directional_tint
 		elif node is SpotLight3D or node is OmniLight3D:
 			if node.has_meta("authored_custom_light"):
 				continue
@@ -402,7 +473,7 @@ func save_logs(input_data, output_image_path):
 	var cam = get_node_or_null("MainCamera")
 	if cam:
 		log_data["camera_actual"] = {
-			"position": {"x": cam.position.x, "y": cam.position.y, "z": cam.position.z},
+			"position": { "x": cam.position.x, "y": cam.position.y, "z": cam.position.z },
 			"fov": cam.fov
 		}
 	
@@ -472,8 +543,9 @@ func setup_fixed_fill_lights():
 	var energy_multiplier = 1.0
 	var fixture_count = get_tree().get_nodes_in_group("fixture_lights").size()
 	if day_render:
-		energy_multiplier = 1.85
-		print("[Render] Day Render active: Using dynamic grid fill lighting (1.85x).")
+		# Keep the room bright, but leave enough contrast for window-frame shadows to read.
+		energy_multiplier = 1.25
+		print("[Render] Day Render: Fill grid at 1.25x — preserving sunlight contrast and window shadows.")
 	elif fixture_count > 0 or _has_fixture_lights_cache:
 		energy_multiplier = 0.5
 		if fixture_count > 0:
@@ -497,7 +569,7 @@ func setup_fixed_fill_lights():
 		# For sunbeam detection
 		var sun_dir_flat = Vector3.ZERO
 		if day_render and _dir_light:
-			sun_dir_flat = - _dir_light.global_transform.basis.z
+			sun_dir_flat = -_dir_light.global_transform.basis.z
 			sun_dir_flat.y = 0
 			if sun_dir_flat.length() > 0.001:
 				sun_dir_flat = sun_dir_flat.normalized()
@@ -534,7 +606,7 @@ func setup_fixed_fill_lights():
 			var cz = sum_z / float(count)
 
 			# ── Ceiling height for THIS room ──
-			var ceil_h = 2.4 # default 240 cm → 2.4 m
+			var ceil_h = 2.4  # default 240 cm → 2.4 m
 			if area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY:
 				var cp = area["ceiling_properties"]
 				if cp.has("height"):
@@ -556,17 +628,18 @@ func setup_fixed_fill_lights():
 
 			# Light hangs 30 cm below the ceiling — well inside the room
 			var light_y = ceil_h - 0.30
-			light_y = max(light_y, 1.4) # never lower than 1.4 m
+			light_y = max(light_y, 1.4)  # never lower than 1.4 m
 
 			var room_w = max(max_x - min_x, 0.5)
 			var room_d = max(max_z - min_z, 0.5)
-			var diag = sqrt(room_w * room_w + room_d * room_d)
+			var diag   = sqrt(room_w * room_w + room_d * room_d)
 
 			if day_render:
 				# ── Day Render: Dynamic Grid Fill Lighting ──
 				var spacing = clamp(min(room_w, room_d) / 4.0, 1.2, 2.5)
-				# Reduced energy to prevent whitish overexposed look
-				var grid_energy = clamp(0.45 + diag * 0.03, 0.45, 1.0) * energy_multiplier * illumination_scale
+				# Fill grid is the room's ambient fill — sun handles the primary drama.
+				# Slightly softer fill keeps the daylight believable without flattening the sun patch.
+				var grid_energy = clamp(0.28 + diag * 0.016, 0.28, 0.58) * energy_multiplier * illumination_scale
 				
 				var steps_x = int(ceil(room_w / spacing))
 				var steps_z = int(ceil(room_d / spacing))
@@ -598,14 +671,14 @@ func setup_fixed_fill_lights():
 										break
 						
 						if not in_sunlight:
-							# Use SpotLight3D pointing DOWN to prevent white hotspots on the ceiling!
+							# SpotLight pointed DOWN — angle MUST be ≤60° or light bleeds back onto ceiling
+							# 85° was nearly a hemisphere, creating bright hotspots on the ceiling surface
+							# from each grid light directly above it.
 							var light = SpotLight3D.new()
 							light.name = "GridFill_%s_%d_%d" % [area_id, ix, iz]
-							# Placed very close to the ceiling so it doesn't intersect tall wardrobes
 							light.position = Vector3(px, ceil_h - 0.2, pz)
 							light.rotation_degrees = Vector3(-90, 0, 0)
-							light.spot_angle = 85.0
-							# Increased range to soften distance attenuation so light reaches the floor strongly
+							light.spot_angle = 55.0   # Tight cone — only illuminates downward, no ceiling bleed
 							light.spot_range = clamp(spacing * 3.5, 6.0, 12.0)
 							light.light_energy = grid_energy
 							light.shadow_enabled = false
@@ -615,17 +688,22 @@ func setup_fixed_fill_lights():
 							add_child(light)
 							placed += 1
 
-				# Weak floor bounce for the whole room to prevent pure black floor
-				var floor_fill = OmniLight3D.new()
-				floor_fill.name = "GridFloorFill_" + str(area_id)
-				floor_fill.position = Vector3(cx, 0.35, cz)
-				floor_fill.light_energy = 0.35 * energy_multiplier * illumination_scale
-				floor_fill.omni_range = clamp(diag + 3.0, 8.0, 20.0)
-				floor_fill.shadow_enabled = false
-				floor_fill.light_color = floor_fill_color
-				floor_fill.light_specular = 0.1
-				floor_fill.add_to_group("fill_lights")
-				add_child(floor_fill)
+				# GridFloorFill OmniLight: SKIP for day renders.
+				# OmniLight at y=0.35 radiates in ALL directions including UP.
+				# With omni_range up to 20m it creates a visible circular hotspot on the ceiling
+				# which combined with adjacent grid SpotLights creates the wave/diamond pattern.
+				# Day renders don't need this — the sun + grid SpotLights handle floor fill.
+				if not day_render:
+					var floor_fill = OmniLight3D.new()
+					floor_fill.name = "GridFloorFill_" + str(area_id)
+					floor_fill.position = Vector3(cx, 0.35, cz)
+					floor_fill.light_energy = 0.35 * energy_multiplier * illumination_scale
+					floor_fill.omni_range = clamp(diag + 3.0, 8.0, 20.0)
+					floor_fill.shadow_enabled = false
+					floor_fill.light_color = floor_fill_color
+					floor_fill.light_specular = 0.1
+					floor_fill.add_to_group("fill_lights")
+					add_child(floor_fill)
 
 			else:
 				# ── Night / Legacy: Center SpotLight and OmniLight ──
@@ -634,14 +712,14 @@ func setup_fixed_fill_lights():
 
 				var light = SpotLight3D.new()
 				light.name = "RoomLight_" + str(area_id)
-				light.position = Vector3(cx, light_y, cz) # ← fixed world position
+				light.position = Vector3(cx, light_y, cz)  # ← fixed world position
 				light.rotation_degrees = Vector3(-90, 0, 0)
 				light.spot_angle = 85.0
 				light.spot_range = omni_range
 				light.light_energy = energy * energy_multiplier * illumination_scale
 				light.shadow_enabled = false
 				light.light_color = fill_color
-				light.light_specular = 0.10 # small specular — points DOWN so hits floor, not ceiling
+				light.light_specular = 0.10  # small specular — points DOWN so hits floor, not ceiling
 				light.add_to_group("fill_lights")
 				add_child(light)
 				placed += 1
@@ -664,10 +742,10 @@ func setup_fixed_fill_lights():
 				ceil_fill.light_energy = ceil_energy_base
 				# Wide range to reach ceiling and corners uniformly
 				ceil_fill.omni_range = clamp(diag * 1.6 + 3.0, 10.0, 25.0)
-				ceil_fill.omni_attenuation = 1.5 # Gentler falloff for softer spread
+				ceil_fill.omni_attenuation = 1.5  # Gentler falloff for softer spread
 				ceil_fill.shadow_enabled = false
 				ceil_fill.light_color = fill_color
-				ceil_fill.light_specular = 0.12 # soft floor gloss — mid-room height avoids ceiling hotspot
+				ceil_fill.light_specular = 0.12  # soft floor gloss — mid-room height avoids ceiling hotspot
 				ceil_fill.add_to_group("fill_lights")
 				add_child(ceil_fill)
 				
@@ -675,9 +753,9 @@ func setup_fixed_fill_lights():
 				var corner_energy = ceil_energy_base * 0.45
 				var corner_range = clamp(diag * 1.0 + 2.0, 6.0, 16.0)
 				var corner_offsets = [
-					Vector2(room_w * 0.35, room_d * 0.35),
-					Vector2(-room_w * 0.35, room_d * 0.35),
-					Vector2(room_w * 0.35, -room_d * 0.35),
+					Vector2( room_w * 0.35,  room_d * 0.35),
+					Vector2(-room_w * 0.35,  room_d * 0.35),
+					Vector2( room_w * 0.35, -room_d * 0.35),
 					Vector2(-room_w * 0.35, -room_d * 0.35),
 				]
 				var ci = 0
@@ -700,12 +778,12 @@ func setup_fixed_fill_lights():
 
 				var floor_fill = OmniLight3D.new()
 				floor_fill.name = "FloorFill_" + str(area_id)
-				floor_fill.position = Vector3(cx, 0.35, cz) # near-floor height
+				floor_fill.position = Vector3(cx, 0.35, cz)  # near-floor height
 				floor_fill.light_energy = energy * 0.25 * energy_multiplier * illumination_scale
 				floor_fill.omni_range = clamp(omni_range * 0.7, 3.0, 10.0)
 				floor_fill.shadow_enabled = false
 				floor_fill.light_color = floor_fill_color
-				floor_fill.light_specular = 0.35 # grazing-angle shimmer on polished marble/tile
+				floor_fill.light_specular = 0.35  # grazing-angle shimmer on polished marble/tile
 				floor_fill.add_to_group("fill_lights")
 				add_child(floor_fill)
 
@@ -915,8 +993,8 @@ func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 	var max_dim = 480
 	var w = thumb.get_width(); var h = thumb.get_height()
 	if w > max_dim or h > max_dim:
-		if w >= h: thumb.resize(max_dim, int(float(h) * max_dim / w), Image.INTERPOLATE_LANCZOS)
-		else: thumb.resize(int(float(w) * max_dim / h), max_dim, Image.INTERPOLATE_LANCZOS)
+		if w >= h: thumb.resize(max_dim, int(float(h)*max_dim/w), Image.INTERPOLATE_LANCZOS)
+		else: thumb.resize(int(float(w)*max_dim/h), max_dim, Image.INTERPOLATE_LANCZOS)
 	thumb.save_webp(thumb_path, true, 0.75)
 
 func _wait_frames(count: int) -> void:

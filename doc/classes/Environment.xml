@@ -208,7 +208,18 @@
 			The denoiser used to reduce noise in the path-traced image. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] uses NVIDIA DLSS Ray Reconstruction for high-quality temporal denoising and requires an NVIDIA RTX GPU. Use [constant RenderingServer.PT_DENOISER_NONE] to disable denoising.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
-		<member name="pathtracing_enabled" type="bool" setter="set_pathtracing_enabled" getter="is_pathtracing_enabled" default="false">
+		<member name="pathtracing_accumulate" type="bool" setter="set_pathtracing_accumulate" getter="is_pathtracing_accumulate" default="false">
+			If [code]true[/code], the path tracer accumulates one sample per pixel across driver frames into a persistent buffer, producing a converging still image (noise decreases ~1/sqrt(N) with the number of frames). This is the offline-quality path for still renders. If [code]false[/code] (default), the tracer uses the original one-shot per-launch sample budget. Accumulation resets automatically when the camera or viewport changes; static-scene convergence is driven by the caller (e.g. a capture loop) up to [member pathtracing_accumulation_target] frames.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_accumulation_target" type="int" setter="set_pathtracing_accumulation_target" getter="get_pathtracing_accumulation_target" default="64">
+			Target number of accumulation frames a still-render capture loop drives before grabbing the image. Higher values produce a cleaner (less noisy) result at the cost of more render frames. Only consumed by callers that drive convergence when [member pathtracing_accumulate] is [code]true[/code].
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_accumulate] are both [code]true[/code].
+		</member>
+		<member name="pathtracing_oidn_denoise" type="bool" setter="set_pathtracing_oidn_denoise" getter="is_pathtracing_oidn_denoise" default="false">
+			If [code]true[/code], runs a one-shot in-process OIDN [i]RT[/i] filter on the converged path-tracing accumulator before tonemapping. This is the final-denoise step of the [i]accumulate raw, denoise final[/i] pipeline (the same approach Blender Cycles uses): the clean, low-noise still image is produced by physically accumulating samples and then denoising once, rather than by a per-frame temporal reconstruction like DLSS Ray Reconstruction. Preserves fine detail better than a temporal denoiser on static scenes.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_accumulate] are both [code]true[/code]. Requires the [code]raycaster_oidn[/code] module to be built and the OIDN runtime DLLs to be present alongside the editor binary.
+		</member>
 			If [code]true[/code], enables hardware-accelerated path tracing for this environment. Path tracing produces physically accurate global illumination, reflections, and shadows by simulating light rays bouncing through the scene. Requires a GPU with ray tracing support.
 			[b]Note:[/b] Path tracing is mutually exclusive with rasterization-based rendering. When enabled, features such as SDFGI, screen-space reflections, and shadow maps are bypassed.
 		</member>

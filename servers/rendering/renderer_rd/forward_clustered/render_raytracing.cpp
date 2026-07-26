@@ -2807,6 +2807,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.indirect_energy = ls->light_get_param(base, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
 		ld.inv_spot_attenuation = 0.0f;
 		ld.cos_spot_angle = 0.0f;
+		// Pack shadow_enabled: directional lights always cast PT shadows when shadow is on.
+		ld.shadow_enabled = ls->light_has_shadow(base) ? 1.0f : 0.0f;
 		ld.spot_direction[0] = 0.0f;
 		ld.spot_direction[1] = 0.0f;
 		ld.spot_direction[2] = 0.0f;
@@ -2875,6 +2877,10 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			ld.spot_direction[1] = 0.0f;
 			ld.spot_direction[2] = 0.0f;
 		}
+		// Pack shadow_enabled for positional lights. When false, the PT shader
+		// skips shadow rays entirely — light contributes full illumination with
+		// no occlusion test (matches Blender Cycles shadow_enabled = false).
+		ld.shadow_enabled = ls->light_has_shadow(base) ? 1.0f : 0.0f;
 		rt_light_count++;
 	}
 
@@ -3000,8 +3006,60 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 		// rt_params layout (see RaytracingParamIndex enum):
 		// [0] = VIS_MODE, [1] = SAMPLE_COUNT, [2] = MAX_BOUNCES,
-		// [3] = DLSS_RR_ENABLED, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
+		// [3] = DLSS_RR_ENABLED, [4] = ACCUM_FLAG, [5] = ACCUM_FRAMES,
+		// [14] = LIGHT_COUNT, [15] = FRAME_INDEX
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
+
+		// Phase A: accumulation reset detection + per-frame index injection.
+		// When accumulation is enabled (env PT_PARAM_ACCUM_FLAG), reset the
+		// running-average buffer whenever the camera moved since last frame
+		// (the stored view would otherwise smear into the new one). On reset we
+		// force accumulation frame back to 0 so the shader's 1/(n+1) weight
+		// takes the very first sample wholesale. The actual GPU clear of the
+		// accum textures is issued by the dispatch site (see
+		// render_forward_clustered.cpp) using accum_reset_pending.
+		bool accum_enabled = rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FLAG] >= 0.5f;
+		// If accumulation was just switched on (or first run), the accum buffer
+		// may hold stale one-shot data → force a clear before the next trace.
+		if (accum_enabled && !p_state->accum_enabled) {
+			p_state->accum_reset_pending = true;
+			p_state->accum_frame = 0;
+			p_state->oidn_denoise_done = false; // a new convergence cycle must re-denoise.
+		}
+		if (accum_enabled) {
+			bool need_reset = false;
+			if (p_render_data && p_render_data->scene_data) {
+				const Transform3D &cam_xform = p_render_data->scene_data->cam_transform;
+				if (p_state->accum_last_cam_transform != cam_xform) {
+					p_state->accum_last_cam_transform = cam_xform;
+					need_reset = true;
+				}
+			}
+			// Viewport resize also invalidates the running average.
+			if (p_render_data && p_render_data->render_buffers.is_valid()) {
+				Size2i cur_size = p_render_data->render_buffers->get_internal_size();
+				if (p_state->accum_last_size != cur_size) {
+					p_state->accum_last_size = cur_size;
+					need_reset = true;
+				}
+			}
+			if (need_reset) {
+				p_state->accum_frame = 0;
+				p_state->accum_reset_pending = true;
+				p_state->oidn_denoise_done = false; // view changed → invalidate the prior denoise.
+			}
+		} else {
+			// One-shot mode: not accumulating; keep the running index at 0 so the
+			// shader unconditional (non-accumulate) write is unaffected.
+			p_state->accum_frame = 0;
+			p_state->accum_reset_pending = false;
+			p_state->oidn_denoise_done = false; // no accumulation → no final-denoise to remember.
+		}
+
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame);
+		p_state->accum_enabled = accum_enabled;
+		// accum_frame is incremented post-trace in the dispatch site
+		// (render_forward_clustered.cpp) so it only advances after a real launch.
 
 		// Unjittered VP for motion vectors (matches raster convention).
 		{
@@ -3168,6 +3226,26 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 28;
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rb->get_velocity_buffer(false));
+		uniforms.push_back(u);
+	}
+
+	// Bindings 29 & 30: Phase A accumulation buffers (running-average radiance +
+	// per-pixel sample count). Allocated on demand by rt_ensure_textures(); bound
+	// unconditionally so the raygen shader's accumulator path has valid storage
+	// images whether or not accumulation is active this frame.
+	{
+		rb_data->rt_ensure_textures();
+		RD::Uniform u;
+		u.binding = 29;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rb_data->rt_get_accum_texture());
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 30;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rb_data->rt_get_accum_n_texture());
 		uniforms.push_back(u);
 	}
 

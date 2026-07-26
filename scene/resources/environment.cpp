@@ -650,6 +650,33 @@ RSE::PathtracingDenoiser Environment::get_pathtracing_denoiser() const {
 	return pathtracing_denoiser;
 }
 
+void Environment::set_pathtracing_accumulate(bool p_accumulate) {
+	pathtracing_accumulate = p_accumulate;
+	_update_pathtracing();
+}
+
+bool Environment::is_pathtracing_accumulate() const {
+	return pathtracing_accumulate;
+}
+
+void Environment::set_pathtracing_accumulation_target(int p_target) {
+	pathtracing_accumulation_target = CLAMP(p_target, 1, 8192);
+	_update_pathtracing();
+}
+
+int Environment::get_pathtracing_accumulation_target() const {
+	return pathtracing_accumulation_target;
+}
+
+void Environment::set_pathtracing_oidn_denoise(bool p_oidn) {
+	pathtracing_oidn_denoise = p_oidn;
+	_update_pathtracing();
+}
+
+bool Environment::is_pathtracing_oidn_denoise() const {
+	return pathtracing_oidn_denoise;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(environment, pathtracing_enabled);
 
@@ -659,6 +686,10 @@ void Environment::_update_pathtracing() {
 	params.write[RSE::PT_PARAM_SAMPLE_COUNT] = (float)pathtracing_samples_per_pixel;
 	params.write[RSE::PT_PARAM_MAX_BOUNCES] = (float)pathtracing_max_bounces;
 	params.write[RSE::PT_PARAM_DENOISER] = (float)(int)pathtracing_denoiser;
+	params.write[RSE::PT_PARAM_ACCUM_FLAG] = pathtracing_accumulate ? 1.0f : 0.0f;
+	// PT_PARAM_ACCUM_FRAMES is driver-injected per launch; leave 0 here.
+	params.write[RSE::PT_PARAM_OIDN_FLAG] = pathtracing_oidn_denoise ? 1.0f : 0.0f;
+	params.write[RSE::PT_PARAM_ACCUM_TARGET] = (float)pathtracing_accumulation_target;
 	RS::get_singleton()->environment_set_pathtracing_params(environment, params);
 }
 
@@ -1501,6 +1532,12 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_max_bounces"), &Environment::get_pathtracing_max_bounces);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_denoiser", "denoiser"), &Environment::set_pathtracing_denoiser);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_denoiser"), &Environment::get_pathtracing_denoiser);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_accumulate", "accumulate"), &Environment::set_pathtracing_accumulate);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_accumulate"), &Environment::is_pathtracing_accumulate);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_accumulation_target", "target"), &Environment::set_pathtracing_accumulation_target);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_accumulation_target"), &Environment::get_pathtracing_accumulation_target);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_oidn_denoise", "oidn"), &Environment::set_pathtracing_oidn_denoise);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_oidn_denoise"), &Environment::is_pathtracing_oidn_denoise);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_pathtracing_enabled", "is_pathtracing_enabled");
@@ -1508,6 +1545,9 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_samples_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_samples_per_pixel", "get_pathtracing_samples_per_pixel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_accumulate"), "set_pathtracing_accumulate", "is_pathtracing_accumulate");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_accumulation_target", PROPERTY_HINT_RANGE, "1,8192,1"), "set_pathtracing_accumulation_target", "get_pathtracing_accumulation_target");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_oidn_denoise"), "set_pathtracing_oidn_denoise", "is_pathtracing_oidn_denoise");
 
 	// Glow
 

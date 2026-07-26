@@ -24,7 +24,65 @@
 layout(set = 0, binding = 0, rgba32f) uniform image2D image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
+// Phase A accumulation buffers (bound by render_raytracing.cpp update_uniform_set).
+// `accum` holds the running-average radiance; `accum_n` the per-pixel sample count.
+// Both are R16G16B16A16_SFLOAT / R32_SFLOAT on the C++ side and cast at the bind
+// (mirrors the existing `image` <-> RB_TEX_RAYTRACING R16F bind).
+layout(set = 0, binding = 29, rgba32f) uniform image2D rt_accum;
+layout(set = 0, binding = 30, r32f) uniform image2D rt_accum_n;
+
 layout(location = 0) rayPayloadEXT PathPayload payload;
+
+// Traces a single camera path for `p_sample_idx` and returns the accumulated
+// radiance. Shared by the one-shot SPP loop and the Phase A accumulator
+// (which calls this once per launch with the running-average frame index as
+// the sample seed so frames decorrelate). File-scope because GLSL forbids
+// nested function definitions.
+// When `p_is_sample_zero` is true, the primary-ray G-buffer / depth /
+// velocity / DLSS-RR writes fire (matches the original SAMPLE_ZERO_FLAG).
+vec3 trace_one_sample(uvec2 p_pixel, uint p_frame_index, uint p_sample_idx, bool p_is_sample_zero,
+		uint p_max_bounces, vec3 p_origin, vec3 p_dir) {
+	PathState ps;
+	ps.radiance = vec3(0.0);
+	ps.throughput = vec3(1.0);
+	ps.packed_bounces_flags = p_is_sample_zero ? set_sample_zero(0u) : 0u;
+	ps.rng_state = init_rng(p_pixel, p_frame_index, p_sample_idx);
+
+	vec3 ray_origin = p_origin;
+	vec3 ray_dir = p_dir;
+
+	[[dont_unroll]] for (uint bounce = 0u; bounce <= p_max_bounces; bounce++) {
+		path_pack(payload, ps);
+
+#ifdef USE_SER
+		hitObjectEXT hitObject;
+		hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+
+		// Reorder with a coherence hint that has 8 bits
+		uint hint = 0;
+		if (hitObjectIsHitEXT(hitObject)) {
+			// TODO: This hint barely does anything. There is a lot of untapped potential here.
+			hint = hitObjectGetInstanceIdEXT(hitObject);
+		}
+		reorderThreadEXT(hitObject, hint, 8);
+
+		hitObjectExecuteShaderEXT(hitObject, 0);
+#else
+		traceRayEXT(tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+#endif
+
+		ps = path_unpack(payload);
+		if (is_path_terminated(ps.packed_bounces_flags)) {
+			break;
+		}
+		// Reconstruct the next ray origin from the current ray + hit distance, apply bias
+		vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
+		ray_origin = offset_ray_origin(hit_pos, ps.offset_normal);
+		ray_dir = ps.next_ray_dir;
+	}
+
+	return ps.radiance;
+}
 
 void main() {
 	uvec2 pixel = gl_LaunchIDEXT.xy;
@@ -45,60 +103,53 @@ void main() {
 	const uint samples_per_pixel = RT_GET_SAMPLE_COUNT();
 	uint frame_index = uint(get_rt_param(RT_PARAM_FRAME_INDEX));
 
-	// Accumulate multiple samples per pixel
-	vec3 total_radiance = vec3(0.0);
-
 	const uint max_bounces = RT_GET_MAX_BOUNCES();
 
-	// TODO: when we have a spp > 0 the first raycast is always identical,
-	// we should move it out of the loop
+	// Phase A accumulation: blend one 1-SPP sample per launch into a persistent
+	// running average so a still image converges across driver frames.
+	if (get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5) {
+		// 0-based accumulation frame the driver injected for this launch.
+		uint accum_frame = uint(get_rt_param(RT_PARAM_ACCUM_FRAMES));
 
-	[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
-		PathState ps;
-		ps.radiance = vec3(0.0);
-		ps.throughput = vec3(1.0);
-		ps.packed_bounces_flags = (sample_idx == 0u) ? set_sample_zero(0u) : 0u;
-		ps.rng_state = init_rng(pixel, frame_index, sample_idx);
+		// Write the primary-ray G-buffer / depth / velocity / DLSS-RR outputs on
+		// EVERY accumulate frame (pass p_is_sample_zero = true), not just frame 0.
+		// The temporal upscalers are bypassed while accumulating (see the
+		// SCALE_NONE override in render_forward_clustered.cpp), so no consumer
+		// double-integrates them, and any per-frame depth/velocity reader (debug
+		// draw, future denoise) must not see a stale frame-0 buffer.
 
-		vec3 ray_origin = origin.xyz;
-		vec3 ray_dir = direction.xyz;
+		// One new sample per launch. Seed the frame index so each accum frame
+		// decorrelates; reuse frame_index (separately varied per launch by the
+		// driver) mixed with accum_frame for extra spread.
+		vec3 sample_rad = trace_one_sample(pixel, frame_index, accum_frame, true,
+				max_bounces, origin.xyz, direction.xyz);
 
-		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
-			path_pack(payload, ps);
+		float n = imageLoad(rt_accum_n, ivec2(pixel)).x;
+		// Guard against an uninitialized / cleared (n==0) and float drift; clamp to
+		// a sane maximum so the running average stays well-conditioned.
+		n = max(n, 0.0);
+		float w = 1.0 / (n + 1.0);
 
-#ifdef USE_SER
-			hitObjectEXT hitObject;
-			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+		vec3 prev = imageLoad(rt_accum, ivec2(pixel)).rgb;
+		vec3 running = mix(prev, sample_rad, w);
 
-			// Reorder with a coherence hint that has 8 bits
-			uint hint = 0;
-			if (hitObjectIsHitEXT(hitObject)) {
-				// TODO: This hint barely does anything. There is a lot of untapped potential here.
-				hint = hitObjectGetInstanceIdEXT(hitObject);
-			}
-			reorderThreadEXT(hitObject, hint, 8);
-
-			hitObjectExecuteShaderEXT(hitObject, 0);
-#else
-			traceRayEXT(tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
-#endif
-
-			ps = path_unpack(payload);
-			if (is_path_terminated(ps.packed_bounces_flags)) {
-				break;
-			}
-			// Reconstruct the next ray origin from the current ray + hit distance, apply bias
-			vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
-			ray_origin = offset_ray_origin(hit_pos, ps.offset_normal);
-			ray_dir = ps.next_ray_dir;
+		imageStore(rt_accum, ivec2(pixel), vec4(running, 1.0));
+		imageStore(rt_accum_n, ivec2(pixel), vec4(n + 1.0));
+		// The accumulator image is the visible output the downstream copy/tonemap
+		// reads; keep it in sync with the running average each launch.
+		imageStore(image, ivec2(pixel), vec4(running, 1.0));
+	} else {
+		// Original one-shot path: trace `samples_per_pixel` samples in this
+		// launch and average. Behaviour is byte-identical to pre-Phase A.
+		vec3 total_radiance = vec3(0.0);
+		[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
+			bool sz = (sample_idx == 0u);
+			total_radiance += trace_one_sample(pixel, frame_index, sample_idx, sz,
+					max_bounces, origin.xyz, direction.xyz);
 		}
-
-		total_radiance += ps.radiance;
+		vec3 final_radiance = total_radiance / float(samples_per_pixel);
+		imageStore(image, ivec2(pixel), vec4(final_radiance, 1.0));
 	}
-
-	vec3 final_radiance = total_radiance / float(samples_per_pixel);
-
-	imageStore(image, ivec2(pixel), vec4(final_radiance, 1.0));
 }
 
 #[miss]

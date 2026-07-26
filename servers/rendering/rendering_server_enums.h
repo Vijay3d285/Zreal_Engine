@@ -763,7 +763,23 @@ enum PathtracingParamIndex {
 	PT_PARAM_SAMPLE_COUNT = 1,
 	PT_PARAM_MAX_BOUNCES = 2,
 	PT_PARAM_DENOISER = 3,
-	// Indices 4-13 reserved for future use.
+	// PT_PARAM_ACCUM_FLAG: 1.0 = accumulate samples across driver frames into a
+	// persistent buffer (still-image convergence), 0.0 = single one-shot launch.
+	PT_PARAM_ACCUM_FLAG = 4,
+	// PT_PARAM_ACCUM_FRAMES: driver-injected 0-based accumulation frame index for
+	// the current launch (used by the shader as the running-average mix weight
+	// 1/(n+1)). Not authored on the Environment; overwritten per-frame by the RT driver.
+	PT_PARAM_ACCUM_FRAMES = 5,
+	// PT_PARAM_OIDN_FLAG: 1.0 = run a one-shot in-process OIDN `RT` filter on the
+	// converged accumulator before tonemap (still-image final-denoise, matches the
+	// Cycles "accumulate raw, denoise final" paradigm). 0.0 = ship the raw converged
+	// PT image with no spatial denoise. Only honored when PT_PARAM_ACCUM_FLAG is set.
+	PT_PARAM_OIDN_FLAG = 6,
+	// PT_PARAM_ACCUM_TARGET: environment-authored target accumulation frame count the
+	// capture loop drives to. Read by the RT render path to know when the accumulator has
+	// converged enough to fire the one-shot OIDN final-denoise. Packed on the Environment.
+	PT_PARAM_ACCUM_TARGET = 7,
+	// Indices 8-13 reserved for future use.
 	PT_PARAM_LIGHT_COUNT = 14,
 	PT_PARAM_FRAME_INDEX = 15,
 };

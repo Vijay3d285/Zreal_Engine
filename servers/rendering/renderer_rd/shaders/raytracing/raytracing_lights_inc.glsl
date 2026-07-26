@@ -31,7 +31,7 @@ struct RTLightData {
 	float indirect_energy; // Godot indirect energy multiplier.
 	float inv_spot_attenuation; // Spot cone softness.
 	float cos_spot_angle; // Cosine of spot cone half-angle.
-	float _pad0;
+	float shadow_enabled; // 1.0 = trace shadow rays, 0.0 = skip (shadowless fill). Must match C++ _pad0 position.
 	vec3 spot_direction; // Spot direction (normalized, world space).
 	float _pad1;
 };
@@ -324,7 +324,10 @@ vec3 lights_evaluate_direct_lighting(
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
+		// Shadow test — skipped entirely when shadow_enabled == 0.0 (shadowless fill light).
+		// This matches Blender Cycles behaviour: light contributes full radiance with
+		// no occlusion ray, casting no shadows while still illuminating the scene.
+		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
 			return vec3(0.0);
 		}
 
@@ -357,7 +360,8 @@ vec3 lights_evaluate_direct_lighting(
 			return vec3(0.0);
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
+		// Shadow test for directional light — skipped when shadow_enabled == 0.0.
+		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
 			return vec3(0.0);
 		}
 

@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/math/transform_3d.h"
+#include "core/math/vector2i.h"
 #include "core/string/string_name.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
@@ -42,6 +43,9 @@
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
+// Phase A: persistent accumulation buffers for still-image convergence.
+#define RB_TEX_RAYTRACING_ACCUM SNAME("rt_accum")       // running-average radiance (R16G16B16A16_SFLOAT)
+#define RB_TEX_RAYTRACING_ACCUM_N SNAME("rt_accum_n") // sample count per pixel (R32_SFLOAT)
 
 #define RB_SCOPE_DLSS_RR SNAME("dlss_rr")
 #define RB_TEX_DLSS_RR_DIFFUSE_ALBEDO SNAME("diffuse_albedo")
@@ -135,7 +139,7 @@ struct alignas(16) RT_LightData {
 	float indirect_energy;
 	float inv_spot_attenuation;
 	float cos_spot_angle;
-	float _pad0;
+	float shadow_enabled; // 1.0 = trace shadow rays normally. 0.0 = skip shadow ray (shadowless fill light). Repurposed from _pad0; struct size stays 80 bytes.
 	float spot_direction[3];
 	float _pad1;
 };
@@ -318,6 +322,22 @@ struct RTViewportState {
 	RID params_buffer;
 
 	uint32_t frame_counter = 0;
+
+	// Phase A accumulation state (per-viewport). The accumulator blends 1-SPP
+	// renders across frames for still-image convergence. It must reset (clear
+	// the accum buffer + sample count) when the camera moves or the viewport
+	// is resized; otherwise the running average would smear the old view.
+	bool accum_enabled = false;          // mirrors env PT_PARAM_ACCUM_FLAG this viewport.
+	uint32_t accum_frame = 0;            // 0-based accumulation frame for the current view.
+	Transform3D accum_last_cam_transform; // last camera transform seen; mismatch => reset.
+	Size2i accum_last_size;              // last internal render size; mismatch => reset (resize).
+	bool accum_reset_pending = true;     // clear accum/accum_n to 0 before the next trace.
+	// Phase F: one-shot OIDN final-denoise bookkeeping. Set true once a converged OIDN
+	// denoise has been applied this accumulation cycle so it does not re-fire every frame
+	// (OIDN is non-temporal; it must run once after convergence, not per frame). Reset to
+	// false on the same events that clear the accumulator (camera move / resize / accumulate
+	// toggle) so the next convergence cycle denoises again.
+	bool oidn_denoise_done = false;
 };
 
 class RenderRaytracing {
