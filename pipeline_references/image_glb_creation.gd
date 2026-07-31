@@ -521,6 +521,8 @@ func setup_lighting(data, geom_data = {}):
 	var env = Environment.new()
 	env.background_mode = Environment.BG_SKY
 	env.sky = Sky.new()
+	env.sky.radiance_size = Sky.RADIANCE_SIZE_1024
+	env.sky.process_mode = Sky.PROCESS_MODE_QUALITY
 
 	var exr_path = ""
 	if data.has("environment_url") and data["environment_url"] != null and data["environment_url"] != "":
@@ -533,9 +535,11 @@ func setup_lighting(data, geom_data = {}):
 		var exr_image = Image.new()
 		var load_err = exr_image.load(exr_path)
 		if load_err == OK:
+			exr_image.generate_mipmaps()
 			var sky_tex = ImageTexture.create_from_image(exr_image)
 			var panorama_mat = PanoramaSkyMaterial.new()
 			panorama_mat.panorama = sky_tex
+			panorama_mat.filter = true
 			env.sky.sky_material = panorama_mat
 			sky_material_set = true
 			print("Loaded EXR sky background: ", exr_path)
@@ -789,31 +793,33 @@ func setup_lighting(data, geom_data = {}):
 	#   PT_DENOISER_NONE = 0
 	#   PT_DENOISER_DLSS_RAY_RECONSTRUCTION = 1
 	env.set_pathtracing_enabled(true)
-	# Day render: 12 bounces / 20 SPP — more bounces needed for realistic interior GI
-	# when relying solely on the directional sun (no fill lights). More SPP gives DLSS
-	# RR a cleaner input, producing noise-free shadows and GI at still-image quality.
-	# Night render keeps 8 bounces / 10 SPP (scene is mostly emissive, fewer bounces needed).
+	# Pathtracer config. DLSS Ray Reconstruction (DLSS-RR) is a NEURAL TEMPORAL denoiser:
+	# it cleans noise by ACCUMULATING INFORMATION ACROSS FRAMES (per RenderingServer docs: "a
+	# low sample count (1-2) is typically sufficient since the denoiser accumulates information
+	# across frames"). So for stills we run the REALTIME DLSS-RR path (accumulate OFF, 1-SPP
+	# per frame) and let the render.gd loop drive enough frames for that temporal accumulation
+	# to converge to a clean, detail-reconstructed still — DLSS-RR IS the temporal accumulator,
+	# so no separate Phase-A running-average is wanted (feeding DLSS a converged image gives it
+	# nothing new to accumulate → passthrough/no denoise, which is the Phase F2 dead end).
+	# Day: 12 bounces (interior GI off the sun), night: 8 (mostly emissive). SPP stays moderate;
+	# DLSS-RR temporally integrates 1 sample/frame across the drive-frame count.
 	if day_render:
 		env.set_pathtracing_max_bounces(12)
 		env.set_pathtracing_samples_per_pixel(20)
 	else:
 		env.set_pathtracing_max_bounces(8)
 		env.set_pathtracing_samples_per_pixel(10)
-	env.set_pathtracing_denoiser(1) # 1 = PT_DENOISER_DLSS_RAY_RECONSTRUCTION
-	# Phase A: still-image accumulation. The raygen shader blends one 1-SPP sample
-	# per driver frame into a persistent running-average buffer, so the still
-	# converges over `pathtracing_accumulation_target` frames instead of being
-	# capped by the per-launch SPP. SPP here stays the *denoiser input quality*
-	# for the realtime path; the accumulator overrides convergence for stills.
-	# env.set_pathtracing_accumulate(false) # OFF path: per-frame 1-SPP + DLSS-RR (fast preview, temporal).
-	# Phase F: accumulate raw, denoise final. Set accumulate true and enable the
-	# in-process OIDN `RT` final-denoise that runs once after convergence. This is
-	# the Cycles-grade final-quality still path (non-temporal, preserves fine detail
-	# better than DLSS-RR on static scenes). The render.gd loop drives accum_target+1
-	# frames so OIDN has a frame to render onto the final output before capture.
-	env.set_pathtracing_accumulate(true)
-	env.set_pathtracing_accumulation_target(128) # OIDN denoises the residual, so fewer frames than the 256 raw target suffice; ~128 ≈ high-quality, tune up for cleaner.
-	env.set_pathtracing_oidn_denoise(true)
+	env.set_pathtracing_denoiser(1) # 1 = PT_DENOISER_DLSS_RAY_RECONSTRUCTION (realtime temporal path)
+	# DLSS-RR REALTIME STILL path: accumulate OFF (no Phase-A running average — DLSS-RR is the
+	# temporal integrator), Viewport.SCALING_3D_MODE_DLSS + scaling_3d_scale=1.0 (set in render.gd
+	# line ~144) → DLAA 1:1 (no upscaling) so the SCALE_DLSS branch runs DLSS-RR every frame on the
+	# raw 1-SPP noisy radiance. render.gd drives ~DLSS_RR_REALTIME_STILL_FRAMES frames (256) so the
+	# temporal accumulation converges to a clean reconstructed still, then captures.
+	# Alternatives left compiled but OFF: Phase F OIDN final (pathtracing_oidn_denoise) and Phase F2
+	# converge-then-reconstruct (pathtracing_dlss_rr_final) — documented fallbacks, not this route.
+	env.set_pathtracing_accumulate(false)
+	env.set_pathtracing_oidn_denoise(false)
+	env.set_pathtracing_dlss_rr_final(false)
 	# NOTE: the earlier `env.set("raytracing_params", PackedFloat32Array([...]))` line was
 	# a no-op (Environment._set doesn't handle that key, and there's no ClassDB property by
 	# that name), so removing it does not change behavior and avoids it shadowing the real
@@ -3604,6 +3610,10 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 	elif props.has("rotation"):
 		rot = float(props["rotation"])
 	root.rotation.y = _world_yaw_from_source_rotation(rot)
+	if structure.has("rotationX"):
+		root.rotation.x = float(structure["rotationX"])
+	if structure.has("rotationZ"):
+		root.rotation.z = float(structure["rotationZ"])
 	root.scale = Vector3(
 		-1.0 if bool(structure.get("flipX", false)) else 1.0,
 		1.0,
@@ -3613,6 +3623,8 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 
 	var mat_data = structure_builder._resolve_structure_material(structure, structure_type)
 	match structure_type:
+		"partitionwall":
+			structure_builder._add_partitionwall_structure(root, structure, width, depth, height, mat_data)
 		"squarecolumn", "flue", "beam":
 			structure_builder._add_box_structure(root, structure_type, width, depth, height, mat_data)
 		"circlecolumn":

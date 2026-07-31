@@ -150,7 +150,7 @@ func _add_niche_structure(parent: Node3D, width: float, depth: float, height: fl
 	right.mesh.size = Vector2(d, h)
 	right.mesh.orientation = PlaneMesh.FACE_Z
 	right.position = Vector3(w / 2.0, 0, 0)
-	right.rotation.y = -PI / 2.0
+	right.rotation.y = - PI / 2.0
 	right.material_override = mat
 	niche_group.add_child(right)
 	
@@ -182,6 +182,46 @@ func _add_box_structure(parent: Node3D, structure_type: String, width: float, de
 	mi.material_override = main_script.create_material(mat_data)
 	mi.position = Vector3(0, max(height, 0.05) * 0.5, 0)
 	parent.add_child(mi)
+
+func _add_partitionwall_structure(parent: Node3D, structure: Dictionary, width: float, depth: float, height: float, mat_data: Dictionary) -> void:
+	# The frontend stores the shape under properties.partition_shape, not at the root level.
+	var props = structure.get("properties", {})
+	var subtype = ""
+	if typeof(props) == TYPE_DICTIONARY:
+		subtype = str(props.get("partition_shape", "")).to_lower().strip_edges()
+	if subtype == "":
+		subtype = str(structure.get("partitionwall_subtype", "rect")).to_lower().strip_edges()
+
+	# Wall thickness: prefer the authored value from properties (stored as {length: N} in source units).
+	var wall_thickness = 0.1524 # fallback: standard 6-inch wall
+	if typeof(props) == TYPE_DICTIONARY and props.has("wall_thickness"):
+		var wt = props["wall_thickness"]
+		var raw_t = 0.0
+		if typeof(wt) == TYPE_DICTIONARY and wt.has("length"):
+			raw_t = float(wt["length"])
+		else:
+			raw_t = float(wt)
+		if raw_t > 0.0:
+			wall_thickness = raw_t * main_script._scene_unit_scale
+
+	match subtype:
+		"rect":
+			# Front/Back walls
+			_add_box_part(parent, Vector3(width, height, wall_thickness), mat_data, Vector3(0, height / 2.0, (depth / 2.0) - (wall_thickness / 2.0)))
+			_add_box_part(parent, Vector3(width, height, wall_thickness), mat_data, Vector3(0, height / 2.0, - (depth / 2.0) + (wall_thickness / 2.0)))
+			# Side walls
+			_add_box_part(parent, Vector3(wall_thickness, height, depth - (2 * wall_thickness)), mat_data, Vector3((width / 2.0) - (wall_thickness / 2.0), height / 2.0, 0))
+			_add_box_part(parent, Vector3(wall_thickness, height, depth - (2 * wall_thickness)), mat_data, Vector3(- (width / 2.0) + (wall_thickness / 2.0), height / 2.0, 0))
+		"l_shaped":
+			_add_box_part(parent, Vector3(width, height, wall_thickness), mat_data, Vector3(0, height / 2.0, - (depth / 2.0) + (wall_thickness / 2.0)))
+			_add_box_part(parent, Vector3(wall_thickness, height, depth - wall_thickness), mat_data, Vector3(- (width / 2.0) + (wall_thickness / 2.0), height / 2.0, wall_thickness / 2.0))
+		"u_shaped":
+			_add_box_part(parent, Vector3(width, height, wall_thickness), mat_data, Vector3(0, height / 2.0, - (depth / 2.0) + (wall_thickness / 2.0)))
+			_add_box_part(parent, Vector3(wall_thickness, height, depth - wall_thickness), mat_data, Vector3((width / 2.0) - (wall_thickness / 2.0), height / 2.0, wall_thickness / 2.0))
+			_add_box_part(parent, Vector3(wall_thickness, height, depth - wall_thickness), mat_data, Vector3(- (width / 2.0) + (wall_thickness / 2.0), height / 2.0, wall_thickness / 2.0))
+		_:
+			_add_box_structure(parent, "partitionwall", width, depth, height, mat_data)
+
 
 func _add_cylinder_structure(parent: Node3D, width: float, depth: float, height: float, mat_data: Dictionary) -> void:
 	var radius = max(width, depth) * 0.5
@@ -318,7 +358,7 @@ func _add_step_structure(parent: Node3D, structure: Dictionary, width: float, de
 		"backward", "back", "reverse":
 			support_node.rotation.y = 0.0
 		"left":
-			support_node.rotation.y = -PI / 2.0
+			support_node.rotation.y = - PI / 2.0
 		"right":
 			support_node.rotation.y = PI / 2.0
 		_:
@@ -338,7 +378,7 @@ func _add_step_structure(parent: Node3D, structure: Dictionary, width: float, de
 		stair_csg.add_child(step_node)
 		
 	# Offset the entire stair CSG so the highest step is at the pivot (matching frontend)
-	stair_csg.position = -dir_vec * run_length
+	stair_csg.position = - dir_vec * run_length
 
 func _create_step_support_mesh(width: float, run_length: float, total_height: float) -> ArrayMesh:
 	var w = max(width, 0.05)
@@ -411,7 +451,7 @@ func _add_false_ceiling_structure(parent: Node3D, structure: Dictionary, width: 
 		_add_box_part(parent, Vector3(max(width - border * 2.0, 0.1), slab_h, max(depth - border * 2.0, 0.1)), root_color, Vector3(0, -slab_h * 0.5, 0))
 
 		# Lower perimeter bands
-		var drop_y = -(drop_height + slab_h * 0.5)
+		var drop_y = - (drop_height + slab_h * 0.5)
 		_add_box_part(parent, Vector3(width, slab_h, border), drop_mat, Vector3(0, drop_y, depth * 0.5 - border * 0.5))
 		_add_box_part(parent, Vector3(width, slab_h, border), drop_mat, Vector3(0, drop_y, -depth * 0.5 + border * 0.5))
 		_add_box_part(parent, Vector3(border, slab_h, max(depth - border * 2.0, 0.1)), drop_mat, Vector3(width * 0.5 - border * 0.5, drop_y, 0))
@@ -544,16 +584,16 @@ func _add_staircase_structure(parent: Node3D, structure: Dictionary, width: floa
 		pass
 	elif stair_type == "u_shaped":
 		var turn_dir_str = "left"
-		if structure.has("stair") and structure["stair"].has("turn_direction"):
-			turn_dir_str = str(structure["stair"]["turn_direction"]).to_lower()
+		if stair.has("turn_direction"):
+			turn_dir_str = str(stair["turn_direction"]).to_lower()
 		elif structure.has("turn_direction"):
 			turn_dir_str = str(structure["turn_direction"]).to_lower()
 			
 		var landing_x_offset = stair_width * 0.5
 		var second_start_x = stair_width
 		if turn_dir_str == "right":
-			landing_x_offset = -stair_width * 0.5
-			second_start_x = -stair_width
+			landing_x_offset = - stair_width * 0.5
+			second_start_x = - stair_width
 
 		_add_multi_mat_box(parent, Vector3(stair_width * 2.0, landing_h, landing_depth), Vector3(landing_x_offset, current_height - landing_h * 0.5, first_run + landing_depth * 0.5), landing_mats, 0.0)
 		if flights.size() > 1:
@@ -571,8 +611,8 @@ func _add_staircase_structure(parent: Node3D, structure: Dictionary, width: floa
 			_add_stair_flight(parent, second_steps, second_riser, second_tread, stair_width, Vector3(second_start_x, current_height, first_run), t_dir, r_y, step_material, bottom_type)
 	elif stair_type == "winder":
 		var turn_dir_str = "left"
-		if structure.has("stair") and structure["stair"].has("turn_direction"):
-			turn_dir_str = str(structure["stair"]["turn_direction"]).to_lower()
+		if stair.has("turn_direction"):
+			turn_dir_str = str(stair["turn_direction"]).to_lower()
 		elif structure.has("turn_direction"):
 			turn_dir_str = str(structure["turn_direction"]).to_lower()
 		
@@ -600,8 +640,8 @@ func _add_staircase_structure(parent: Node3D, structure: Dictionary, width: floa
 			var step_h = first_riser
 			var bottom_y = -i * step_h
 			for s in range(segs):
-				var p1 = pts[s+1]
-				var p2 = pts[s+2]
+				var p1 = pts[s + 1]
+				var p2 = pts[s + 2]
 				
 				# top
 				st.add_vertex(Vector3(0, step_h, 0)); st.add_vertex(Vector3(p2.x, step_h, p2.z)); st.add_vertex(Vector3(p1.x, step_h, p1.z))
@@ -612,7 +652,7 @@ func _add_staircase_structure(parent: Node3D, structure: Dictionary, width: floa
 				st.add_vertex(Vector3(p2.x, bottom_y, p2.z)); st.add_vertex(Vector3(p1.x, step_h, p1.z)); st.add_vertex(Vector3(p2.x, step_h, p2.z))
 			
 			var p_start = pts[1]
-			var p_end = pts[pts.size()-1]
+			var p_end = pts[pts.size() - 1]
 			st.add_vertex(Vector3(0, bottom_y, 0)); st.add_vertex(Vector3(p_start.x, step_h, p_start.z)); st.add_vertex(Vector3(0, step_h, 0))
 			st.add_vertex(Vector3(0, bottom_y, 0)); st.add_vertex(Vector3(p_start.x, bottom_y, p_start.z)); st.add_vertex(Vector3(p_start.x, step_h, p_start.z))
 			st.add_vertex(Vector3(p_end.x, bottom_y, p_end.z)); st.add_vertex(Vector3(0, step_h, 0)); st.add_vertex(Vector3(p_end.x, step_h, p_end.z))
@@ -660,6 +700,10 @@ func _add_staircase_structure(parent: Node3D, structure: Dictionary, width: floa
 			if float(second_flight_l.get("tread_depth", 0.0)) > 0:
 				second_tread_l = float(second_flight_l.get("tread_depth", 0.0)) * main_script._scene_unit_scale
 			var dir_str_l = str(second_flight_l.get("direction", "left")).to_lower()
+			if stair.has("turn_direction"):
+				dir_str_l = str(stair["turn_direction"]).to_lower()
+			elif structure.has("turn_direction"):
+				dir_str_l = str(structure["turn_direction"]).to_lower()
 			var t_dir_l = _resolve_stair_travel_direction(dir_str_l)
 			var r_y_l = _resolve_stair_step_rotation(dir_str_l)
 			var start_x_l = (stair_width * 0.5) * sign(t_dir_l.x) if abs(t_dir_l.x) > 0.1 else 0.0

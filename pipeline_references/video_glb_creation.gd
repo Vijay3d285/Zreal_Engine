@@ -861,6 +861,8 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	var env = Environment.new()
 	env.background_mode = Environment.BG_SKY
 	env.sky = Sky.new()
+	env.sky.radiance_size = Sky.RADIANCE_SIZE_1024
+	env.sky.process_mode = Sky.PROCESS_MODE_QUALITY
 
 	var exr_path = ""
 	if data.has("environment_url") and data["environment_url"] != null and data["environment_url"] != "":
@@ -873,9 +875,11 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		var exr_image = Image.new()
 		var load_err = exr_image.load(exr_path)
 		if load_err == OK:
+			exr_image.generate_mipmaps()
 			var sky_tex = ImageTexture.create_from_image(exr_image)
 			var panorama_mat = PanoramaSkyMaterial.new()
 			panorama_mat.panorama = sky_tex
+			panorama_mat.filter = true
 			env.sky.sky_material = panorama_mat
 			sky_material_set = true
 			print("[VideoGLB] Loaded EXR sky: ", exr_path)
@@ -2036,6 +2040,10 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 	elif props.has("rotation"):
 		rot = float(props["rotation"])
 	root.rotation.y = _world_yaw_from_source_rotation(rot)
+	if structure.has("rotationX"):
+		root.rotation.x = float(structure["rotationX"])
+	if structure.has("rotationZ"):
+		root.rotation.z = float(structure["rotationZ"])
 	root.scale = Vector3(
 		-1.0 if bool(structure.get("flipX", false)) else 1.0,
 		1.0,
@@ -2045,7 +2053,9 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 
 	var mat_data = structure_builder._resolve_structure_material(structure, structure_type)
 	match structure_type:
-		"squarecolumn", "flue", "beam", "partitionwall":
+		"partitionwall":
+			structure_builder._add_partitionwall_structure(root, structure, width, depth, height, mat_data)
+		"squarecolumn", "flue", "beam":
 			structure_builder._add_box_structure(root, structure_type, width, depth, height, mat_data)
 		"circlecolumn":
 			structure_builder._add_cylinder_structure(root, width, depth, height, mat_data)
@@ -2143,8 +2153,8 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			wall_thickness_val = get_dimension_value(line["properties"]["thickness"], 20.0)
 
 		var dir_2d = (Vector2(v2_x, v2_y) - Vector2(v1_x, v1_y)).normalized()
-		var left_normal_2d  = Vector2( dir_2d.y, -dir_2d.x) # 90° CCW in frontend Y-down space
-		var right_normal_2d = Vector2(-dir_2d.y,  dir_2d.x) # 90° CW
+		var left_normal_2d = Vector2(dir_2d.y, -dir_2d.x) # 90° CCW in frontend Y-down space
+		var right_normal_2d = Vector2(-dir_2d.y, dir_2d.x) # 90° CW
 
 		var align_offset_2d = Vector2.ZERO
 		if alignment == "left":

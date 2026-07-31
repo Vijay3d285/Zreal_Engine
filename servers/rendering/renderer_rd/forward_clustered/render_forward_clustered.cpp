@@ -1917,8 +1917,19 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 	if (p_rt_state->oidn_denoise_done ||
 			p_rt_state->accum_frame < p_accum_target ||
 			!p_rt_state->accum_enabled) {
+		// DIAG: log why we skipped (only first few frames, to confirm the gate values).
+		// NOTE: Godot vformat supports only %d/%s/%f/%x/%c — NOT %u nor %.4f precision.
+		if (p_rt_state->accum_frame < 5 || p_rt_state->accum_frame == p_accum_target) {
+			print_line(vformat("[OIDN-DIAG] skip: done=%d accum_frame=%d target=%d accum_enabled=%d",
+					(int)p_rt_state->oidn_denoise_done, (int)p_rt_state->accum_frame,
+					(int)p_accum_target, (int)p_rt_state->accum_enabled));
+		}
 		return;
 	}
+	print_line(vformat("[OIDN-DIAG] FIRE: accum_frame=%d target=%d dims=%dx%d",
+			(int)p_rt_state->accum_frame, (int)p_accum_target,
+			(int)p_rb->get_internal_size().width, (int)p_rb->get_internal_size().height));
+
 
 	// The factory returns a null Ref when the raycaster_oidn module isn't linked; in that
 	// case we just keep the raw converged image (no denoise).
@@ -2023,11 +2034,26 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		}
 
 		// Run the RT filter in place on color_f.
+		// DIAG: capture a center-pixel before-sample so we can compare to the OIDN output and
+		// confirm the filter actually changes the image (rules out "output discarded" silently).
+		const size_t diag_px = (size_t)(height / 2) * width + (width / 2);
+		const float diag_in_r = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 0] : -1.0f;
+		const float diag_in_g = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 1] : -1.0f;
+		const float diag_in_b = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 2] : -1.0f;
+		print_line(vformat("[OIDN-DIAG] view=%d albedo=%d normal=%d | accum_bytes=%d albedo_bytes=%d normal_bytes=%d",
+				(int)v, (int)has_albedo, (int)has_normal,
+				(int)accum_bytes.size(), (int)albedo_bytes.size(), (int)normal_bytes.size()));
 		bool ok = denoiser->denoise_rt(width, height,
 				color_f.ptrw(),
 				has_albedo ? albedo_f.ptr() : nullptr,
 				has_normal ? normal_f.ptr() : nullptr,
 				(int)p_accum_target);
+
+		const float diag_out_r = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 0] : -1.0f;
+		const float diag_out_g = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 1] : -1.0f;
+		const float diag_out_b = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 2] : -1.0f;
+		print_line(vformat("[OIDN-DIAG] view=%d ok=%d | center in=(%f,%f,%f) out=(%f,%f,%f)",
+				(int)v, (int)ok, diag_in_r, diag_in_g, diag_in_b, diag_out_r, diag_out_g, diag_out_b));
 
 		ERR_CONTINUE_MSG(!ok, "OIDN final-denoise failed; keeping raw converged image for this view.");
 
@@ -2199,6 +2225,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// temporal reconstruction. The accumulate-OFF path keeps the full upscaler.
 	bool rt_accumulate_active = false;
 	bool rt_oidn_active = false;
+	bool rt_dlss_rr_final_active = false;
 	uint32_t rt_accum_target = 0;
 	if (scene_features.rt && p_render_data && p_render_data->environment.is_valid()) {
 		const float *env_params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
@@ -2206,15 +2233,19 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			rt_accumulate_active = true;
 			scale_type = SCALE_NONE;
 			using_taa = false;
-			// Phase F: OIDN one-shot final-denoise only makes sense on the converged
-			// accumulator (requires accumulate ON). Capture the target frame count so the
-			// denoise fires once after convergence rather than every converging frame.
+			// Phase F: OIDN one-shot final-denoise / Phase F2: DLSS-RR "reconstruct final"
+			// only make sense on the converged accumulator (requires accumulate ON).
+			// Capture the target frame count so the final pass fires after convergence
+			// (OIDN once; DLSS-RR warmup start).
 			if (env_params[RSE::PT_PARAM_OIDN_FLAG] >= 0.5f) {
 				rt_oidn_active = true;
+			}
+			if (env_params[RSE::PT_PARAM_DLSS_RR_FINAL_FLAG] >= 0.5f) {
+				rt_dlss_rr_final_active = true;
+			}
+			if (rt_oidn_active || rt_dlss_rr_final_active) {
 				// Accumulation target is environment-authored into the params buffer
-				// (PT_PARAM_ACCUM_TARGET, pack at scene/resources/environment.cpp), so the RT
-				// render path knows when the running-average accumulator has converged enough to
-				// fire the one-shot OIDN final-denoise once.
+				// (PT_PARAM_ACCUM_TARGET, pack at scene/resources/environment.cpp).
 				rt_accum_target = (uint32_t)env_params[RSE::PT_PARAM_ACCUM_TARGET];
 				if (rt_accum_target == 0) {
 					rt_accum_target = 64; // safe default if the Environment left it unset.
@@ -2401,10 +2432,31 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		const bool fog_enabled = p_render_data && p_render_data->environment.is_valid() && environment_get_fog_enabled(p_render_data->environment);
 		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled);
 
+		// The albedo + normal AOVs the final-denoise passes need are written by the path-tracer
+		// shader only under #ifdef DLSS_RR_ENABLED (raytracing_closest_hit_common_inc.glsl:483),
+		// a COMPILE-TIME shader variant driven by RT_FLAG_DLSS_RR_ENABLED. If the env denoiser is
+		// not DLSS_RR (the staged render pipeline ships denoiser=0) the flag is off, so the AOVs
+		// are NEVER WRITTEN and OIDN ran color-only → over-smoothed fabric/panel/lamp detail
+		// ([OIDN-DIAG] albedo=0 normal=0 in urbantestdark35/36). DLSS_RR's shader code only writes
+		// SEPARATE AOV images (no radiance change), so forcing the flag when any final-denoise
+		// pass is active is safe for the beauty image and guarantees the AOVs are allocated + written.
+		// Both OIDN (Phase F) and DLSS-RR "reconstruct final" (Phase F2) consume these AOVs.
+		if (rt_oidn_active || rt_dlss_rr_final_active) {
+			rt_flags |= SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED;
+		}
+
 		const bool dlss_rr_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED) != 0;
-		if (dlss_rr_enabled) {
+		// The DLSS-RR diffuse_albedo + normal_roughness AOVs are the guide images OIDN's RT
+		// final-denoise and DLSS-RR reconstruct both need. The RT shader writes BOTH every
+		// accumulate frame (p_is_sample_zero=true, Phase A) under DLSS_RR_ENABLED — which we
+		// force on above when a final pass is active. `final_needs_aovs` is a belt-and-suspenders
+		// guard in case the flag forcing is ever path-dependent.
+		const bool final_needs_aovs = (rt_oidn_active || rt_dlss_rr_final_active);
+		if (dlss_rr_enabled || final_needs_aovs) {
 			rb_data->dlss_rr_ensure_buffers();
-			scene_features.set(SCENE_FEATURE_DEPTH_RECONSTRUCT);
+			if (dlss_rr_enabled) {
+				scene_features.set(SCENE_FEATURE_DEPTH_RECONSTRUCT);
+			}
 		} else if (rb_data->dlss_rr_has_buffers()) {
 			rb_data->dlss_rr_free_buffers();
 		}
@@ -3093,6 +3145,171 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_begin_label("RT OIDN Re-blit Denoised -> Internal");
 			raytracing->copy_output_texture(p_render_data);
 			RD::get_singleton()->draw_command_end_label();
+		}
+	}
+
+	// Phase F2: DLSS Ray Reconstruction (DLSS-RR) "reconstruct final" over the converged
+	// accumulator — the neural *reconstructive* final pass. DLSS-RR rebuilds plausible
+	// fabric weave / specular / refraction / clean edges from the albedo+normal AOVs, the
+	// detail OIDN's spatial filter physically cannot invent. Runs in 1:1 DLAA mode (no
+	// upscaling; ensure_dlss -> create_context(internal_size, target_size) which are equal
+	// under accumulate's SCALE_NONE). DLSS-RR is TEMPORAL, so for a still capture we feed it
+	// the SAME converged accumulator image over N warmup frames: reset=true on the first
+	// warmup frame flushes history (the reconstruction network still runs on the AOVs), then
+	// reset=false lets the reconstructor lock onto the converged (noise-free) image. Output
+	// goes to a scratch texture, then blits into internal_texture — which is what tonemap
+	// reads under SCALE_NONE (renderer_scene_render_rd.cpp:497 use_upscaled_texture=false for
+	// native scale). Mutually exclusive with the OIDN block above (both stay compiled).
+	// Best-effort: if DLSS DLLs aren't ready / 1:1 DLAA rejected, the raw converged image
+	// (already in internal_texture via copy_output_texture, line ~2900) survives untouched.
+	if (rb_data.is_valid() && rt_dlss_rr_final_active && raytracing && dlss_effect && rb_data->dlss_rr_has_buffers()) {
+		RendererSceneRenderImplementation::RTViewportState *rt_state =
+				raytracing->_get_viewport_state(p_render_data);
+		// Gate mirrors OIDN's: only after convergence. Unlike OIDN, DLSS-RR is temporal and
+		// must NOT re-flush history each frame, so the warmup counter drives the dispatch
+		// lifecycle; dlss_rr_final_done stops it after warmup completes.
+		const bool converged = rt_state && rt_state->accum_enabled &&
+				rt_state->accum_frame >= rt_accum_target;
+		const bool was_done = rt_state && rt_state->dlss_rr_final_done;
+		if (rt_state && converged && !was_done) {
+			// Begin warmup on the first converged frame.
+			static const int DLSS_RR_WARMUP = 16;
+			if (rt_state->dlss_rr_warmup_left <= 0) {
+				rt_state->dlss_rr_warmup_left = DLSS_RR_WARMUP;
+			}
+			// reset=true ONLY on the first warmup frame (flush history); false after so the
+			// reconstructor accumulates converged frames.
+			const bool reset = (rt_state->dlss_rr_warmup_left == DLSS_RR_WARMUP);
+			const int warmup_left_pre = rt_state->dlss_rr_warmup_left;
+
+			RD::get_singleton()->draw_command_begin_label("RT DLSS-RR Reconstruct Final");
+			rb_data->ensure_dlss(dlss_effect);
+			// CRITICAL: clear DLSS's internal `delay` warmup (DLSSContext::delay, default 8, see
+			// dlss.cpp:211-215). On the first `delay` upscale() calls DLSS returns EARLY and does
+			// NOTHING (no mvec decode, no tagging, no slEvaluateFeature). With delay=8, 8 of our
+			// warmup frames were no-ops AND our `reset=true` on frame 1 landed on a frame where
+			// DLSS skipped -> history never flushed that frame; the first frame DLSS actually ran
+			// (frame 9) got reset=false -> it started from stale/uninitialized Streamline history
+			// -> corrupt reconstruction -> grainy output (urbantestdark46, no denoise). The delay
+			// exists for MovieWriter video frame-token lifecycle (dlss.h:73); for a static still
+			// where copy_output_texture already established Streamline's token lifecycle each
+			// frame, it is not needed. Zero it so DLSS evaluates on EVERY warmup frame and our
+			// reset=true on frame 1 actually flushes history while DLSS is active.
+			RendererRD::DLSSContext *dlss_ctx = rb_data->get_dlss_context();
+			if (dlss_ctx) {
+				dlss_ctx->delay = 0;
+			}
+			// DLSS binds depth + velocity unconditionally (dlss.cpp:464-465), but
+			// assignResource skips null RIDs (dlss.cpp:305-307). Under accumulate motion vectors
+			// weren't requested, so ensure a (zeroed) velocity buffer: zero contents + identity
+			// reprojection are valid under reset=true, and during reset=false warmup zero motion
+			// = "static camera" = correct for a still.
+			rb->ensure_velocity();
+
+			RID exposure;
+			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
+				exposure = luminance->get_current_luminance_buffer(rb);
+			}
+			// Scratch output texture (persisted across warmup frames): same format as the RT
+			// color. We can NOT reuse the upscaled_texture — it isn't allocated under SCALE_NONE
+			// (has_upscaled_texture() returns false), and DLSS requires color != output
+			// (dlss.cpp:462-463 tag them as separate ScalingInputColor/ScalingOutputColor).
+			const Size2i internal_size = rb->get_internal_size();
+			const uint32_t view_count = rb->get_view_count();
+			static const StringName DLSSRR_OUT_NAME = SNAME("rt_dlss_rr_out");
+			if (!rb->has_texture(RB_SCOPE_FORWARD_CLUSTERED, DLSSRR_OUT_NAME)) {
+				// DLSS writes output as a storage image (STORAGE_BIT); we then read it back as a
+				// copy SOURCE into internal_texture (CAN_COPY_FROM_BIT — the blit needs this, and
+				// it was missing, causing "Source texture requires CAN_COPY_FROM_BIT to be
+				// retrieved" each warmup frame so the reconstructed result never landed).
+				uint32_t out_usage = RD::TEXTURE_USAGE_SAMPLING_BIT |
+						(rb->get_can_be_storage() ? RD::TEXTURE_USAGE_STORAGE_BIT : 0) |
+						RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT |
+						RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+				rb->create_texture(RB_SCOPE_FORWARD_CLUSTERED, DLSSRR_OUT_NAME,
+						RD::DATA_FORMAT_R16G16B16A16_SFLOAT, out_usage, RD::TEXTURE_SAMPLES_1);
+			}
+
+			for (uint32_t v = 0; v < view_count; v++) {
+				real_t fov = p_render_data->scene_data->cam_projection.get_fov();
+				real_t aspect = p_render_data->scene_data->cam_projection.get_aspect();
+				real_t fovy = p_render_data->scene_data->cam_projection.get_fovy(fov, aspect);
+				// No TAA jitter under accumulate; feed zero so DLSS-RR sees a static frame.
+				Vector2 jitter = Vector2(0.0f, 0.0f);
+				RendererRD::DLSSContext::Parameters params;
+				params.context = rb_data->get_dlss_context();
+				params.internal_size = internal_size;
+				params.sharpness = 0.0f;
+				// color holds the converged accumulator (copy_output_texture, line ~2900).
+				params.color = rb->get_internal_texture(v);
+				params.depth = rb->get_depth_texture(v); // RT depth copy, filled every trace.
+				params.velocity = rb->get_velocity_buffer(false, v);
+				params.reactive = RID();
+				params.exposure = exposure;
+				// 1:1 DLAA: single-layer-per-view scratch output (default layers = view_count).
+				params.output = rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, DLSSRR_OUT_NAME, v, 0);
+				params.dlss_g = rb->get_frame_generation();
+				params.preset = '?'; // engine default -> DLSS-RR default preset.
+				params.z_near = p_render_data->scene_data->z_near;
+				params.z_far = p_render_data->scene_data->z_far;
+				params.fovy = fovy;
+				params.jitter = jitter;
+				params.delta_time = float(time_step);
+				params.reset_accumulation = reset; // first true assignment in the repo.
+
+				// Four AOVs the RT shader populated this frame under forced RT_FLAG_DLSS_RR_ENABLED.
+				params.dlss_rr = true;
+				params.dlss_rr_alpha_upscaling = false;
+				params.dlss_rr_diffuse_albedo = rb_data->dlss_rr_get_diffuse_albedo();
+				params.dlss_rr_specular_albedo = rb_data->dlss_rr_get_specular_albedo();
+				params.dlss_rr_normal_roughness = rb_data->dlss_rr_get_normal_roughness();
+				params.dlss_rr_specular_hit_dist = rb_data->dlss_rr_get_specular_hit_dist();
+
+				// Static still: prev camera == current -> reprojection collapses to identity.
+				Projection correction;
+				correction.set_depth_correction(true, true, false);
+				const Projection &prev_proj = p_render_data->scene_data->prev_cam_projection;
+				const Projection &cur_proj = p_render_data->scene_data->cam_projection;
+				const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
+				const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
+				params.reprojection = (correction * prev_proj) * prev_transform.affine_inverse() * cur_transform * (correction * cur_proj).inverse();
+				params.cam_projection = cur_proj;
+				params.cam_transform = cur_transform;
+
+				dlss_effect->upscale(params);
+			}
+			RD::get_singleton()->draw_command_end_label();
+
+			// Blit DLSS-RR output -> internal_texture so tonemap (reads internal_texture under
+			// SCALE_NONE) + the Phase A blit + the captured PNG see the reconstructed image.
+			// NOTE: use copy_effects->copy_to_rect (a GPU draw -> dst attachment), NOT
+			// RD::texture_copy. internal_texture does NOT have TEXTURE_USAGE_CAN_COPY_TO_BIT (it is
+			// a render-pass target attachment, not a copy-exchange surface), so texture_copy(dst)
+			// fails with "Destination texture requires CAN_COPY_TO_BIT to be retrieved" every frame
+			// and the reconstructed image never lands. copy_to_rect is exactly what the proven
+			// copy_output_texture path uses to blit RT color -> internal_texture (render_raytracing.cpp:3334-3348).
+			RD::get_singleton()->draw_command_begin_label("RT DLSS-RR Blit Reconstructed -> Internal");
+			for (uint32_t v = 0; v < view_count; v++) {
+				copy_effects->copy_to_rect(
+						rb->get_texture_slice(RB_SCOPE_FORWARD_CLUSTERED, DLSSRR_OUT_NAME, v, 0),
+						rb->get_internal_texture(v),
+						Rect2i(0, 0, internal_size.width, internal_size.height),
+						false, false, false, false, false, true);
+			}
+			RD::get_singleton()->draw_command_end_label();
+
+			// Advance the warmup state machine: last warmup frame marks done so we stop.
+			rt_state->dlss_rr_warmup_left -= 1;
+			if (rt_state->dlss_rr_warmup_left <= 0) {
+				rt_state->dlss_rr_final_done = true;
+			}
+			// NOTE: Godot vformat supports only %d/%s/%f/%x/%c — NOT %u nor %.4f.
+			print_line(vformat("[DLSS-RR-DIAG] warmup_left=%d reset=%d dims=%dx%d done_after=%d delay=%d ready=%d",
+					warmup_left_pre, (int)reset,
+					(int)internal_size.width, (int)internal_size.height,
+					(int)rt_state->dlss_rr_final_done,
+					(dlss_ctx ? dlss_ctx->delay : -1),
+					(int)(dlss_effect->is_ready(rb_data->get_dlss_context()))));
 		}
 	}
 

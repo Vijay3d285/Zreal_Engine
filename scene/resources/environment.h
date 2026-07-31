@@ -208,6 +208,13 @@ private:
 	// raycaster_oidn module to be built (`oidn=yes`) and the OIDN runtime DLLs present
 	// next to the editor binary. Default off so the raw-converge path is unchanged.
 	bool pathtracing_oidn_denoise = false;
+	// When true (and accumulate is on), run DLSS Ray Reconstruction (DLSS-RR) in 1:1 DLAA
+	// mode as the final pass over the converged accumulator, warmed up over several
+	// frames, so the neural reconstructor rebuilds fabric/edge/refraction detail the
+	// OIDN spatial filter cannot. Mutually exclusive with `pathtracing_oidn_denoise`
+	// (the render path prefers DLSS-RR-final when both are set). Requires the Streamline
+	// DLSS-D DLLs already shipped for the realtime DLSS path. Default off.
+	bool pathtracing_dlss_rr_final = false;
 	void _update_pathtracing();
 
 	// Glow
@@ -414,6 +421,8 @@ public:
 	int get_pathtracing_accumulation_target() const;
 	void set_pathtracing_oidn_denoise(bool p_oidn);
 	bool is_pathtracing_oidn_denoise() const;
+	void set_pathtracing_dlss_rr_final(bool p_dlss_rr);
+	bool is_pathtracing_dlss_rr_final() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

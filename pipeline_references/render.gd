@@ -343,10 +343,29 @@ func render_image(data, output_path):
 	var accumulate_enabled = env != null and env.environment != null and env.environment.pathtracing_accumulate
 	var accum_target = env.environment.pathtracing_accumulation_target if accumulate_enabled else 0
 	var oidn_enabled = env != null and env.environment != null and env.environment.pathtracing_oidn_denoise
-	# OIDN final-denoise only runs on the converged accumulator, so it implies accumulate-on.
-	# If the user enabled OIDN without accumulate, force accumulate on so the running-average
-	# accumulator converges and OIDN has something stable to denoise.
-	if oidn_enabled and not accumulate_enabled:
+	# DLSS-RR "reconstruct final" (Phase F2): a neural *reconstructive* final pass on the
+	# converged accumulator (1:1 DLAA, warmed up over several frames). Mutually exclusive
+	# with OIDN — the C++ render path prefers DLSS-RR-final when both are set.
+	var dlss_rr_final_enabled = env != null and env.environment != null and env.environment.pathtracing_dlss_rr_final
+	# DLSS-RR REALTIME STILL path (the intended high-quality still route): accumulate OFF +
+	# denoiser=DLSS Ray Reconstruction (1) + Viewport.SCALING_3D_MODE_DLSS @ scale 1.0 (DLAA).
+	# DLSS-RR is a NEURAL TEMPORAL denoiser — it cleans noise by accumulating info across frames
+	# on the raw 1-SPP noisy input (per RenderingServer docs, "low sample count is sufficient
+	# since the denoiser accumulates information across frames"). So we drive enough frames for
+	# that temporal accumulation to converge to a clean, detail-reconstructed still, then capture.
+	# Feeding DLSS-RR the converged image instead gives it nothing to accumulate (Phase F2 dead end).
+	var dlss_rr_realtime = env != null and env.environment != null and not env.environment.pathtracing_accumulate and env.environment.pathtracing_denoiser == 1
+	# Number of driver frames to let the realtime DLSS-RR temporal accumulator converge for a still.
+	# 256 (~256 effective samples via temporal integration) gives a clean result; bump to 512 for hero.
+	const DLSS_RR_REALTIME_STILL_FRAMES = 256
+	# Number of warmup frames to feed DLSS-RR after convergence so its temporal history
+	# locks onto the converged image (reset=true frame 1, reset=false after). Cheap — each
+	# warmup frame re-blends the same converged image, letting the reconstructor settle.
+	const DLSS_RR_WARMUP_FRAMES = 16
+	# A final-denoise pass only runs on the converged accumulator, so it implies accumulate-on.
+	# If the user enabled a final pass without accumulate, force accumulate on so the
+	# running-average accumulator converges and the final pass has something stable to work on.
+	if (oidn_enabled or dlss_rr_final_enabled) and not accumulate_enabled:
 		env.environment.pathtracing_accumulate = true
 		accumulate_enabled = true
 		accum_target = env.environment.pathtracing_accumulation_target
@@ -365,27 +384,44 @@ func render_image(data, output_path):
 				# blends one 1-SPP sample into the running average, so waiting N
 				# frames yields ~N effective samples (noise ~1/sqrt(N)). Give the
 				# denoiser its warm-up too.
-				# Phase F: if OIDN final-denoise is on, drive one extra frame past
-				# the target so the in-process OIDN `RT` filter (which fires in the
-				# C++ render path once accum_frame >= target) has actually rendered
-				# once before we grab the PNG.
-				var drive_frames = accum_target + (1 if oidn_enabled else 0)
+				# Phase F2: if DLSS-RR reconstruct-final is on, drive ~16 extra frames
+				# past the target so the DLSS-RR one-shot dispatch (which fires in the C++
+				# render path once accum_frame >= target) warms its temporal history and
+				# produces the reconstructed frame before we grab the PNG. OIDN (Phase F)
+				# only needs +1 (non-temporal, runs once).
+				var final_frames = (DLSS_RR_WARMUP_FRAMES if dlss_rr_final_enabled else (1 if oidn_enabled else 0))
+				var drive_frames = accum_target + final_frames
+				var final_note = (" (+%d for DLSS-RR reconstruct warmup)" % DLSS_RR_WARMUP_FRAMES) if dlss_rr_final_enabled else (" (+1 for OIDN final-denoise)" if oidn_enabled else "")
 				print("[Render] Accumulating %d frames for path-tracer convergence%s..." %
-						[accum_target, " (+1 for OIDN final-denoise)" if oidn_enabled else ""])
+						[accum_target, final_note])
 				await _wait_frames(drive_frames)
 			else:
-				print("[Render] Waiting 80 frames for SDFGI and TAA warm-up...")
-				await _wait_frames(80)
+				# No Phase-A accumulator. If the realtime DLSS-RR denoiser is on it IS the
+				# temporal accumulator — drive ~256 frames so its across-frame noise integration
+				# converges to a clean reconstructed still, then capture. Otherwise just SDFGI warmup.
+				if dlss_rr_realtime:
+					print("[Render] Driving %d frames of realtime DLSS Ray Reconstruction (1-SPP/frame temporal denoising) for still convergence..." % DLSS_RR_REALTIME_STILL_FRAMES)
+					await _wait_frames(DLSS_RR_REALTIME_STILL_FRAMES)
+				else:
+					print("[Render] Waiting 80 frames for SDFGI and TAA warm-up...")
+					await _wait_frames(80)
 		else:
 			# Night renders need more frames for SDFGI GI to converge and propagate
 			# bounce light from spotlights up to the ceiling. 5 frames is too few.
 			if accumulate_enabled:
-				var drive_frames_n = accum_target + (1 if oidn_enabled else 0)
+				var final_frames_n = (DLSS_RR_WARMUP_FRAMES if dlss_rr_final_enabled else (1 if oidn_enabled else 0))
+				var drive_frames_n = accum_target + final_frames_n
+				var final_note_n = (" (+%d for DLSS-RR reconstruct warmup)" % DLSS_RR_WARMUP_FRAMES) if dlss_rr_final_enabled else (" (+1 for OIDN final-denoise)" if oidn_enabled else "")
 				print("[Render] Accumulating %d frames for path-tracer convergence%s..." %
-						[accum_target, " (+1 for OIDN final-denoise)" if oidn_enabled else ""])
+						[accum_target, final_note_n])
 				await _wait_frames(drive_frames_n)
 			else:
-				await _wait_frames(40)
+				# No Phase-A accumulator. Realtime DLSS-RR = temporal accumulator → drive still frames.
+				if dlss_rr_realtime:
+					print("[Render] Driving %d frames of realtime DLSS Ray Reconstruction (1-SPP/frame temporal denoising) for still convergence..." % DLSS_RR_REALTIME_STILL_FRAMES)
+					await _wait_frames(DLSS_RR_REALTIME_STILL_FRAMES)
+				else:
+					await _wait_frames(40)
 
 	var img = await _capture_viewport_image(6)
 	if img:
@@ -398,8 +434,10 @@ func render_image(data, output_path):
 		# once the readback is exposed this is where it would be emitted alongside
 		# the PNG. See PATH_TRACER_QUALITY_ROADMAP.md Phase A.
 		if accumulate_enabled:
-			var denoise_note = " with in-process OIDN final-denoise" if oidn_enabled else ""
+			var denoise_note = " with in-process OIDN final-denoise" if oidn_enabled else (" with DLSS-RR reconstruct-final" if dlss_rr_final_enabled else "")
 			print("[Render] Accumulated still captured%s (PNG, tonemapped). Linear EXR export pending C++ readback hook." % denoise_note)
+		elif dlss_rr_realtime:
+			print("[Render] Realtime DLSS-RR still captured (PNG, tonemapped) — %d-frame temporal accumulation." % DLSS_RR_REALTIME_STILL_FRAMES)
 
 	save_logs(data, output_path)
 	get_tree().quit(0)

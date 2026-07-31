@@ -3025,6 +3025,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			p_state->accum_reset_pending = true;
 			p_state->accum_frame = 0;
 			p_state->oidn_denoise_done = false; // a new convergence cycle must re-denoise.
+			p_state->dlss_rr_warmup_left = 0; // Phase F2: re-warm DLSS-RR final next cycle.
+			p_state->dlss_rr_final_done = false;
 		}
 		if (accum_enabled) {
 			bool need_reset = false;
@@ -3047,6 +3049,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				p_state->accum_frame = 0;
 				p_state->accum_reset_pending = true;
 				p_state->oidn_denoise_done = false; // view changed → invalidate the prior denoise.
+				p_state->dlss_rr_warmup_left = 0; // Phase F2: re-warm DLSS-RR final next cycle.
+				p_state->dlss_rr_final_done = false;
 			}
 		} else {
 			// One-shot mode: not accumulating; keep the running index at 0 so the
@@ -3054,6 +3058,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			p_state->accum_frame = 0;
 			p_state->accum_reset_pending = false;
 			p_state->oidn_denoise_done = false; // no accumulation → no final-denoise to remember.
+			p_state->dlss_rr_warmup_left = 0; // Phase F2: no accumulation → no DLSS-RR warmup.
+			p_state->dlss_rr_final_done = false;
 		}
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame);

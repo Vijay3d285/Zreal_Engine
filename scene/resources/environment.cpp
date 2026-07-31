@@ -677,6 +677,15 @@ bool Environment::is_pathtracing_oidn_denoise() const {
 	return pathtracing_oidn_denoise;
 }
 
+void Environment::set_pathtracing_dlss_rr_final(bool p_dlss_rr) {
+	pathtracing_dlss_rr_final = p_dlss_rr;
+	_update_pathtracing();
+}
+
+bool Environment::is_pathtracing_dlss_rr_final() const {
+	return pathtracing_dlss_rr_final;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(environment, pathtracing_enabled);
 
@@ -690,6 +699,7 @@ void Environment::_update_pathtracing() {
 	// PT_PARAM_ACCUM_FRAMES is driver-injected per launch; leave 0 here.
 	params.write[RSE::PT_PARAM_OIDN_FLAG] = pathtracing_oidn_denoise ? 1.0f : 0.0f;
 	params.write[RSE::PT_PARAM_ACCUM_TARGET] = (float)pathtracing_accumulation_target;
+	params.write[RSE::PT_PARAM_DLSS_RR_FINAL_FLAG] = pathtracing_dlss_rr_final ? 1.0f : 0.0f;
 	RS::get_singleton()->environment_set_pathtracing_params(environment, params);
 }
 
@@ -1538,6 +1548,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_accumulation_target"), &Environment::get_pathtracing_accumulation_target);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_oidn_denoise", "oidn"), &Environment::set_pathtracing_oidn_denoise);
 	ClassDB::bind_method(D_METHOD("is_pathtracing_oidn_denoise"), &Environment::is_pathtracing_oidn_denoise);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_dlss_rr_final", "dlss_rr"), &Environment::set_pathtracing_dlss_rr_final);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_dlss_rr_final"), &Environment::is_pathtracing_dlss_rr_final);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_pathtracing_enabled", "is_pathtracing_enabled");
@@ -1548,6 +1560,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_accumulate"), "set_pathtracing_accumulate", "is_pathtracing_accumulate");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_accumulation_target", PROPERTY_HINT_RANGE, "1,8192,1"), "set_pathtracing_accumulation_target", "get_pathtracing_accumulation_target");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_oidn_denoise"), "set_pathtracing_oidn_denoise", "is_pathtracing_oidn_denoise");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_dlss_rr_final"), "set_pathtracing_dlss_rr_final", "is_pathtracing_dlss_rr_final");
 
 	// Glow
 

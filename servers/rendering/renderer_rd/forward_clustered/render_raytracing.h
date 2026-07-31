@@ -338,6 +338,15 @@ struct RTViewportState {
 	// false on the same events that clear the accumulator (camera move / resize / accumulate
 	// toggle) so the next convergence cycle denoises again.
 	bool oidn_denoise_done = false;
+	// Phase F2: DLSS-RR "reconstruct final" warmup bookkeeping. DLSS-RR is temporal, so to
+	// capture a high-quality still we feed it the SAME converged accumulator image over N
+	// warmup frames: reset=true on the first warmup frame (flushes history), then reset=false
+	// for the rest so the neural reconstructor's history accumulates converged (noise-free)
+	// frames. `dlss_rr_warmup_left` counts down to 0; once 0, `dlss_rr_final_done` stops the
+	// per-frame dispatch so tonemap/capture freeze at the warmed result. Reset to {0, false}
+	// on the same events that clear the accumulator so each convergence cycle re-warms.
+	int dlss_rr_warmup_left = 0;
+	bool dlss_rr_final_done = false;
 };
 
 class RenderRaytracing {

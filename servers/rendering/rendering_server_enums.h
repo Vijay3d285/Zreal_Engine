@@ -779,7 +779,14 @@ enum PathtracingParamIndex {
 	// capture loop drives to. Read by the RT render path to know when the accumulator has
 	// converged enough to fire the one-shot OIDN final-denoise. Packed on the Environment.
 	PT_PARAM_ACCUM_TARGET = 7,
-	// Indices 8-13 reserved for future use.
+	// PT_PARAM_DLSS_RR_FINAL_FLAG: 1.0 = instead of OIDN, run DLSS Ray Reconstruction
+	// (DLSS-RR) in 1:1 DLAA mode as the final pass on the converged accumulator, warmed
+	// up over several frames (reset on frame 1) so the neural reconstructor gets its
+	// temporal lock and rebuilds fabric/edge/refraction detail OIDN's spatial filter
+	// cannot. Only honored when PT_PARAM_ACCUM_FLAG is set. Mutually exclusive with
+	// PT_PARAM_OIDN_FLAG (the render path prefers DLSS-RR-final when both are set).
+	PT_PARAM_DLSS_RR_FINAL_FLAG = 8,
+	// Indices 9-13 reserved for future use.
 	PT_PARAM_LIGHT_COUNT = 14,
 	PT_PARAM_FRAME_INDEX = 15,
 };

@@ -96,7 +96,20 @@ bool OIDNDenoiser::denoise_rt(int p_width, int p_height,
 
 	// Scene-linear HDR radiance: input and output are untonemapped, may exceed 1.0.
 	oidnSetFilterBool(filter, "hdr", true);
-	// RT filter expects physically meaningful radiance; disable post-denoise clean-up of aux.
+	// cleanAux=true means "trust the albedo/normal guides as-is (they are clean, no prefilter)."
+	// cleanAux=false means "guides may be noisy/aliased, prefilter them first."
+	//
+	// Our guides ARE deterministic G-buffers from an UN-JITTERED primary ray (scene_raytracing_
+	// raygen.glsl uses pixel_center = pixel + 0.5 with inv_view/inv_projection directly, no TAA
+	// jitter). So per-frame they are stable — but they are a SINGLE sample per pixel with no
+	// anti-aliasing: a high-frequency texture (sofa fabric, TV wall panel weave) sampled at one
+	// sub-pixel uv produces ALIASED/stair-stepped guide albedo + normal-map-perturbed normals.
+	// Feeding that raw to OIDN (cleanAux=true) made run-32 WORSE than run-27 — OIDN over-smoothed
+	// the color where the aliased guide looked ambiguous, flattening the TV panel fabric.
+	// Keeping cleanAux=false lets OIDN prefilter the aliased guides, which looked better (run-27).
+	// The remaining over-smoothing in run-27 is the COLOR noise at low SPP, fixed by raising the
+	// accumulation target (less radiance residual → OIDN preserves more detail). See memory note
+	// pt-oidn-cleanaux-worldspace-normal.
 	oidnSetFilterBool(filter, "cleanAux", false);
 
 	(void)p_input_spp; // OIDN RT filter has no per-call SPP parameter; reserved for future calibration.
