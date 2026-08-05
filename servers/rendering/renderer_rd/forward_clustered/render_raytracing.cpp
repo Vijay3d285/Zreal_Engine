@@ -2865,7 +2865,12 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.position[0] = xform.origin.x;
 		ld.position[1] = xform.origin.y;
 		ld.position[2] = xform.origin.z;
-		ld.type = (type == RSE::LIGHT_SPOT) ? RT_LIGHT_TYPE_SPOT : RT_LIGHT_TYPE_OMNI;
+		float spot_angle_deg = (type == RSE::LIGHT_SPOT) ? ls->light_get_param(base, RSE::LIGHT_PARAM_SPOT_ANGLE) : 0.0f;
+		if (type == RSE::LIGHT_SPOT && spot_angle_deg >= 179.9f) {
+			ld.type = RT_LIGHT_TYPE_RECT;
+		} else {
+			ld.type = (type == RSE::LIGHT_SPOT) ? RT_LIGHT_TYPE_SPOT : RT_LIGHT_TYPE_OMNI;
+		}
 
 		Color linear_col = ls->light_get_color(base).srgb_to_linear();
 		float energy = compute_light_energy(base, type);
@@ -2885,20 +2890,43 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.specular_amount = ls->light_get_param(base, RSE::LIGHT_PARAM_SPECULAR) * 2.0f; // Matches rasterizer convention (light_storage.cpp), normalizes 0.5 default to 1.0.
 		ld.indirect_energy = ls->light_get_param(base, RSE::LIGHT_PARAM_INDIRECT_ENERGY);
 
-		if (type == RSE::LIGHT_SPOT) {
+		if (ld.type == RT_LIGHT_TYPE_RECT) {
+			Vector3 local_x = xform.basis.get_column(0).normalized();
+			Vector3 local_y = xform.basis.get_column(1).normalized();
+			float hw = ls->light_get_param(base, RSE::LIGHT_PARAM_SIZE); // half-width
+			float hh = ls->light_get_param(base, RSE::LIGHT_PARAM_SPOT_ATTENUATION); // half-height
+			Vector3 axisU = local_x * hw;
+			Vector3 axisV = local_y * hh;
+			ld.spot_direction[0] = axisU.x;
+			ld.spot_direction[1] = axisU.y;
+			ld.spot_direction[2] = axisU.z;
+			ld.rect_axis_v[0] = axisV.x;
+			ld.rect_axis_v[1] = axisV.y;
+			ld.rect_axis_v[2] = axisV.z;
+			ld.rect_half_height = hh;
+			ld.cos_spot_angle = 0.0f;
+			ld.inv_spot_attenuation = 0.0f;
+		} else if (ld.type == RT_LIGHT_TYPE_SPOT) {
 			ld.inv_spot_attenuation = 1.0f / MAX(0.001f, ls->light_get_param(base, RSE::LIGHT_PARAM_SPOT_ATTENUATION));
-			float spot_angle_deg = ls->light_get_param(base, RSE::LIGHT_PARAM_SPOT_ANGLE);
 			ld.cos_spot_angle = Math::cos(Math::deg_to_rad(spot_angle_deg));
 			Vector3 spot_dir = -xform.basis.get_column(2).normalized();
 			ld.spot_direction[0] = spot_dir.x;
 			ld.spot_direction[1] = spot_dir.y;
 			ld.spot_direction[2] = spot_dir.z;
+			ld.rect_axis_v[0] = 0.0f;
+			ld.rect_axis_v[1] = 0.0f;
+			ld.rect_axis_v[2] = 0.0f;
+			ld.rect_half_height = 0.0f;
 		} else {
 			ld.inv_spot_attenuation = 0.0f;
 			ld.cos_spot_angle = 0.0f;
 			ld.spot_direction[0] = 0.0f;
 			ld.spot_direction[1] = 0.0f;
 			ld.spot_direction[2] = 0.0f;
+			ld.rect_axis_v[0] = 0.0f;
+			ld.rect_axis_v[1] = 0.0f;
+			ld.rect_axis_v[2] = 0.0f;
+			ld.rect_half_height = 0.0f;
 		}
 		// Pack shadow_enabled for positional lights. When false, the PT shader
 		// skips shadow rays entirely — light contributes full illumination with

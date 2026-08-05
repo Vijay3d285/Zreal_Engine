@@ -124,6 +124,7 @@ static_assert(sizeof(RT_MaterialData) == 96, "RT_MaterialData must be 96 bytes f
 enum RTLightType : uint32_t {
 	RT_LIGHT_TYPE_OMNI = 0,
 	RT_LIGHT_TYPE_DIRECTIONAL = 1,
+	RT_LIGHT_TYPE_RECT = 2,
 	RT_LIGHT_TYPE_SPOT = 3,
 };
 
@@ -142,6 +143,9 @@ struct alignas(16) RT_LightData {
 	float cos_spot_angle;
 	float shadow_enabled; // 1.0 = trace shadow rays normally. 0.0 = skip shadow ray (shadowless fill light).
 	float spot_direction[3];
+	float rect_half_height; // rect: half-height scalar (0 for non-rect)
+	float rect_axis_v[3]; // rect: axisV half-height world vector
+	float _pad2;
 	int32_t ies_slot; // IES photometric profile slot index, -1 = none.
 	float ies_strength; // IES intensity multiplier.
 	// Light basis columns in world space: [0..2] = local X axis, [3..5] = local Y,
@@ -155,6 +159,7 @@ struct alignas(16) RT_LightData {
 };
 static_assert(sizeof(RT_LightData) == 128, "RT_LightData must be 128 bytes for std430");
 static_assert(offsetof(RT_LightData, ies_basis) == 84, "RT_LightData::ies_basis must sit at offset 84 to match std430");
+
 
 enum {
 	RT_LIGHTS_MAX = 64,
