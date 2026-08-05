@@ -8,6 +8,7 @@
 
 #define RT_LIGHT_TYPE_OMNI 0 // Point light with radius (soft shadows)
 #define RT_LIGHT_TYPE_DIRECTIONAL 1 // Sun/moon with angular size
+#define RT_LIGHT_TYPE_RECT 2 // Area / rectangle light
 #define RT_LIGHT_TYPE_SPOT 3 // Spot light with cone falloff
 
 // Reservoir sampling batch size for stochastic light selection.
@@ -32,8 +33,10 @@ struct RTLightData {
 	float inv_spot_attenuation; // Spot cone softness.
 	float cos_spot_angle; // Cosine of spot cone half-angle.
 	float shadow_enabled; // 1.0 = trace shadow rays, 0.0 = skip (shadowless fill). Must match C++ _pad0 position.
-	vec3 spot_direction; // Spot direction (normalized, world space).
-	float _pad1;
+	vec3 spot_direction; // Spot direction or rect axisU (half-width world vec).
+	float rect_half_height; // rect: half-height scalar (0 for non-rect)
+	vec3 rect_axis_v; // rect: axisV half-height world vector
+	float _pad2;
 };
 
 // Light buffer SSBO (binding provided by the including shader via RT_LIGHT_BUFFER_BINDING).
@@ -229,6 +232,79 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 }
 
 // ============================================================================
+// Rectangle light sampling (uniform area, NEE)
+// ============================================================================
+vec3 lights_eval_rect_light(
+		vec3 hit_pos,
+		vec3 N,
+		vec3 V,
+		RTLightData light,
+		vec2 u,
+		float light_select_pdf,
+		bool is_indirect_bounce,
+		MaterialProperties material,
+		inout uint rng_state) {
+
+	// 1. Sample random point on the quad
+	vec3 axisU = light.spot_direction; // half-width vector
+	vec3 axisV = light.rect_axis_v; // half-height vector
+	float su = u.x * 2.0 - 1.0; // [-1, 1]
+	float sv = u.y * 2.0 - 1.0;
+	vec3 sample_point = light.position + su * axisU + sv * axisV;
+
+	// 2. Direction from shading point to sample point
+	vec3 to_light = sample_point - hit_pos;
+	float dist_sq = dot(to_light, to_light);
+	float dist = sqrt(dist_sq);
+	vec3 L = to_light / max(dist, 0.0001);
+
+	// 3. Cosine of angle between shadow ray and light normal
+	vec3 light_normal = normalize(cross(axisV, axisU)); // Emit along local -Z (Godot SpotLight forward)
+	float cos_theta = dot(-L, light_normal);
+	if (cos_theta <= 1e-5) {
+		return vec3(0.0);
+	}
+
+	// 4. Check shading normal
+	float NdotL = dot(N, L);
+	if (NdotL <= 0.0) {
+		return vec3(0.0);
+	}
+
+	// 5. Area and area-to-solid-angle PDF conversion
+	float area = 4.0 * length(axisU) * length(axisV);
+	float area_pdf = 1.0 / max(area, 1e-10);
+	float solid_ang_pdf = area_pdf * dist_sq / cos_theta;
+
+	// 6. Range check
+	if (light.max_range_squared != 0.0 && dist_sq > light.max_range_squared) {
+		return vec3(0.0);
+	}
+
+	// 7. Shadow ray
+	if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, dist, rng_state)) {
+		return vec3(0.0);
+	}
+
+	// 8. Attenuation (inverse-square + windowed)
+	LightSample ls_atten;
+	ls_atten.distance_sq = dist_sq;
+	float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation);
+
+	// 9. BRDF
+	vec3 brdf_diffuse, brdf_specular;
+	evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
+	float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+	vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+
+	// 10. Combine — divide by solid angle pdf
+	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
+	vec3 radiance = light.emission / max(area, 1e-5);
+	vec3 contribution = brdf_value * radiance * atten * indirect_mul;
+	return contribution / max(light_select_pdf * solid_ang_pdf, 1e-10);
+}
+
+// ============================================================================
 // Next Event Estimation (NEE) - Direct Light Sampling
 // ============================================================================
 
@@ -256,7 +332,7 @@ vec3 lights_evaluate_direct_lighting(
 		RTLightData test_light = rt_lights[idx];
 
 		// Range check for positional lights.
-		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT);
+		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT || test_light.type == RT_LIGHT_TYPE_RECT);
 		bool is_valid = !is_positional;
 		if (!is_valid) {
 			vec3 to_l = test_light.position - hit_pos;
@@ -348,6 +424,12 @@ vec3 lights_evaluate_direct_lighting(
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
 		vec3 contribution = brdf_value * light.emission * atten * indirect_mul;
 		return contribution / max(light_select_pdf, 1e-10);
+	}
+	// === RECT LIGHT PATH ===
+	else if (light.type == RT_LIGHT_TYPE_RECT) {
+		return lights_eval_rect_light(
+				hit_pos, N, V, light, u,
+				light_select_pdf, is_indirect_bounce, material, rng_state);
 	}
 	// === CONE LIGHT PATH (directional) ===
 	else {
