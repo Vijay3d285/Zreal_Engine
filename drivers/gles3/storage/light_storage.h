@@ -443,6 +443,16 @@ public:
 	virtual uint64_t light_get_version(RID p_light) const override;
 	virtual uint32_t light_get_cull_mask(RID p_light) const override;
 
+	// IES photometric profile API — no-op stubs for GLES3.
+	// GLES3 is a rasterizer with no path tracing; IES profiles are not evaluated.
+	// These overrides satisfy the pure-virtual contract from RendererLightStorage.
+	virtual void light_set_ies_profile(RID p_light, RSE::LightIESMode p_mode,
+			const String &p_filepath, const String &p_ies_content) override {}
+	virtual void light_set_ies_strength(RID p_light, float p_strength) override {}
+	virtual int light_get_ies_slot(RID p_light) const override { return -1; }
+	virtual float light_get_ies_strength(RID p_light) const override { return 1.0f; }
+	virtual bool light_has_ies_profile(RID p_light) const override { return false; }
+
 	/* LIGHT INSTANCE API */
 
 	LightInstance *get_light_instance(RID p_rid) { return light_instance_owner.get_or_null(p_rid); }

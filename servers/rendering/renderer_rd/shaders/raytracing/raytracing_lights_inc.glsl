@@ -1,6 +1,10 @@
 // Light sampling and Next Event Estimation (NEE) for raytracing.
 // Requires: raytracing_inc.glsl, brdf_inc.glsl, tlas at binding 1, payload at location 0.
 // Note: ray_query_alpha_test() still requires GL_EXT_ray_query (used by DLSS-RR path).
+//
+// IES photometric profiles are supported via ies_lookup_inc.glsl.
+// Each RTLightData carries an ies_slot (-1 = none) and ies_strength multiplier.
+#include "ies_lookup_inc.glsl"
 
 // ============================================================================
 // Light Types and Constants
@@ -16,7 +20,7 @@
 #endif
 
 // ============================================================================
-// Light Data (matches C++ RT_LightData, 80 bytes, std430)
+// Light Data (matches C++ RT_LightData, 128 bytes, std430)
 // ============================================================================
 
 struct RTLightData {
@@ -33,8 +37,23 @@ struct RTLightData {
 	float cos_spot_angle; // Cosine of spot cone half-angle.
 	float shadow_enabled; // 1.0 = trace shadow rays, 0.0 = skip (shadowless fill). Must match C++ _pad0 position.
 	vec3 spot_direction; // Spot direction (normalized, world space).
-	float _pad1;
+	int ies_slot; // IES profile slot index (-1 = no IES).
+	float ies_strength; // IES intensity multiplier.
+	// Light basis columns in world space: [0..2] = local X, [3..5] = local Y,
+	// [6..8] = local Z. Orthonormal, so world->local is the transpose (three
+	// dot products). Used only to evaluate IES profiles in the light's frame.
+	float ies_basis[9];
+	float _pad1[2]; // Pad to 128 bytes total (matches C++ RT_LightData).
 };
+
+// Rotate a world-space direction into the light's local frame, where the fixture
+// aims along -Z (Godot light convention, matching Blender/Cycles).
+vec3 lights_world_to_light_local(RTLightData light, vec3 world_dir) {
+	return vec3(
+			dot(world_dir, vec3(light.ies_basis[0], light.ies_basis[1], light.ies_basis[2])),
+			dot(world_dir, vec3(light.ies_basis[3], light.ies_basis[4], light.ies_basis[5])),
+			dot(world_dir, vec3(light.ies_basis[6], light.ies_basis[7], light.ies_basis[8])));
+}
 
 // Light buffer SSBO (binding provided by the including shader via RT_LIGHT_BUFFER_BINDING).
 #ifndef RT_LIGHT_BUFFER_BINDING
@@ -345,8 +364,17 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
+		// Apply IES photometric profile modulation. The profile is evaluated in
+		// the light's local frame, so rotating the light aims the beam exactly as
+		// it would a real fixture.
+		float ies_factor = 1.0;
+		if (light.ies_slot >= 0) {
+			vec3 ies_dir = lights_world_to_light_local(light, hit_pos - light.position);
+			ies_factor = ies_lookup(light.ies_slot, ies_dir) * light.ies_strength;
+		}
+
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
-		vec3 contribution = brdf_value * light.emission * atten * indirect_mul;
+		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * ies_factor;
 		return contribution / max(light_select_pdf, 1e-10);
 	}
 	// === CONE LIGHT PATH (directional) ===
@@ -373,6 +401,9 @@ vec3 lights_evaluate_direct_lighting(
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
+		// No IES modulation here: a photometric distribution has no meaning for a
+		// light at infinite distance, so gather_lights() forces ies_slot = -1 for
+		// every directional light (render_raytracing.cpp).
 		return brdf_value * light.emission * indirect_mul / max(light_select_pdf, 1e-10);
 	}
 }

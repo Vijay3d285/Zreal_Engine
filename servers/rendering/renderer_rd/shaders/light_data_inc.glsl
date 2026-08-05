@@ -20,7 +20,8 @@ struct LightData { //this structure needs to be as packed as possible
 
 	float specular_amount;
 	float shadow_opacity;
-	float pad[2];
+	int ies_slot;     // IES profile slot index (-1 = no IES profile).
+	float ies_strength; // IES intensity multiplier.
 
 	vec4 atlas_rect; // rect in the shadow atlas
 	mat4 shadow_matrix;
@@ -34,6 +35,7 @@ struct LightData { //this structure needs to be as packed as possible
 	uint bake_mode;
 	vec4 projector_rect; //projector rect in srgb decal atlas
 };
+
 
 #define REFLECTION_AMBIENT_DISABLED 0
 #define REFLECTION_AMBIENT_ENVIRONMENT 1

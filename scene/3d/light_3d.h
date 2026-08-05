@@ -31,6 +31,7 @@
 #pragma once
 
 #include "scene/3d/visual_instance_3d.h"
+#include "scene/resources/ies_profile.h"
 
 class Light3D : public VisualInstance3D {
 	GDCLASS(Light3D, VisualInstance3D);
@@ -67,6 +68,14 @@ public:
 		BAKE_DYNAMIC,
 	};
 
+	// IES photometric profile mode.
+	// Mirrors RSE::LightIESMode but exposed via GDScript-friendly enum name.
+	enum IESMode {
+		IES_MODE_NONE,
+		IES_MODE_EXTERNAL,
+		IES_MODE_INTERNAL,
+	};
+
 private:
 	Color color;
 	real_t param[PARAM_MAX] = {};
@@ -86,9 +95,20 @@ private:
 	Ref<Texture2D> projector;
 	Color correlated_color = Color(1.0, 1.0, 1.0);
 	float temperature = 6500.0;
+
+	// IES photometric profile.
+	IESMode ies_mode = IES_MODE_NONE;
+	String ies_filepath;
+	Ref<IESProfile> ies_profile;
+	float ies_strength = 1.0f;
+
 	// bind helpers
 
 	virtual void owner_changed_notify() override;
+
+	// IES helpers.
+	void _ies_profile_changed(); // Called when the IESProfile resource emits changed().
+	void _push_ies_to_server(); // Calls RS::light_set_ies_profile with current mode/data.
 
 protected:
 	RID light;
@@ -148,6 +168,19 @@ public:
 	float get_temperature() const;
 	Color get_correlated_color() const;
 
+	// IES photometric profile.
+	void set_ies_mode(IESMode p_mode);
+	IESMode get_ies_mode() const;
+
+	void set_ies_filepath(const String &p_filepath);
+	String get_ies_filepath() const;
+
+	void set_ies_profile(const Ref<IESProfile> &p_profile);
+	Ref<IESProfile> get_ies_profile() const;
+
+	void set_ies_strength(float p_strength);
+	float get_ies_strength() const;
+
 	virtual AABB get_aabb() const override;
 	virtual PackedStringArray get_configuration_warnings() const override;
 
@@ -157,6 +190,7 @@ public:
 
 VARIANT_ENUM_CAST(Light3D::Param);
 VARIANT_ENUM_CAST(Light3D::BakeMode);
+VARIANT_ENUM_CAST(Light3D::IESMode);
 
 class DirectionalLight3D : public Light3D {
 	GDCLASS(DirectionalLight3D, Light3D);

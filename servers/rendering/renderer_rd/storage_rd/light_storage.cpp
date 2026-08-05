@@ -205,6 +205,10 @@ void LightStorage::light_free(RID p_rid) {
 
 	// delete the texture
 	Light *light = light_owner.get_or_null(p_rid);
+	if (light->ies_slot >= 0) {
+		ies_manager.remove_ies(light->ies_slot);
+		light->ies_slot = -1;
+	}
 	light->dependency.deleted_notify(p_rid);
 	light_owner.free(p_rid);
 }
@@ -283,6 +287,43 @@ void LightStorage::light_set_projector(RID p_light, RID p_texture) {
 		}
 		light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT_SOFT_SHADOW_AND_PROJECTOR);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// IES photometric profile management
+// ---------------------------------------------------------------------------
+
+void LightStorage::light_set_ies_profile(RID p_light, RSE::LightIESMode p_mode,
+		const String &p_filepath, const String &p_ies_content) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+
+	// Release the existing IES slot if any.
+	if (light->ies_slot >= 0) {
+		ies_manager.remove_ies(light->ies_slot);
+		light->ies_slot = -1;
+	}
+
+	light->ies_mode = p_mode;
+	light->ies_filepath = p_filepath;
+	light->ies_content = p_ies_content;
+
+	if (p_mode == RSE::LIGHT_IES_EXTERNAL && !p_filepath.is_empty()) {
+		light->ies_slot = ies_manager.add_ies_from_file(p_filepath);
+	} else if (p_mode == RSE::LIGHT_IES_INTERNAL && !p_ies_content.is_empty()) {
+		light->ies_slot = ies_manager.add_ies(p_ies_content);
+	}
+	// LIGHT_IES_NONE: ies_slot stays -1.
+
+	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
+}
+
+void LightStorage::light_set_ies_strength(RID p_light, float p_strength) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+
+	light->ies_strength = p_strength;
+	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
 }
 
 void LightStorage::light_set_negative(RID p_light, bool p_enable) {
@@ -1056,6 +1097,15 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		light_data.specular_amount = light->param[RSE::LIGHT_PARAM_SPECULAR] * 2.0;
 		light_data.volumetric_fog_energy = light->param[RSE::LIGHT_PARAM_VOLUMETRIC_FOG_ENERGY];
 		light_data.bake_mode = light->bake_mode;
+
+		// IES photometric profile. Area lights don't support IES (no physical meaning for planar emitters).
+		if (type != RSE::LIGHT_AREA) {
+			light_data.ies_slot = light->ies_slot;
+			light_data.ies_strength = light->ies_strength;
+		} else {
+			light_data.ies_slot = -1;
+			light_data.ies_strength = 1.0f;
+		}
 
 		float radius = MAX(0.001, light->param[RSE::LIGHT_PARAM_RANGE]);
 		light_data.inv_radius = 1.0 / radius;

@@ -33,6 +33,7 @@
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/object/class_db.h"
+#include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "scene/main/scene_tree.h"
 #include "servers/rendering/rendering_server.h"
@@ -289,6 +290,95 @@ float Light3D::get_temperature() const {
 	return temperature;
 }
 
+// ---------------------------------------------------------------------------
+// IES photometric profile
+// ---------------------------------------------------------------------------
+
+void Light3D::set_ies_mode(IESMode p_mode) {
+	if (ies_mode == p_mode) {
+		return;
+	}
+
+	// Mirror Internal→External: auto-populate filepath from resource path (matches Blender).
+	if (p_mode == IES_MODE_EXTERNAL && ies_mode == IES_MODE_INTERNAL && ies_profile.is_valid()) {
+		String res_path = ies_profile->get_path();
+		if (!res_path.is_empty() && res_path.begins_with("res://")) {
+			ies_filepath = ProjectSettings::get_singleton()->globalize_path(res_path);
+		}
+	}
+
+	ies_mode = p_mode;
+	notify_property_list_changed();
+	_push_ies_to_server();
+}
+
+Light3D::IESMode Light3D::get_ies_mode() const {
+	return ies_mode;
+}
+
+void Light3D::set_ies_filepath(const String &p_filepath) {
+	ies_filepath = p_filepath;
+	if (ies_mode == IES_MODE_EXTERNAL) {
+		_push_ies_to_server();
+	}
+}
+
+String Light3D::get_ies_filepath() const {
+	return ies_filepath;
+}
+
+void Light3D::set_ies_profile(const Ref<IESProfile> &p_profile) {
+	if (ies_profile == p_profile) {
+		return;
+	}
+	// Disconnect old profile's changed signal.
+	if (ies_profile.is_valid()) {
+		ies_profile->disconnect_changed(callable_mp(this, &Light3D::_ies_profile_changed));
+	}
+	ies_profile = p_profile;
+	if (ies_profile.is_valid()) {
+		ies_profile->connect_changed(callable_mp(this, &Light3D::_ies_profile_changed));
+	}
+	if (ies_mode == IES_MODE_INTERNAL) {
+		_push_ies_to_server();
+	}
+}
+
+Ref<IESProfile> Light3D::get_ies_profile() const {
+	return ies_profile;
+}
+
+void Light3D::set_ies_strength(float p_strength) {
+	ies_strength = p_strength;
+	RS::get_singleton()->light_set_ies_strength(light, ies_strength);
+}
+
+float Light3D::get_ies_strength() const {
+	return ies_strength;
+}
+
+void Light3D::_ies_profile_changed() {
+	if (ies_mode == IES_MODE_INTERNAL) {
+		_push_ies_to_server();
+	}
+}
+
+void Light3D::_push_ies_to_server() {
+	ERR_FAIL_COND(!light.is_valid());
+	switch (ies_mode) {
+		case IES_MODE_NONE:
+			RS::get_singleton()->light_set_ies_profile(light, RSE::LIGHT_IES_NONE, String(), String());
+			break;
+		case IES_MODE_EXTERNAL:
+			RS::get_singleton()->light_set_ies_profile(light, RSE::LIGHT_IES_EXTERNAL, ies_filepath, String());
+			break;
+		case IES_MODE_INTERNAL: {
+			String content = ies_profile.is_valid() ? ies_profile->get_ies_text() : String();
+			RS::get_singleton()->light_set_ies_profile(light, RSE::LIGHT_IES_INTERNAL, String(), content);
+		} break;
+	}
+}
+
 void Light3D::_update_visibility() {
 	if (!is_inside_tree()) {
 		return;
@@ -343,6 +433,18 @@ void Light3D::_validate_property(PropertyInfo &p_property) const {
 	} else if (!GLOBAL_GET_CACHED(bool, "rendering/lights_and_shadows/use_physical_light_units") && (p_property.name == "light_intensity_lumens" || p_property.name == "light_intensity_lux" || p_property.name == "light_temperature")) {
 		p_property.usage = PROPERTY_USAGE_NONE;
 	} else if (get_light_type() == RSE::LIGHT_AREA && p_property.name == "light_projector") {
+		p_property.usage = PROPERTY_USAGE_NONE;
+	}
+	// IES property visibility: hide properties irrelevant to the current mode.
+	if (p_property.name == "ies_filepath" && ies_mode != IES_MODE_EXTERNAL) {
+		p_property.usage = PROPERTY_USAGE_NONE;
+	} else if (p_property.name == "ies_profile" && ies_mode != IES_MODE_INTERNAL) {
+		p_property.usage = PROPERTY_USAGE_NONE;
+	} else if ((p_property.name == "ies_strength") && ies_mode == IES_MODE_NONE) {
+		p_property.usage = PROPERTY_USAGE_NONE;
+	}
+	// Directional lights do not support IES profiles.
+	if (get_light_type() == RSE::LIGHT_DIRECTIONAL && (p_property.name == "ies_mode" || p_property.name == "ies_filepath" || p_property.name == "ies_profile" || p_property.name == "ies_strength")) {
 		p_property.usage = PROPERTY_USAGE_NONE;
 	}
 }
@@ -458,6 +560,29 @@ void Light3D::_bind_methods() {
 	BIND_ENUM_CONSTANT(BAKE_DISABLED);
 	BIND_ENUM_CONSTANT(BAKE_STATIC);
 	BIND_ENUM_CONSTANT(BAKE_DYNAMIC);
+
+	// IES photometric profile.
+	ClassDB::bind_method(D_METHOD("set_ies_mode", "mode"), &Light3D::set_ies_mode);
+	ClassDB::bind_method(D_METHOD("get_ies_mode"), &Light3D::get_ies_mode);
+
+	ClassDB::bind_method(D_METHOD("set_ies_filepath", "filepath"), &Light3D::set_ies_filepath);
+	ClassDB::bind_method(D_METHOD("get_ies_filepath"), &Light3D::get_ies_filepath);
+
+	ClassDB::bind_method(D_METHOD("set_ies_profile", "profile"), &Light3D::set_ies_profile);
+	ClassDB::bind_method(D_METHOD("get_ies_profile"), &Light3D::get_ies_profile);
+
+	ClassDB::bind_method(D_METHOD("set_ies_strength", "strength"), &Light3D::set_ies_strength);
+	ClassDB::bind_method(D_METHOD("get_ies_strength"), &Light3D::get_ies_strength);
+
+	ADD_GROUP("IES Profile", "ies_");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "ies_mode", PROPERTY_HINT_ENUM, "None,External,Internal"), "set_ies_mode", "get_ies_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "ies_filepath", PROPERTY_HINT_FILE, "*.ies"), "set_ies_filepath", "get_ies_filepath");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "ies_profile", PROPERTY_HINT_RESOURCE_TYPE, "IESProfile"), "set_ies_profile", "get_ies_profile");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "ies_strength", PROPERTY_HINT_RANGE, "0,1000000,0.01,or_greater"), "set_ies_strength", "get_ies_strength");
+
+	BIND_ENUM_CONSTANT(IES_MODE_NONE);
+	BIND_ENUM_CONSTANT(IES_MODE_EXTERNAL);
+	BIND_ENUM_CONSTANT(IES_MODE_INTERNAL);
 }
 
 Light3D::Light3D(RSE::LightType p_type) {

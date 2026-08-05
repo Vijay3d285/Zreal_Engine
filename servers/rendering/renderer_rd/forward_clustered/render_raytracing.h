@@ -39,6 +39,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/ies_manager.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
@@ -126,7 +127,7 @@ enum RTLightType : uint32_t {
 	RT_LIGHT_TYPE_SPOT = 3,
 };
 
-// Must match GLSL RTLightData (std430, 80 bytes).
+// Must match GLSL RTLightData (std430, 128 bytes).
 struct alignas(16) RT_LightData {
 	float position[3]; // World position (omni/spot) or direction (directional, normalized).
 	uint32_t type;
@@ -139,11 +140,21 @@ struct alignas(16) RT_LightData {
 	float indirect_energy;
 	float inv_spot_attenuation;
 	float cos_spot_angle;
-	float shadow_enabled; // 1.0 = trace shadow rays normally. 0.0 = skip shadow ray (shadowless fill light). Repurposed from _pad0; struct size stays 80 bytes.
+	float shadow_enabled; // 1.0 = trace shadow rays normally. 0.0 = skip shadow ray (shadowless fill light).
 	float spot_direction[3];
-	float _pad1;
+	int32_t ies_slot; // IES photometric profile slot index, -1 = none.
+	float ies_strength; // IES intensity multiplier.
+	// Light basis columns in world space: [0..2] = local X axis, [3..5] = local Y,
+	// [6..8] = local Z. IES profiles are evaluated in the light's own frame (where
+	// the fixture aims along local -Z, Godot's light convention and the same as
+	// Blender/Cycles), so the shader needs the world->local rotation. The basis is
+	// orthonormalized on upload, so that rotation is the transpose: three dot
+	// products against these columns. Only read when ies_slot >= 0.
+	float ies_basis[9];
+	float _ies_pad[2]; // Pad to 128 bytes.
 };
-static_assert(sizeof(RT_LightData) == 80, "RT_LightData must be 80 bytes for std430");
+static_assert(sizeof(RT_LightData) == 128, "RT_LightData must be 128 bytes for std430");
+static_assert(offsetof(RT_LightData, ies_basis) == 84, "RT_LightData::ies_basis must sit at offset 84 to match std430");
 
 enum {
 	RT_LIGHTS_MAX = 64,
@@ -319,6 +330,8 @@ struct RTViewportState {
 	uint32_t motion_transform_buffer_capacity = 0;
 
 	RID light_buffer;
+	RID ies_buffer; // GPU SSBO for packed IES photometric profile data.
+	uint32_t ies_buffer_bytes = 0; // Tracks allocated size to detect resize need.
 	RID params_buffer;
 
 	uint32_t frame_counter = 0;

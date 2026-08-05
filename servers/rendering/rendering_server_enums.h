@@ -306,6 +306,16 @@ enum LightProjectorFilter {
 	LIGHT_PROJECTOR_FILTER_LINEAR_MIPMAPS_ANISOTROPIC,
 };
 
+// IES photometric profile mode.
+// LIGHT_IES_NONE     : no IES profile; light is isotropic (default).
+// LIGHT_IES_EXTERNAL : load .ies file from filesystem path (ies_filepath).
+// LIGHT_IES_INTERNAL : use embedded IESProfile resource (ies_profile).
+enum LightIESMode {
+	LIGHT_IES_NONE,
+	LIGHT_IES_EXTERNAL,
+	LIGHT_IES_INTERNAL,
+};
+
 /* REFLECTION PROBE API */
 
 enum ReflectionProbeUpdateMode {

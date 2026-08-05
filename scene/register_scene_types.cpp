@@ -152,6 +152,7 @@
 #include "scene/resources/shader_include_resource_format.h"
 #include "scene/resources/shader_resource_format.h"
 #include "scene/resources/skeleton_profile.h"
+#include "scene/resources/ies_profile.h"
 #include "scene/resources/sky.h"
 #include "scene/resources/style_box.h"
 #include "scene/resources/style_box_flat.h"
@@ -943,6 +944,7 @@ void register_scene_types() {
 	GDREGISTER_CLASS(CameraAttributesPractical);
 	GDREGISTER_CLASS(World2D);
 	GDREGISTER_CLASS(Sky);
+	GDREGISTER_CLASS(IESProfile);
 	GDREGISTER_CLASS(CompressedTexture2D);
 	GDREGISTER_CLASS(PortableCompressedTexture2D);
 	GDREGISTER_CLASS(ImageTexture);

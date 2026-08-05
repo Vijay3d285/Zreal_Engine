@@ -35,6 +35,7 @@
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/storage_rd/forward_id_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/ies_manager.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/storage/light_storage.h"
@@ -83,10 +84,20 @@ private:
 		RID area_texture;
 		uint64_t version = 0;
 
+		// IES photometric profile.
+		RSE::LightIESMode ies_mode = RSE::LIGHT_IES_NONE;
+		String ies_filepath; // External mode: path to .ies file.
+		String ies_content; // Internal mode: raw IES text content.
+		int ies_slot = -1; // Slot index in IESManager (-1 = none).
+		float ies_strength = 1.0f; // IES intensity multiplier.
+
 		Dependency dependency;
 	};
 
 	mutable RID_Owner<Light, true> light_owner;
+
+	// IES photometric profile manager (hash-dedup slot table for GPU upload).
+	IESManager ies_manager;
 
 	/* LIGHT INSTANCE */
 
@@ -154,7 +165,8 @@ private:
 		float specular_amount;
 		float shadow_opacity;
 
-		float pad[2];
+		int32_t ies_slot; // IES profile slot index (-1 = no IES profile). Must match GLSL LightData layout.
+		float ies_strength; // IES intensity multiplier.
 		float atlas_rect[4]; // in omni, used for atlas uv, in spot, used for projector uv
 		float shadow_matrix[16];
 		float shadow_bias;
@@ -593,6 +605,32 @@ public:
 
 		return TextureStorage::get_singleton()->owns_texture(light->projector);
 	}
+
+	// IES photometric profile API.
+	virtual void light_set_ies_profile(RID p_light, RSE::LightIESMode p_mode,
+			const String &p_filepath, const String &p_ies_content) override;
+	virtual void light_set_ies_strength(RID p_light, float p_strength) override;
+
+	virtual int light_get_ies_slot(RID p_light) const override {
+		const Light *light = light_owner.get_or_null(p_light);
+		ERR_FAIL_NULL_V(light, -1);
+		return light->ies_slot;
+	}
+
+	virtual float light_get_ies_strength(RID p_light) const override {
+		const Light *light = light_owner.get_or_null(p_light);
+		ERR_FAIL_NULL_V(light, 1.0f);
+		return light->ies_strength;
+	}
+
+	virtual bool light_has_ies_profile(RID p_light) const override {
+		const Light *light = light_owner.get_or_null(p_light);
+		ERR_FAIL_NULL_V(light, false);
+		return light->ies_mode != RSE::LIGHT_IES_NONE && light->ies_slot >= 0;
+	}
+
+	// Access the IES manager (used by the raytracing renderer for GPU upload).
+	IESManager *get_ies_manager() { return &ies_manager; }
 
 	_FORCE_INLINE_ bool light_is_negative(RID p_light) const {
 		const Light *light = light_owner.get_or_null(p_light);

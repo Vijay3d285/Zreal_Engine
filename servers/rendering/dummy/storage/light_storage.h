@@ -116,6 +116,14 @@ public:
 	virtual uint64_t light_get_version(RID p_light) const override { return 0; }
 	virtual uint32_t light_get_cull_mask(RID p_light) const override { return 0; }
 
+	// IES photometric profile stubs (no-op for the dummy renderer).
+	virtual void light_set_ies_profile(RID p_light, RSE::LightIESMode p_mode,
+			const String &p_filepath, const String &p_ies_content) override {}
+	virtual void light_set_ies_strength(RID p_light, float p_strength) override {}
+	virtual int light_get_ies_slot(RID p_light) const override { return -1; }
+	virtual float light_get_ies_strength(RID p_light) const override { return 1.0f; }
+	virtual bool light_has_ies_profile(RID p_light) const override { return false; }
+
 	/* LIGHT INSTANCE API */
 
 	RID light_instance_create(RID p_light) override { return RID(); }

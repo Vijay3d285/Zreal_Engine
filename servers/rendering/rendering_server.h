@@ -333,6 +333,14 @@ public:
 	virtual void light_area_set_normalize_energy(RID p_light, bool p_enabled) = 0;
 	virtual void light_area_set_texture(RID p_light, RID texture) = 0;
 
+	// IES photometric profile.
+	// Pass LIGHT_IES_NONE to clear any existing profile.
+	// p_filepath is used when p_mode == LIGHT_IES_EXTERNAL.
+	// p_ies_content is the raw IES text used when p_mode == LIGHT_IES_INTERNAL.
+	virtual void light_set_ies_profile(RID p_light, RSE::LightIESMode p_mode,
+			const String &p_filepath, const String &p_ies_content) = 0;
+	virtual void light_set_ies_strength(RID p_light, float p_strength) = 0;
+
 	// Shadow atlas
 
 	virtual RID shadow_atlas_create() = 0;
@@ -1110,6 +1118,7 @@ VARIANT_ENUM_CAST_EXT(RSE::LightOmniShadowMode, RenderingServer::LightOmniShadow
 VARIANT_ENUM_CAST_EXT(RSE::LightDirectionalShadowMode, RenderingServer::LightDirectionalShadowMode);
 VARIANT_ENUM_CAST_EXT(RSE::LightDirectionalSkyMode, RenderingServer::LightDirectionalSkyMode);
 VARIANT_ENUM_CAST_EXT(RSE::LightProjectorFilter, RenderingServer::LightProjectorFilter);
+VARIANT_ENUM_CAST_EXT(RSE::LightIESMode, RenderingServer::LightIESMode);
 VARIANT_ENUM_CAST_EXT(RSE::ReflectionProbeUpdateMode, RenderingServer::ReflectionProbeUpdateMode);
 VARIANT_ENUM_CAST_EXT(RSE::ReflectionProbeAmbientMode, RenderingServer::ReflectionProbeAmbientMode);
 VARIANT_ENUM_CAST_EXT(RSE::VoxelGIQuality, RenderingServer::VoxelGIQuality);

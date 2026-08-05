@@ -1,0 +1,706 @@
+# IES Light Profile Support — Product Requirements Document (PRD)
+
+> **Author**: Engineering  
+> **Date**: 2026-08-01  
+> **Status**: Draft — Awaiting Review  
+> **Reference**: [ies_light_implementation.md](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/ies_light_implementation.md) (Blender Cycles IES analysis)
+
+---
+
+## 1. Executive Summary
+
+IES (Illuminating Engineering Society) photometric profiles describe the real-world angular intensity distribution of light fixtures. Architectural visualization, product rendering, and physically-based lighting all depend on IES data to produce realistic illumination from manufacturer-specified luminaires.
+
+This PRD defines the complete scope of work required to add IES light profile support to our Godot-based RTX path tracing engine, modeled after the proven Blender Cycles implementation while adapted to our Vulkan raytracing architecture.
+
+---
+
+## 2. Problem Statement
+
+Our engine currently treats all lights as **isotropic emitters** — point/omni, spot, directional, and area lights emit uniformly within their cone or solid angle. There is no mechanism to modulate intensity by direction using real-world photometric data. This limits the engine's usefulness for:
+
+- Architectural visualization (interior/exterior lighting design)
+- Product rendering with manufacturer-accurate luminaires
+- Film/VFX lighting pipelines that rely on IES profiles
+- Any scene requiring physically-measured light distribution
+
+---
+
+## 3. Goals
+
+| # | Goal | Success Criteria |
+|---|------|-----------------|
+| G1 | **IES file parsing** | Parse standard IESNA LM-63 files (all photometric types A, B, C) with candela-to-watts conversion |
+| G2 | **External mode** | Load `.ies` files from filesystem paths with relative path support |
+| G3 | **Internal mode** | Embed IES text data inside scene resources for portability |
+| G4 | **GPU upload** | Pack IES profiles into a flat GPU buffer with offset-table addressing |
+| G5 | **Raytracing evaluation** | Bicubic spherical interpolation in the RT lighting shader |
+| G6 | **Forward/rasterizer evaluation** | IES lookup in the forward clustered lighting pass |
+| G7 | **Editor integration** | Inspector UI for IES mode toggle, file picker, and preview |
+| G8 | **Deduplication** | Hash-based dedup + reference counting (same as Cycles `LightManager`) |
+| G9 | **GDScript API** | Full scripting interface for IES assignment, mode switching, and strength |
+
+---
+
+## 4. Non-Goals (Out of Scope for V1)
+
+- IES profile *editor/viewer* (visual goniometric diagram)
+- EEVEE/forward-mobile fallback (may silently ignore IES)
+- IES-aware importance sampling for NEE (uniform cone sampling is sufficient initially)
+- HDR preview thumbnails for IES profiles in the asset browser
+
+---
+
+## 5. Architecture Overview
+
+The implementation mirrors the 10-layer Blender Cycles architecture, adapted to our engine's structure:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  LAYER 1: Scene Node (Light3D)                                      │
+│  Light3D stores: ies_mode (internal/external),                      │
+│                  ies_filepath (String), ies_data (Ref<Resource>)     │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 2: Rendering Server API                                      │
+│  RenderingServer::light_set_ies_profile(RID, mode, data)            │
+│  LightStorage::Light struct gains ies_* fields                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 3: IES Parser (core/io/ies_file.h/.cpp)                      │
+│  IESFile::load(), parse(), process(), pack()                        │
+│  Type A/B/C → Type C normalization, candela→watts                   │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 4: IES Manager (storage_rd/ies_manager.h/.cpp)               │
+│  Slot table with hash dedup, ref counting, thread mutex             │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 5: GPU Upload (device_vector<float> ies_profiles)            │
+│  [offset_table][packed_profile_0][packed_profile_1]...              │
+├─────────────────────────────────────────────────────────────────────┤
+│  LAYER 6a: RT Shader Eval (raytracing_ies_inc.glsl)                 │
+│  Bicubic interp in spherical coords, multiplied into emission       │
+│                                                                     │
+│  LAYER 6b: Forward Shader Eval (scene_forward_lights_inc.glsl)      │
+│  Same bicubic interp, applied in the rasterizer light loop          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 6. Detailed Design
+
+### 6.1 Layer 1 — Scene Node Changes
+
+#### Files Modified
+
+##### [MODIFY] [light_3d.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/3d/light_3d.h)
+
+Add IES properties to the base `Light3D` class:
+
+```cpp
+// IES Light Profile support
+enum IESMode {
+    IES_MODE_NONE,       // No IES profile (default, isotropic)
+    IES_MODE_EXTERNAL,   // Load from filesystem path
+    IES_MODE_INTERNAL,   // Embedded resource data
+};
+
+private:
+    IESMode ies_mode = IES_MODE_NONE;
+    String ies_filepath;              // External mode: path to .ies file
+    Ref<IESProfile> ies_profile;      // Internal mode: embedded IES resource
+    float ies_strength = 1.0;         // IES intensity multiplier
+```
+
+##### [MODIFY] [light_3d.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/3d/light_3d.cpp)
+
+- Add getter/setter methods for `ies_mode`, `ies_filepath`, `ies_profile`, `ies_strength`
+- Add `_bind_methods()` entries for GDScript/Inspector exposure
+- Add `_validate_property()` logic: hide `ies_filepath` when mode is Internal, hide `ies_profile` when mode is External
+- On mode switch from Internal→External: auto-populate filepath from resource path (mirrors Blender's `rna_ShaderNodeTexIES_mode_set`)
+- Propagate changes to RenderingServer via `RS::get_singleton()->light_set_ies_profile(light, ...)`
+
+---
+
+### 6.2 Layer 2 — Rendering Server API
+
+##### [MODIFY] [rendering_server_enums.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/rendering_server_enums.h)
+
+```cpp
+enum LightIESMode {
+    LIGHT_IES_NONE,
+    LIGHT_IES_EXTERNAL,
+    LIGHT_IES_INTERNAL,
+};
+```
+
+##### [MODIFY] [rendering_server.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/rendering_server.h)
+
+Add API methods:
+
+```cpp
+virtual void light_set_ies_profile(RID p_light, LightIESMode p_mode,
+                                   const String &p_filepath,
+                                   const PackedByteArray &p_ies_data) = 0;
+virtual void light_set_ies_strength(RID p_light, float p_strength) = 0;
+```
+
+##### [MODIFY] [light_storage.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/light_storage.h)
+
+Add to the `Light` struct:
+
+```cpp
+// IES profile support
+RSE::LightIESMode ies_mode = RSE::LIGHT_IES_NONE;
+String ies_filepath;
+String ies_content;           // Raw IES text (internal mode)
+int ies_slot = -1;            // Slot index in IESManager (-1 = none)
+float ies_strength = 1.0f;
+```
+
+Add accessor methods:
+```cpp
+virtual void light_set_ies_profile(RID p_light, RSE::LightIESMode p_mode,
+                                   const String &p_filepath,
+                                   const PackedByteArray &p_data) override;
+virtual void light_set_ies_strength(RID p_light, float p_strength) override;
+int light_get_ies_slot(RID p_light) const;
+float light_get_ies_strength(RID p_light) const;
+bool light_has_ies_profile(RID p_light) const;
+```
+
+---
+
+### 6.3 Layer 3 — IES File Parser
+
+##### [NEW] [core/io/ies_file.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/core/io/ies_file.h)
+##### [NEW] [core/io/ies_file.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/core/io/ies_file.cpp)
+
+Direct port of the Cycles `IESFile` class ([intern/cycles/util/ies.h/cpp](file:///c:/Users/aiadmin/Desktop/blender_build/blender/intern/cycles/util/ies.h)):
+
+```cpp
+class IESFile {
+public:
+    enum PhotometricType {
+        TYPE_C = 1,
+        TYPE_B = 2,
+        TYPE_A = 3,
+    };
+
+    bool load(const String &p_content);
+    bool parse(const String &p_content);
+    void process();
+    void pack(float *p_data) const;
+    int packed_size() const;
+    void clear();
+
+    bool is_valid() const { return !v_angles.is_empty(); }
+
+private:
+    Vector<float> v_angles;    // Vertical angles (radians, 0..π)
+    Vector<float> h_angles;    // Horizontal angles (radians, 0..2π)
+    Vector<Vector<float>> intensity;  // [h][v] grid
+
+    void process_type_a();
+    void process_type_b();
+    void process_type_c();
+};
+```
+
+**Key behaviors (matching Cycles):**
+
+| Step | Description |
+|------|-------------|
+| `TILT=` marker | Find and skip tilt data |
+| Header values | Lamp count, lumen, candela multiplier, angle counts, photometric type |
+| Candela → Watts | `factor *= 0.0706650768394` (4π / 177.83 luminous efficacy of D65) |
+| Type normalization | All types → Type C spherical coordinates |
+| Angle conversion | Degrees → radians |
+| Symmetry expansion | Half-profiles (0°–90°, 0°–180°) expanded to full 0°–360° |
+
+**Packed data format (matches Cycles exactly):**
+
+```
+[ h_num (float-encoded int) ]
+[ v_num (float-encoded int) ]
+[ h_angle_0, h_angle_1, ..., h_angle_{h_num-1} ]
+[ v_angle_0, v_angle_1, ..., v_angle_{v_num-1} ]
+[ intensity[0][0..v_num-1], intensity[1][0..v_num-1], ... ]
+```
+
+Total size: `2 + h_num + v_num + h_num * v_num` floats.
+
+##### [NEW] [scene/resources/ies_profile.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/resources/ies_profile.h)
+##### [NEW] [scene/resources/ies_profile.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/resources/ies_profile.cpp)
+
+A `Resource` subclass for embedded IES data:
+
+```cpp
+class IESProfile : public Resource {
+    GDCLASS(IESProfile, Resource);
+
+    String ies_text;   // Raw IES file content
+
+protected:
+    static void _bind_methods();
+
+public:
+    void set_ies_text(const String &p_text);
+    String get_ies_text() const;
+
+    // Load from file and store internally
+    Error load_from_file(const String &p_path);
+};
+```
+
+---
+
+### 6.4 Layer 4 — IES Manager (Slot Table with Dedup)
+
+##### [NEW] [servers/rendering/renderer_rd/storage_rd/ies_manager.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/ies_manager.h)
+##### [NEW] [servers/rendering/renderer_rd/storage_rd/ies_manager.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/ies_manager.cpp)
+
+```cpp
+class IESManager {
+public:
+    // Returns slot index. Content is hashed for dedup.
+    int add_ies(const String &p_content);
+    int add_ies_from_file(const String &p_filepath);
+
+    // Decrement reference count. Marks for GPU re-upload when reaching 0.
+    void remove_ies(int p_slot);
+
+    // Upload all active IES data to GPU SSBO.
+    void device_update(RenderingDevice *p_rd, RID &r_ies_buffer);
+
+    bool is_dirty() const { return needs_update; }
+
+private:
+    struct IESSlot {
+        IESFile ies;
+        uint32_t hash = 0;
+        int users = 0;
+    };
+
+    LocalVector<IESSlot> slots;
+    Mutex mutex;
+    bool needs_update = false;
+};
+```
+
+**Design decisions (matching Cycles):**
+
+| Feature | Implementation |
+|---------|---------------|
+| **Hash dedup** | `String::hash()` on raw content — identical IES text shares one slot |
+| **Ref counting** | `users` field incremented on `add_ies`, decremented on `remove_ies` |
+| **Slot recycling** | Empty slots (users==0, hash==0) reused before appending |
+| **Thread safety** | All operations protected by `Mutex` |
+| **Dirty flag** | Set on any add/remove; cleared after GPU upload |
+
+---
+
+### 6.5 Layer 5 — GPU Buffer Layout & Upload
+
+The IES GPU buffer follows the same layout as Cycles:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  OFFSET TABLE (one float per slot)                      │
+│  data[i] = intBitsToFloat(byte_offset)                  │
+│  data[i] = intBitsToFloat(-1) for invalid/empty slots   │
+├─────────────────────────────────────────────────────────┤
+│  PACKED IES DATA                                        │
+│  [profile_0_packed][profile_1_packed]...                 │
+└─────────────────────────────────────────────────────────┘
+```
+
+**SSBO Binding:**
+
+The IES buffer is bound as a `readonly buffer` in both the raytracing and forward shaders:
+
+```glsl
+layout(set = 0, binding = RT_IES_BUFFER_BINDING, std430) readonly buffer IESBuffer {
+    float ies_data[];
+};
+```
+
+##### [MODIFY] [render_raytracing.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/forward_clustered/render_raytracing.h)
+
+Add to `RT_LightData` (expanding from 80 → 96 bytes):
+
+```cpp
+struct alignas(16) RT_LightData {
+    // ... existing 80 bytes ...
+    int32_t ies_slot;        // IES slot index (-1 = no IES profile)
+    float ies_strength;       // IES intensity multiplier
+    float _ies_pad[2];       // Pad to 96 bytes
+};
+static_assert(sizeof(RT_LightData) == 96, "RT_LightData must be 96 bytes for std430");
+```
+
+> [!IMPORTANT]
+> **Breaking change**: `RT_LightData` grows from 80 → 96 bytes. Both C++ and GLSL structs must be updated simultaneously. The `static_assert` guards correctness.
+
+##### [MODIFY] [render_raytracing.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp)
+
+In `gather_lights()`, populate the new fields:
+
+```cpp
+ld.ies_slot = ls->light_get_ies_slot(base);
+ld.ies_strength = ls->light_get_ies_strength(base);
+```
+
+Add IES buffer management:
+- Create/resize the IES SSBO via `IESManager::device_update()`
+- Bind the IES SSBO to the raytracing descriptor set
+
+##### [MODIFY] [light_storage.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/light_storage.h)
+
+Add to the rasterizer `LightData` struct (for forward pass):
+
+```cpp
+struct LightData {
+    // ... existing fields ...
+    int32_t ies_slot;         // IES slot index (-1 = no IES)
+    float ies_strength;
+};
+```
+
+##### [MODIFY] [light_data_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/light_data_inc.glsl)
+
+Add to the GLSL `LightData` struct:
+
+```glsl
+struct LightData {
+    // ... existing fields ...
+    int ies_slot;
+    float ies_strength;
+};
+```
+
+---
+
+### 6.6 Layer 6 — Shader Evaluation
+
+##### [NEW] [raytracing/ies_lookup_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/raytracing/ies_lookup_inc.glsl)
+
+Port of Cycles' `kernel/util/ies.h` — bicubic interpolation in spherical coordinates:
+
+```glsl
+// Bicubic IES lookup.
+// Returns intensity multiplier for the given direction.
+float ies_lookup(int slot, vec3 direction) {
+    if (slot < 0) return 1.0; // No IES profile, isotropic fallback
+
+    int ofs = floatBitsToInt(ies_data[slot]);
+    if (ofs < 0) return 1.0; // Invalid slot
+
+    // Compute spherical coordinates from direction
+    vec3 d = normalize(direction);
+    float v_angle = acos(clamp(-d.y, -1.0, 1.0));   // Vertical: 0 at top (Y-up)
+    float h_angle = atan(d.x, d.z) + PI;             // Horizontal: 0..2π
+
+    // Read grid dimensions
+    int h_num = floatBitsToInt(ies_data[ofs]);
+    int v_num = floatBitsToInt(ies_data[ofs + 1]);
+
+    // ... bicubic interpolation (4x4 grid sampling) ...
+    // Full implementation mirrors kernel_ies_interp() from Cycles
+    // with pole wrapping and wraparound for full 360° horizontal
+
+    return max(result, 0.0);
+}
+```
+
+> [!NOTE]
+> Our engine uses **Y-up** coordinates whereas Blender Cycles uses **Z-up**. The vertical angle computation changes from `acos(-z)` to `acos(-y)`, and horizontal uses `atan(x, z)` instead of `atan(x, y)`.
+
+##### [MODIFY] [raytracing_lights_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/raytracing/raytracing_lights_inc.glsl)
+
+Add `RTLightData` fields and apply IES modulation:
+
+```glsl
+struct RTLightData {
+    // ... existing fields ...
+    int ies_slot;
+    float ies_strength;
+    float _ies_pad[2];
+};
+```
+
+In `lights_evaluate_direct_lighting()`, after computing the light direction `L`:
+
+```glsl
+// Apply IES angular modulation
+float ies_factor = 1.0;
+if (light.ies_slot >= 0) {
+    // For omni/spot: direction is from light to hit point (in light-local space)
+    vec3 ies_dir = hit_pos - light.position;
+    ies_factor = ies_lookup(light.ies_slot, ies_dir) * light.ies_strength;
+}
+// Multiply into emission
+vec3 modulated_emission = light.emission * ies_factor;
+```
+
+##### [MODIFY] [scene_forward_lights_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/scene_forward_lights_inc.glsl)
+
+Same IES lookup applied in the rasterizer light evaluation functions:
+- `light_process_omni()` — apply IES factor after direction computation
+- `light_process_spot()` — apply IES factor after direction computation
+
+---
+
+### 6.7 Layer 7 — Editor Integration
+
+##### [MODIFY] Light3D Inspector
+
+The Inspector should show:
+
+```
+▼ IES Profile
+    Mode:       [None ▾] / [External ▾] / [Internal ▾]
+    
+    (if External)
+    File Path:  [___________________] [📂]
+    
+    (if Internal)
+    IES Data:   [IESProfile resource picker]
+    
+    Strength:   [1.0          ] (range: 0..1000000)
+```
+
+**Mode switch behavior** (matching Blender):
+- None → External: Clear filepath
+- None → Internal: Clear resource
+- Internal → External: If the IES resource has a source path, auto-populate the filepath
+- External → Internal: Read the file, create an IESProfile resource with the content
+
+---
+
+## 7. Data Flow Diagram
+
+```mermaid
+graph TD
+    subgraph "Scene Layer"
+        A[Light3D Node] -->|"ies_mode, ies_filepath, ies_profile"| B[RenderingServer API]
+    end
+
+    subgraph "Server Layer"
+        B -->|"light_set_ies_profile()"| C[LightStorage::Light]
+        C -->|"ies_content / ies_filepath"| D[IESManager]
+    end
+
+    subgraph "IES Manager"
+        D -->|"add_ies() / add_ies_from_file()"| E[IESFile::load/parse/process]
+        E -->|"Type A/B/C → Type C"| F["IESSlot (hash dedup, refcount)"]
+        F -->|"pack()"| G[GPU SSBO Upload]
+    end
+
+    subgraph "GPU"
+        G -->|"ies_data[] buffer"| H["RT Shader: ies_lookup()"]
+        G -->|"ies_data[] buffer"| I["Forward Shader: ies_lookup()"]
+        H --> J[Modulate light.emission]
+        I --> J
+    end
+
+    subgraph "Per-Light Data"
+        C -->|"ies_slot, ies_strength"| K[RT_LightData / LightData]
+        K --> H
+        K --> I
+    end
+```
+
+---
+
+## 8. File Inventory
+
+### New Files
+
+| File | Purpose |
+|------|---------|
+| [core/io/ies_file.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/core/io/ies_file.h) | IES parser header |
+| [core/io/ies_file.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/core/io/ies_file.cpp) | IES parser impl (port of Cycles `util/ies.cpp`) |
+| [scene/resources/ies_profile.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/resources/ies_profile.h) | IESProfile resource header |
+| [scene/resources/ies_profile.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/resources/ies_profile.cpp) | IESProfile resource impl |
+| [storage_rd/ies_manager.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/ies_manager.h) | IES slot manager header |
+| [storage_rd/ies_manager.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/ies_manager.cpp) | IES slot manager impl |
+| [shaders/raytracing/ies_lookup_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/raytracing/ies_lookup_inc.glsl) | GPU bicubic IES interpolation |
+
+### Modified Files
+
+| File | Change |
+|------|--------|
+| [light_3d.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/3d/light_3d.h) | Add IES mode/filepath/profile/strength properties |
+| [light_3d.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/3d/light_3d.cpp) | Add IES getters/setters, bind_methods, validate_property |
+| [rendering_server_enums.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/rendering_server_enums.h) | Add `LightIESMode` enum |
+| [rendering_server.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/rendering_server.h) | Add `light_set_ies_profile()`, `light_set_ies_strength()` |
+| [light_storage.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/light_storage.h) | Add IES fields to Light struct + LightData struct |
+| [light_storage.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/storage_rd/light_storage.cpp) | Implement IES server methods |
+| [render_raytracing.h](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/forward_clustered/render_raytracing.h) | Expand RT_LightData (80→96 bytes), add IES buffer RID |
+| [render_raytracing.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp) | Populate IES fields in gather_lights(), manage IES SSBO |
+| [light_data_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/light_data_inc.glsl) | Add ies_slot/ies_strength to LightData |
+| [raytracing_lights_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/raytracing/raytracing_lights_inc.glsl) | Add IES fields to RTLightData, apply ies_lookup() in NEE |
+| [scene_forward_lights_inc.glsl](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/servers/rendering/renderer_rd/shaders/scene_forward_lights_inc.glsl) | Apply ies_lookup() in light_process_omni/spot |
+| [register_scene_types.cpp](file:///c:/Users/aiadmin/Desktop/RTX_path_tracing/scene/register_scene_types.cpp) | Register IESProfile class |
+
+---
+
+## 9. Key Technical Decisions
+
+### 9.1 Coordinate System Adaptation
+
+| Aspect | Blender Cycles (Z-up) | Our Engine (Y-up) |
+|--------|----------------------|-------------------|
+| Vertical angle | `acos(-z)` | `acos(-y)` |
+| Horizontal angle | `atan(x, y)` | `atan(x, z)` |
+| Pole direction | +Z = north pole | +Y = north pole |
+
+### 9.2 RT_LightData Size Change
+
+> [!WARNING]
+> Expanding `RT_LightData` from 80 to 96 bytes is a **breaking change** for any serialized/cached shader data. Both the C++ struct and the GLSL struct must match exactly. The `static_assert` ensures compile-time validation.
+
+**Alternative considered**: Pack `ies_slot` into an existing padding field. Rejected because:
+- The current 80-byte struct has no unused padding suitable for two new fields
+- A clean 16-byte expansion maintains alignment and avoids fragile bit-packing
+
+### 9.3 IES Buffer as Separate SSBO vs. Texture
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **SSBO (chosen)** | Exact Cycles parity, arbitrary size, simple offset addressing, no format conversion | Slightly more complex descriptor management |
+| 1D Texture | Hardware filtering | Size limits, requires format conversion, no int-as-float trick |
+
+### 9.4 IES Applicability
+
+IES profiles will be supported on these light types:
+
+| Light Type | IES Support | Rationale |
+|------------|-------------|-----------|
+| **OmniLight3D** | ✅ Yes | Primary use case — omnidirectional luminaire |
+| **SpotLight3D** | ✅ Yes | Spot + IES = focused luminaire with angular detail |
+| **DirectionalLight3D** | ❌ No | IES doesn't make physical sense for infinite-distance lights |
+| **AreaLight3D** | ❌ No | Area lights already have complex emission geometry |
+
+---
+
+## 10. Open Questions
+
+> [!IMPORTANT]
+> **Q1: RT_LightData struct size**  
+> Expanding RT_LightData from 80→96 bytes increases GPU memory per light by 20%. With `RT_LIGHTS_MAX = 64`, total light buffer goes from 5120 to 6144 bytes — negligible. But the GLSL struct change requires regenerating all shader `.gen.h` files. Is this acceptable, or should we try to pack IES into existing padding?
+
+> [!IMPORTANT]
+> **Q2: Light-local vs. world-space IES lookup**  
+> Blender Cycles evaluates IES in the light's local coordinate frame (the incoming direction vector is already in light space). Our engine currently passes world-space positions. Two options:
+> - **A)** Transform hit-to-light direction into light-local space in the shader (requires adding the light's inverse rotation to RT_LightData — another 36 bytes or a quaternion at 16 bytes)
+> - **B)** Evaluate in world space, requiring the user to orient the Light3D node to match the IES profile's intended orientation
+>
+> **Recommendation**: Option B for V1 (simpler, matches user expectation that rotating a light rotates its IES distribution). We can add Option A as a "lock orientation" toggle in V2.
+
+> [!IMPORTANT]
+> **Q3: Forward/rasterizer priority**  
+> Should IES support in the forward clustered pass be included in V1, or deferred to V2? The raytracing path is the primary use case, but users may switch between renderers.
+
+---
+
+## 11. Verification Plan
+
+### 11.1 Unit Tests
+
+##### [NEW] tests/ies_parser_test.cpp
+
+Port of Cycles' `util_ies_test.cpp`:
+
+| Test | Description |
+|------|-------------|
+| `parse_type_c_basic` | Standard Type C file parses correctly |
+| `parse_type_a` | Type A (automotive) normalizes to Type C |
+| `parse_type_b` | Type B normalizes to Type C |
+| `parse_tilt_include` | Files with TILT=INCLUDE skip tilt data |
+| `parse_invalid` | Malformed files return error gracefully |
+| `candela_to_watts` | Verify conversion factor 0.0706650768394 |
+| `symmetry_expansion` | Half-profiles expand to full 360° |
+| `pack_unpack` | Packed data roundtrips correctly |
+| `dedup` | IESManager returns same slot for identical content |
+| `refcount` | Slots freed only when all references released |
+
+### 11.2 Integration Tests
+
+| Test | Description |
+|------|-------------|
+| Load external `.ies` file | Verify shader receives correct slot index |
+| Load internal IES resource | Verify embedded data produces identical results |
+| Mode switch | Internal→External preserves path; External→Internal reads file |
+| Multiple lights, same IES | Verify dedup (single slot, refcount=N) |
+| GPU buffer layout | Dump buffer and verify offset table + packed data |
+
+### 11.3 Visual Verification
+
+| Test | Method |
+|------|--------|
+| Known IES pattern | Render a point light with a known IES profile (e.g., a downlight with 60° cone), compare against Blender Cycles reference render |
+| Omni + IES vs. raw Omni | Side-by-side showing non-uniform vs. uniform emission |
+| Spot + IES | Verify IES modulates within the spot cone |
+
+### 11.4 Build Verification
+
+```bash
+# Build the engine
+scons platform=windows target=editor
+scons platform=windows target=template_release
+
+# Run unit tests
+./bin/godot.windows.editor.x86_64 --test --run-tests="*ies*"
+```
+
+---
+
+## 12. Implementation Phases
+
+### Phase 1: Parser + Manager (Foundation)
+- [ ] `IESFile` parser (core/io)
+- [ ] `IESProfile` resource (scene/resources)
+- [ ] `IESManager` slot table (storage_rd)
+- [ ] Unit tests for parser + manager
+- **Estimated effort**: 3–4 days
+
+### Phase 2: GPU Pipeline (Raytracing)
+- [ ] Expand `RT_LightData` struct (C++ + GLSL)
+- [ ] IES SSBO creation, upload, binding
+- [ ] `ies_lookup_inc.glsl` bicubic interpolation
+- [ ] Apply IES modulation in `raytracing_lights_inc.glsl`
+- [ ] Populate IES fields in `gather_lights()`
+- **Estimated effort**: 3–4 days
+
+### Phase 3: Scene Integration
+- [ ] `Light3D` properties (mode, filepath, profile, strength)
+- [ ] `RenderingServer` API methods
+- [ ] `LightStorage` IES field management
+- [ ] Inspector UI and mode-switch logic
+- [ ] GDScript bindings
+- **Estimated effort**: 2–3 days
+
+### Phase 4: Forward Pass (Optional V1)
+- [ ] IES buffer binding in forward clustered pipeline
+- [ ] IES lookup in `scene_forward_lights_inc.glsl`
+- **Estimated effort**: 1–2 days
+
+### Phase 5: Polish & Testing
+- [ ] Visual comparison tests vs. Blender Cycles
+- [ ] Edge cases (malformed files, missing files, hot-reload)
+- [ ] Documentation and API reference
+- **Estimated effort**: 2–3 days
+
+**Total estimated effort**: 11–16 days
+
+---
+
+## 13. Risks & Mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| RT_LightData size change breaks existing shaders | Compile errors, visual artifacts | `static_assert`, regenerate all `.gen.h` files, full rebuild |
+| IES bicubic interpolation too expensive | GPU perf regression | Profile; degrade to bilinear for low-quality mode |
+| Coordinate system mismatch (Y-up vs Z-up) | Wrong light distribution | Explicit test with known IES pattern, visual comparison |
+| IES buffer unbounded growth | GPU OOM for many unique profiles | Cap slot count (e.g., 256), warn in editor |
+| Thread safety in IESManager | Race conditions | Mutex on all slot operations (matches Cycles pattern) |

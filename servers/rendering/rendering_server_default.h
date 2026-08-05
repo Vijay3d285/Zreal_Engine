@@ -506,6 +506,10 @@ public:
 	FUNC2(light_area_set_normalize_energy, RID, bool)
 	FUNC2(light_area_set_texture, RID, RID)
 
+	// IES photometric profile.
+	FUNC4(light_set_ies_profile, RID, RSE::LightIESMode, const String &, const String &)
+	FUNC2(light_set_ies_strength, RID, float)
+
 	/* PROBE API */
 
 	FUNCRIDSPLIT(reflection_probe)

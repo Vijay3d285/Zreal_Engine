@@ -2550,6 +2550,16 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::LIGHT_PROJECTOR_FILTER_NEAREST_MIPMAPS_ANISOTROPIC);
 	BIND_ENUM_CONSTANT(RSE::LIGHT_PROJECTOR_FILTER_LINEAR_MIPMAPS_ANISOTROPIC);
 
+	// IES photometric profile API.
+	ClassDB::bind_method(D_METHOD("light_set_ies_profile", "light", "mode", "filepath", "ies_content"),
+			&RenderingServer::light_set_ies_profile);
+	ClassDB::bind_method(D_METHOD("light_set_ies_strength", "light", "strength"),
+			&RenderingServer::light_set_ies_strength);
+
+	BIND_ENUM_CONSTANT(RSE::LIGHT_IES_NONE);
+	BIND_ENUM_CONSTANT(RSE::LIGHT_IES_EXTERNAL);
+	BIND_ENUM_CONSTANT(RSE::LIGHT_IES_INTERNAL);
+
 	BIND_ENUM_CONSTANT(RSE::LIGHT_DIRECTIONAL);
 	BIND_ENUM_CONSTANT(RSE::LIGHT_OMNI);
 	BIND_ENUM_CONSTANT(RSE::LIGHT_SPOT);

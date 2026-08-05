@@ -729,6 +729,25 @@ void light_process_omni(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 	}
 
 	vec3 light_rel_vec_norm = light_rel_vec / light_length;
+
+#ifdef USE_IES_PROFILES
+	// Apply IES photometric modulation to omni light (direction: light→surface).
+	// NOTE: nothing defines USE_IES_PROFILES yet, so this is inactive. Finishing
+	// the forward path needs three things this file does not have: an include
+	// directive for raytracing/ies_lookup_inc.glsl, the IES SSBO bound in the
+	// forward uniform set, and the light's basis in LightData — ies_lookup()
+	// expects a direction in the light's LOCAL frame (aim axis = -Z), not the
+	// world-space vector passed below. See raytracing_lights_inc.glsl for the
+	// reference call.
+	//
+	// (Spell that first item out and glsl_builders.py will try to open the
+	// comment text as a file — its include scan does not skip comments.)
+	if (omni_lights.data[idx].ies_slot >= 0) {
+		float ies_factor = ies_lookup(omni_lights.data[idx].ies_slot, -light_rel_vec_norm) * omni_lights.data[idx].ies_strength;
+		color *= ies_factor;
+	}
+#endif
+
 	light_compute(normal, hvec3(light_rel_vec_norm), eye_vec, size, hvec3(color), false, omni_attenuation * shadow, f0, roughness, metallic, half(omni_lights.data[idx].specular_amount), albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
 			backlight,
@@ -930,6 +949,16 @@ void light_process_spot(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 			color *= proj.rgb * proj.a;
 		}
 	}
+
+#ifdef USE_IES_PROFILES
+	// Apply IES photometric modulation to spot light (direction: light→surface).
+	// Inactive — see the matching note in light_process_omni() above for what the
+	// forward path still needs before this can be switched on.
+	if (spot_lights.data[idx].ies_slot >= 0) {
+		float ies_factor = ies_lookup(spot_lights.data[idx].ies_slot, -light_rel_vec_norm) * spot_lights.data[idx].ies_strength;
+		color *= ies_factor;
+	}
+#endif
 
 	light_compute(normal, hvec3(light_rel_vec_norm), eye_vec, size, hvec3(color), false, spot_attenuation * shadow, f0, roughness, metallic, half(spot_lights.data[idx].specular_amount), albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED

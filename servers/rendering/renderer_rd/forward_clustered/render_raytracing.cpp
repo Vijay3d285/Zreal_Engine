@@ -136,6 +136,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
 	}
+	if (p_state->ies_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->ies_buffer);
+	}
 	if (p_state->params_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->params_buffer);
 	}
@@ -2757,6 +2760,20 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 
 	LocalVector<LightScore> positional_lights;
 
+	// Store the light's rotation as three world-space basis columns. The shader
+	// uses the transpose to rotate a world direction into the light's frame for
+	// IES evaluation, which is only valid if the basis is orthonormal — lights
+	// carry no meaningful scale, but a scaled parent transform would leak in.
+	auto pack_light_basis = [](RT_LightData &ld, const Transform3D &p_xform) {
+		Basis b = p_xform.basis.orthonormalized();
+		for (int col = 0; col < 3; col++) {
+			Vector3 axis = b.get_column(col);
+			ld.ies_basis[col * 3 + 0] = axis.x;
+			ld.ies_basis[col * 3 + 1] = axis.y;
+			ld.ies_basis[col * 3 + 2] = axis.z;
+		}
+	};
+
 	// Helper: score a positional light and add to candidates.
 	auto score_positional_light = [&](RID light_instance) {
 		RID base = ls->light_instance_get_base_light(light_instance);
@@ -2812,6 +2829,12 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.spot_direction[0] = 0.0f;
 		ld.spot_direction[1] = 0.0f;
 		ld.spot_direction[2] = 0.0f;
+		// Directional lights do not support IES profiles (no physical meaning at infinite distance).
+		ld.ies_slot = -1;
+		ld.ies_strength = 1.0f;
+		pack_light_basis(ld, xform); // Unused while ies_slot < 0, but keep it well-defined.
+		ld._ies_pad[0] = 0.0f;
+		ld._ies_pad[1] = 0.0f;
 		rt_light_count++;
 	}
 
@@ -2881,6 +2904,25 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		// skips shadow rays entirely — light contributes full illumination with
 		// no occlusion test (matches Blender Cycles shadow_enabled = false).
 		ld.shadow_enabled = ls->light_has_shadow(base) ? 1.0f : 0.0f;
+		// IES photometric profile. The basis lets the shader evaluate the profile
+		// in the light's own frame, so rotating the node aims the beam.
+		ld.ies_slot = ls->light_get_ies_slot(base);
+		ld.ies_strength = ls->light_get_ies_strength(base);
+		// The IES lookup treats the fixture aim axis (vertical angle 0 = nadir) as
+		// the light's local -Z, matching Cycles. Cycles is Z-up, so an unrotated
+		// luminaire's nadir points world-down; our engine is Y-up, so an unrotated
+		// node's -Z points horizontally. A spot is always aimed by the user (its
+		// -Z cone points where wanted), so its raw basis is already correct. An
+		// omni has no visible aim and is typically left unrotated, so apply a fixed
+		// -90 deg X correction that sends its default nadir to world -Y (down),
+		// while still letting node rotation re-aim the profile.
+		Transform3D ies_xform = xform;
+		if (type != RSE::LIGHT_SPOT) {
+			ies_xform.basis = xform.basis * Basis(Vector3(1, 0, 0), Math::deg_to_rad(-90.0));
+		}
+		pack_light_basis(ld, ies_xform);
+		ld._ies_pad[0] = 0.0f;
+		ld._ies_pad[1] = 0.0f;
 		rt_light_count++;
 	}
 
@@ -3097,6 +3139,22 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, buf_size, rt_light_data);
 		}
 
+		// Upload IES photometric profile buffer. IESManager is a shared singleton, so its
+		// dirty flag alone isn't enough to gate this per-viewport: a viewport created after
+		// another viewport already cleared the flag would otherwise never get an initial
+		// upload and would be stuck on the empty fallback buffer. Also upload whenever this
+		// viewport doesn't have a buffer yet.
+		{
+			RendererRD::LightStorage *ls = RendererRD::LightStorage::get_singleton();
+			IESManager *ies_mgr = ls->get_ies_manager();
+			if (ies_mgr && (ies_mgr->is_dirty() || !p_state->ies_buffer.is_valid())) {
+				ies_mgr->device_update(RD::get_singleton(), p_state->ies_buffer, p_state->ies_buffer_bytes);
+				if (p_state->ies_buffer.is_valid()) {
+					RD::get_singleton()->set_resource_name(p_state->ies_buffer, "RT IES Profile Buffer");
+				}
+			}
+		}
+
 		if (!p_state->params_buffer.is_valid()) {
 			p_state->params_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(rt_ubo));
 			RD::get_singleton()->set_resource_name(p_state->params_buffer, "RT Params Buffer");
@@ -3252,6 +3310,20 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 30;
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rb_data->rt_get_accum_n_texture());
+		uniforms.push_back(u);
+	}
+
+	// Binding 31: IES photometric profile SSBO.
+	// Populated by IESManager::device_update(); empty fallback when no profiles are loaded.
+	{
+		RD::Uniform u;
+		u.binding = 31;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (p_state->ies_buffer.is_valid()) {
+			u.append_id(p_state->ies_buffer);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
 		uniforms.push_back(u);
 	}
 
