@@ -38,16 +38,16 @@ struct RTLightData {
 	float cos_spot_angle; // Cosine of spot cone half-angle.
 	float shadow_enabled; // 1.0 = trace shadow rays, 0.0 = skip (shadowless fill). Must match C++ _pad0 position.
 	vec3 spot_direction; // Spot direction (normalized, world space).
+	float rect_half_height; // rect: half-height scalar (0 for non-rect)
+	float rect_axis_v[3]; // rect: axisV half-height world vector (float[3] to match C++ std430 packing)
+	float _pad2;
 	int ies_slot; // IES profile slot index (-1 = no IES).
 	float ies_strength; // IES intensity multiplier.
 	// Light basis columns in world space: [0..2] = local X, [3..5] = local Y,
 	// [6..8] = local Z. Orthonormal, so world->local is the transpose (three
 	// dot products). Used only to evaluate IES profiles in the light's frame.
 	float ies_basis[9];
-	float _pad1[2]; // Pad to 128 bytes total (matches C++ RT_LightData).
-	float rect_half_height; // rect: half-height scalar (0 for non-rect)
-	vec3 rect_axis_v; // rect: axisV half-height world vector
-	float _pad2;
+	float _ies_pad[2]; // Pad to 160 bytes total (matches C++ RT_LightData).
 };
 
 // Rotate a world-space direction into the light's local frame, where the fixture
@@ -267,7 +267,7 @@ vec3 lights_eval_rect_light(
 
 	// 1. Sample random point on the quad
 	vec3 axisU = light.spot_direction; // half-width vector
-	vec3 axisV = light.rect_axis_v; // half-height vector
+	vec3 axisV = vec3(light.rect_axis_v[0], light.rect_axis_v[1], light.rect_axis_v[2]); // half-height vector
 	float su = u.x * 2.0 - 1.0; // [-1, 1]
 	float sv = u.y * 2.0 - 1.0;
 	vec3 sample_point = light.position + su * axisU + sv * axisV;

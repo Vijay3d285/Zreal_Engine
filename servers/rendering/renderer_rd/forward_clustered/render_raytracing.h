@@ -128,7 +128,7 @@ enum RTLightType : uint32_t {
 	RT_LIGHT_TYPE_SPOT = 3,
 };
 
-// Must match GLSL RTLightData (std430, 128 bytes).
+// Must match GLSL RTLightData (std430, 160 bytes).
 struct alignas(16) RT_LightData {
 	float position[3]; // World position (omni/spot) or direction (directional, normalized).
 	uint32_t type;
@@ -157,8 +157,11 @@ struct alignas(16) RT_LightData {
 	float ies_basis[9];
 	float _ies_pad[2]; // Pad to 128 bytes.
 };
-static_assert(sizeof(RT_LightData) == 128, "RT_LightData must be 128 bytes for std430");
-static_assert(offsetof(RT_LightData, ies_basis) == 84, "RT_LightData::ies_basis must sit at offset 84 to match std430");
+static_assert(sizeof(RT_LightData) == 160, "RT_LightData must be 160 bytes for std430");
+static_assert(offsetof(RT_LightData, ies_basis) == 104, "RT_LightData::ies_basis must sit at offset 104 to match std430");
+static_assert(offsetof(RT_LightData, rect_half_height) == 76, "RT_LightData::rect_half_height must sit at offset 76 to match std430");
+static_assert(offsetof(RT_LightData, rect_axis_v) == 80, "RT_LightData::rect_axis_v must sit at offset 80 to match std430");
+static_assert(offsetof(RT_LightData, ies_slot) == 96, "RT_LightData::ies_slot must sit at offset 96 to match std430");
 
 
 enum {
