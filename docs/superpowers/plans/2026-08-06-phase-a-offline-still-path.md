@@ -10,12 +10,12 @@
 
 ## Global Constraints
 
-- Build with `scons platform=windows target=editor` — always pass `platform=windows` on this machine.
+- Build with `python -m SCons platform=windows target=editor arch=x86_64 d3d12=no tests=yes` — always pass `platform=windows` on this machine; `tests=yes` is required for every task in this plan (each adds/uses doctests); `d3d12=no` matches the project's build environment and skips the D3D12 driver.
 - **After touching any `.glsl`, run a full scons build** so `*.glsl.gen.h` regenerates. Never hand-edit a `.gen.h`.
 - Any struct crossing C++↔GLSL must keep byte-identical layout: `std430`, matching member order, `alignas(16)`, and its `static_assert(sizeof(...) == N)`.
 - New `RenderingServer` API must be added in all four places or the headless build breaks: `rendering_server.h` virtual → `rendering_server_default.h` `FUNC*` forward → RD impl → `servers/rendering/dummy/` stub.
 - Free `PT_PARAM` slots are **9–13 only**. Slots 0–8 are taken (`VIS_MODE, SAMPLE_COUNT, MAX_BOUNCES, DENOISER, ACCUM_FLAG, ACCUM_FRAMES, OIDN_FLAG, ACCUM_TARGET, DLSS_RR_FINAL_FLAG`), 14 = `LIGHT_COUNT`, 15 = `FRAME_INDEX`.
-- Tests live in `tests/servers/rendering/*.cpp` and are auto-globbed by `tests/SCsub` — no `test_main.cpp` edit needed. Build with `tests=yes`, run via `bin\godot.windows.editor.x86_64.exe --test`.
+- Tests live in `tests/servers/rendering/*.cpp` and are auto-globbed by `tests/SCsub` — no `test_main.cpp` edit needed. **BUT** every test `.cpp` must also register its force-link stub or the final link fails with `unresolved external symbol force_link_<name>`: immediately after `#include "tests/test_macros.h"`, add `TEST_FORCE_LINK(<file_basename_without_extension>)` (e.g. `TEST_FORCE_LINK(test_pt_accumulator)`), exactly as `tests/servers/rendering/test_shader_preprocessor.cpp:33` does. Run tests via `bin\godot.windows.editor.x86_64.exe --test`.
 - Do not change realtime one-shot behaviour except where a task says so explicitly. The DLSS-RR realtime still path must keep working.
 
 ---
@@ -80,6 +80,11 @@ Create `tests/servers/rendering/test_pt_accumulator.cpp`:
 /**************************************************************************/
 
 #include "tests/test_macros.h"
+
+// Registers this file's force-link stub. Without it the tests build fails at
+// link with `unresolved external symbol force_link_test_pt_accumulator`.
+// The macro argument is the file basename; see test_shader_preprocessor.cpp.
+TEST_FORCE_LINK(test_pt_accumulator)
 
 #include "core/math/math_funcs.h"
 
