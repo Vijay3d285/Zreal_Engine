@@ -83,8 +83,13 @@ func _render_accum(p_env: Environment, p_vp_rid: RID, p_frames: int) -> Image:
 	await RenderingServer.frame_post_draw
 	return RenderingServer.viewport_get_pathtracing_accum_image(p_vp_rid)
 
-## Prints a curve and asserts it actually descends. A stalled accumulator
-## produces a flat tail, which is exactly the fp16 defect Task 1 fixed.
+## Prints the curve and asserts convergence in TWO ways: the overall reduction
+## from first to last, AND that the final consecutive segment is still improving.
+## The second check is the one that matters: the regression this harness exists
+## to catch is a LATE-stage stall (e.g. an fp16 accumulator freezing at high
+## sample counts) where early segments converge normally but the tail flattens.
+## A first-vs-last check alone is fooled by the healthy early segments.
+## NOTE: assumes p_frame_counts was ascending (as in the usage example).
 func report_convergence(p_results: Array) -> void:
 	print("--- convergence curve ---")
 	for r in p_results:
@@ -93,5 +98,12 @@ func report_convergence(p_results: Array) -> void:
 		var first: float = p_results[0]["rmse"]
 		var last: float = p_results[p_results.size() - 1]["rmse"]
 		print("  reduction: %.2fx" % [first / max(last, 1e-9)])
+		# Overall the curve must fall substantially across the whole sweep.
 		assert(last < first * 0.5,
-				"Accumulator is not converging: RMSE barely improved with more frames.")
+				"Accumulator is not converging: RMSE barely improved from first to last.")
+		# AND the final segment (largest sample counts) must still be dropping.
+		# A stalled tail gives last ~= prev (ratio ~1.0), which fails this; a
+		# healthy 1/sqrt(N) segment gives last well below prev.
+		var prev: float = p_results[p_results.size() - 2]["rmse"]
+		assert(last < prev * 0.98,
+				"Accumulator stalled in the final segment: RMSE stopped falling at high sample counts (the fp16-style late stall this harness guards against).")
