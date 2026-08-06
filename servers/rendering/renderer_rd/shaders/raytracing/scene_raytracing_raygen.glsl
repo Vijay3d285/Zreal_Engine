@@ -84,11 +84,12 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_frame_index, uint p_sample_idx, bool
 	return ps.radiance;
 }
 
-void main() {
-	uvec2 pixel = gl_LaunchIDEXT.xy;
-	const vec2 pixel_center = vec2(pixel) + vec2(0.5);
+/// Build the primary camera ray for `p_pixel` offset by `p_jitter` (in pixels).
+/// Passing vec2(0.5) reproduces the original pixel-centre ray exactly.
+void camera_ray(uvec2 p_pixel, vec2 p_jitter, out vec3 r_origin, out vec3 r_dir) {
+	const vec2 pixel_center = vec2(p_pixel) + p_jitter;
 	const vec2 in_uv = pixel_center / vec2(gl_LaunchSizeEXT.xy);
-	vec2 d = in_uv * 2.0 - 1.0;
+	const vec2 d = in_uv * 2.0 - 1.0;
 
 	mat4 inv_view = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
 			scene_data_block.data.inv_view_matrix[1],
@@ -96,8 +97,12 @@ void main() {
 			vec4(0.0, 0.0, 0.0, 1.0)));
 
 	vec4 target = scene_data_block.data.inv_projection_matrix * vec4(d.x, d.y, 1.0, 1.0);
-	vec4 origin = inv_view * vec4(0.0, 0.0, 0.0, 1.0);
-	vec4 direction = inv_view * vec4(normalize(target.xyz), 0);
+	r_origin = (inv_view * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	r_dir = (inv_view * vec4(normalize(target.xyz), 0.0)).xyz;
+}
+
+void main() {
+	uvec2 pixel = gl_LaunchIDEXT.xy;
 
 	// Sample count from specialization constant, frame index from uniform
 	const uint samples_per_pixel = RT_GET_SAMPLE_COUNT();
@@ -111,22 +116,16 @@ void main() {
 		// 0-based accumulation frame the driver injected for this launch.
 		uint accum_frame = uint(get_rt_param(RT_PARAM_ACCUM_FRAMES));
 
-		// Write the primary-ray G-buffer / depth / velocity / DLSS-RR outputs on
-		// EVERY accumulate frame (pass p_is_sample_zero = true), not just frame 0.
-		// The temporal upscalers are bypassed while accumulating (see the
-		// SCALE_NONE override in render_forward_clustered.cpp), so no consumer
-		// double-integrates them, and any per-frame depth/velocity reader (debug
-		// draw, future denoise) must not see a stale frame-0 buffer.
+		// Jitter the primary ray per accumulated frame. Without this the
+		// accumulator averages the same camera ray forever and never
+		// anti-aliases, however many frames are driven.
+		vec3 origin, direction;
+		camera_ray(pixel, camera_filter_jitter(pixel, accum_frame), origin, direction);
 
-		// One new sample per launch. Seed the frame index so each accum frame
-		// decorrelates; reuse frame_index (separately varied per launch by the
-		// driver) mixed with accum_frame for extra spread.
 		vec3 sample_rad = trace_one_sample(pixel, frame_index, accum_frame, true,
-				max_bounces, origin.xyz, direction.xyz);
+				max_bounces, origin, direction);
 
 		float n = imageLoad(rt_accum_n, ivec2(pixel)).x;
-		// Guard against an uninitialized / cleared (n==0) and float drift; clamp to
-		// a sane maximum so the running average stays well-conditioned.
 		n = max(n, 0.0);
 		float w = 1.0 / (n + 1.0);
 
@@ -135,17 +134,19 @@ void main() {
 
 		imageStore(rt_accum, ivec2(pixel), vec4(running, 1.0));
 		imageStore(rt_accum_n, ivec2(pixel), vec4(n + 1.0));
-		// The accumulator image is the visible output the downstream copy/tonemap
-		// reads; keep it in sync with the running average each launch.
 		imageStore(image, ivec2(pixel), vec4(running, 1.0));
 	} else {
-		// Original one-shot path: trace `samples_per_pixel` samples in this
-		// launch and average. Behaviour is byte-identical to pre-Phase A.
+		// One-shot path: trace `samples_per_pixel` samples this launch and
+		// average. Sample 0 stays centred so the primary-ray G-buffer / depth /
+		// velocity writes keep their pixel-centre alignment; samples 1..N-1 are
+		// jittered, which is a free anti-aliasing win for realtime SPP > 1.
 		vec3 total_radiance = vec3(0.0);
 		[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
 			bool sz = (sample_idx == 0u);
+			vec3 origin, direction;
+			camera_ray(pixel, camera_filter_jitter(pixel, sample_idx), origin, direction);
 			total_radiance += trace_one_sample(pixel, frame_index, sample_idx, sz,
-					max_bounces, origin.xyz, direction.xyz);
+					max_bounces, origin, direction);
 		}
 		vec3 final_radiance = total_radiance / float(samples_per_pixel);
 		imageStore(image, ivec2(pixel), vec4(final_radiance, 1.0));

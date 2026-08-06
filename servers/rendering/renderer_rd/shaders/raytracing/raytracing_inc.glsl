@@ -175,6 +175,35 @@ vec2 rand2(inout uint state) {
 }
 
 // ============================================================================
+// CAMERA RECONSTRUCTION FILTER
+// ============================================================================
+
+/// Inverse CDF of a triangle (tent) distribution of radius 1, mapping u in
+/// [0,1) to an offset in [-1, 1]. Filter importance sampling: the sample may
+/// land outside the pixel footprint but still accumulates into this pixel,
+/// which is what gives triangle reconstruction instead of a box.
+float tent_filter_1d(float u) {
+	return (u < 0.5) ? (sqrt(2.0 * u) - 1.0) : (1.0 - sqrt(max(0.0, 2.0 - 2.0 * u)));
+}
+
+/// Sub-pixel offset for accumulation/loop sample `p_sample`.
+/// Sample 0 is centred, matching Cycles (`init_from_camera.h`): the first frame
+/// of a preview stays identical to the un-jittered image, and the primary-ray
+/// G-buffer writes that fire on sample 0 keep their pixel-centre alignment.
+vec2 camera_filter_jitter(uvec2 p_pixel, uint p_sample) {
+	if (p_sample == 0u) {
+		return vec2(0.5);
+	}
+	// Dedicated RNG stream: keeping jitter off the path RNG stops sub-pixel
+	// position from correlating with shading decisions.
+	uint s = pcg_hash(p_pixel.x + p_pixel.y * 65536u + 0x9E3779B9u);
+	s = pcg_hash(s + p_sample * 2654435761u);
+	float jx = rand(s);
+	float jy = rand(s);
+	return vec2(0.5) + vec2(tent_filter_1d(jx), tent_filter_1d(jy));
+}
+
+// ============================================================================
 // RAY ORIGIN OFFSET (prevents self-intersection)
 // Wachter-Binder method: offsets in integer float representation so the
 // displacement scales naturally with position magnitude.
