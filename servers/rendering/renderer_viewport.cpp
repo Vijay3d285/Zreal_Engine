@@ -1257,6 +1257,13 @@ RID RendererViewport::viewport_get_texture(RID p_viewport) const {
 	return RSG::texture_storage->render_target_get_texture(viewport->render_target);
 }
 
+Ref<Image> RendererViewport::viewport_get_pathtracing_accum_image(RID p_viewport) const {
+	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL_V(viewport, Ref<Image>());
+	ERR_FAIL_COND_V(viewport->render_buffers.is_null(), Ref<Image>());
+	return RSG::scene->get_pathtracing_accum_image(viewport->render_buffers);
+}
+
 RID RendererViewport::viewport_get_occluder_debug_texture(RID p_viewport) const {
 	const Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL_V(viewport, RID());

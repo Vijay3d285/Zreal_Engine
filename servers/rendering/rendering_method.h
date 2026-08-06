@@ -348,6 +348,11 @@ public:
 
 	virtual void gi_set_use_half_resolution(bool p_enable) = 0;
 
+	// Reads back the path-tracer accumulation buffer as scene-linear float RGBA.
+	// Returns an empty ref when the buffer does not exist (path tracing off, or
+	// no accumulation has run).
+	virtual Ref<Image> get_pathtracing_accum_image(Ref<RenderSceneBuffers> p_render_buffers) = 0;
+
 	virtual void set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_draw) = 0;
 
 	virtual TypedArray<Image> bake_render_uv2(RID p_base, const TypedArray<RID> &p_material_overrides, const Size2i &p_image_size) = 0;

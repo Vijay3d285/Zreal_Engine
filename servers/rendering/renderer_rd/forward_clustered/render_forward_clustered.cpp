@@ -5089,6 +5089,35 @@ uint32_t RenderForwardClustered::sdfgi_get_pending_region_cascade(const Ref<Rend
 	return sdfgi->get_pending_region_data(p_region, from, size, bounds);
 }
 
+Ref<Image> RenderForwardClustered::get_pathtracing_accum_image(Ref<RenderSceneBuffers> p_render_buffers) {
+	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
+	ERR_FAIL_COND_V(rb.is_null(), Ref<Image>());
+
+	Ref<RenderBufferDataForwardClustered> rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+	ERR_FAIL_COND_V(rb_data.is_null(), Ref<Image>());
+
+	if (!rb_data->rt_has_accum_texture()) {
+		return Ref<Image>();
+	}
+
+	const RID accum_rid = rb_data->rt_get_accum_texture();
+	if (!RD::get_singleton()->texture_is_valid(accum_rid)) {
+		return Ref<Image>();
+	}
+
+	const Size2i size = rb->get_internal_size();
+	ERR_FAIL_COND_V(size.width <= 0 || size.height <= 0, Ref<Image>());
+
+	// View 0 only: still capture is single-view.
+	Vector<uint8_t> bytes = RD::get_singleton()->texture_get_data(accum_rid, 0);
+	const int64_t expected = (int64_t)size.width * size.height * 16; // RGBA32F
+	ERR_FAIL_COND_V_MSG(bytes.size() != expected, Ref<Image>(),
+			vformat("Path-tracer accumulator readback size mismatch: got %d, expected %d.",
+					(int)bytes.size(), (int)expected));
+
+	return Image::create_from_data(size.width, size.height, false, Image::FORMAT_RGBAF, bytes);
+}
+
 void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {
 	if (dirty_list_element.in_list()) {
 		return;

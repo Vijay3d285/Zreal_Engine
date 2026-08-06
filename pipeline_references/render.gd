@@ -428,14 +428,20 @@ func render_image(data, output_path):
 		img.save_png(output_path)
 		print("Image saved to: ", output_path)
 		_save_thumbnail_webp(img, output_path)
-		# Phase A HDR: linear pre-tonemap EXR capture is a deferred follow-up
-		# (task: pre-tonemap linear EXR C++ readback hook). The converged
-		# accumulator already holds scene-linear radiance in RB_TEX_RAYTRACING_ACCUM;
-		# once the readback is exposed this is where it would be emitted alongside
-		# the PNG. See PATH_TRACER_QUALITY_ROADMAP.md Phase A.
 		if accumulate_enabled:
-			var denoise_note = " with in-process OIDN final-denoise" if oidn_enabled else (" with DLSS-RR reconstruct-final" if dlss_rr_final_enabled else "")
-			print("[Render] Accumulated still captured%s (PNG, tonemapped). Linear EXR export pending C++ readback hook." % denoise_note)
+			var exr_path: String = output_path.get_basename() + ".exr"
+			var hdr: Image = RenderingServer.viewport_get_pathtracing_accum_image(
+					get_viewport().get_viewport_rid())
+			if hdr != null and not hdr.is_empty():
+				var err: int = hdr.save_exr(exr_path, false)
+				if err == OK:
+					print("[Render] Linear HDR EXR saved to: ", exr_path)
+				else:
+					push_warning("[Render] EXR save failed (err %d): %s" % [err, exr_path])
+			else:
+				push_warning("[Render] Accumulator readback returned no image; EXR skipped.")
+			var denoise_note := " with in-process OIDN final-denoise" if oidn_enabled else (" with DLSS-RR reconstruct-final" if dlss_rr_final_enabled else "")
+			print("[Render] Accumulated still captured%s (PNG tonemapped + EXR linear)." % denoise_note)
 		elif dlss_rr_realtime:
 			print("[Render] Realtime DLSS-RR still captured (PNG, tonemapped) — %d-frame temporal accumulation." % DLSS_RR_REALTIME_STILL_FRAMES)
 

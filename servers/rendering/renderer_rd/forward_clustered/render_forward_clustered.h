@@ -957,6 +957,10 @@ public:
 	virtual uint32_t sdfgi_get_pending_region_cascade(const Ref<RenderSceneBuffers> &p_render_buffers, int p_region) const override;
 	RID sdfgi_get_ubo() const { return gi.sdfgi_ubo; }
 
+	/* PATH TRACER ACCUMULATOR READBACK */
+
+	virtual Ref<Image> get_pathtracing_accum_image(Ref<RenderSceneBuffers> p_render_buffers) override;
+
 	/* GEOMETRY INSTANCE */
 
 	virtual RenderGeometryInstance *geometry_instance_create(RID p_base) override;

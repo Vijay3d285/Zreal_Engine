@@ -571,6 +571,10 @@ public:
 	virtual RID viewport_get_render_target(RID p_viewport) const = 0;
 	virtual RID viewport_get_texture(RID p_viewport) const = 0;
 
+	// Reads back the path-tracer accumulation buffer as scene-linear float RGBA
+	// (Image::FORMAT_RGBAF), or an empty ref when path tracing is off / not accumulating.
+	virtual Ref<Image> viewport_get_pathtracing_accum_image(RID p_viewport) const = 0;
+
 	virtual void viewport_set_environment_mode(RID p_viewport, RSE::ViewportEnvironmentMode p_mode) = 0;
 	virtual void viewport_set_disable_3d(RID p_viewport, bool p_disable) = 0;
 	virtual void viewport_set_disable_2d(RID p_viewport, bool p_disable) = 0;
