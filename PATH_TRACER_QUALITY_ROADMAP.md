@@ -1,243 +1,307 @@
-# RTX Path Tracer Quality Gap Analysis & Roadmap to Blender-Cycles / D5 Parity
+# RTX Path Tracer — Quality Gap Analysis & Roadmap to Blender-Cycles Parity
 
-**Scope:** Code-level diagnosis of why this Godot 4.7 fork's path-traced image/video renders do not match reference-grade renderers (Blender Cycles, D5 Render), with a prioritized, code-anchored roadmap of concrete modifications.
+**Scope:** Code-level diagnosis of why this Godot 4.7 fork's path-traced output does not match Blender Cycles, with a prioritized, code-anchored roadmap.
 
-All file:line references are against the current branch `vijay_pt2_shadows`.
+**Engine branch:** `vijay_PTEngine_v8_Quality`
+**Reference:** Blender Cycles at `C:\Users\aiadmin\Desktop\blender_build\blender\intern\cycles`
 
----
+Every "Cycles does X" claim below is anchored to a real file:line in that tree. Every "we do Y" claim is anchored to this branch. **This document was re-verified against both source trees; it supersedes the earlier `vijay_pt2_shadows`-era revision, which described several already-solved problems as open.**
 
-## 0. Executive Summary
-
-The engine has a genuine, well-engineered GPU hardware-raytracing path tracer living inside the Forward+ renderer:
-`servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp` + `scene_shader_raytracing.{cpp,h}`
-shaders in `servers/rendering/renderer_rd/shaders/raytracing/`.
-
-It uses a high-quality BRDF library (Boksansky "Crash Course in BRDFs" — VNDF GGX sampling, height-correlated Smith G2, **multi-scatter energy compensation already present**), does **Next Event Estimation (NEE)** with cone-sampled soft shadows for point/spot/sun lights, and outputs DLSS Ray Reconstruction G-buffers for denoising.
-
-The reason quality trails Cycles/D5 is **not** the BRDF — it is a cluster of integrator and pipeline gaps. Ranked by impact:
-
-| # | Gap | Cycles/D5 behavior | Severity |
-|---|-----|--------------------|----------|
-| 1 | **No accumulative offline render path.** Image "render" = wait 80 frames + grab one **LDR PNG**. No EXR/HDR, no convergence buffer, SPP fixed per-launch. | Cycles accumulates to a float buffer until noise threshold / sample target; outputs 32-bit EXR linear. | **Critical** |
-| 2 | **No MIS** between NEE light sampling and BRDF indirect sampling. Direct + indirect both added, no balance/power heuristic → bias + extra noise. | Cycles uses MIS for every light/BSDF pair | High |
-| 3 | **Emissive geometry is not sampled as a light** (only analytic `rt_lights[]`). | Cycles treats emissive meshes as area lights with MIS | High |
-| 4 | **`MAX_DIFFUSE_BOUNCES` hardcoded to 2** regardless of user `max_bounces`. Global GI dies after 2 hops. | Cycles: separate diffuse/glossy/transmission bounce counts, all user-controlled and high | High |
-| 5 | **White-noise PCG RNG, no blue-noise / stratification / Owen scrambling.** At low SPP this is the single biggest perceived-quality gap vs D5. | D5: blue-noise + path-space; Cycles: scrambled Sobol + PMJ | High |
-| 6 | **No Russian Roulette.** Paths killed only by bounce caps → wasted work, biased path length. | Both: RR with throughput-based continuation probability | Medium |
-| 7 | **Point-sampled camera** (no jitter, no pixel filter). Aliasing + jagged silhouettes at low SPP; DLSS-RR can't synthesize what was never sampled. | Cycles: EWA/mitchell pixel filter + jitter | Medium |
-| 8 | **Path radiance/throughput stored in fp16** in the payload. Loses precision in high-dynamic-range scenes (sun, fire, bright area lights → banding/highlight energy loss). | Cycles: fp32 throughout | Medium |
-| 9 | **Sky/IBL sampled uniformly** (octmap lookup on miss), no environment importance sampling. Noisy/flat sky reflections. | Cycles: MIS environment sampling (alias/portal/Latin-hypercube) | Medium |
-| 10 | **No transmission/refraction in the BRDF path** (`transmissivness` hardcoded 0 in integrator), no **BSSRDF/subsurface**, no anisotropy, no clearcoat/sheen. | Cycles: full Principled BSDF incl. subsurface, glass, dispersion | Medium |
-| 11 | **Biased bump-map workaround** (shading-normal clamp + plane mirror) instead of offset/position-normal sampling. | Cycles: proper offset normals, no clamp bias | Low-Med |
-| 12 | **Denoiser dependency is binary-only (DLSS-RR).** No OIDN/CPU fallback; silently no-op if `sl.*.dll` missing (see `DLSS_Implementation.md`). | Cycles: bundled OIDN, optional OptiX | Low (ops) |
-
-The roadmap below addresses these in priority order, each with concrete code anchors.
+**North star:** offline-first. Converged, reference-grade stills are the primary bar; the realtime DLSS-RR path stays working but is secondary.
 
 ---
 
-## 1. Architecture — what is actually here (reference map)
+## 0. Status reconciliation — what already landed
 
-### Integrator location
-- C++ driver: `servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp` (3271 lines). Builds the TLAS/BLAS, light buffer, `rt_params` UBO, dispatches the raygen pipeline.
-- Shader reflection / pipeline: `scene_shader_raytracing.{cpp,h}`.
-- GLSL shaders: `servers/rendering/renderer_rd/shaders/raytracing/`:
-  - `scene_raytracing_raygen.glsl` — raygen/miss/closest_hit/any_hit/intersection stages.
-  - `raytracing_inc.glsl` — payload packing, RNG, ray-origin offset, bounce flags, **`MAX_DIFFUSE_BOUNCES 2u`**.
-  - `brdf_inc.glsl` — full BRDF library (Boksansky CC0).
-  - `raytracing_lights_inc.glsl` — NEE + reservoir light selection + shadow rays.
-  - `raytracing_closest_hit_common_inc.glsl` — `shade_and_bounce()` = the integrator kernel.
-  - `raytracing_material_eval_inc.glsl`, `raytracing_hit_inc.glsl`, `raytracing_data_inc.glsl`, `raytracing_common_inc.glsl`, `raytracing_samplers_inc.glsl`, custom-hit `raytracing_custom_*.glsl`.
+The previous roadmap revision listed these as open. They are implemented on this branch. Do not re-plan them.
 
-### How path tracing is turned on (from GDScript)
-- Environment storage of 16-float packed params: `environment_storage.cpp:911` (`environment_set_pathtracing_params`), `environment_storage.h:177` (`float pathtracing_params[16]`).
-- UBO plumbing into shader: `render_raytracing.cpp:3001` (`environment_get_pathtracing_params_ptr` → `memcpy` into `rt_ubo.params`).
-- Exposed knobs (ClassDB-bound): `set_pathtracing_enabled`, `set_pathtracing_max_bounces`, `set_pathtracing_samples_per_pixel`, `set_pathtracing_denoiser`. Defaults actually used in pipeline: **image 12 bounces / 20 SPP; video 6 bounces / 6 SPP** (`pipeline_references/image_glb_creation.gd:788-794`, `pipeline_references/video_glb_creation.gd:1111-1113`).
-- `SPP` is a **specialization constant** (`RT_GET_SAMPLE_COUNT()` in raygen, `scene_raytracing_raygen.glsl:45`); `max_bounces` likewise (`:51`). Changing them recompiles the pipeline.
+| Item | Status | Evidence |
+|------|--------|----------|
+| **Accumulation buffer / offline convergence** | ✅ Landed | `rt_accum` + `rt_accum_n` running average, `scene_raytracing_raygen.glsl:110-140`; `RT_PARAM_ACCUM_FLAG/FRAMES/TARGET`, `scene_shader_raytracing.h:99-102`; `Environment::set_pathtracing_accumulate` / `set_pathtracing_accumulation_target`, `environment.cpp:653-668` |
+| **OIDN denoiser fallback** | ✅ Landed | `modules/raycaster_oidn/` (in-process), driven as the accumulate→denoise final pass in `render.gd` |
+| **DLSS-RR realtime-still path** | ✅ Landed | `render.gd:350-440`; correctly feeds DLSS-RR *per-frame noisy* samples rather than a converged image |
+| **Rect / area analytic light** | ✅ Landed | `RT_LIGHT_TYPE_RECT` + `lights_eval_rect_light`, `raytracing_lights_inc.glsl:257-325` (correct area→solid-angle pdf conversion) |
+| **IES photometric profiles** | ✅ Landed | `ies_lookup_inc.glsl`, `core/io/ies_file.cpp`, `ies_manager.cpp`; applied at `raytracing_lights_inc.glsl:447-451` |
+| **Below-hemisphere recovery gating** | ✅ Landed | now behind `RT_BELOW_HEMISPHERE_RECOVERY_ENABLED`, with debug vis mode 22 |
 
-### Per-frame state
-Only `RT_PARAM_FRAME_INDEX = p_state->frame_counter++` varies per frame (`render_raytracing.cpp:3010`). It only reseeds the RNG. **Nothing accumulates across frames** for the image/video capture path (see §2.1).
-
-### DLSS-RR denoiser
-- `servers/rendering/renderer_rd/effects/dlss.{cpp,h}` + `drivers/streamline/streamline_context.cpp`. Requires `sl.interposer.dll`, `sl.common.dll`, `sl.dlss_d.dll`, `nvngx_dlssd.dll` in `bin/` (see root `DLSS_Implementation.md`). If absent, `slDLSSDSetOptions` stays null and DLSS-RR silently evaluates false (`dlss.cpp:340`-region). Only runs when `Viewport.SCALING_3D_MODE_DLSS` is set (`pipeline_references/render.gd:139-145` — scale 1.0 for denoise-only).
-
-### Tone mapping
-AgX/ACES/Filmic/Reinhard/Linear all present (`rendering_server_enums.h:683-687`, `effects/tone_mapper.cpp:262-266`). So the **operator** is not the gap — the gap is the HDR float pipeline *into* it (§2.1).
-
-### Still-image and video capture (the actual output path)
-`pipeline_references/render.gd`:
-- `render_image()` (`:338`) → `await _wait_frames(80)` for warm-up → `_capture_viewport_image(6)` (`:358`) → `img.save_png()` (`:360`). Captured from `vp.get_texture().get_image()` — an **8-bit PNG of the tonemapped viewport**.
-- `render_video()` (`:443`) / `video_render.gd` → `for frame in total_frames: cam.lerp(); await _wait_frames(1); _capture_viewport_image()` → PNG per frame.
-
-Both paths are "fire the realtime viewport N times then grab a snapshot." There is no offline accumulation step.
+**Consequence for planning:** the bottleneck has moved. Convergence machinery exists; what it converges *toward* is still biased and under-sampled. The remaining gaps are integrator correctness, sampling quality, light/material data richness — not buffer plumbing.
 
 ---
 
-## 2. Gap Analysis — code-level detail
+## 1. The headline finding
 
-### 2.1 [CRITICAL] No accumulative offline render path → no convergence, no HDR output
+> **Accumulation shipped without camera jitter. The primary ray is identical on every accumulated sample.**
 
-**Where:** `render.gd:338-365`, `_capture_viewport_image:957-967`.
-The viewable image is the tonemapped, 8-bit viewport after 80 warm-up frames. The path tracer writes to `image` (rgba32f) **fresh every launch** (`scene_raytracing_raygen.glsl:101` `imageStore`), dividing by `samples_per_pixel` of *that launch*. There is no history buffer, no `accumulate(buffer += new / (frame+1))`. So the only way to raise effective SPP is to recompile the shader with a higher `RT_GET_SAMPLE_COUNT()` specialization constant — bounded by RT-core register pressure and single-frame time.
+`scene_raytracing_raygen.glsl:89`
 
-Cycles accumulates `pixel += throughput*rad; samples++` across thousands of independent samples into a persistent fp32 buffer, converging asymptotically, and outputs 32-bit linear EXR (open for grade).
+```glsl
+const vec2 pixel_center = vec2(pixel) + vec2(0.5);   // never jittered
+```
 
-**Consequence:** Even with the BRDF quality equal to Cycles, the still can never reach reference convergence quality; highlights/clipping, firefly persistence, and noise floor are all capped by per-launch SPP. 8-bit PNG loses the HDR headroom Cycles preserves for grading.
+`trace_one_sample()` is called once per accumulation frame with `origin.xyz, direction.xyz` computed **outside** the loop from that fixed pixel center. So accumulating 1000 frames averages 1000 samples that all enter the scene through the exact same point in the exact same direction.
 
-### 2.2 [HIGH] No Multiple Importance Sampling (MIS)
+What that costs:
+- **Zero anti-aliasing gain from accumulation.** Geometric edges stay hard-aliased no matter how long you render. This is the most visible "not Cycles" tell in a still.
+- Accumulation only reduces *shading* noise (RNG diverges after the first hit), not *geometric* noise.
+- No sub-pixel information for DLSS-RR to reconstruct from.
 
-**Where:** integrator kernel `shade_and_bounce()` in `raytracing_closest_hit_common_inc.glsl:442-592`; NEE in `raytracing_lights_inc.glsl:237-378`.
+Cycles jitters the filter dimension on every sample except sample 0, which it centers deliberately (`init_from_camera.h:28-29`):
 
-The NEE loop (`:528-534`) adds `direct_light = lights_evaluate_direct_lighting(...)` scaled only by `1/light_select_pdf` and shadow/attenuation — **not** by an MIS weight. Meanwhile the BRDF-sampled bounce (`:561-591`) just multiplies throughput by `brdf_weight` with no compensating term. Consequences:
-- **Direct bias/noise:** When a BRDF lobe is sharp (low-roughness metal) and the NEE point-sample misses the specular highlight, the estimator wastes samples; when the BRDF bounce *also* hits the light, both contributions partially count without MIS damping → slight over-bright + variance.
-- For area lights this is exactly the case MIS fixes: Cycles weights `w = p_light / (p_light + p_brdf)` (balance or power heuristic) for the light sample and `1 - w` on the BSDF sample. Neither term exists here.
+```cpp
+const float2 rand_filter = (sample == 0) ? make_float2(0.5f, 0.5f)
+                                         : path_rng_2D(kg, rng_pixel, sample, PRNG_FILTER);
+```
 
-(Existing reservoir selection in `lights_evaluate_direct_lighting:250-281` only approximates the *light-picking* PDF; it does not introduce MIS against the BSDF.)
-
-### 2.3 [HIGH] Emissive geometry is not a light
-
-**Where:** `raytracing_closest_hit_common_inc.glsl:458` — emissive only contributes via throughput: `ps.radiance += ps.throughput * m.emissive;` when a path *happens* to hit it. The NEE function `lights_evaluate_direct_lighting` only iterates the analytic `rt_lights[]` buffer (`raytracing_lights_inc.glsl:255`). Emissive meshes/triangle lights are never sampled explicitly and never part of MIS → strongly emissive scenes (neon signs, screens, light panels) are noisy and biased exactly where they matter most.
-
-### 2.4 [HIGH] Hardcoded diffuse bounce cap of 2
-
-**Where:** `raytracing_inc.glsl:134` `#define MAX_DIFFUSE_BOUNCES 2u`, enforced in `raytracing_closest_hit_common_inc.glsl:461`:
-`if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) terminate;`
-
-User `set_pathtracing_max_bounces(12)` raises the **total** ceiling, but diffuse (GI) is independently capped at 2. Interior daylight (sun → floor → wall → ceiling) needs ≥3-4 diffuse hops to look right; color-bleeding and corner-fill die early → flat, "no real GI" look even though the code *can* bounce 12 times. This single constant is the cheapest high-impact fix.
-
-### 2.5 [HIGH] White-noise sampling — no blue noise / stratification
-
-**Where:** `raytracing_inc.glsl:151-168` PCG with naive seed (`pixel.x + pixel.y*65536 + frame*1e6 + sample*1e8`), then `rand()`/`rand2()` drawn directly. No Owen scrambling, no Sobol/PMJ, no blue-noise tile.
-
-At the configured **20 SPP still** / **6 SPP video**, the error is dominated by *structured* noise (splotches, banding) because samples are uncorrelated per pixel. D5 and modern Cycles use Owen-scrambled Sobol + blue-noise dithering so the rendered error looks like fine filmic grain, not clumps, and denoising removes it cleanly. This is the largest *perceptual* gap for the same sample budget.
-
-### 2.6 [MEDIUM] No Russian Roulette
-
-**Where:** integrator has no roulette; termination is only the bounce check at `:461`. Cycles/D5 terminate a path probabilistically based on throughput (e.g. `p = clamp(luminance(throughput), 0.05, 0.95)`; on termination scale surviving samples by `1/(1-p)`). Without RR, work is wasted on low-throughput tails and the *effective* path-length distribution is biased (truncated) not unbiased.
-
-### 2.7 [MEDIUM] Point-sampled camera (no jitter / no AA filter)
-
-**Where:** `scene_raytracing_raygen.glsl:31` `const vec2 pixel_center = vec2(pixel) + vec2(0.5);`. Every sample for a pixel uses the identical ray direction; `samples_per_pixel` internal loop multiplies SPP but all SPP rays share the origin direction → SPP above 1 only helps via the bounce RNG, not pixel coverage. No jitter = hard edges, shimmering silhouettes; the DLSS-RR input lacks sub-pixel info to reconstruct. Cycles uses jittered/poisson subpixel + EWA/Mitchell filtering.
-
-### 2.8 [MEDIUM] fp16 radiance/throughput in payload
-
-**Where:** `PathPayload.packed_rt[3]` fp16 packing, `raytracing_inc.glsl:38-85`; `path_pack` clamps to `FP16_MAX=65504`. Throughput multiplied over many bounces accumulates fp16 rounding; bright direct hits near 65504 clamp lose energy. Cycles runs fp32 end-to-end. For indoor/night scenes with huge sun/intralight dynamic range this shows as banding in highlights and slightly darker caustics.
-
-### 2.9 [MEDIUM] Sky/IBL uniform sampling
-
-**Where:** miss shader `scene_raytracing_raygen.glsl:128-225` — on miss, looks up `radiance_octmap` along the **exact** ray direction with no importance sampling. With high dynamic range skies (e.g. sunset window) tiny bright regions get hit by chance only → noisy sky reflections/specular. Cycles MIS-samples the environment (alias method over a marginals CDF + conditional, or portal lights). Adding env-MIS on top of existing NEE is the canonical upgrade.
-
-### 2.10 [MEDIUM] Missing BSDFs
-
-**Where:** `brdf_inc.glsl:270-279` `MaterialProperties` has `transmissivness` and `opacity` fields, but the integrator hardcodes `brdf_mat.transmissivness = 0.0; brdf_mat.opacity = 1.0;` (`raytracing_closest_hit_common_inc.glsl:474-475`). Rough glass (refraction) is unsupported in the PT BSDF path; recent "glass vanishing" commit workaround hints this is handled out-of-band. No BSSRDF (skin/wax/marble wrong), no anisotropic roughness (alpha2D is always `alpha,alpha` per `sampleGGXVNDF` callers), no clearcoat, no sheen — all present in Cycles Principled BSDF.
-
-### 2.11 [LOW-MED] Biased bump-map recovery
-
-**Where:** `clampShadingNormal` (`brdf_inc.glsl:954-965`) + `recoverBelowHemisphereSample` (`:998-1009`) — when a BRDF sample goes below the geometry plane (aggressive normal map + grazing angle), it mirrors the direction across the geometry plane and reuses the original BRDF weight. The comment itself admits "energy-non-conserving (over-bright at grazing angles)." Cycles uses offset/position-normal sampling that never goes below-plane, no bias. This is intentional duct tape; proper fix is offset normals.
-
-### 2.12 [LOW] Denoiser robustness
-
-`dlss.cpp` checks `slDLSSDSetOptions != nullptr && streamline_capabilities.dlss_rr_available`. If Streamline DLLs aren't deployed (documented in `DLSS_Implementation.md`), denoising silently no-ops. Cycles ships a fallback. Recommend an OIDN path option (or at least a loud warning + null-fallback) so CI/other machines don't silently regress.
+This is a ~20-line fix against machinery that is already built and already running. It is the highest value-per-line change on this document.
 
 ---
 
-## 3. Roadmap (prioritized, code-anchored)
+## 2. Gap table (re-verified)
 
-Phases are ordered so earlier work *de-risks / magnifies* later work. Each item lists the file(s) to change and a concrete acceptance test.
+Ranked by impact on offline still quality.
 
-### Phase A — "Make the still render actually converge" (highest ROI, ~1-2 weeks)
+| # | Gap | Our code | Cycles reference | Severity |
+|---|-----|----------|------------------|----------|
+| 0 | **Accumulator stored at fp16** — running average stalls; shader declares `rgba32f` but the texture is `R16G16B16A16_SFLOAT` | `render_forward_clustered.cpp:131` vs `raygen.glsl:31` | Cycles accumulates to fp32 | **Critical** |
+| 1 | **No camera jitter / reconstruction filter** — accumulation cannot anti-alias | `raygen.glsl:89` | `init_from_camera.h:28-29` (`PRNG_FILTER`) | **Critical** |
+| 2 | **No MIS** between NEE and BSDF sampling | `closest_hit_common:531,561` | `mis.h:26`, `light/sample.h:344,469` | **Critical** |
+| 3 | **No HDR/EXR output** — accumulator holds linear radiance, capture is 8-bit PNG | `render.gd:428,561` | Cycles writes 32-bit linear EXR | High |
+| 4 | **`MAX_DIFFUSE_BOUNCES` hardcoded to 2** | `raytracing_inc.glsl:136` | `data_template.h:181` (`max_diffuse_bounce`, user-set) | High |
+| 5 | **Emissive geometry is never sampled as a light** | `closest_hit_common:458` | `light/triangle.h`, `triangle_light_pdf` | High |
+| 6 | **White-noise PCG; no Sobol / Owen / blue noise** | `raytracing_inc.glsl:153-175` | `sample/pattern.h`, `sobol_burley.h` | High |
+| 7 | **Uniform light selection** — reservoir ignores power & distance | `lights_inc.glsl:350-377` | `light/tree.h:304` (energy-weighted importance) | High |
+| 8 | **No Russian Roulette** | absent | `path_state.h:277-305` | Medium |
+| 9 | **No adaptive sampling / noise threshold** | absent | `film/adaptive_sampling.h:29` | Medium |
+| 10 | **No firefly clamp** | absent | `data_template.h:202-203` (`sample_clamp_direct/indirect`) | Medium |
+| 11 | **Sky/IBL sampled uniformly** — no env importance sampling | `raygen.glsl:232` | `light/background.h:29,118` (marginal/conditional CDF) | Medium |
+| 12 | **glTF PBR extensions dropped at import** | only `_pbr`, `_unlit`, `_emissive_strength` | Cycles Principled BSDF carries all | High (blocks #13) |
+| 13 | **Missing BSDFs** — transmission hardcoded off, no SSS/aniso/clearcoat/sheen | `closest_hit_common:474-475` | `subsurface_random_walk.h`, Principled | Medium |
+| 14 | **fp16 radiance/throughput payload** | `raytracing_inc.glsl:75-87` | fp32 throughout | Medium |
+| 15 | **Biased bump-map mirror recovery** | `brdf_inc.glsl:998-1009` | offset/position normals, no bias | Low-Med |
+| 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
 
-#### A1. Add a persistent accumulation buffer + offline still path  [addresses 2.1]
-- In `render_raytracing.cpp`, allocate a persistent fp32 `history_color` image (per render target). Add `RT_PARAM_ACCUM_FRAMES` and `RT_PARAM_RESET_ACCUM` to the `rt_ubo.params` slot (indices 4-13 are reserved-free per `raytracing_inc.glsl:22`).
-- Change `scene_raytracing_raygen.glsl` to, instead of `imageStore(image, px, total/SPP)`, do per-launch single-sample (SPP=1) accumulation: `float n = frame_index; imageStore(acc, px, mix(prev, new, 1/(n+1)))` and write the running average to the display `image`. Reset buffer when `RT_PARAM_RESET_ACCUM` flips (camera/scene change).
-- Add a new RenderingServer entry point such as `set_pathtracing_accumulate(enabled, target_frames)` mirroring the existing `environment_set_pathtracing` plumbing (`rendering_server.h:690`, `environment_storage.cpp:911`).
-- GDScript: in `render.gd:render_image`, replace "wait 80 frames, grab one PNG" with *drive N draw frames into the accumulator until convergence* then grab the 32-bit image.
-- **A2. HDR output.** Capture the compositor input (linear fp buffer) and `img.save_exr(...)` (Godot 4.x `Image.save_exr` exists). Optionally export both `.png` (tonemapped) and `.exr` (linear).
-
-**Acceptance:** Diffuse a Cornell-ish test scene at 64 vs 4096 frames → variance falls ~16× and output noise matches SPP-equivalent reference; EXR opens in Blender with intact highlights.
-
-#### A2. Decouple SPP specialization from convergence  [enables A1]
-- `RT_GET_SAMPLE_COUNT` is a specialization constant recompiling the pipeline. With A1, SPP-per-launch can stay 1 and accumulation provides the budget; remove the need to recompile to raise quality. Keep the variable for realtime.
-
-### Phase B — Integrator correctness (1-2 weeks)
-
-#### B1. Multiple Importance Sampling  [addresses 2.2]
-- Add `mis_weight` computation in `lights_evaluate_direct_lighting`: compute the BSDF pdf for the sampled light direction (`diffusePdf(NdotL)` for diffuse; `specularPdf(...)` for specular) and weight the NEE estimate by `w = p_light² / (p_light² + p_brdf²)` (power heuristic).
-- On the BRDF-sampled bounce in `shade_and_bounce` (`:561`), when the new ray would hit a light (detected next-bounce emissive), apply the complementary MIS term `1 - w` — implemented simplest via recording the chosen BSDF pdf on the payload and *also tracing* a shadow ray to lights on the BRDF sample (the dual of NEE). Easiest separation: keep two estimators but power-heuristic them; add a `bsdf_pdf` field to payload.
-- **Acceptance:** Reflection of a small bright area light off a glossy floor → specular highlight variance drops, no double-bright near the light.
-
-#### B2. Enable diffuse bounces from the user knob  [addresses 2.4]
-- Replace `#define MAX_DIFFUSE_BOUNCES 2u` (`raytracing_inc.glsl:134`) with an `rt_params` slot (e.g. reuse reserved index 16-region; the packed-bounce byte already tracks diffuse count at `:91-95`). Bind `set_pathtracing_max_diffuse_bounces` analogously to `set_pathtracing_max_bounces`. Default ≥4.
-- **Acceptance:** Sun-on-floor interior: warm bounce reaches the ceiling/wall, eliminating the "no GI above 2 hops" flatness without raising total bounces.
-
-#### B3. Blue-noise / Owen-scrambled Sobol sampler  [addresses 2.5]
-- Add a Sobol sequence table + per-pixel Owen scramble key seeded from pixel/frame (small LUT in the UBO, or a 1D 256-entry buffer). Provide `sample_sobol(dim, seed)` returning `[0,1)` and replace `rand2`/`rand` call-sites in `brdf_inc.glsl` and `raytracing_lights_inc.glsl` with dimension-advancing Sobol. Optionally XOR a blue-noise dither tile for the per-pixel offset.
-- **Acceptance:** At equal low SPP the noise is fine grain, not clumps; after A1's denoiser, residual pattern disappears at 1/4 the sample count.
-
-### Phase C — Light & environment fidelity (1-2 weeks)
-
-#### C1. Emissive-geometry light sampling (mesh lights)  [addresses 2.3]
-- Maintain an emissive-triangle light buffer built in `render_raytracing.cpp` alongside `gather_lights` (a list of emissive triangles with area, emission, sampled position). In `lights_evaluate_direct_lighting`, pick either an analytic light or an emissive triangle with pdf proportional to emitted power × area; sample a point on the triangle; MIS-combine with the BSDF.
-- This reuses the existing TLAS for shadow rays.
-- **Acceptance:** A scene lit only by a glowing panel renders clean at low SPP; no hotspot speckle.
-
-#### C2. Environment importance sampling / MIS  [addresses 2.9]
-- Build a 2D marginal/conditional CDF over the sky `radiance` cube (once per environment update); store as a 2D texture. In the miss shader, when *sampling* the sky for NEE, draw a (u,v) from the CDF, return `sky_color/0`. Apply the same power MIS between BRDF sky bounce and env-NEE.
-- Optional portal lights via Godot's existing `DirectionalLight3D`-style API for windows.
-- **Acceptance:** Sunset-window specular reflection converges at 2× the rate of uniform.
-
-### Phase D — Sampling math & throughput correctness (1 week)
-
-#### D1. Camera jitter + pixel filter  [addresses 2.7]
-- In `scene_raytracing_raygen.glsl:31`, replace `+ vec2(0.5)` with a jittered sample drawn from the Sobol/blue-noise sampler (Phase B3), e.g. `vec2(p) + sample2d(dim_camera)`. When A1 accumulation is active, jitter each frame. Apply a box/triangle filter (triangle is cheap and crisp). Wire unjittered VPs into the DLSS-RR motion path so denoiser still works (the `curr_vp_unjittered` plumbing at `render_raytracing.cpp:3012-3022` already exists).
-- **Acceptance:** Edges of foreground objects vs background are smooth at low SPP; DLSS-RR history reprojection improves (visible through frame-to-frame stability).
-
-#### D2. Russian Roulette  [addresses 2.6]
-- After throughput update in `shade_and_bounce` (`:578`), when `total_bounces > MIN_RR_BOUNCES` (e.g. 3) compute `p = clamp(maxComponent(throughput), 0.05, 0.95)`. If `rand > p`, terminate; else `throughput /= p`. Pack p-scaled throughput.
-- **Acceptance:** Same image with RR on at throughput-clamped scenes; render time per frame drops in long-bounce heavy scenes with no visible bias.
-
-#### D3. fp32 payload (optional)  [addresses 2.8]
-- Widen `PathPayload` radiance/throughput to fp32 (costs 6 bytes/payload; revisit the 32-byte packing at `raytracing_inc.glsl:38`). Profile RT-core occupancy; if it hurts, keep fp16 for indirect but carry a secondary fp32 "active throughput" register via the raygen loop reconstruction (the raygen loop already rebuilds state per bounce — `:86-93`).
-- **Acceptance:** A bright-area-light test (sun 1000×) no longer clamps/bands in specular tails.
-
-### Phase E — BSDF completeness (2-3 weeks, parallelizable)
-
-#### E1. Transmission / rough glass in the BRDF path  [addresses 2.10]
-- Implement GGX refraction sampling (`sampleMicrofacet` half-vector then refract instead of reflect when entering a dielectric). Branch in `evalIndirectCombinedBRDF` on `material.transmissivness > 0`. Handle IOR side (front/back face, total internal reflection → reflect). Remove the `transmissivness=0` hardcode (`raytracing_closest_hit_common_inc.glsl:474`).
-- Add `set_pathtracing_max_transmission_bounces`.
-- **Acceptance:** A glass vase renders refractive, rough-glass blurs correctly; no more "glass vanishing" workaround.
-
-#### E2. Subsurface scattering (BSSRDF)  [addresses 2.10]
-- Either random-walk BSSRDF inside the volume (cost ~ moderate) or the burley dipole approximation for realtime. Add via a new `MaterialProperties` flag and an `evalBSSRDF` separable lobe sampled with the techniques in Heitz/"BSSRDF importance sampling".
-- **Acceptance:** Skin/wax reads correctly under the existing NEE direct lighting.
-
-#### E3. Anisotropy, clearcoat, sheen (Principled parity)  [addresses 2.10]
-- `alpha2D` is already plumbed through `sampleGGXVNDF(Ve, alpha2D, u)`; callers pass `(alpha,alpha)`. Thread an anisotropy factor through `MaterialData` and remap to `alpha2D`. Add a clearcoat GGX lobe evaluated/sampled alongside the base. Add Charlie/sheen for fabric.
-- **Acceptance:** Brushed-metal anisotropic reflections, clearcoat car paint, and fabric sheen render with Cycles-comparable response.
-
-### Phase F — Robustness / polish (rolling)
-
-#### F1. Optional OIDN denoiser fallback  [addresses 2.12]
-- Add `PT_DENOISER_OIDN` enum value (currently only `NONE=0`, `DLSS_RR=1` per `rendering_server_enums.h` PT enum). Wire to Intel OIDN (it's already a common thirdparty option). Use when DLSS-RR unavailable.
-- **Acceptance:** A machine without Streamline DLLs still denoises (slower, CPU), with a logged warning.
-
-#### F2. Replace biased bump workaround with offset normals  [addresses 2.11]
-- Use normal-mapping offset/`safe` normals so BRDF samples never fall below the geometry plane; remove `clampShadingNormal` mirror fallback (`recoverBelowHemisphereSample`). Preserve the debug vis at `raytracing_closest_hit_common_inc.glsl:22` for comparison.
-- **Acceptance:** At grazing angles on a high-frequency normal-mapped water plane, energy stays flat (no over-bright), no more black speckle.
+**Not gaps — verified correct, leave alone:**
+- BRDF library (VNDF GGX, height-correlated Smith G2, multi-scatter compensation) — Cycles-class.
+- `alpha = roughness²` (`brdf_inc.glsl:1046`) — matches Cycles/glTF convention exactly.
+- Rect-light area→solid-angle pdf conversion (`lights_inc.glsl:294-297`) — correct.
+- Wächter-Binder ray-origin offset (`raytracing_inc.glsl:182-197`) — correct.
+- TLAS/BLAS build, SER reorder, motion vectors, DLSS-RR G-buffers, AgX/ACES/Filmic tone operators.
 
 ---
 
-## 4. Validation harness recommendation
-Build a fixed test scene set (Cornell box, mirror-on-floor area light, glass vase, interior daylight room) with reference Cycles EXRs at matching exposure; diff each phase's EXR output via mean-squared-error + structural (FLIP/LPIPS-style) and SSIM. Cheapest durable signal that the changes move toward parity rather than sideways.
+## 3. Detailed analysis
+
+### 3.1 [CRITICAL] MIS is entirely absent
+
+Cycles runs a **two-sided** MIS scheme. Both sides are missing here.
+
+**Side A — NEE sample weighted against the BSDF pdf** (`shade_surface.h:414`):
+```cpp
+const float mis_weight = light_sample_mis_weight_nee(kg, ls.pdf, bsdf_pdf);
+bsdf_eval_mul(&bsdf_eval, light_shader_eval * ls.eval_fac / ls.pdf * mis_weight);
+```
+
+**Side B — BSDF ray that lands on emissive geometry, weighted against the light pdf** (`shade_surface.h:150`):
+```cpp
+const float mis_weight = light_sample_mis_weight_forward_surface(kg, state, path_visibility, path_flag, sd);
+```
+which reads the pdf stashed from the previous bounce (`light/sample.h:488`):
+```cpp
+const float bsdf_pdf = INTEGRATOR_STATE(state, path, mis_ray_pdf);
+float pdf = triangle_light_pdf(kg, sd, t);
+```
+
+Both reduce to `power_heuristic(a,b) = a²/(a²+b²)` (`mis.h:26`).
+
+Ours: `lights_evaluate_direct_lighting` divides only by `light_select_pdf` (`lights_inc.glsl:455`) with no BSDF-pdf term, and the BSDF bounce at `closest_hit_common:561-578` multiplies throughput by `brdf_weight` with no complementary weight. Emissive surfaces hit by a BSDF ray add `throughput * m.emissive` **unweighted** (`:458`).
+
+Because we don't yet sample emissive meshes via NEE, the two estimators don't currently double-count *mesh* emission — but they will the moment Gap #5 lands, and analytic lights already suffer the variance MIS exists to kill. **MIS must land before or with emissive-mesh sampling**, never after.
+
+Implementation requires a `mis_ray_pdf` field on the payload. The payload is a tight 32 bytes (`raytracing_inc.glsl:40-47`) and full — this is the structural reason to schedule the payload widening (Gap #14) in the same phase.
+
+### 3.2 [HIGH] Bounce controls are a single hardcoded constant
+
+`raytracing_inc.glsl:136` → `#define MAX_DIFFUSE_BOUNCES 2u`, enforced at `closest_hit_common:461`.
+
+Cycles exposes six independent user-controlled caps (`data_template.h:179-184`): `min_bounce`, `max_bounce`, `max_diffuse_bounce`, `max_glossy_bounce`, `max_transmission_bounce`, `max_volume_bounce`. `min_bounce` additionally guarantees RR does not fire early.
+
+Interior daylight needs ≥3–4 diffuse hops for color bleeding and corner fill. Capped at 2, `set_pathtracing_max_bounces(12)` is misleading: GI dies at hop 2 regardless. Note the bounce counters are already packed per-type (`:89-104`), so the data model supports this — only the constant and the plumbing are missing.
+
+### 3.3 [HIGH] Sampling is white noise
+
+`raytracing_inc.glsl:160-164`:
+```glsl
+uint seed = pixel.x + pixel.y * 65536u + frame * 1000000u + sample_idx * 100000000u;
+return pcg_hash(seed);
+```
+Then `rand()`/`rand2()` draw sequentially — no dimension tracking, no stratification, no scrambling.
+
+Cycles offers Tabulated Sobol, Sobol-Burley, and two blue-noise modes (`pattern.h:38-61`), with **dimension-indexed** draws (`path_rng_2D(..., dimension)`) so each decision gets its own well-stratified dimension, and Owen-scrambled per-pixel offsets via `nested_uniform_scramble_base4(morton2d(x, y), seed)` (`pattern.h:156`).
+
+Cycles' own guidance (`pattern.h:20-32`) — earlier dimensions are better stratified, so assign them to what matters most (filter, lens, first-bounce BSDF, light selection).
+
+At equal sample count, white noise produces clumpy splotches; Sobol/blue-noise produces fine even grain that denoises far more cleanly. This is the largest *perceptual* gap per unit of sample budget.
+
+### 3.4 [HIGH] Light selection ignores light power
+
+`lights_inc.glsl:350-377` picks `k=16` candidates **uniformly at random**, keeps one by reservoir, and estimates `light_select_pdf` from the valid-count ratio. Selection probability is unrelated to a light's contribution.
+
+Cycles builds an importance-weighted light tree (`light/tree.h:304` `light_tree_node_importance`, weighting by `energy` × angular/distance bounds, `tree.h:215,452`) with a flat power-based distribution as fallback.
+
+In a scene with one 10000W key and forty 5W fills, we spend ~97.5% of shadow rays on lights contributing almost nothing. This scales badly precisely in the archviz scenes this engine targets.
+
+### 3.5 [MEDIUM] No Russian Roulette, no clamp, no adaptive sampling
+
+Three independent efficiency mechanisms, all absent.
+
+- **RR** (`path_state.h:296-305`): `min(sqrtf(reduce_max(fabs(throughput))), 1.0f)`, applied only after `min_bounce`. *Note the `sqrt`* — Cycles deliberately terminates later than naive luminance-based RR to better match the view transform. The earlier revision of this document specified `clamp(luminance, 0.05, 0.95)`; that was wrong. Match the reference.
+- **Clamping** (`data_template.h:202-203`): separate `sample_clamp_direct` / `sample_clamp_indirect`. Without indirect clamp, a single unlucky specular-caustic path leaves a permanent white pixel that the running average never washes out — fireflies are *more* damaging with accumulation than without it, because they persist.
+- **Adaptive sampling** (`adaptive_sampling.h:29`): per-pixel convergence check against a noise threshold, plus a two-pass box filter (`filter_x`/`filter_y`) so converged pixels near noisy ones keep sampling. Cycles stops sampling converged pixels entirely and spends the budget where variance remains.
+
+### 3.6 [HIGH] glTF material extensions are dropped at import
+
+Verified — the importer supports exactly three material extensions:
+```
+KHR_materials_emissive_strength, KHR_materials_pbr, KHR_materials_unlit
+```
+
+Absent: `KHR_materials_transmission`, `_volume`, `_ior`, `_clearcoat`, `_sheen`, `_specular`, `_anisotropy`, `_iridescence`.
+
+And the GPU-side struct has nowhere to put them anyway (`raytracing_data_inc.glsl:87-105`) — `MaterialData` carries albedo/normal/orm/emission indices, metallic, roughness, ao, specular, uv1 scale/offset, normal depth. No transmission, IOR, clearcoat, sheen, or anisotropy fields.
+
+**This is why the material phase must precede the BSDF phase.** A physically perfect rough-glass BSDF is untestable while `KHR_materials_transmission` is discarded at import and has no slot in the struct. Any GLB authored in Blender with a glass or car-paint Principled setup arrives at our path tracer as opaque diffuse — the data is gone before the shader ever runs.
+
+### 3.7 [MEDIUM] Payload precision and MIS state
+
+`path_pack` clamps to `FP16_MAX = 65504` (`raytracing_inc.glsl:76-78`). Throughput multiplied across many bounces accumulates fp16 rounding; bright direct hits clamp and lose energy. Cycles is fp32 end-to-end.
+
+The payload is exactly 32 bytes and fully packed. MIS needs a `mis_ray_pdf` float. Both changes touch the same struct → do them together, once, and re-measure occupancy.
 
 ---
 
-## 5. Out of scope / already good
-- BRDF library quality (GGX VNDF, height-correlated G2, multi-scatter comp) is **at** Cycles-class already.
-- NEE and soft-shadow cone sampling for point/spot/sun lights is present and correct (only MIS against BSDF is missing).
-- TLAS/BLAS building, SER reorder hint, motion-vector/depth output for DLSS-RR are solid.
-- DLSS-RR G-buffer outputs (diffuse/specular albedo, normal/roughness, specular hit distance) are correctly fed to the denoiser.
-- AgX/ACES/Filmic tone operators are available; that is not a gap.
+## 4. Roadmap
+
+Phases are ordered so each one de-risks the next. **A → B → C → D → E → F.**
+
+### Phase A — Finish the offline still path *(highest ROI; ~1 week)*
+
+Accumulation exists but is half-wired. Close it out.
+**Detailed task-by-task plan: [`docs/superpowers/plans/2026-08-06-phase-a-offline-still-path.md`](docs/superpowers/plans/2026-08-06-phase-a-offline-still-path.md)**
+
+**A0. fp32 accumulator** — *Gap #0*
+`RB_TEX_RAYTRACING_ACCUM` is allocated `R16G16B16A16_SFLOAT` while the raygen shader declares `rgba32f`. Beyond the format mismatch, fp16's relative epsilon near 1.0 (~9.8e-4) exceeds the `1/(n+1)` blend weight past a few hundred samples, so the increment rounds away and **the image stops converging** long before the configured target — which can be set as high as 8192. Also fixes highlight clipping at 65504. Update the OIDN readback (`render_forward_clustered.cpp:1962,2002-2012,2060-2074`) for the 16-byte stride.
+*Accept:* RMSE against a high-sample reference keeps falling from 256→1024 frames instead of flattening.
+
+**A1. Camera jitter + reconstruction filter** — *Gap #1*
+Jitter `pixel_center` per accumulated sample; keep sample 0 centered (Cycles convention, `init_from_camera.h:28`). Move ray setup **inside** `trace_one_sample` so each sample gets its own primary ray. Start with a box filter; add Blackman-Harris/Gaussian reconstruction after A3. Feed unjittered VPs to the DLSS-RR motion path — `curr_vp_unjittered` plumbing already exists at `render_raytracing.cpp:3012-3022`.
+*Accept:* a 45° edge at 256 accumulated frames shows smooth gradation, not stairsteps. Diff against the current build to prove the change is doing the work.
+
+**A2. HDR / EXR output** — *Gap #3*
+`RB_TEX_RAYTRACING_ACCUM` already holds scene-linear radiance. Read it back and `Image.save_exr()` alongside the tonemapped PNG.
+*Accept:* EXR opens in Blender's compositor with highlights above 1.0 intact and recoverable.
+
+**A3. Firefly clamp** — *Gap #10*
+`pathtracing_clamp_direct` / `pathtracing_clamp_indirect` in the params block. **Free `PT_PARAM` slots are 9-13 only** — 0-8 are taken (`VIS_MODE, SAMPLE_COUNT, MAX_BOUNCES, DENOISER, ACCUM_FLAG, ACCUM_FRAMES, OIDN_FLAG, ACCUM_TARGET, DLSS_RR_FINAL_FLAG`), 14-15 are `LIGHT_COUNT`/`FRAME_INDEX`. Clamp contributions by bounce depth at the shading site.
+*Accept:* a small bright specular caustic no longer leaves permanent white pixels at 500 frames.
+
+**A4. Adaptive sampling + noise threshold** — *Gap #9*
+Per-pixel variance in the spare `rt_accum_n` channels; stop sampling converged pixels; box-filter the convergence mask so noisy neighbors keep their neighbors alive (`adaptive_sampling.h:95-138`).
+*Accept:* an interior scene reaches a target noise floor in measurably fewer total samples, with no visible convergence-boundary seams.
+
+### Phase B — Integrator correctness *(~2 weeks)*
+
+**B1. Widen the payload: fp32 + `mis_ray_pdf`** — *Gaps #14, prerequisite for B2*
+One struct change: fp32 radiance/throughput plus a `mis_ray_pdf` float. Profile RT-core occupancy; if it regresses badly, keep radiance fp16 but carry throughput and pdf at fp32.
+*Accept:* a sun-at-1000× test no longer bands in specular tails; frame time regression stays within budget.
+
+**B2. Multiple Importance Sampling** — *Gap #2*
+Both sides, power heuristic, mirroring `light/sample.h:344` and `:469`. Weight the NEE estimate by `power_heuristic(light_pdf, bsdf_pdf)`; store the BSDF pdf on the payload and weight emissive hits by `power_heuristic(bsdf_pdf, light_pdf)`.
+*Accept:* a small bright area light reflected in a glossy floor — specular highlight variance drops sharply, no over-bright ring near the light. Compare to a Cycles EXR of the same setup.
+
+**B3. Per-type bounce controls** — *Gap #4*
+Replace the `MAX_DIFFUSE_BOUNCES` constant with params-block slots. Expose `min_bounce`, `max_diffuse_bounce`, `max_glossy_bounce`, `max_transmission_bounce` on `Environment` following the existing `set_pathtracing_max_bounces` pattern. Default diffuse ≥4.
+*Accept:* sun→floor→wall→ceiling color bleeding is visible; diffuse cap at 2 vs 4 produces a clearly different, warmer interior.
+
+**B4. Russian Roulette** — *Gap #8*
+After the throughput update at `closest_hit_common:578`, once `total_bounces > min_bounce`: `p = min(sqrt(max_component(throughput)), 1.0)`; terminate on `rand() > p`, else `throughput /= p`. Match the `sqrt` — see §3.5.
+*Accept:* render time per frame drops in deep-bounce scenes with no measurable bias (mean of 2000 accumulated frames matches the pre-RR mean within noise).
+
+**B5. Owen-scrambled Sobol / blue-noise sampler** — *Gap #6*
+Replace bare PCG with a dimension-indexed Sobol-Burley sampler; per-pixel Owen scramble seeded via `nested_uniform_scramble_base4(morton2d(x,y), seed)`. Thread an explicit `dimension` through `rand()`/`rand2()` call sites and assign the earliest dimensions to filter, then first-bounce BSDF, then light selection (`pattern.h:20-32`).
+*Accept:* at 16 spp the residual error is fine even grain, not clumps; OIDN output at 1/4 the sample count matches today's quality.
+
+### Phase C — Light & environment fidelity *(~2 weeks)*
+
+**C1. Emissive-mesh light sampling** — *Gap #5*
+Build an emissive-triangle buffer alongside `gather_lights` in `render_raytracing.cpp` (area, emission, power). Sample by power, MIS-combine against the BSDF (B2 must be in first). Reuse the existing TLAS for shadow rays.
+*Accept:* a room lit only by a glowing panel converges clean; no hotspot speckle; matches a Cycles reference of the same scene.
+
+**C2. Power-weighted light selection** — *Gap #7*
+Replace uniform reservoir candidate selection with importance proportional to `energy / distance²` × angular falloff, following `light_tree_node_importance` (`tree.h:304`). A flat power-weighted CDF captures most of the benefit; the full tree is optional.
+*Accept:* one bright key among 40 dim fills converges at several× the current rate.
+
+**C3. Environment importance sampling** — *Gap #11*
+Build marginal + conditional CDFs over the sky octmap on environment update (`background.h:29` `background_map_sample`, `:118` `background_map_pdf`). Sample the env for NEE; MIS against the BSDF sky bounce.
+*Accept:* a sunset-HDRI window reflection converges at ≥2× the uniform-sampling rate.
+
+### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)*
+
+**Nothing in Phase E is testable until this lands.** See §3.6.
+
+**D1. glTF extension import** — *Gap #12*
+Add `KHR_materials_transmission`, `_ior`, `_volume`, `_specular`, `_clearcoat`, `_sheen`, `_anisotropy` to `modules/gltf/`.
+
+**D2. Material representation**
+Extend `StandardMaterial3D` (or introduce a `PrincipledMaterial3D`) to carry the new parameters, so imported data survives into the scene tree and the Inspector.
+
+**D3. Widen RT `MaterialData`**
+Add transmission, IOR, clearcoat (+roughness), sheen (+tint), anisotropy (+rotation) to `raytracing_data_inc.glsl:87-105` and its C++ twin. **Respect the std430 / `static_assert(sizeof == N)` / `alignas(16)` parity rules** — the struct has a verbatim GLSL counterpart and both must agree byte-for-byte.
+
+*Accept:* a Blender-authored GLB with glass, car paint, and fabric round-trips with every parameter intact and inspectable, *before* any new BSDF math exists to consume it.
+
+### Phase E — BSDF completeness *(~3 weeks, parallelizable after D)*
+
+**E1. Transmission / rough glass** — *Gap #13*
+GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_hit_common:474`). Handle front/back faces, IOR sides, total internal reflection. Wire `max_transmission_bounce` from B3.
+*Accept:* a glass vase refracts correctly; rough glass blurs plausibly; retire the "glass vanishing" workaround.
+
+**E2. Anisotropy, clearcoat, sheen**
+`sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles.
+
+**E3. Subsurface scattering**
+Random-walk BSSRDF following `subsurface_random_walk.h`.
+*Accept:* skin and wax read correctly under existing NEE.
+
+### Phase F — Precision & robustness *(rolling)*
+
+**F1. Offset normals replacing the biased bump mirror** — *Gap #15*
+Remove `recoverBelowHemisphereSample` (`brdf_inc.glsl:998-1009`); its own comment concedes it is energy-non-conserving. Keep debug vis mode 22 for comparison.
+*Accept:* grazing angles on a high-frequency normal-mapped surface stay energy-flat; no over-bright, no speckle.
+
+**F2. Volumetrics** — *Gap #16*
+Homogeneous fog/god-rays via a volume integrator (`shade_volume.h`), with `max_volume_bounce` from B3.
 
 ---
 
-*Bottom line:* the fastest path to "looks like Cycles" is Phase A (accumulation + HDR output) + A2 + B3 (blue-noise) + B2 (diffuse bounces) — those four changes alone will close most of the perceived gap for still images at modest cost and unblock everything else. MIS (B1) and emissive/env sampling (C1/C2) are the next visible wins. Phase E is where matched-per-feature parity (glass/skin/fabric) lives.
+## 5. Validation harness
+
+Build this **during Phase A**, not later — every subsequent acceptance test depends on it.
+
+Fixed scene set: Cornell box, area-light-on-glossy-floor, glass vase, interior daylight room, emissive-panel-only room, sunset-HDRI window.
+
+For each: a Cycles reference EXR at matched exposure, camera, and light units. Compare our EXR per phase via MSE + SSIM (and FLIP if convenient). Track error-vs-sample-count curves, not just final images — most of these phases are variance-reduction work, and a curve shows that where a single frame does not.
+
+Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stratification, power-heuristic math, light-selection pdf normalization, glTF extension round-trip.
+
+---
+
+## 6. Bottom line
+
+**Phase A alone** — jitter, EXR, clamp, adaptive — converts the already-built accumulator from "converges shading noise at fixed aliasing" into a genuine offline renderer. A1 in particular is a handful of lines against machinery that already works, and it is currently the most visible defect in any still.
+
+**Phase B** makes the converged image *correct* rather than merely stable: MIS and real bounce counts are what separate "a path tracer" from "a reference path tracer."
+
+**Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
+
+Ordering summary: **A1 → A2/A3/A4 → B1/B2 → B3/B4/B5 → C → D → E → F.**
