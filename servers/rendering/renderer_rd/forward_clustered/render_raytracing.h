@@ -45,7 +45,7 @@
 #define RB_TEX_RAYTRACING SNAME("raytracing")
 #define RB_TEX_RT_DEPTH SNAME("rt_depth")
 // Phase A: persistent accumulation buffers for still-image convergence.
-#define RB_TEX_RAYTRACING_ACCUM SNAME("rt_accum")       // running-average radiance (R16G16B16A16_SFLOAT)
+#define RB_TEX_RAYTRACING_ACCUM SNAME("rt_accum")       // running-average radiance (R32G32B32A32_SFLOAT)
 #define RB_TEX_RAYTRACING_ACCUM_N SNAME("rt_accum_n") // sample count per pixel (R32_SFLOAT)
 
 #define RB_SCOPE_DLSS_RR SNAME("dlss_rr")

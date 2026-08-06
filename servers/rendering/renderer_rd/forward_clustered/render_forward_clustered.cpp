@@ -128,7 +128,7 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 		render_buffers->create_texture(
 				RB_SCOPE_FORWARD_CLUSTERED,
 				RB_TEX_RAYTRACING_ACCUM,
-				RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				RD::DATA_FORMAT_R32G32B32A32_SFLOAT,
 				usage_bits_oidn,
 				RD::TEXTURE_SAMPLES_1);
 	}
@@ -1952,14 +1952,14 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 	// Single-view still capture is the supported case. Denoise the (stereo, if present) views
 	// independently; the AOV layout is per-view in each RB scope texture.
 	for (uint32_t v = 0; v < view_count; v++) {
-		// --- accumulator: R16G16B16A16_SFLOAT scene-linear radiance (8 bytes/pixel) ---
+		// --- accumulator: R32G32B32A32_SFLOAT scene-linear radiance (16 bytes/pixel) ---
 		const RID accum_rid = p_rb_data->rt_get_accum_texture();
 		if (!RD::get_singleton()->texture_is_valid(accum_rid)) {
 			WARN_PRINT_ONCE("OIDN final-denoise: accumulator texture invalid, skipping.");
 			return;
 		}
 		Vector<uint8_t> accum_bytes = RD::get_singleton()->texture_get_data(accum_rid, v);
-		ERR_CONTINUE(accum_bytes.size() != (int64_t)width * height * 8);
+		ERR_CONTINUE(accum_bytes.size() != (int64_t)width * height * 16);
 
 		// --- diffuse albedo AOV: R8G8B8A8_UNORM (4 bytes/pixel), optional ---
 		Vector<uint8_t> albedo_bytes;
@@ -1999,15 +1999,15 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 			normal_f.resize((int)pixel_count * 3);
 		}
 
-		// Convert accum R16G16B16A16_SFLOAT -> RGB float3.
+		// Convert accum R32G32B32A32_SFLOAT -> RGB float3.
 		{
-			const uint16_t *src16 = reinterpret_cast<const uint16_t *>(accum_bytes.ptr());
+			const float *src = reinterpret_cast<const float *>(accum_bytes.ptr());
 			float *dst = color_f.ptrw();
 			for (size_t i = 0; i < pixel_count; i++) {
-				dst[i * 3 + 0] = Math::half_to_float(src16[i * 4 + 0]);
-				dst[i * 3 + 1] = Math::half_to_float(src16[i * 4 + 1]);
-				dst[i * 3 + 2] = Math::half_to_float(src16[i * 4 + 2]);
-				// alpha (src16[i*4+3]) unused by OIDN color (RGB only).
+				dst[i * 3 + 0] = src[i * 4 + 0];
+				dst[i * 3 + 1] = src[i * 4 + 1];
+				dst[i * 3 + 2] = src[i * 4 + 2];
+				// alpha (src[i*4+3]) unused by OIDN color (RGB only).
 			}
 		}
 		// Convert albedo R8G8B8A8_UNORM -> RGB float3 in [0,1].
@@ -2063,14 +2063,14 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		Vector<uint8_t> out_bytes;
 		out_bytes.resize((int)pixel_count * 8);
 		{
-			const uint16_t *src16 = reinterpret_cast<const uint16_t *>(accum_bytes.ptr());
+			const float *accum_src = reinterpret_cast<const float *>(accum_bytes.ptr());
 			uint16_t *dst16 = reinterpret_cast<uint16_t *>(out_bytes.ptrw());
 			const float *src = color_f.ptr();
 			for (size_t i = 0; i < pixel_count; i++) {
 				dst16[i * 4 + 0] = Math::make_half_float(src[i * 3 + 0]);
 				dst16[i * 4 + 1] = Math::make_half_float(src[i * 3 + 1]);
 				dst16[i * 4 + 2] = Math::make_half_float(src[i * 3 + 2]);
-				dst16[i * 4 + 3] = src16[i * 4 + 3]; // keep original alpha.
+				dst16[i * 4 + 3] = Math::make_half_float(accum_src[i * 4 + 3]); // keep original alpha.
 			}
 		}
 
