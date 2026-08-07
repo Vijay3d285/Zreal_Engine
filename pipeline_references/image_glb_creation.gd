@@ -809,17 +809,73 @@ func setup_lighting(data, geom_data = {}):
 	else:
 		env.set_pathtracing_max_bounces(8)
 		env.set_pathtracing_samples_per_pixel(10)
-	env.set_pathtracing_denoiser(1) # 1 = PT_DENOISER_DLSS_RAY_RECONSTRUCTION (realtime temporal path)
-	# DLSS-RR REALTIME STILL path: accumulate OFF (no Phase-A running average — DLSS-RR is the
-	# temporal integrator), Viewport.SCALING_3D_MODE_DLSS + scaling_3d_scale=1.0 (set in render.gd
-	# line ~144) → DLAA 1:1 (no upscaling) so the SCALE_DLSS branch runs DLSS-RR every frame on the
-	# raw 1-SPP noisy radiance. render.gd drives ~DLSS_RR_REALTIME_STILL_FRAMES frames (256) so the
-	# temporal accumulation converges to a clean reconstructed still, then captures.
-	# Alternatives left compiled but OFF: Phase F OIDN final (pathtracing_oidn_denoise) and Phase F2
-	# converge-then-reconstruct (pathtracing_dlss_rr_final) — documented fallbacks, not this route.
-	env.set_pathtracing_accumulate(false)
-	env.set_pathtracing_oidn_denoise(false)
-	env.set_pathtracing_dlss_rr_final(false)
+
+	# ── ROUTE SELECT: realtime DLSS-RR (default) vs Phase A offline accumulation ──
+	# Set the environment variable ZR_PHASE_A=1 before launching to take the Phase A
+	# offline route. Unset/anything-else keeps the production realtime route with
+	# byte-identical behaviour to before, so this toggle is safe to ship.
+	#
+	# REQUIRES an engine built from vijay_PTEngine_v8_Quality at commit 6d6efa87ad or
+	# later. On an older binary render.gd will not even parse, because
+	# RenderingServer.viewport_get_pathtracing_accum_image is unbound there.
+	#
+	# Optional tuning env vars (offline route only):
+	#   ZR_PT_ACCUM_TARGET   accumulation frames        (default 256)
+	#   ZR_PT_CLAMP_INDIRECT firefly clamp, 0 = off     (default 0; Blender's is 10)
+	#   ZR_PT_NOISE_THRESH   adaptive sampling, 0 = off (default 0 for a pure reference)
+	#   ZR_PT_FINAL          "oidn" | "dlssrr" | "none" (default "oidn")
+	var phase_a_offline := OS.get_environment("ZR_PHASE_A") == "1"
+
+	if phase_a_offline:
+		# PHASE A OFFLINE STILL: trace one sample per driver frame into a persistent
+		# fp32 running average until it converges, then optionally denoise once. This
+		# is the Cycles-style route — it anti-aliases (jittered primary ray per frame)
+		# and render.gd additionally writes a linear .exr beside the .png.
+		# SPP is ignored here: the accumulate branch traces exactly one sample per
+		# launch and the frame count supplies the budget instead.
+		var accum_target := 256
+		var t_env := OS.get_environment("ZR_PT_ACCUM_TARGET")
+		if t_env.is_valid_int():
+			accum_target = maxi(1, t_env.to_int())
+
+		var clamp_indirect := 0.0
+		var c_env := OS.get_environment("ZR_PT_CLAMP_INDIRECT")
+		if c_env.is_valid_float():
+			clamp_indirect = maxf(0.0, c_env.to_float())
+
+		var noise_thresh := 0.0
+		var n_env := OS.get_environment("ZR_PT_NOISE_THRESH")
+		if n_env.is_valid_float():
+			noise_thresh = maxf(0.0, n_env.to_float())
+
+		var final_pass := OS.get_environment("ZR_PT_FINAL")
+		if final_pass == "":
+			final_pass = "oidn"
+
+		env.set_pathtracing_denoiser(0) # 0 = PT_DENOISER_NONE; realtime DLSS-RR is not the integrator here.
+		env.set_pathtracing_accumulate(true)
+		env.set_pathtracing_accumulation_target(accum_target)
+		env.set_pathtracing_oidn_denoise(final_pass == "oidn")
+		env.set_pathtracing_dlss_rr_final(final_pass == "dlssrr")
+		# Opt-in knobs added in Phase A. Both default to off so a first run measures the
+		# unmodified estimator; that is what the convergence check needs.
+		env.set_pathtracing_clamp_direct(0.0)
+		env.set_pathtracing_clamp_indirect(clamp_indirect)
+		env.set_pathtracing_noise_threshold(noise_thresh)
+		print("[PhaseA] Offline accumulation ON — target=%d frames, final=%s, clamp_indirect=%.2f, noise_threshold=%.4f"
+				% [accum_target, final_pass, clamp_indirect, noise_thresh])
+	else:
+		env.set_pathtracing_denoiser(1) # 1 = PT_DENOISER_DLSS_RAY_RECONSTRUCTION (realtime temporal path)
+		# DLSS-RR REALTIME STILL path: accumulate OFF (no Phase-A running average — DLSS-RR is the
+		# temporal integrator), Viewport.SCALING_3D_MODE_DLSS + scaling_3d_scale=1.0 (set in render.gd
+		# line ~144) → DLAA 1:1 (no upscaling) so the SCALE_DLSS branch runs DLSS-RR every frame on the
+		# raw 1-SPP noisy radiance. render.gd drives ~DLSS_RR_REALTIME_STILL_FRAMES frames (256) so the
+		# temporal accumulation converges to a clean reconstructed still, then captures.
+		# Alternatives left compiled but OFF: Phase F OIDN final (pathtracing_oidn_denoise) and Phase F2
+		# converge-then-reconstruct (pathtracing_dlss_rr_final) — documented fallbacks, not this route.
+		env.set_pathtracing_accumulate(false)
+		env.set_pathtracing_oidn_denoise(false)
+		env.set_pathtracing_dlss_rr_final(false)
 	# NOTE: the earlier `env.set("raytracing_params", PackedFloat32Array([...]))` line was
 	# a no-op (Environment._set doesn't handle that key, and there's no ClassDB property by
 	# that name), so removing it does not change behavior and avoids it shadowing the real
@@ -3817,8 +3873,14 @@ func _build_custom_lights(geom_data: Dictionary) -> void:
 		# Crucial: mark as authored so render.gd doesn't overwrite its color with the global fill tint
 		light.set_meta("authored_custom_light", true)
 		
-		var color_hex = light_data.get("color", "#ffffff")
-		var base_color = Color(color_hex)
+		# ── Color: prefer colorTemp (Kelvin) when present, else use hex color ──
+		var color_temp_k = light_data.get("colorTemp", 0)
+		var base_color: Color
+		if float(color_temp_k) > 0.0:
+			base_color = _kelvin_to_rgb(float(color_temp_k))
+		else:
+			var color_hex = light_data.get("color", "#ffffff")
+			base_color = Color(color_hex)
 		var energy_mult = 1.0
 		if light_data.has("intensityMultiplier"):
 			energy_mult = float(light_data["intensityMultiplier"])
@@ -3855,8 +3917,83 @@ func _build_custom_lights(geom_data: Dictionary) -> void:
 			# Ensure rotations work as expected
 			light.rotation.y = rot_y
 			light.rotation.x = - deg_to_rad(tilt) if tilt != 0.0 else -PI / 2
-			
+
+		# ── IES Photometric Profile ────────────────────────────────────────────
+		# Only OmniLight3D and SpotLight3D support IES profiles (guide §"Which lights
+		# support it"). IES only visibly affects path-tracing (env.pathtracing_enabled);
+		# the rasterizer silently falls back to isotropic emission — no crash.
+		var photometric_type = str(light_data.get("photometricType", "")).to_lower()
+		if photometric_type == "ies":
+			var ies_profile_id = str(light_data.get("iesProfileId", "")).strip_edges()
+			if ies_profile_id != "":
+				var ies_path = _resolve_ies_filepath(ies_profile_id)
+				if ies_path != "":
+					light.ies_mode = Light3D.IES_MODE_EXTERNAL
+					light.ies_filepath = ies_path
+					# ies_strength multiplies the profile's own candela data.
+					# Use intensityMultiplier so per-fixture dimming applies on top.
+					light.ies_strength = clamp(energy_mult, 0.01, 1000000.0)
+
+					# ── IES energy override ──────────────────────────────────────────
+					# In the RTX path tracer, light_energy acts as a physical watt
+					# multiplier on top of the IES candela-normalised lobe.  The
+					# standard base_e (5–20) tuned for the rasterizer is far too low
+					# here because the IES normalisation scales the raw candela peak
+					# (e.g. 262 637 cd) by 4π/177.83 ≈ 0.0707 — the resulting per-watt
+					# value is physically large, so a small energy multiplier makes the
+					# light appear extremely dim in PT.  Multiply by a physical factor
+					# (300 × base_e) to produce a clearly visible beam.  Tune
+					# ies_strength for relative per-profile brightness afterwards.
+					var ies_energy = energy_mult * _lighting_illumination_scale * 0.2
+					light.light_energy = ies_energy
+
+					# IES controls the actual beam shape — the spot cone must be wide
+					# enough (≥ the IES half-angle) that the lobe isn't clipped.  Set
+					# it to 90° (hemisphere) so the profile alone determines shaping.
+					# Extend range to 25 m so the beam reaches far walls/floor.
+					if light is SpotLight3D:
+						(light as SpotLight3D).spot_angle = 90.0
+						(light as SpotLight3D).spot_range = 15.0
+
+					print("[IES] Profile '", ies_profile_id, "' assigned to '", light.name,
+						"' | energy=", snappedf(ies_energy, 0.1), " ies_strength=", light.ies_strength,
+						" | path: ", ies_path)
+				else:
+					print("[IES] WARNING: .ies file not found for iesProfileId '", ies_profile_id, "' — '", light.name, "' uses isotropic fallback.")
+			else:
+				print("[IES] WARNING: photometricType is 'ies' but iesProfileId is empty for '", light.name, "' — isotropic fallback.")
+
 		add_child(light)
+
+# Returns the absolute filesystem path to a local .ies file matching the given
+# iesProfileId (e.g. "ies_cob_spotlight" → ".../IES_Lights/ies_cob_spotlight.ies").
+#
+# Lookup order (first existing path wins):
+#   1. <project_parent>/IES_Lights/<id>.ies   — standard layout (IES_Lights next to godot_project/)
+#   2. <project_root>/IES_Lights/<id>.ies      — IES_Lights inside the Godot project folder
+#   3. <project_root>/<id>.ies                 — file placed directly at project root
+#
+# Returns "" when no candidate file is found so the caller can log a clear warning.
+func _resolve_ies_filepath(ies_profile_id: String) -> String:
+	# globalize_path("res://") includes a trailing slash on Windows
+	# (e.g. "C:/…/godot_project/"). get_base_dir() treats a trailing slash as
+	# an empty final component and returns the same directory instead of its
+	# parent. Stripping the slash first makes it climb one level correctly.
+	var project_root: String = ProjectSettings.globalize_path("res://").trim_suffix("/")
+	var parent_dir: String = project_root.get_base_dir()
+
+	var candidates: PackedStringArray = [
+		parent_dir.path_join("IES_Lights").path_join(ies_profile_id + ".ies"),
+		project_root.path_join("IES_Lights").path_join(ies_profile_id + ".ies"),
+		project_root.path_join(ies_profile_id + ".ies"),
+	]
+
+	print("[IES] Resolving '", ies_profile_id, "' — searching: ", candidates[0])
+	for candidate in candidates:
+		if FileAccess.file_exists(candidate):
+			return candidate
+
+	return ""
 
 func _collect_custom_lights_from_source(source: Dictionary, out_lights: Dictionary) -> void:
 	if typeof(source) != TYPE_DICTIONARY or source.is_empty():
