@@ -3355,6 +3355,19 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// Binding 33: Task 6 adaptive-sampling variance buffer (Welford mean/M2 per
+	// pixel). Bindings 31 and 32 are already claimed (IES SSBO / motion
+	// transforms), so this lands past them rather than at the brief's originally
+	// assumed slot 31. Allocated on demand by rt_ensure_textures() alongside the
+	// other Phase A accumulation buffers; bound unconditionally like 29/30.
+	{
+		RD::Uniform u;
+		u.binding = 33;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rb_data->rt_get_variance_texture());
+		uniforms.push_back(u);
+	}
+
 	// Use the pipeline-side shader so UniformSetFormat matches at bind time.
 	RID shader_rd = shader ? shader->get_pipeline_shader_rd(p_rt_flags) : RID();
 

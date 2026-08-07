@@ -21,9 +21,10 @@
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
 #define RT_PARAM_ACCUM_FLAG 4 // rt_params[1].x - 1.0 = accumulate across frames, 0.0 = one-shot
 #define RT_PARAM_ACCUM_FRAMES 5 // rt_params[1].y - 0-based accumulation frame index (driver-injected)
-#define RT_PARAM_CLAMP_DIRECT 9 // rt_params[2].x - Max direct contribution (0 = off)
-#define RT_PARAM_CLAMP_INDIRECT 10 // rt_params[2].y - Max indirect contribution (0 = off)
-// Indices 11-13 reserved for future use
+#define RT_PARAM_CLAMP_DIRECT 9 // rt_params[2].y - Max direct contribution (0 = off)
+#define RT_PARAM_CLAMP_INDIRECT 10 // rt_params[2].z - Max indirect contribution (0 = off)
+#define RT_PARAM_NOISE_THRESHOLD 11 // rt_params[2].w - Adaptive sampling relative-error target (0 = off)
+// Indices 12-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 

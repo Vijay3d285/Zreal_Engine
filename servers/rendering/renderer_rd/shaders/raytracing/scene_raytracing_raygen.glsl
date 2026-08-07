@@ -30,6 +30,11 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 // (mirrors the existing `image` <-> RB_TEX_RAYTRACING R16F bind).
 layout(set = 0, binding = 29, rgba32f) uniform image2D rt_accum;
 layout(set = 0, binding = 30, r32f) uniform image2D rt_accum_n;
+// Adaptive sampling (Task 6): Welford (running mean luminance, M2) per pixel.
+// Bound at 33, not 31 -- binding 31 is IES_BUFFER_BINDING (ies_lookup_inc.glsl)
+// and 32 is the motion-transforms SSBO (raytracing_inc.glsl); both already
+// occupy the scene raytracing set. See render_raytracing.cpp update_uniform_set.
+layout(set = 0, binding = 33, rg32f) uniform image2D rt_variance;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
 
@@ -113,8 +118,29 @@ void main() {
 	// Phase A accumulation: blend one 1-SPP sample per launch into a persistent
 	// running average so a still image converges across driver frames.
 	if (get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5) {
-		// 0-based accumulation frame the driver injected for this launch.
 		uint accum_frame = uint(get_rt_param(RT_PARAM_ACCUM_FRAMES));
+
+		float n = max(imageLoad(rt_accum_n, ivec2(pixel)).x, 0.0);
+		vec3 prev = imageLoad(rt_accum, ivec2(pixel)).rgb;
+		vec2 var_state = imageLoad(rt_variance, ivec2(pixel)).xy;
+
+		// Adaptive sampling: once a pixel's relative standard error drops below
+		// the threshold, stop spending samples on it. Needs a minimum sample
+		// count first, otherwise early noise luck freezes a pixel prematurely.
+		const float MIN_ADAPTIVE_SAMPLES = 16.0;
+		float noise_threshold = get_rt_param(RT_PARAM_NOISE_THRESHOLD);
+		if (noise_threshold > 0.0 && n >= MIN_ADAPTIVE_SAMPLES) {
+			float mean_luma = var_state.x;
+			float m2 = var_state.y;
+			// Standard error of the mean, relative to the mean itself.
+			float variance = m2 / max(n - 1.0, 1.0);
+			float std_err = sqrt(variance / n);
+			if (std_err < noise_threshold * max(mean_luma, 1e-4)) {
+				// Converged: republish the running average and take no sample.
+				imageStore(image, ivec2(pixel), vec4(prev, 1.0));
+				return;
+			}
+		}
 
 		// Jitter the primary ray per accumulated frame. Without this the
 		// accumulator averages the same camera ray forever and never
@@ -125,15 +151,18 @@ void main() {
 		vec3 sample_rad = trace_one_sample(pixel, frame_index, accum_frame, true,
 				max_bounces, origin, direction);
 
-		float n = imageLoad(rt_accum_n, ivec2(pixel)).x;
-		n = max(n, 0.0);
 		float w = 1.0 / (n + 1.0);
-
-		vec3 prev = imageLoad(rt_accum, ivec2(pixel)).rgb;
 		vec3 running = mix(prev, sample_rad, w);
+
+		// Welford online variance on sample luminance.
+		float luma = dot(sample_rad, vec3(0.2126, 0.7152, 0.0722));
+		float delta = luma - var_state.x;
+		float new_mean = var_state.x + delta * w;
+		float new_m2 = var_state.y + delta * (luma - new_mean);
 
 		imageStore(rt_accum, ivec2(pixel), vec4(running, 1.0));
 		imageStore(rt_accum_n, ivec2(pixel), vec4(n + 1.0));
+		imageStore(rt_variance, ivec2(pixel), vec4(new_mean, new_m2, 0.0, 0.0));
 		imageStore(image, ivec2(pixel), vec4(running, 1.0));
 	} else {
 		// One-shot path: trace `samples_per_pixel` samples this launch and

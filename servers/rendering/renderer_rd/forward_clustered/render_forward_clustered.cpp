@@ -140,6 +140,14 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 				usage_bits_oidn, // CAN_COPY_TO_BIT: accum_reset_pending clears this counter too.
 				RD::TEXTURE_SAMPLES_1);
 	}
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_VARIANCE)) {
+		render_buffers->create_texture(
+				RB_SCOPE_FORWARD_CLUSTERED,
+				RB_TEX_RAYTRACING_VARIANCE,
+				RD::DATA_FORMAT_R32G32_SFLOAT,
+				usage_bits_oidn, // CAN_COPY_TO_BIT: cleared alongside the accumulator on reset.
+				RD::TEXTURE_SAMPLES_1);
+	}
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::dlss_rr_ensure_buffers() {
@@ -2832,6 +2840,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		if (rt_state && rt_state->accum_reset_pending) {
 			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
 			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_n_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
+			RD::get_singleton()->texture_clear(rb_data->rt_get_variance_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
 			rt_state->accum_reset_pending = false;
 		}
 

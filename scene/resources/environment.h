@@ -217,6 +217,12 @@ private:
 	bool pathtracing_dlss_rr_final = false;
 	float pathtracing_clamp_direct = 0.0f;
 	float pathtracing_clamp_indirect = 10.0f;
+	// Adaptive sampling: once a pixel's relative standard error (tracked via a
+	// per-pixel Welford running mean/variance) falls below this threshold, that
+	// pixel stops accumulating new samples and the budget goes elsewhere.
+	// 0.0 = disabled (sample every pixel every frame). Mirrors Cycles adaptive
+	// sampling (intern/cycles/kernel/film/adaptive_sampling.h).
+	float pathtracing_noise_threshold = 0.01f;
 	void _update_pathtracing();
 
 	// Glow
@@ -429,6 +435,8 @@ public:
 	float get_pathtracing_clamp_direct() const;
 	void set_pathtracing_clamp_indirect(float p_clamp);
 	float get_pathtracing_clamp_indirect() const;
+	void set_pathtracing_noise_threshold(float p_threshold);
+	float get_pathtracing_noise_threshold() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

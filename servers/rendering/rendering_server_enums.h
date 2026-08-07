@@ -804,7 +804,12 @@ enum PathtracingParamIndex {
 	// bounce. This is the one that kills fireflies; indirect specular paths are
 	// where the outliers come from. 0.0 = disabled.
 	PT_PARAM_CLAMP_INDIRECT = 10,
-	// Indices 11-13 reserved for future use.
+	// PT_PARAM_NOISE_THRESHOLD: per-pixel relative-error target. Once a pixel's
+	// estimated error falls below this, sampling stops for that pixel and the
+	// budget goes elsewhere. 0.0 = disabled (sample every pixel every frame).
+	// Mirrors Cycles adaptive sampling (intern/cycles/kernel/film/adaptive_sampling.h).
+	PT_PARAM_NOISE_THRESHOLD = 11,
+	// Indices 12-13 reserved for future use.
 	PT_PARAM_LIGHT_COUNT = 14,
 	PT_PARAM_FRAME_INDEX = 15,
 };
