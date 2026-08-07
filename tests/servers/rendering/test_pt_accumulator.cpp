@@ -1,6 +1,32 @@
 /**************************************************************************/
 /*  test_pt_accumulator.cpp                                               */
 /**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
 
 #include "tests/test_macros.h"
 
@@ -68,6 +94,47 @@ TEST_CASE("[PathTracer][Accumulator] fp16 discards the increment past ~4096 samp
 	const float stored = Math::half_to_float(Math::make_half_float(running));
 	const float stored_prev = Math::half_to_float(Math::make_half_float(prev));
 	CHECK(stored == stored_prev);
+}
+
+// Mirrors clamp_contribution() in raytracing_inc.glsl. Scales a radiance
+// contribution so its largest channel does not exceed p_limit, preserving hue.
+static void clamp_contribution_ref(float p_c[3], float p_limit) {
+	if (p_limit <= 0.0f) {
+		return; // 0 disables clamping.
+	}
+	const float m = MAX(p_c[0], MAX(p_c[1], p_c[2]));
+	if (m > p_limit) {
+		const float s = p_limit / m;
+		p_c[0] *= s;
+		p_c[1] *= s;
+		p_c[2] *= s;
+	}
+}
+
+TEST_CASE("[PathTracer][Clamp] limits the peak channel and preserves hue") {
+	float c[3] = { 40.0f, 20.0f, 10.0f };
+	clamp_contribution_ref(c, 10.0f);
+
+	CHECK(c[0] == doctest::Approx(10.0f));
+	// Ratios are unchanged: 40:20:10 -> 10:5:2.5.
+	CHECK(c[1] == doctest::Approx(5.0f));
+	CHECK(c[2] == doctest::Approx(2.5f));
+}
+
+TEST_CASE("[PathTracer][Clamp] leaves in-range contributions untouched") {
+	float c[3] = { 1.0f, 2.0f, 3.0f };
+	clamp_contribution_ref(c, 10.0f);
+
+	CHECK(c[0] == doctest::Approx(1.0f));
+	CHECK(c[1] == doctest::Approx(2.0f));
+	CHECK(c[2] == doctest::Approx(3.0f));
+}
+
+TEST_CASE("[PathTracer][Clamp] a limit of zero disables clamping") {
+	float c[3] = { 1000.0f, 0.0f, 0.0f };
+	clamp_contribution_ref(c, 0.0f);
+
+	CHECK(c[0] == doctest::Approx(1000.0f));
 }
 
 } // namespace TestPTAccumulator

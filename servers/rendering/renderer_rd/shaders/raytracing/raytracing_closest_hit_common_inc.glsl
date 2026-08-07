@@ -455,7 +455,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
 
 	// Emissive contribution.
-	ps.radiance += ps.throughput * m.emissive;
+	float clamp_limit = (total_bounces == 0u)
+			? get_rt_param(RT_PARAM_CLAMP_DIRECT)
+			: get_rt_param(RT_PARAM_CLAMP_INDIRECT);
+	ps.radiance += clamp_contribution(ps.throughput * m.emissive, clamp_limit);
 
 	// Bounce limit check.
 	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
@@ -530,7 +533,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
 				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
-		ps.radiance += ps.throughput * direct_light;
+		ps.radiance += clamp_contribution(ps.throughput * direct_light, clamp_limit);
 	}
 
 	// =================================================================

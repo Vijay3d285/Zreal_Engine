@@ -796,7 +796,15 @@ enum PathtracingParamIndex {
 	// cannot. Only honored when PT_PARAM_ACCUM_FLAG is set. Mutually exclusive with
 	// PT_PARAM_OIDN_FLAG (the render path prefers DLSS-RR-final when both are set).
 	PT_PARAM_DLSS_RR_FINAL_FLAG = 8,
-	// Indices 9-13 reserved for future use.
+	// PT_PARAM_CLAMP_DIRECT: maximum radiance a single direct-lighting contribution
+	// may add at the first bounce. 0.0 = disabled. Mirrors Cycles
+	// `sample_clamp_direct` (intern/cycles/kernel/data_template.h).
+	PT_PARAM_CLAMP_DIRECT = 9,
+	// PT_PARAM_CLAMP_INDIRECT: same limit for every contribution after the first
+	// bounce. This is the one that kills fireflies; indirect specular paths are
+	// where the outliers come from. 0.0 = disabled.
+	PT_PARAM_CLAMP_INDIRECT = 10,
+	// Indices 11-13 reserved for future use.
 	PT_PARAM_LIGHT_COUNT = 14,
 	PT_PARAM_FRAME_INDEX = 15,
 };

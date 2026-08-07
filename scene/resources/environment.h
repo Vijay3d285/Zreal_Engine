@@ -215,6 +215,8 @@ private:
 	// (the render path prefers DLSS-RR-final when both are set). Requires the Streamline
 	// DLSS-D DLLs already shipped for the realtime DLSS path. Default off.
 	bool pathtracing_dlss_rr_final = false;
+	float pathtracing_clamp_direct = 0.0f;
+	float pathtracing_clamp_indirect = 10.0f;
 	void _update_pathtracing();
 
 	// Glow
@@ -423,6 +425,10 @@ public:
 	bool is_pathtracing_oidn_denoise() const;
 	void set_pathtracing_dlss_rr_final(bool p_dlss_rr);
 	bool is_pathtracing_dlss_rr_final() const;
+	void set_pathtracing_clamp_direct(float p_clamp);
+	float get_pathtracing_clamp_direct() const;
+	void set_pathtracing_clamp_indirect(float p_clamp);
+	float get_pathtracing_clamp_indirect() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

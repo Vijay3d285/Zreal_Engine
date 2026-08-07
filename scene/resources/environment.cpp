@@ -686,6 +686,24 @@ bool Environment::is_pathtracing_dlss_rr_final() const {
 	return pathtracing_dlss_rr_final;
 }
 
+void Environment::set_pathtracing_clamp_direct(float p_clamp) {
+	pathtracing_clamp_direct = MAX(0.0f, p_clamp);
+	_update_pathtracing();
+}
+
+float Environment::get_pathtracing_clamp_direct() const {
+	return pathtracing_clamp_direct;
+}
+
+void Environment::set_pathtracing_clamp_indirect(float p_clamp) {
+	pathtracing_clamp_indirect = MAX(0.0f, p_clamp);
+	_update_pathtracing();
+}
+
+float Environment::get_pathtracing_clamp_indirect() const {
+	return pathtracing_clamp_indirect;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(environment, pathtracing_enabled);
 
@@ -700,6 +718,8 @@ void Environment::_update_pathtracing() {
 	params.write[RSE::PT_PARAM_OIDN_FLAG] = pathtracing_oidn_denoise ? 1.0f : 0.0f;
 	params.write[RSE::PT_PARAM_ACCUM_TARGET] = (float)pathtracing_accumulation_target;
 	params.write[RSE::PT_PARAM_DLSS_RR_FINAL_FLAG] = pathtracing_dlss_rr_final ? 1.0f : 0.0f;
+	params.write[RSE::PT_PARAM_CLAMP_DIRECT] = pathtracing_clamp_direct;
+	params.write[RSE::PT_PARAM_CLAMP_INDIRECT] = pathtracing_clamp_indirect;
 	RS::get_singleton()->environment_set_pathtracing_params(environment, params);
 }
 
@@ -1550,6 +1570,10 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_pathtracing_oidn_denoise"), &Environment::is_pathtracing_oidn_denoise);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_dlss_rr_final", "dlss_rr"), &Environment::set_pathtracing_dlss_rr_final);
 	ClassDB::bind_method(D_METHOD("is_pathtracing_dlss_rr_final"), &Environment::is_pathtracing_dlss_rr_final);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_clamp_direct", "clamp"), &Environment::set_pathtracing_clamp_direct);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_clamp_direct"), &Environment::get_pathtracing_clamp_direct);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_clamp_indirect", "clamp"), &Environment::set_pathtracing_clamp_indirect);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_clamp_indirect"), &Environment::get_pathtracing_clamp_indirect);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_pathtracing_enabled", "is_pathtracing_enabled");
@@ -1561,6 +1585,8 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_accumulation_target", PROPERTY_HINT_RANGE, "1,8192,1"), "set_pathtracing_accumulation_target", "get_pathtracing_accumulation_target");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_oidn_denoise"), "set_pathtracing_oidn_denoise", "is_pathtracing_oidn_denoise");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_dlss_rr_final"), "set_pathtracing_dlss_rr_final", "is_pathtracing_dlss_rr_final");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_clamp_direct", PROPERTY_HINT_RANGE, "0,100,0.01"), "set_pathtracing_clamp_direct", "get_pathtracing_clamp_direct");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_clamp_indirect", PROPERTY_HINT_RANGE, "0,100,0.01"), "set_pathtracing_clamp_indirect", "get_pathtracing_clamp_indirect");
 
 	// Glow
 

@@ -21,7 +21,9 @@
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
 #define RT_PARAM_ACCUM_FLAG 4 // rt_params[1].x - 1.0 = accumulate across frames, 0.0 = one-shot
 #define RT_PARAM_ACCUM_FRAMES 5 // rt_params[1].y - 0-based accumulation frame index (driver-injected)
-// Indices 6-13 reserved for future use
+#define RT_PARAM_CLAMP_DIRECT 9 // rt_params[2].x - Max direct contribution (0 = off)
+#define RT_PARAM_CLAMP_INDIRECT 10 // rt_params[2].y - Max indirect contribution (0 = off)
+// Indices 11-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
@@ -201,6 +203,25 @@ vec2 camera_filter_jitter(uvec2 p_pixel, uint p_sample) {
 	float jx = rand(s);
 	float jy = rand(s);
 	return vec2(0.5) + vec2(tent_filter_1d(jx), tent_filter_1d(jy));
+}
+
+// ============================================================================
+// FIREFLY CLAMPING
+// ============================================================================
+
+/// Scales a radiance contribution so its largest channel does not exceed
+/// `p_limit`, preserving hue. `p_limit <= 0.0` disables clamping.
+///
+/// This biases the estimator by design — it is the standard, and Cycles ships
+/// the same knob (`sample_clamp_direct` / `sample_clamp_indirect`). Clamping
+/// matters more here than in a one-shot renderer: under accumulation a single
+/// outlier decays only as 1/N and stays visible for the whole render.
+vec3 clamp_contribution(vec3 p_c, float p_limit) {
+	if (p_limit <= 0.0) {
+		return p_c;
+	}
+	float m = max(p_c.r, max(p_c.g, p_c.b));
+	return (m > p_limit) ? p_c * (p_limit / m) : p_c;
 }
 
 // ============================================================================
