@@ -78,6 +78,10 @@ func _render_accum(p_env: Environment, p_vp_rid: RID, p_frames: int) -> Image:
 	await get_tree().process_frame
 	p_env.pathtracing_accumulate = true
 	p_env.pathtracing_accumulation_target = p_frames
+	# Adaptive sampling early-outs converged pixels, freezing them and flattening
+	# the tail of the convergence curve. This harness must measure the
+	# UN-accelerated estimator for the 1/sqrt(N) law to hold, so disable it here.
+	p_env.pathtracing_noise_threshold = 0.0
 	for i in range(p_frames):
 		await get_tree().process_frame
 	await RenderingServer.frame_post_draw

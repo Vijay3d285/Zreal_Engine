@@ -21,6 +21,9 @@
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
 #define RT_PARAM_ACCUM_FLAG 4 // rt_params[1].x - 1.0 = accumulate across frames, 0.0 = one-shot
 #define RT_PARAM_ACCUM_FRAMES 5 // rt_params[1].y - 0-based accumulation frame index (driver-injected)
+// Indices 6-8 are taken by PT_PARAM_OIDN_FLAG, PT_PARAM_ACCUM_TARGET, and
+// PT_PARAM_DLSS_RR_FINAL_FLAG (defined C++-side in rendering_server_enums.h);
+// they are not read by GLSL, so do not reuse them here.
 #define RT_PARAM_CLAMP_DIRECT 9 // rt_params[2].y - Max direct contribution (0 = off)
 #define RT_PARAM_CLAMP_INDIRECT 10 // rt_params[2].z - Max indirect contribution (0 = off)
 #define RT_PARAM_NOISE_THRESHOLD 11 // rt_params[2].w - Adaptive sampling relative-error target (0 = off)

@@ -216,7 +216,9 @@ private:
 	// DLSS-D DLLs already shipped for the realtime DLSS path. Default off.
 	bool pathtracing_dlss_rr_final = false;
 	float pathtracing_clamp_direct = 0.0f;
-	float pathtracing_clamp_indirect = 10.0f;
+	// 0.0 = disabled (opt-in). Blender's comparable default is 10.0 for indirect;
+	// we default off so existing realtime/video output (one-shot path) is unchanged.
+	float pathtracing_clamp_indirect = 0.0f;
 	// Adaptive sampling: once a pixel's relative standard error (tracked via a
 	// per-pixel Welford running mean/variance) falls below this threshold, that
 	// pixel stops accumulating new samples and the budget goes elsewhere.

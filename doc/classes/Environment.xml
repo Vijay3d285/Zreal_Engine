@@ -216,6 +216,14 @@
 			Target number of accumulation frames a still-render capture loop drives before grabbing the image. Higher values produce a cleaner (less noisy) result at the cost of more render frames. Only consumed by callers that drive convergence when [member pathtracing_accumulate] is [code]true[/code].
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_accumulate] are both [code]true[/code].
 		</member>
+		<member name="pathtracing_clamp_direct" type="float" setter="set_pathtracing_clamp_direct" getter="get_pathtracing_clamp_direct" default="0.0">
+			Maximum radiance a single direct-lighting contribution may add at the first bounce. [code]0.0[/code] disables clamping. Mirrors Blender Cycles' Clamp Direct.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_clamp_indirect" type="float" setter="set_pathtracing_clamp_indirect" getter="get_pathtracing_clamp_indirect" default="0.0">
+			The same radiance limit as [member pathtracing_clamp_direct], but applied to every contribution after the first bounce. This is the one that suppresses fireflies. [code]0.0[/code] disables clamping (Blender's comparable default is [code]10.0[/code]).
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
 		<member name="pathtracing_oidn_denoise" type="bool" setter="set_pathtracing_oidn_denoise" getter="is_pathtracing_oidn_denoise" default="false">
 			If [code]true[/code], runs a one-shot in-process OIDN [i]RT[/i] filter on the converged path-tracing accumulator before tonemapping. This is the final-denoise step of the [i]accumulate raw, denoise final[/i] pipeline (the same approach Blender Cycles uses): the clean, low-noise still image is produced by physically accumulating samples and then denoising once, rather than by a per-frame temporal reconstruction like DLSS Ray Reconstruction. Preserves fine detail better than a temporal denoiser on static scenes.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_accumulate] are both [code]true[/code]. Requires the [code]raycaster_oidn[/code] module to be built and the OIDN runtime DLLs to be present alongside the editor binary.
@@ -230,6 +238,10 @@
 		<member name="pathtracing_max_bounces" type="int" setter="set_pathtracing_max_bounces" getter="get_pathtracing_max_bounces" default="3">
 			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_noise_threshold" type="float" setter="set_pathtracing_noise_threshold" getter="get_pathtracing_noise_threshold" default="0.01">
+			Per-pixel relative-error target for adaptive sampling; once a pixel's estimated error falls below it, sampling stops for that pixel. [code]0.0[/code] disables adaptive sampling.
+			[b]Note:[/b] Only has an effect when [member pathtracing_accumulate] is [code]true[/code].
 		</member>
 		<member name="pathtracing_samples_per_pixel" type="int" setter="set_pathtracing_samples_per_pixel" getter="get_pathtracing_samples_per_pixel" default="1">
 			Number of ray samples cast per pixel per frame. Higher values reduce noise but increase GPU cost proportionally. When using a temporal denoiser such as DLSS Ray Reconstruction, a low sample count (1-2) is typically sufficient since the denoiser accumulates information across frames.
