@@ -1,4 +1,8 @@
-extends PTValidation
+# Extended by explicit path rather than by the `PTValidation` class_name: the
+# global class-name registry lives in the project's .godot/ cache, which is not
+# guaranteed to exist on a fresh checkout or when running the scene directly
+# without opening the editor first. A path extends always resolves.
+extends "res://tests/pt_validation.gd"
 
 ## Standalone Phase A verification runner.
 ##
@@ -66,23 +70,21 @@ func _check_convergence(p_env: Environment) -> void:
 	print("\n[check 2] convergence — sweep %s against a %d-frame reference" % [str(counts), reference])
 	print("          (this renders %d frames total; be patient)" % [reference + _sum(counts)])
 
+	# The reference must be meaningfully more converged than the longest run, or its
+	# own noise dominates the comparison and flattens the measured curve.
+	var largest: int = 0
+	for c in counts:
+		largest = maxi(largest, int(c))
+	if reference < largest * 4:
+		push_warning("reference (%d) is less than 4x the longest run (%d); the measured reduction will read low." % [reference, largest])
+
 	var results := await convergence_curve(p_env, counts, reference)
 	if results.is_empty():
 		_failures.append("convergence: no results returned (readback failed?)")
 		return
 
-	# report_convergence asserts; in a release build asserts are stripped, so we
-	# also evaluate the same two conditions explicitly and record them.
-	report_convergence(results)
-
-	var first: float = results[0]["rmse"]
-	var last: float = results[results.size() - 1]["rmse"]
-	if last >= first * 0.5:
-		_failures.append("convergence: RMSE only fell %.2fx across the sweep (need >2x)" % [first / maxf(last, 1e-9)])
-	if results.size() >= 2:
-		var prev: float = results[results.size() - 2]["rmse"]
-		if last >= prev * 0.98:
-			_failures.append("convergence: FLAT TAIL — RMSE stopped falling at high sample counts (%.6f -> %.6f). This is the fp16-style stall." % [prev, last])
+	for f in report_convergence(results):
+		_failures.append(f)
 
 
 ## check 3 — jitter must produce real anti-aliasing on a hard silhouette.
@@ -97,10 +99,76 @@ func _check_anti_aliasing(p_env: Environment) -> void:
 	var best := 0
 	for frac in [0.35, 0.5, 0.65]:
 		var y := int(img.get_height() * frac)
-		best = maxi(best, PTValidation.edge_gradient_steps(img, y))
+		best = maxi(best, edge_gradient_steps(img, y))
 	print("          max intermediate-tone pixels across scanlines: %d" % best)
 	if best < 3:
 		_failures.append("anti-aliasing: only %d intermediate tones on the edge (need >=3). Camera jitter is not taking effect." % best)
+
+	# The count above is a floor, not a precise AA measure: it tallies every
+	# mid-band pixel on the scanline, and a lit scene has plenty of those from
+	# ordinary shading gradients. Dump the frame so the silhouette can be checked
+	# by eye — a jittered render shows a soft stair-free diagonal, an unjittered
+	# one shows hard single-pixel steps no matter how long it accumulated.
+	# Decisive check, on the LINEAR buffer rather than the clipped PNG. Find the
+	# steepest luminance transition on a scanline (that is the silhouette) and print
+	# the pixels either side of it. A jittered render puts genuinely intermediate
+	# values in the transition; an unjittered one jumps in a single step. This
+	# matters because the 8-bit PNG below cannot show it — the slab is emissive at
+	# 6x, so even a slightly-covered pixel still exceeds 1.0 and clips to white.
+	_dump_edge_profile(img, int(img.get_height() * 0.35))
+
+	# Converting the linear float buffer to RGB8 clips anything above 1.0, which is
+	# fine here: we only need the silhouette readable, not the radiometry.
+	var out := img.duplicate() as Image
+	out.convert(Image.FORMAT_RGB8)
+	var png_path := "user://pt_aa_check.png"
+	if out.save_png(png_path) == OK:
+		print("          edge image written to: %s" % ProjectSettings.globalize_path(png_path))
+	# Also emit the linear original, which is the real Phase A deliverable.
+	var exr_path := "user://pt_aa_check.exr"
+	if img.save_exr(exr_path, false) == OK:
+		print("          linear EXR written to:  %s" % ProjectSettings.globalize_path(exr_path))
+
+
+## Prints the linear luminance profile across the sharpest edge on a scanline.
+## Intermediate values between the two plateaus mean the pixel filter is working.
+func _dump_edge_profile(p_img: Image, p_y: int) -> void:
+	var w := p_img.get_width()
+	var lum := PackedFloat32Array()
+	lum.resize(w)
+	for x in range(w):
+		var c := p_img.get_pixel(x, p_y)
+		lum[x] = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+
+	var best_i := 1
+	var best_d := 0.0
+	for x in range(1, w):
+		var d: float = absf(lum[x] - lum[x - 1])
+		if d > best_d:
+			best_d = d
+			best_i = x
+
+	var lo := maxi(0, best_i - 5)
+	var hi := mini(w - 1, best_i + 5)
+	var parts: Array[String] = []
+	for x in range(lo, hi + 1):
+		parts.append("%.3f" % lum[x])
+	print("          linear edge profile @y=%d x=%d..%d: %s" % [p_y, lo, hi, ", ".join(parts)])
+
+	# Count values strictly between the two plateau levels either side of the jump.
+	var a: float = lum[lo]
+	var b: float = lum[hi]
+	var band_lo: float = minf(a, b) + absf(b - a) * 0.1
+	var band_hi: float = minf(a, b) + absf(b - a) * 0.9
+	var mids := 0
+	for x in range(lo, hi + 1):
+		if lum[x] > band_lo and lum[x] < band_hi:
+			mids += 1
+	print("          intermediate samples inside the transition: %d %s" % [mids,
+			("(jitter active — pixel filter is resolving partial coverage)" if mids >= 1
+			else "(NONE — hard step; jitter is NOT taking effect)")])
+	if mids < 1:
+		_failures.append("anti-aliasing: the silhouette transitions in a single step with no partial-coverage samples — camera jitter is not reaching the primary ray.")
 
 
 func _sum(p_arr: Array) -> int:
