@@ -385,10 +385,16 @@ func render_image(data, output_path):
 	# needs a temporal upscaler. Turn scaling off so our filter is the only one.
 	# (DLSS-RR "reconstruct final" is the one exception: that pass genuinely runs
 	# inside the SCALE_DLSS branch, so it keeps the DLSS viewport mode.)
+	# BILINEAR is the non-scaling default on Viewport (there is no SCALING_3D_MODE_OFF
+	# in the GDScript enum — that name belongs to the internal RenderingServer enum).
+	# BILINEAR is a SPATIAL mode, so the viewport leaves jitter_phase_count at 0, and
+	# at scale 1.0 render size equals target size, so no resampling happens either.
+	# use_taa is already false above, which is the other thing that could add jitter.
 	if accumulate_enabled and not dlss_rr_final_enabled:
-		get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_OFF
+		get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
 		get_viewport().scaling_3d_scale = 1.0
-		print("[PhaseA] Viewport scaling OFF — removes the temporal upscaler's projection jitter so it cannot double up with the path tracer's pixel filter.")
+		get_viewport().use_taa = false
+		print("[PhaseA] Viewport scaling set to BILINEAR @1.0 (no temporal upscaler) — removes the projection jitter so it cannot double up with the path tracer's pixel filter.")
 
 	if cam:
 		setup_fixed_fill_lights()
