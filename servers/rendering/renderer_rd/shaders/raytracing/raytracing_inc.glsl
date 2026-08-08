@@ -4,6 +4,8 @@
 
 #include "../oct_inc.glsl"
 
+#include "sobol_burley_inc.glsl"
+
 #define MAX_VIEWS 2
 
 #ifndef PI
@@ -46,7 +48,7 @@
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
 	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:8][diffuse:8][total:8]
-	uint rng_state; //  4 bytes - RNG state for PCG
+	uint rng_packed; //  4 bytes - packed [sample_index:20][dimension offset:12]
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
 	uint oct_next_dir; //  4 bytes - packUnorm2x16(vec3_to_oct(next direction))
@@ -57,7 +59,7 @@ struct PathState {
 	vec3 radiance;
 	vec3 throughput;
 	uint packed_bounces_flags;
-	uint rng_state;
+	uint rng_packed;
 	float hit_t;
 	vec3 offset_normal;
 	vec3 next_ray_dir;
@@ -71,7 +73,7 @@ PathState path_unpack(PathPayload p) {
 	s.radiance = max(vec3(rg.x, rg.y, bR.x), vec3(0.0));
 	s.throughput = max(vec3(bR.y, GB.x, GB.y), vec3(0.0));
 	s.packed_bounces_flags = p.packed_bounces_flags;
-	s.rng_state = p.rng_state;
+	s.rng_packed = p.rng_packed;
 	s.hit_t = p.hit_t;
 	s.offset_normal = oct_to_vec3(unpackUnorm2x16(p.oct_offset_nrm) * 2.0 - 1.0);
 	s.next_ray_dir = oct_to_vec3(unpackUnorm2x16(p.oct_next_dir) * 2.0 - 1.0);
@@ -86,7 +88,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.packed_rt[1] = packHalf2x16(vec2(r.b, t.r));
 	p.packed_rt[2] = packHalf2x16(vec2(t.g, t.b));
 	p.packed_bounces_flags = s.packed_bounces_flags;
-	p.rng_state = s.rng_state;
+	p.rng_packed = s.rng_packed;
 	p.hit_t = s.hit_t;
 	p.oct_offset_nrm = packUnorm2x16(vec3_to_oct(s.offset_normal));
 	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
@@ -152,32 +154,124 @@ const uint FLAG_PROCEDURAL = 2u;
 const uint FLAG_DEFORMED = 4u;
 
 // ============================================================================
-// RANDOM NUMBER GENERATION - PCG (Permuted Congruential Generator)
+// RANDOM NUMBER GENERATION
 // ============================================================================
+//
+// Two samplers coexist here on purpose.
+//
+// 1. Sobol-Burley (rng_1d / rng_2d) is the production sampler and mirrors Cycles.
+//    Every draw names an explicit DIMENSION rather than advancing a stream. That
+//    is the whole mechanism: stratification only holds if a given decision uses
+//    the same dimension on every path in the frame, and a stream cannot promise
+//    that because different paths branch differently. Never convert these back
+//    into "advance and return" helpers.
+//
+// 2. PCG (pcg_hash / rand) survives for the light reservoir loop, which draws a
+//    variable number of values per shading point (raytracing_lights_inc.glsl).
+//    Giving that loop 2 * RT_LIGHT_RESERVOIR_SIZE Sobol dimensions would spend
+//    our best-stratified dimensions on the decision Cycles itself does not Sobol
+//    sample -- its light tree descends on one rescaled number (kernel/light/tree.h).
+//    Replacing the reservoir with a power-weighted selector is roadmap item C2.
+//    Until then the stream is at least SEEDED from the Sobol state so it stays
+//    decorrelated from the rest of the path.
 
-/// PCG random number generator - improved XSH-RR variant with better avalanche
+/// PCG random number generator - improved XSH-RR variant with better avalanche.
 uint pcg_hash(uint seed) {
 	uint state = seed * 747796405u + 2891336453u;
 	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
 	return (word >> 22u) ^ word;
 }
 
-/// Initialize RNG state with improved mixing to eliminate patterns
-uint init_rng(uvec2 pixel, uint frame, uint sample_idx) {
-	// Use Wang hash for better mixing - eliminates linear patterns
-	uint seed = pixel.x + pixel.y * 65536u + frame * 1000000u + sample_idx * 100000000u;
-	return pcg_hash(seed);
-}
-
-/// Random float in [0, 1)
+/// Random float in [0, 1) from a mutable PCG stream. Reservoir loop only.
 float rand(inout uint state) {
 	state = pcg_hash(state);
 	return float(state) / 4294967296.0;
 }
 
-/// Random vec2 in [0, 1)
-vec2 rand2(inout uint state) {
-	return vec2(rand(state), rand(state));
+/// Fixed scramble seed. Cycles randomizes this per frame when pixel jitter is on;
+/// we keep it constant so a given accumulation frame index always reproduces the
+/// same image, which the validation harness depends on. Sample decorrelation
+/// across frames comes from the sample index, not from reseeding.
+const uint RT_SAMPLER_SEED = 0x5f356495u;
+
+// Dimension allocation, mirroring Cycles' PathTraceDimension (kernel/types.h:72).
+// Each bounce owns a block of RT_PRNG_BOUNCE_NUM consecutive dimensions; the
+// constants below index within the current block. Earlier dimensions are better
+// stratified, so the highest-variance decision (the BSDF direction) gets 0.
+// Cycles uses a block of 16; we have fewer decisions, so 8 with room to grow.
+#define RT_PRNG_BOUNCE_NUM 8u
+#define RT_PRNG_FILTER 0u // 2D, init block only: sub-pixel reconstruction filter.
+#define RT_PRNG_SURFACE_BSDF 0u // 2D: BSDF direction sample.
+#define RT_PRNG_LIGHT 2u // 2D: position on the selected light.
+#define RT_PRNG_LOBE 4u // 1D: diffuse-vs-specular lobe choice.
+#define RT_PRNG_TERMINATE 5u // 1D: reserved for B4 Russian Roulette.
+#define RT_PRNG_RESERVOIR 6u // 1D: seeds the reservoir's PCG side stream.
+
+/// Sampler state for one path. `pixel` is the per-pixel Owen scramble seed,
+/// `sample_index` selects the point in the sequence, and `offset` is the base
+/// dimension of the current bounce's block.
+struct RNGState {
+	uint pixel;
+	uint sample_index;
+	uint offset;
+};
+
+/// Per-pixel scramble seed (Cycles `path_rng_pixel_init`, pattern.h:143).
+uint rng_pixel_seed(uvec2 p_pixel) {
+	return sb_hash_iqnt2d(p_pixel.x, p_pixel.y) ^ RT_SAMPLER_SEED;
+}
+
+/// Start a path. Block 0 is reserved for the camera/init decisions (the pixel
+/// filter), so shading starts at block 1 -- same convention as Cycles, which
+/// initializes rng_offset to PRNG_BOUNCE_NUM (path_state.h:58).
+RNGState rng_init(uvec2 p_pixel, uint p_sample_index) {
+	RNGState r;
+	r.pixel = rng_pixel_seed(p_pixel);
+	r.sample_index = p_sample_index;
+	r.offset = RT_PRNG_BOUNCE_NUM;
+	return r;
+}
+
+/// Advance to the next bounce's dimension block (Cycles path_state.h:241).
+RNGState rng_next_bounce(RNGState p_rng) {
+	RNGState r = p_rng;
+	r.offset += RT_PRNG_BOUNCE_NUM;
+	return r;
+}
+
+/// 1D draw from dimension `p_dim` of the current block. Does not mutate state.
+float rng_1d(RNGState p_rng, uint p_dim) {
+	// 0xffffffff = maximum sequence length. Cycles derives a shorter mask from the
+	// sample count purely to shorten this loop; it does not change the values.
+	return sobol_burley_sample_1D(p_rng.sample_index, p_rng.offset + p_dim, p_rng.pixel, 0xffffffffu);
+}
+
+/// 2D draw from dimension set `p_dim` of the current block. Does not mutate state.
+vec2 rng_2d(RNGState p_rng, uint p_dim) {
+	return sobol_burley_sample_2D(p_rng.sample_index, p_rng.offset + p_dim, p_rng.pixel, 0xffffffffu);
+}
+
+/// Seed for a PCG side stream that is decorrelated from every Sobol dimension.
+/// Used only where the draw count is data-dependent (the light reservoir).
+uint rng_side_stream(RNGState p_rng, uint p_dim) {
+	return pcg_hash(p_rng.pixel ^ pcg_hash(p_rng.sample_index * 2654435761u + p_rng.offset + p_dim));
+}
+
+/// Pack the travelling part of the state into the payload's 32 bits:
+/// [sample_index:20][offset:12]. `pixel` is not packed -- every ray-tracing stage
+/// can recompute it from gl_LaunchIDEXT, so it costs nothing to carry.
+/// 20 bits covers 1,048,575 samples (the accumulation target caps at 8192) and
+/// 12 bits covers 4095 dimensions (16 bounces x 8 = 128).
+uint rng_pack(RNGState p_rng) {
+	return (min(p_rng.sample_index, 0xFFFFFu) << 12u) | (p_rng.offset & 0xFFFu);
+}
+
+RNGState rng_unpack(uint p_packed, uvec2 p_pixel) {
+	RNGState r;
+	r.pixel = rng_pixel_seed(p_pixel);
+	r.sample_index = p_packed >> 12u;
+	r.offset = p_packed & 0xFFFu;
+	return r;
 }
 
 // ============================================================================
@@ -233,13 +327,16 @@ vec2 camera_filter_jitter(uvec2 p_pixel, uint p_sample) {
 	if (p_sample == 0u) {
 		return vec2(0.5);
 	}
-	// Dedicated RNG stream: keeping jitter off the path RNG stops sub-pixel
-	// position from correlating with shading decisions.
-	uint s = pcg_hash(p_pixel.x + p_pixel.y * 65536u + 0x9E3779B9u);
-	s = pcg_hash(s + p_sample * 2654435761u);
-	float jx = rand(s);
-	float jy = rand(s);
-	return vec2(0.5) + vec2(bh_filter_1d(jx), bh_filter_1d(jy));
+	// Dimension block 0 (the init block), dimension RT_PRNG_FILTER. This is the
+	// best-stratified pair in the whole sequence, which is what anti-aliasing
+	// wants: the sub-pixel positions of N samples should tile the pixel evenly
+	// rather than clump. Shading draws start at block 1 and are decorrelated.
+	RNGState r;
+	r.pixel = rng_pixel_seed(p_pixel);
+	r.sample_index = p_sample;
+	r.offset = 0u;
+	vec2 u = rng_2d(r, RT_PRNG_FILTER);
+	return vec2(0.5) + vec2(bh_filter_1d(u.x), bh_filter_1d(u.y));
 }
 
 // ============================================================================

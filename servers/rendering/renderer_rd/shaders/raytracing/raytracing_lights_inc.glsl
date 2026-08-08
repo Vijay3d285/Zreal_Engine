@@ -211,7 +211,7 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 /// Returns true if light is visible.
 /// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
-bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
+bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 #ifdef USE_SER
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
@@ -230,7 +230,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	shadow_ps.radiance = vec3(0.0);
 	shadow_ps.throughput = vec3(0.0);
 	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
-	shadow_ps.rng_state = 0u;
+	shadow_ps.rng_packed = 0u;
 	shadow_ps.hit_t = 0.0;
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
@@ -263,7 +263,7 @@ vec3 lights_eval_rect_light(
 		float light_select_pdf,
 		bool is_indirect_bounce,
 		MaterialProperties material,
-		inout uint rng_state) {
+		RNGState p_rng) {
 
 	// 1. Sample random point on the quad
 	vec3 axisU = light.spot_direction; // half-width vector
@@ -302,7 +302,7 @@ vec3 lights_eval_rect_light(
 	}
 
 	// 7. Shadow ray
-	if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, dist, rng_state)) {
+	if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, dist)) {
 		return vec3(0.0);
 	}
 
@@ -335,7 +335,7 @@ vec3 lights_evaluate_direct_lighting(
 		vec3 N,
 		vec3 V,
 		MaterialProperties material,
-		inout uint rng_state,
+		RNGState p_rng,
 		bool is_indirect_bounce,
 		uint light_count) {
 	if (light_count == 0u) {
@@ -347,8 +347,13 @@ vec3 lights_evaluate_direct_lighting(
 	uint valid_found = 0u;
 	uint selected_idx = 0u;
 
+	// Data-dependent draw count -- see the sampler note in raytracing_inc.glsl.
+	// PCG side stream, decorrelated from every Sobol dimension. Roadmap C2 replaces
+	// this loop with power-weighted selection, at which point it becomes a fixed
+	// number of draws and can move onto Sobol dimensions.
+	uint reservoir_stream = rng_side_stream(p_rng, RT_PRNG_RESERVOIR);
 	for (uint i = 0u; i < k; i++) {
-		uint idx = min(uint(rand(rng_state) * float(light_count)), light_count - 1u);
+		uint idx = min(uint(rand(reservoir_stream) * float(light_count)), light_count - 1u);
 		RTLightData test_light = rt_lights[idx];
 
 		// Range check for positional lights.
@@ -362,7 +367,7 @@ vec3 lights_evaluate_direct_lighting(
 
 		if (is_valid) {
 			valid_found++;
-			if (rand(rng_state) < 1.0 / float(valid_found)) {
+			if (rand(reservoir_stream) < 1.0 / float(valid_found)) {
 				selected_idx = idx;
 			}
 		}
@@ -377,7 +382,7 @@ vec3 lights_evaluate_direct_lighting(
 	float light_select_pdf = 1.0 / max(valid_count_estimate, 1.0);
 
 	RTLightData light = rt_lights[selected_idx];
-	vec2 u = rand2(rng_state);
+	vec2 u = rng_2d(p_rng, RT_PRNG_LIGHT);
 
 	// === POSITIONAL LIGHT PATH (omni + spot) ===
 	if (light.type == RT_LIGHT_TYPE_OMNI || light.type == RT_LIGHT_TYPE_SPOT) {
@@ -423,7 +428,7 @@ vec3 lights_evaluate_direct_lighting(
 		// Shadow test — skipped entirely when shadow_enabled == 0.0 (shadowless fill light).
 		// This matches Blender Cycles behaviour: light contributes full radiance with
 		// no occlusion ray, casting no shadows while still illuminating the scene.
-		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
+		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, shadow_dist)) {
 			return vec3(0.0);
 		}
 
@@ -458,7 +463,7 @@ vec3 lights_evaluate_direct_lighting(
 	else if (light.type == RT_LIGHT_TYPE_RECT) {
 		return lights_eval_rect_light(
 				hit_pos, N, V, light, u,
-				light_select_pdf, is_indirect_bounce, material, rng_state);
+				light_select_pdf, is_indirect_bounce, material, p_rng);
 	}
 	// === CONE LIGHT PATH (directional) ===
 	else {
@@ -472,7 +477,7 @@ vec3 lights_evaluate_direct_lighting(
 		}
 
 		// Shadow test for directional light — skipped when shadow_enabled == 0.0.
-		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
+		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, ls.max_distance)) {
 			return vec3(0.0);
 		}
 

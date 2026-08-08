@@ -401,8 +401,9 @@ void debug_visualize(
 		vec3 dbg_weight;
 		// Draw both random pairs up front so each (specular/diffuse) test in
 		// the un-clamped and clamped pass uses the exact same numbers.
-		vec2 u_spec_rng = rand2(ps.rng_state);
-		vec2 u_diff_rng = rand2(ps.rng_state);
+		RNGState dbg_rng = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
+		vec2 u_spec_rng = rng_2d(dbg_rng, RT_PRNG_SURFACE_BSDF);
+		vec2 u_diff_rng = rng_2d(dbg_rng, RT_PRNG_LIGHT);
 
 		bool u_spec_ok = evalIndirectCombinedBRDF(u_spec_rng, final_normal, geometry_normal, V, dbg_mat, SPECULAR_TYPE, dbg_dir, dbg_weight, vec4(0.0));
 		bool u_diff_ok = evalIndirectCombinedBRDF(u_diff_rng, final_normal, geometry_normal, V, dbg_mat, DIFFUSE_TYPE, dbg_dir, dbg_weight, vec4(0.0));
@@ -441,6 +442,7 @@ void debug_visualize(
 /// Also handles DLSS-RR G-buffer output on primary ray.
 void shade_and_bounce(HitData h, MaterialResult m) {
 	PathState ps = path_unpack(payload);
+	RNGState rng = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
 
 	vec3 V = -gl_WorldRayDirectionEXT;
 
@@ -532,7 +534,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
+				hit_pos_offset, N, V, brdf_mat, rng, is_indirect, rt_light_count);
 		ps.radiance += clamp_contribution(ps.throughput * direct_light, clamp_limit);
 	}
 
@@ -549,7 +551,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
 		float brdfProbability = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
-		if (rand(ps.rng_state) < brdfProbability) {
+		if (rng_1d(rng, RT_PRNG_LOBE) < brdfProbability) {
 			brdfType = SPECULAR_TYPE;
 			ps.throughput /= brdfProbability;
 		} else {
@@ -558,7 +560,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		}
 	}
 
-	vec2 u = rand2(ps.rng_state);
+	vec2 u = rng_2d(rng, RT_PRNG_SURFACE_BSDF);
 	vec3 next_dir;
 	vec3 brdf_weight;
 	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
@@ -591,5 +593,8 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	ps.hit_t = gl_HitTEXT;
 	ps.offset_normal = h.geometry_normal;
 	ps.next_ray_dir = next_dir;
+	// Next bounce gets its own dimension block, so decision k at depth d always
+	// draws from the same dimension across every path in the frame.
+	ps.rng_packed = rng_pack(rng_next_bounce(rng));
 	path_pack(payload, ps);
 }

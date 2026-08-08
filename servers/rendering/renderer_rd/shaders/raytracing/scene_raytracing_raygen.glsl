@@ -51,7 +51,12 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_frame_index, uint p_sample_idx, bool
 	ps.radiance = vec3(0.0);
 	ps.throughput = vec3(1.0);
 	ps.packed_bounces_flags = p_is_sample_zero ? set_sample_zero(0u) : 0u;
-	ps.rng_state = init_rng(p_pixel, p_frame_index, p_sample_idx);
+	// One continuous Sobol sequence per pixel. In accumulate mode p_sample_idx is
+	// the accumulation frame index, so consecutive frames are consecutive points
+	// of the same sequence and the stratification compounds as it converges. In
+	// one-shot mode the frame index offsets the block so successive frames do not
+	// replay the same points.
+	ps.rng_packed = rng_pack(rng_init(p_pixel, p_frame_index * RT_GET_SAMPLE_COUNT() + p_sample_idx));
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
