@@ -27,8 +27,8 @@ func _ready():
 			output_path = arg
 			
 	if (input_json_path == "" or output_path == "") and args.size() >= 2:
-		input_json_path = args[args.size()-2]
-		output_path = args[args.size()-1]
+		input_json_path = args[args.size() - 2]
+		output_path = args[args.size() - 1]
 	
 	if input_json_path == "" or output_path == "":
 		print("Error: Missing arguments.")
@@ -132,7 +132,7 @@ func set_resolution(data):
 	# DLSS RR handles denoising + sub-pixel reconstruction instead.
 	get_viewport().msaa_3d = Viewport.MSAA_DISABLED
 	get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
-	get_viewport().use_taa = false   # DLSS RR handles temporal stability; TAA auto-disabled anyway
+	get_viewport().use_taa = false # DLSS RR handles temporal stability; TAA auto-disabled anyway
 	get_viewport().use_debanding = true
 	get_viewport().mesh_lod_threshold = 0.0
 
@@ -282,43 +282,43 @@ func setup_camera(data):
 					post_fx.contrast = 1.20
 					if is_warm_night:
 						# Warm night: amber CDL push, softer shadows, richer saturation
-						post_fx.exposure          = 1.65  # brighter to reveal warm corners
-						post_fx.saturation        = 1.05  # richer warmth without oversaturation
-						post_fx.lift              = Color(0.06, 0.02, -0.01)  # amber shadow lift
-						post_fx.gain              = Color(1.28, 1.08, 0.82)  # warm highlight push
-						post_fx.gamma_grade       = Color(1.04, 0.98, 0.94)  # amber midtone bias
-						post_fx.vignette_strength = 0.52  # softer vignette: corners stay visible
-						post_fx.chromatic_aberration = 0.0008  # subtle lens warmth
+						post_fx.exposure = 1.65 # brighter to reveal warm corners
+						post_fx.saturation = 1.05 # richer warmth without oversaturation
+						post_fx.lift = Color(0.06, 0.02, -0.01) # amber shadow lift
+						post_fx.gain = Color(1.28, 1.08, 0.82) # warm highlight push
+						post_fx.gamma_grade = Color(1.04, 0.98, 0.94) # amber midtone bias
+						post_fx.vignette_strength = 0.52 # softer vignette: corners stay visible
+						post_fx.chromatic_aberration = 0.0008 # subtle lens warmth
 						print("  [PostFX] Applied Warm-Night CDL (amber lift, golden gain, AgX)")
 					else:
-						post_fx.exposure          = 1.5
-						post_fx.saturation        = 0.85
-						post_fx.lift              = Color(0.02, 0.01, 0.05)
-						post_fx.gain              = Color(1.2, 1.1, 0.9)
+						post_fx.exposure = 1.5
+						post_fx.saturation = 0.85
+						post_fx.lift = Color(0.02, 0.01, 0.05)
+						post_fx.gain = Color(1.2, 1.1, 0.9)
 						post_fx.vignette_strength = 0.6
 						post_fx.chromatic_aberration = 0.001
 						print("  [PostFX] Applied Night S-Curve tuning (AgX, Contrast 1.20)")
 				# CHANGE 8: Day render warm golden CDL — this is the key to Render 2's look.
 				# Lifts shadows to warm amber, pushes highlights to golden, subtle vignette.
 				elif day_render:
-					post_fx.tonemap_mode      = 0  # ACES — punchy, handles sun highlights
-					post_fx.exposure          = 1.05
-					post_fx.contrast          = 1.12
-					post_fx.saturation        = 1.08  # slightly richer for warm interior
-					post_fx.lift              = Color(0.02, 0.01, -0.01)   # warm shadow lift
-					post_fx.gain              = Color(1.10, 1.02, 0.88)    # golden highlight push
-					post_fx.gamma_grade       = Color(1.02, 0.99, 0.96)   # warm midtone bias
-					post_fx.vignette_strength = 0.28   # subtle — Render 2 has mild vignette
-					post_fx.chromatic_aberration = 0.0003  # barely perceptible lens depth
+					post_fx.tonemap_mode = 0 # ACES — punchy, handles sun highlights
+					post_fx.exposure = 1.05
+					post_fx.contrast = 1.12
+					post_fx.saturation = 1.08 # slightly richer for warm interior
+					post_fx.lift = Color(0.02, 0.01, -0.01) # warm shadow lift
+					post_fx.gain = Color(1.10, 1.02, 0.88) # golden highlight push
+					post_fx.gamma_grade = Color(1.02, 0.99, 0.96) # warm midtone bias
+					post_fx.vignette_strength = 0.28 # subtle — Render 2 has mild vignette
+					post_fx.chromatic_aberration = 0.0003 # barely perceptible lens depth
 					print("  [PostFX] Applied Day-Sun CDL (ACES, warm golden gain)")
 				elif str(_lighting_color_mood).to_lower() == "warm":
 					# Day-warm: subtle amber grade without dramatic night look
-					post_fx.tonemap_mode      = 1  # AgX
-					post_fx.exposure          = 1.0
-					post_fx.contrast          = 1.15
-					post_fx.saturation        = 1.12
-					post_fx.lift              = Color(0.03, 0.01, -0.01)
-					post_fx.gain              = Color(1.12, 1.04, 0.90)
+					post_fx.tonemap_mode = 1 # AgX
+					post_fx.exposure = 1.0
+					post_fx.contrast = 1.15
+					post_fx.saturation = 1.12
+					post_fx.lift = Color(0.03, 0.01, -0.01)
+					post_fx.gain = Color(1.12, 1.04, 0.90)
 					post_fx.vignette_strength = 0.35
 					post_fx.chromatic_aberration = 0.0005
 					print("  [PostFX] Applied Day-Warm CDL tuning (AgX, amber grade)")
@@ -429,19 +429,28 @@ func render_image(data, output_path):
 		print("Image saved to: ", output_path)
 		_save_thumbnail_webp(img, output_path)
 		if accumulate_enabled:
-			var exr_path: String = output_path.get_basename() + ".exr"
-			var hdr: Image = RenderingServer.viewport_get_pathtracing_accum_image(
-					get_viewport().get_viewport_rid())
-			if hdr != null and not hdr.is_empty():
-				var err: int = hdr.save_exr(exr_path, false)
-				if err == OK:
-					print("[Render] Linear HDR EXR saved to: ", exr_path)
+			# The .png above is the deliverable — it is the converged, anti-aliased,
+			# tonemapped result, and it is lossless. Note Godot's PNG writer is 8-bit
+			# only (drivers/png/png_driver_common.cpp converts anything else to
+			# RGB8/RGBA8), which matches Blender's default PNG output.
+			#
+			# The linear EXR is an OPTIONAL extra for grading or for verifying that
+			# highlights above 1.0 survived. It is off by default; set ZR_PT_EXR=1 to
+			# emit it alongside the PNG.
+			if OS.get_environment("ZR_PT_EXR") == "1":
+				var exr_path: String = output_path.get_basename() + ".exr"
+				var hdr: Image = RenderingServer.viewport_get_pathtracing_accum_image(
+						get_viewport().get_viewport_rid())
+				if hdr != null and not hdr.is_empty():
+					var err: int = hdr.save_exr(exr_path, false)
+					if err == OK:
+						print("[Render] Linear HDR EXR saved to: ", exr_path)
+					else:
+						push_warning("[Render] EXR save failed (err %d): %s" % [err, exr_path])
 				else:
-					push_warning("[Render] EXR save failed (err %d): %s" % [err, exr_path])
-			else:
-				push_warning("[Render] Accumulator readback returned no image; EXR skipped.")
+					push_warning("[Render] Accumulator readback returned no image; EXR skipped.")
 			var denoise_note := " with in-process OIDN final-denoise" if oidn_enabled else (" with DLSS-RR reconstruct-final" if dlss_rr_final_enabled else "")
-			print("[Render] Accumulated still captured%s (PNG tonemapped + EXR linear)." % denoise_note)
+			print("[Render] PHASE A accumulated still captured%s (PNG, tonemapped, converged)." % denoise_note)
 		elif dlss_rr_realtime:
 			print("[Render] Realtime DLSS-RR still captured (PNG, tonemapped) — %d-frame temporal accumulation." % DLSS_RR_REALTIME_STILL_FRAMES)
 
@@ -517,7 +526,7 @@ func save_logs(input_data, output_image_path):
 	var cam = get_node_or_null("MainCamera")
 	if cam:
 		log_data["camera_actual"] = {
-			"position": { "x": cam.position.x, "y": cam.position.y, "z": cam.position.z },
+			"position": {"x": cam.position.x, "y": cam.position.y, "z": cam.position.z},
 			"fov": cam.fov
 		}
 	
@@ -613,7 +622,7 @@ func setup_fixed_fill_lights():
 		# For sunbeam detection
 		var sun_dir_flat = Vector3.ZERO
 		if day_render and _dir_light:
-			sun_dir_flat = -_dir_light.global_transform.basis.z
+			sun_dir_flat = - _dir_light.global_transform.basis.z
 			sun_dir_flat.y = 0
 			if sun_dir_flat.length() > 0.001:
 				sun_dir_flat = sun_dir_flat.normalized()
@@ -650,7 +659,7 @@ func setup_fixed_fill_lights():
 			var cz = sum_z / float(count)
 
 			# ── Ceiling height for THIS room ──
-			var ceil_h = 2.4  # default 240 cm → 2.4 m
+			var ceil_h = 2.4 # default 240 cm → 2.4 m
 			if area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY:
 				var cp = area["ceiling_properties"]
 				if cp.has("height"):
@@ -672,11 +681,11 @@ func setup_fixed_fill_lights():
 
 			# Light hangs 30 cm below the ceiling — well inside the room
 			var light_y = ceil_h - 0.30
-			light_y = max(light_y, 1.4)  # never lower than 1.4 m
+			light_y = max(light_y, 1.4) # never lower than 1.4 m
 
 			var room_w = max(max_x - min_x, 0.5)
 			var room_d = max(max_z - min_z, 0.5)
-			var diag   = sqrt(room_w * room_w + room_d * room_d)
+			var diag = sqrt(room_w * room_w + room_d * room_d)
 
 			if day_render:
 				# ── Day Render: Dynamic Grid Fill Lighting ──
@@ -722,7 +731,7 @@ func setup_fixed_fill_lights():
 							light.name = "GridFill_%s_%d_%d" % [area_id, ix, iz]
 							light.position = Vector3(px, ceil_h - 0.2, pz)
 							light.rotation_degrees = Vector3(-90, 0, 0)
-							light.spot_angle = 55.0   # Tight cone — only illuminates downward, no ceiling bleed
+							light.spot_angle = 55.0 # Tight cone — only illuminates downward, no ceiling bleed
 							light.spot_range = clamp(spacing * 3.5, 6.0, 12.0)
 							light.light_energy = grid_energy
 							light.shadow_enabled = false
@@ -756,14 +765,14 @@ func setup_fixed_fill_lights():
 
 				var light = SpotLight3D.new()
 				light.name = "RoomLight_" + str(area_id)
-				light.position = Vector3(cx, light_y, cz)  # ← fixed world position
+				light.position = Vector3(cx, light_y, cz) # ← fixed world position
 				light.rotation_degrees = Vector3(-90, 0, 0)
 				light.spot_angle = 85.0
 				light.spot_range = omni_range
 				light.light_energy = energy * energy_multiplier * illumination_scale
 				light.shadow_enabled = false
 				light.light_color = fill_color
-				light.light_specular = 0.10  # small specular — points DOWN so hits floor, not ceiling
+				light.light_specular = 0.10 # small specular — points DOWN so hits floor, not ceiling
 				light.add_to_group("fill_lights")
 				add_child(light)
 				placed += 1
@@ -786,10 +795,10 @@ func setup_fixed_fill_lights():
 				ceil_fill.light_energy = ceil_energy_base
 				# Wide range to reach ceiling and corners uniformly
 				ceil_fill.omni_range = clamp(diag * 1.6 + 3.0, 10.0, 25.0)
-				ceil_fill.omni_attenuation = 1.5  # Gentler falloff for softer spread
+				ceil_fill.omni_attenuation = 1.5 # Gentler falloff for softer spread
 				ceil_fill.shadow_enabled = false
 				ceil_fill.light_color = fill_color
-				ceil_fill.light_specular = 0.12  # soft floor gloss — mid-room height avoids ceiling hotspot
+				ceil_fill.light_specular = 0.12 # soft floor gloss — mid-room height avoids ceiling hotspot
 				ceil_fill.add_to_group("fill_lights")
 				add_child(ceil_fill)
 				
@@ -797,9 +806,9 @@ func setup_fixed_fill_lights():
 				var corner_energy = ceil_energy_base * 0.45
 				var corner_range = clamp(diag * 1.0 + 2.0, 6.0, 16.0)
 				var corner_offsets = [
-					Vector2( room_w * 0.35,  room_d * 0.35),
-					Vector2(-room_w * 0.35,  room_d * 0.35),
-					Vector2( room_w * 0.35, -room_d * 0.35),
+					Vector2(room_w * 0.35, room_d * 0.35),
+					Vector2(-room_w * 0.35, room_d * 0.35),
+					Vector2(room_w * 0.35, -room_d * 0.35),
 					Vector2(-room_w * 0.35, -room_d * 0.35),
 				]
 				var ci = 0
@@ -822,12 +831,12 @@ func setup_fixed_fill_lights():
 
 				var floor_fill = OmniLight3D.new()
 				floor_fill.name = "FloorFill_" + str(area_id)
-				floor_fill.position = Vector3(cx, 0.35, cz)  # near-floor height
+				floor_fill.position = Vector3(cx, 0.35, cz) # near-floor height
 				floor_fill.light_energy = energy * 0.25 * energy_multiplier * illumination_scale
 				floor_fill.omni_range = clamp(omni_range * 0.7, 3.0, 10.0)
 				floor_fill.shadow_enabled = false
 				floor_fill.light_color = floor_fill_color
-				floor_fill.light_specular = 0.35  # grazing-angle shimmer on polished marble/tile
+				floor_fill.light_specular = 0.35 # grazing-angle shimmer on polished marble/tile
 				floor_fill.add_to_group("fill_lights")
 				add_child(floor_fill)
 
@@ -1037,8 +1046,8 @@ func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 	var max_dim = 480
 	var w = thumb.get_width(); var h = thumb.get_height()
 	if w > max_dim or h > max_dim:
-		if w >= h: thumb.resize(max_dim, int(float(h)*max_dim/w), Image.INTERPOLATE_LANCZOS)
-		else: thumb.resize(int(float(w)*max_dim/h), max_dim, Image.INTERPOLATE_LANCZOS)
+		if w >= h: thumb.resize(max_dim, int(float(h) * max_dim / w), Image.INTERPOLATE_LANCZOS)
+		else: thumb.resize(int(float(w) * max_dim / h), max_dim, Image.INTERPOLATE_LANCZOS)
 	thumb.save_webp(thumb_path, true, 0.75)
 
 func _wait_frames(count: int) -> void:

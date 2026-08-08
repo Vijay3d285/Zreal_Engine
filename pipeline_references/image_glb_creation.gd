@@ -811,9 +811,18 @@ func setup_lighting(data, geom_data = {}):
 		env.set_pathtracing_samples_per_pixel(10)
 
 	# ── ROUTE SELECT: realtime DLSS-RR (default) vs Phase A offline accumulation ──
-	# Set the environment variable ZR_PHASE_A=1 before launching to take the Phase A
-	# offline route. Unset/anything-else keeps the production realtime route with
-	# byte-identical behaviour to before, so this toggle is safe to ship.
+	#
+	#   >>> FLIP THIS ONE LINE TO true TO USE THE PHASE A OFFLINE ROUTE <<<
+	const PHASE_A_OFFLINE_STILL := false
+	#
+	# ZR_PHASE_A=1 also forces it on, but be aware the variable must be set for the
+	# process that SPAWNS Godot — i.e. the uvicorn server — not a separate shell.
+	# Setting it in another terminal does nothing, which is why the constant above
+	# exists as the reliable switch.
+	#
+	# Whichever way it is enabled, the run logs a "[PhaseA] Offline accumulation ON"
+	# line. If that line is absent from the Godot log, the offline route did NOT run
+	# and you are looking at the realtime result.
 	#
 	# REQUIRES an engine built from vijay_PTEngine_v8_Quality at commit 6d6efa87ad or
 	# later. On an older binary render.gd will not even parse, because
@@ -824,7 +833,7 @@ func setup_lighting(data, geom_data = {}):
 	#   ZR_PT_CLAMP_INDIRECT firefly clamp, 0 = off     (default 0; Blender's is 10)
 	#   ZR_PT_NOISE_THRESH   adaptive sampling, 0 = off (default 0 for a pure reference)
 	#   ZR_PT_FINAL          "oidn" | "dlssrr" | "none" (default "oidn")
-	var phase_a_offline := OS.get_environment("ZR_PHASE_A") == "1"
+	var phase_a_offline := PHASE_A_OFFLINE_STILL or OS.get_environment("ZR_PHASE_A") == "1"
 
 	if phase_a_offline:
 		# PHASE A OFFLINE STILL: trace one sample per driver frame into a persistent
