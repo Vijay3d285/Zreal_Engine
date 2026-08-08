@@ -184,12 +184,45 @@ vec2 rand2(inout uint state) {
 // CAMERA RECONSTRUCTION FILTER
 // ============================================================================
 
-/// Inverse CDF of a triangle (tent) distribution of radius 1, mapping u in
-/// [0,1) to an offset in [-1, 1]. Filter importance sampling: the sample may
-/// land outside the pixel footprint but still accumulates into this pixel,
-/// which is what gives triangle reconstruction instead of a box.
-float tent_filter_1d(float u) {
-	return (u < 0.5) ? (sqrt(2.0 * u) - 1.0) : (1.0 - sqrt(max(0.0, 2.0 - 2.0 * u)));
+// Blackman-Harris pixel reconstruction filter, matching Blender Cycles.
+//
+// Cycles evaluates the Blackman-Harris window over its half-profile [0, 1],
+// builds an inverted CDF from it, and looks the sub-pixel offset up from that
+// table (intern/cycles/scene/film.cpp: filter_func_blackman_harris +
+// util_cdf_inverted; applied in kernel/camera/camera.h: raster += lookup_table_read).
+// With Cycles' default filter_width of 1.0 the window is widened x2 internally,
+// so offsets span +/-1 pixel around the pixel centre.
+//
+// That is the same RADIUS a tent filter has, but a very different SHAPE: the
+// Blackman-Harris window is strongly centre-weighted, placing half its samples
+// within +/-0.19px of the centre where a tent puts them within +/-0.29px. The
+// tent therefore smears more energy into neighbouring pixels and reads visibly
+// softer — which is why matching the window matters for detail retention.
+//
+// Table below is the inverse CDF of the half-profile sampled at 33 points,
+// generated from the same formula Cycles uses.
+const float BH_INV_CDF_HALF[33] = float[33](
+		0.000000, 0.011217, 0.022451, 0.033716, 0.045031, 0.056412,
+		0.067877, 0.079445, 0.091136, 0.102972, 0.114976, 0.127173,
+		0.139592, 0.152265, 0.165227, 0.178518, 0.192186, 0.206285,
+		0.220880, 0.236047, 0.251880, 0.268495, 0.286038, 0.304696,
+		0.324718, 0.346446, 0.370366, 0.397209, 0.428163, 0.465364,
+		0.513365, 0.585604, 1.000000);
+
+/// Inverse CDF of the Blackman-Harris half-profile: maps a in [0,1] to a
+/// normalized radius in [0,1], linearly interpolating the table.
+float bh_inv_cdf_half(float a) {
+	float t = clamp(a, 0.0, 1.0) * 32.0;
+	int i = min(int(t), 31);
+	return mix(BH_INV_CDF_HALF[i], BH_INV_CDF_HALF[i + 1], t - float(i));
+}
+
+/// Blackman-Harris filter offset in [-1, 1] for u in [0,1). Filter importance
+/// sampling: the sample may land outside the pixel footprint but still
+/// accumulates into this pixel, which is what performs the reconstruction.
+float bh_filter_1d(float u) {
+	float s = 2.0 * u - 1.0;
+	return sign(s) * bh_inv_cdf_half(abs(s));
 }
 
 /// Sub-pixel offset for accumulation/loop sample `p_sample`.
@@ -206,7 +239,7 @@ vec2 camera_filter_jitter(uvec2 p_pixel, uint p_sample) {
 	s = pcg_hash(s + p_sample * 2654435761u);
 	float jx = rand(s);
 	float jy = rand(s);
-	return vec2(0.5) + vec2(tent_filter_1d(jx), tent_filter_1d(jy));
+	return vec2(0.5) + vec2(bh_filter_1d(jx), bh_filter_1d(jy));
 }
 
 // ============================================================================

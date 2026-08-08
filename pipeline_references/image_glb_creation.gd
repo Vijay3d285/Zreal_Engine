@@ -857,9 +857,15 @@ func setup_lighting(data, geom_data = {}):
 		if n_env.is_valid_float():
 			noise_thresh = maxf(0.0, n_env.to_float())
 
+		# Default "none": at a few hundred accumulated samples the image is already
+		# converged, and OIDN is built for NOISY input — run on a clean image it
+		# smooths away fine detail (fabric weave, pencil lines on artwork, wood grain)
+		# and softens edges. Set ZR_PT_FINAL=oidn if a dark scene is still grainy,
+		# but prefer raising ZR_PT_ACCUM_TARGET first: more samples cost time,
+		# denoising costs detail.
 		var final_pass := OS.get_environment("ZR_PT_FINAL")
 		if final_pass == "":
-			final_pass = "oidn"
+			final_pass = "none"
 
 		env.set_pathtracing_denoiser(0) # 0 = PT_DENOISER_NONE; realtime DLSS-RR is not the integrator here.
 		env.set_pathtracing_accumulate(true)

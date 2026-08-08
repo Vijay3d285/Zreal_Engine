@@ -370,6 +370,26 @@ func render_image(data, output_path):
 		accumulate_enabled = true
 		accum_target = env.environment.pathtracing_accumulation_target
 
+	# ── CRITICAL for Phase A: disable the temporal upscaler ────────────────────
+	# SCALING_3D_MODE_DLSS is SCALING_3D_TYPE_TEMPORAL, so the viewport assigns a
+	# jitter_phase_count (renderer_viewport.cpp) and the renderer bakes a per-frame
+	# Halton jitter straight into the projection matrix
+	# (render_scene_data_rd.cpp: correction.add_jitter_offset(taa_jitter)).
+	#
+	# The path tracer's raygen reads that SAME jittered projection and then applies
+	# its own Blackman-Harris pixel filter on top. The two convolve, widening the
+	# effective filter to roughly 1.5px and producing a soft image with ragged
+	# edges — the offline route ends up blurrier than the realtime one it replaced.
+	#
+	# Phase A does its own anti-aliasing and its denoiser is 0, so nothing here
+	# needs a temporal upscaler. Turn scaling off so our filter is the only one.
+	# (DLSS-RR "reconstruct final" is the one exception: that pass genuinely runs
+	# inside the SCALE_DLSS branch, so it keeps the DLSS viewport mode.)
+	if accumulate_enabled and not dlss_rr_final_enabled:
+		get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_OFF
+		get_viewport().scaling_3d_scale = 1.0
+		print("[PhaseA] Viewport scaling OFF — removes the temporal upscaler's projection jitter so it cannot double up with the path tracer's pixel filter.")
+
 	if cam:
 		setup_fixed_fill_lights()
 		_apply_no_authored_light_boost()
