@@ -814,6 +814,19 @@ func setup_lighting(data, geom_data = {}):
 	#
 	#   >>> FLIP THIS ONE LINE TO true TO USE THE PHASE A OFFLINE ROUTE <<<
 	const PHASE_A_OFFLINE_STILL := false
+
+	# Tuning, all editable here (env vars of the same name below still override).
+	#   ACCUM_TARGET     frames to accumulate. Noise falls as 1/sqrt(N), so 4x the
+	#                    frames halves the grain. 256 is a preview, 1024 a hero shot.
+	#   FINAL            "none" | "oidn" | "dlssrr". OIDN removes residual grain at a
+	#                    cost in fine detail; prefer more samples first, but on a dark
+	#                    interior OIDN at 256-512 beats raw at 256.
+	#   CLAMP_INDIRECT   firefly suppression, 0 = off. Blender's default is 10.0.
+	#   NOISE_THRESHOLD  adaptive sampling, 0 = off. Spends the budget on noisy pixels.
+	const PHASE_A_ACCUM_TARGET := 256
+	const PHASE_A_FINAL := "none"
+	const PHASE_A_CLAMP_INDIRECT := 0.0
+	const PHASE_A_NOISE_THRESHOLD := 0.0
 	#
 	# ZR_PHASE_A=1 also forces it on, but be aware the variable must be set for the
 	# process that SPAWNS Godot — i.e. the uvicorn server — not a separate shell.
@@ -842,17 +855,17 @@ func setup_lighting(data, geom_data = {}):
 		# and render.gd additionally writes a linear .exr beside the .png.
 		# SPP is ignored here: the accumulate branch traces exactly one sample per
 		# launch and the frame count supplies the budget instead.
-		var accum_target := 256
+		var accum_target := PHASE_A_ACCUM_TARGET
 		var t_env := OS.get_environment("ZR_PT_ACCUM_TARGET")
 		if t_env.is_valid_int():
 			accum_target = maxi(1, t_env.to_int())
 
-		var clamp_indirect := 0.0
+		var clamp_indirect := PHASE_A_CLAMP_INDIRECT
 		var c_env := OS.get_environment("ZR_PT_CLAMP_INDIRECT")
 		if c_env.is_valid_float():
 			clamp_indirect = maxf(0.0, c_env.to_float())
 
-		var noise_thresh := 0.0
+		var noise_thresh := PHASE_A_NOISE_THRESHOLD
 		var n_env := OS.get_environment("ZR_PT_NOISE_THRESH")
 		if n_env.is_valid_float():
 			noise_thresh = maxf(0.0, n_env.to_float())
@@ -865,7 +878,7 @@ func setup_lighting(data, geom_data = {}):
 		# denoising costs detail.
 		var final_pass := OS.get_environment("ZR_PT_FINAL")
 		if final_pass == "":
-			final_pass = "none"
+			final_pass = PHASE_A_FINAL
 
 		env.set_pathtracing_denoiser(0) # 0 = PT_DENOISER_NONE; realtime DLSS-RR is not the integrator here.
 		env.set_pathtracing_accumulate(true)
