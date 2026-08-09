@@ -995,7 +995,29 @@ Record the RMSE at each sample count in the sweep.
 > original wording confused the perceptual argument (blue-noise-like error is less
 > objectionable at low spp) with RMSE-ratio behaviour. Corrected criterion below.
 
-Accept when RMSE at a given sample count is **lower with Sobol than with PCG at every point in the sweep**, and the fitted convergence exponent is steeper for Sobol than for PCG. Fit each end-to-end by `p = log(RMSE_first / RMSE_last) / log(N_last / N_first)`; expect PCG near 0.5 and Sobol clearly above it. As a consistency check, the improvement ratio between the ends of the sweep should equal `(N_last / N_first)^(p_sobol - p_pcg)` — if the measured ratio and that prediction disagree materially, the measurement is unsound and the sweep should be re-run before anything is recorded.
+> **CORRECTED AGAIN 2026-08-08 after review.** The revision above added a "consistency
+> check": that the end-to-end improvement ratio should equal
+> `(N_last/N_first)^(p_sobol - p_pcg)`. **That check is a tautology and must not be
+> used.** Because each exponent is fitted *only* from the two endpoints,
+> `32^(p_sob - p_pcg)` expands to `(S_16/S_512)/(P_16/P_512)`, and the "measured"
+> ratio-of-ratios `(P_512/S_512)/(P_16/S_16)` expands to the same expression — the same
+> four numbers regrouped by commutativity of division. It agrees to floating-point
+> precision for *any* input, including data from a broken sampler, so it can never fail
+> and validates nothing. Replaced below with a check against the data the fit does not
+> use.
+
+Accept when both hold:
+
+1. **No regression.** RMSE is lower with Sobol than with PCG at every point in the sweep.
+2. **Steeper convergence.** The fitted exponent is clearly steeper for Sobol than for PCG. Fit each end-to-end by `p = log(RMSE_first / RMSE_last) / log(N_last / N_first)`; expect PCG near 0.5 and Sobol clearly above it.
+
+Then, as a genuine (falsifiable) check, validate the two-point fit against the **middle points it does not use**: predict `RMSE(N) = RMSE_first * (N / N_first)^(-p)` at each intermediate N and compare to measurement. This can fail, and what it tells you matters:
+
+- Deviations within roughly ±5% mean a single power law summarizes the curve well.
+- Larger deviations mean the fit is a crude summary, not that the sampler is broken — a QMC sampler's *local* convergence rate legitimately varies across the sweep. Record the deviation rather than hiding it, and say plainly that the exponent is a two-point secant slope, not a regression over all sampled points.
+- A sampler whose measured RMSE falls *below* its own fit at the low-N end while rising above it at the high-N end is the shape to be suspicious of, since that is what a partially-correlated sampler looks like.
+
+Report the harness's own warnings alongside the numbers. In particular, if it warns that the reference frame count is less than 4x the longest run, that caveat belongs in the record — it bears directly on the endpoint the whole fit is anchored to.
 
 If RMSE is *worse* anywhere, stop and re-check the dimension allocation before recording anything: two decisions sharing a dimension index is the usual cause, and it produces correlation that is worse than white noise.
 
