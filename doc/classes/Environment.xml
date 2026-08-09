@@ -232,8 +232,16 @@
 			If [code]true[/code], enables hardware-accelerated path tracing for this environment. Path tracing produces physically accurate global illumination, reflections, and shadows by simulating light rays bouncing through the scene. Requires a GPU with ray tracing support.
 			[b]Note:[/b] Path tracing is mutually exclusive with rasterization-based rendering. When enabled, features such as SDFGI, screen-space reflections, and shadow maps are bypassed.
 		</member>
-		<member name="pathtracing_max_bounces" type="int" setter="set_pathtracing_max_bounces" getter="get_pathtracing_max_bounces" default="3">
-			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only.
+		<member name="pathtracing_max_bounces" type="int" setter="set_pathtracing_max_bounces" getter="get_pathtracing_max_bounces" default="8">
+			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only. Acts as an overall ceiling on top of [member pathtracing_max_diffuse_bounce] and [member pathtracing_max_glossy_bounce]; the per-lobe caps are usually reached first.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_max_diffuse_bounce" type="int" setter="set_pathtracing_max_diffuse_bounce" getter="get_pathtracing_max_diffuse_bounce" default="4">
+			Maximum number of diffuse-lobe bounces a path is allowed before it is terminated, counted separately from glossy bounces. The path terminates as soon as either lobe's cap is reached, so the practical maximum path length is [code]pathtracing_max_diffuse_bounce + pathtracing_max_glossy_bounce - 1[/code], regardless of [member pathtracing_max_bounces].
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_max_glossy_bounce" type="int" setter="set_pathtracing_max_glossy_bounce" getter="get_pathtracing_max_glossy_bounce" default="4">
+			Maximum number of glossy/specular-lobe bounces a path is allowed before it is terminated, counted separately from diffuse bounces. The path terminates as soon as either lobe's cap is reached, so the practical maximum path length is [code]pathtracing_max_diffuse_bounce + pathtracing_max_glossy_bounce - 1[/code], regardless of [member pathtracing_max_bounces].
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
 		<member name="pathtracing_noise_threshold" type="float" setter="set_pathtracing_noise_threshold" getter="get_pathtracing_noise_threshold" default="0.01">

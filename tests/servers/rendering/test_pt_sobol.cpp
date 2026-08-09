@@ -204,19 +204,21 @@ TEST_CASE("[PathTracer][Sobol] 2D samples stay in [0, 1)") {
 	}
 }
 
-TEST_CASE("[PathTracer][Sobol] first 2^k 1D samples hit every stratum exactly once") {
-	// A (0,1)-sequence: the first 2^k points fall one per 1/2^k interval.
-	// Owen scrambling and the Burley index shuffle both preserve this.
-	// White noise does not, which is the entire point of the change.
+// Shared body for the 1D stratification property, parameterized on the mask so it
+// can be exercised both at the length-shortened mask Cycles derives from the sample
+// count (block_mask) AND at 0xffffffffu -- the mask the shader (raytracing_inc.glsl
+// rng_1d/rng_2d) actually always passes in production. `index &= mask` truncates
+// which Sobol point is drawn, so the two masks are not redundant checks of the same
+// thing; both must independently preserve the stratification property.
+static void check_1d_stratification(uint32_t p_mask) {
 	const int k = 6;
 	const uint32_t n = 1u << k;
-	const uint32_t mask = block_mask(k);
 
 	for (uint32_t seed_i = 0; seed_i < 8; seed_i++) {
 		const uint32_t seed = sb_hash_hp(seed_i);
 		int hits[64] = {};
 		for (uint32_t i = 0; i < n; i++) {
-			const float v = sobol_burley_sample_1D(i, 0, seed, mask);
+			const float v = sobol_burley_sample_1D(i, 0, seed, p_mask);
 			hits[(int)(v * (float)n)]++;
 		}
 		for (uint32_t b = 0; b < n; b++) {
@@ -225,17 +227,31 @@ TEST_CASE("[PathTracer][Sobol] first 2^k 1D samples hit every stratum exactly on
 	}
 }
 
-TEST_CASE("[PathTracer][Sobol] first 2^k 2D samples hit every grid cell exactly once") {
-	// A (0,2)-sequence: for 2^(2m) points every 2^m x 2^m cell holds exactly one.
+TEST_CASE("[PathTracer][Sobol] first 2^k 1D samples hit every stratum exactly once (block_mask)") {
+	// A (0,1)-sequence: the first 2^k points fall one per 1/2^k interval.
+	// Owen scrambling and the Burley index shuffle both preserve this.
+	// White noise does not, which is the entire point of the change.
+	check_1d_stratification(block_mask(6));
+}
+
+TEST_CASE("[PathTracer][Sobol] first 2^k 1D samples hit every stratum exactly once (production mask 0xffffffff)") {
+	// Same property, at the mask value the shader actually uses (rng_1d/rng_2d in
+	// raytracing_inc.glsl pass 0xffffffffu unconditionally) -- this is the case the
+	// stratification guarantee needs to hold for in the shipped renderer.
+	check_1d_stratification(0xffffffffu);
+}
+
+// Shared body for the 2D stratification property; see check_1d_stratification above
+// for why both masks are exercised.
+static void check_2d_stratification(uint32_t p_mask) {
 	const uint32_t n = 256; // 2^8 points over a 16x16 grid.
-	const uint32_t mask = block_mask(8);
 
 	for (uint32_t seed_i = 0; seed_i < 8; seed_i++) {
 		const uint32_t seed = sb_hash_hp(seed_i);
 		int hits[16][16] = {};
 		for (uint32_t i = 0; i < n; i++) {
 			float x, y;
-			sobol_burley_sample_2D(i, 0, seed, mask, x, y);
+			sobol_burley_sample_2D(i, 0, seed, p_mask, x, y);
 			hits[(int)(x * 16.0f)][(int)(y * 16.0f)]++;
 		}
 		for (int cx = 0; cx < 16; cx++) {
@@ -244,6 +260,16 @@ TEST_CASE("[PathTracer][Sobol] first 2^k 2D samples hit every grid cell exactly 
 			}
 		}
 	}
+}
+
+TEST_CASE("[PathTracer][Sobol] first 2^k 2D samples hit every grid cell exactly once (block_mask)") {
+	// A (0,2)-sequence: for 2^(2m) points every 2^m x 2^m cell holds exactly one.
+	check_2d_stratification(block_mask(8));
+}
+
+TEST_CASE("[PathTracer][Sobol] first 2^k 2D samples hit every grid cell exactly once (production mask 0xffffffff)") {
+	// Same property, at the mask value the shader actually uses in production.
+	check_2d_stratification(0xffffffffu);
 }
 
 TEST_CASE("[PathTracer][Sobol] different pixel seeds produce different sequences") {

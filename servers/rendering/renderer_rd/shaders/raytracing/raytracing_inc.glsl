@@ -2,8 +2,6 @@
 // Must be included before scene_data_inc.glsl since it defines MAX_VIEWS.
 #include "../oct_inc.glsl"
 
-#include "../oct_inc.glsl"
-
 #include "sobol_burley_inc.glsl"
 
 #define MAX_VIEWS 2
@@ -106,9 +104,6 @@ uint get_diffuse_bounces(uint packed) {
 uint get_glossy_bounces(uint packed) {
 	return (packed >> 16u) & 0xFFu;
 }
-uint pack_bounces(uint total, uint diffuse) {
-	return total | (diffuse << 8u);
-}
 // NOTE: retained for debug_visualize()'s single-bounce debug-ray flag (below),
 // which is unrelated to the diffuse/glossy lobe accounting this task adds --
 // it is not a call site this task's bounce-limit rework touches.
@@ -125,10 +120,14 @@ uint inc_glossy_bounce(uint packed) {
 /// Resolve a per-lobe cap, treating 0 as "unset" and falling back to the total
 /// limit. Environment always writes >= 1; 0 only arrives from a raw
 /// RenderingServer environment that never set the pathtracing params, and
-/// terminating those paths immediately would render the scene black.
+/// terminating those paths immediately would render the scene black. Also
+/// clamps the upper bound to p_max_total so a raw environment_set_pathtracing_params
+/// write of an oversized per-lobe cap cannot exceed the overall bounce budget --
+/// mirrors Environment::set_pathtracing_max_diffuse_bounce/_max_glossy_bounce's
+/// own CLAMP(1, 16), which a direct RenderingServer caller bypasses.
 uint resolve_bounce_cap(float p_param, uint p_max_total) {
 	uint cap = uint(max(p_param, 0.0));
-	return (cap == 0u) ? p_max_total : cap;
+	return (cap == 0u) ? p_max_total : min(cap, p_max_total);
 }
 
 // Sample 0 flag (bit 24) - only write DLSS RR outputs on first sample
@@ -261,7 +260,11 @@ RNGState rng_next_bounce(RNGState p_rng) {
 /// 1D draw from dimension `p_dim` of the current block. Does not mutate state.
 float rng_1d(RNGState p_rng, uint p_dim) {
 	// 0xffffffff = maximum sequence length. Cycles derives a shorter mask from the
-	// sample count purely to shorten this loop; it does not change the values.
+	// sample count purely to shorten this loop. The mask does change the values --
+	// `index &= mask` truncates the shuffled index, so a different Sobol point is
+	// drawn -- what it PRESERVES is the stratification property (see test_pt_sobol.cpp,
+	// "first 2^k samples hit every stratum/cell exactly once", which passes at both
+	// a block_mask(k) and at 0xffffffffu).
 	return sobol_burley_sample_1D(p_rng.sample_index, p_rng.offset + p_dim, p_rng.pixel, 0xffffffffu);
 }
 
@@ -282,13 +285,20 @@ uint rng_side_stream(RNGState p_rng, uint p_dim) {
 /// 20 bits covers 1,048,575 samples and 12 bits covers 4095 dimensions
 /// (16 bounces x 8 = 128). In accumulate mode the caller passes the raw
 /// accum_frame (scene_raytracing_raygen.glsl), which the accumulation target
-/// caps at 8192, so that mode is nowhere near the limit. In one-shot mode the
-/// caller passes frame_index * SPP + sample_idx, and frame_index is a
-/// session-lifetime dispatch counter that never resets -- it CAN in principle
-/// exceed 0xFFFFF on a long-running realtime session, at which point the
-/// clamp below saturates and every subsequent draw for that pixel reuses one
-/// Sobol point. Accepted for now: one-shot mode is the realtime preview path,
-/// not the still/accumulate path the validation harness measures.
+/// caps at 8192, so that mode is nowhere near the limit.
+///
+/// In one-shot mode the caller passes frame_index * stride + sample_idx, where
+/// stride is rt_next_pow2_ge(samples_per_pixel) and frame_index is a
+/// session-lifetime dispatch counter that never resets. sample_index therefore
+/// grows by `stride` every dispatch and CAN exceed 0xFFFFF (1,048,576): at
+/// stride 32 (the production day-branch stride for samples_per_pixel=20) that
+/// takes 1,048,576 / 32 = 32,768 dispatched frames. Past that point the clamp
+/// below saturates sample_index and every subsequent draw for a pixel reuses
+/// one Sobol point, freezing that pixel's noise pattern for the rest of the
+/// session. Accepted for the realtime one-shot path, but NOT a hypothetical
+/// edge case for this repository: pipeline_references/image_glb_creation.gd
+/// ships PHASE_A_OFFLINE_STILL := false, so one-shot is the default
+/// still-render route, not merely a preview mode.
 uint rng_pack(RNGState p_rng) {
 	return (min(p_rng.sample_index, 0xFFFFFu) << 12u) | (p_rng.offset & 0xFFFu);
 }
@@ -299,6 +309,18 @@ RNGState rng_unpack(uint p_packed, uvec2 p_pixel) {
 	r.sample_index = p_packed >> 12u;
 	r.offset = p_packed & 0xFFFu;
 	return r;
+}
+
+/// Smallest power of two >= p_n, for p_n >= 1. Used to give the one-shot RNG
+/// sequence index a power-of-two stride (scene_raytracing_raygen.glsl) so the
+/// per-frame window `[frame_index * stride, frame_index * stride + spp)` is a
+/// power-of-two-aligned Sobol prefix even when samples_per_pixel itself is not
+/// a power of two -- an unaligned window is not a stratified prefix and measured
+/// ~20% worse RMSE than the aligned form at production sample counts.
+uint rt_next_pow2_ge(uint p_n) {
+	// findMSB(0) is defined as -1 by the GLSL spec, so p_n == 1 (p_n - 1 == 0)
+	// correctly falls out to 1u << 0u == 1.
+	return 1u << uint(findMSB(max(p_n, 1u) - 1u) + 1);
 }
 
 // ============================================================================

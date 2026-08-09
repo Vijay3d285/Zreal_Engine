@@ -262,8 +262,7 @@ vec3 lights_eval_rect_light(
 		vec2 u,
 		float light_select_pdf,
 		bool is_indirect_bounce,
-		MaterialProperties material,
-		RNGState p_rng) {
+		MaterialProperties material) {
 
 	// 1. Sample random point on the quad
 	vec3 axisU = light.spot_direction; // half-width vector
@@ -463,7 +462,7 @@ vec3 lights_evaluate_direct_lighting(
 	else if (light.type == RT_LIGHT_TYPE_RECT) {
 		return lights_eval_rect_light(
 				hit_pos, N, V, light, u,
-				light_select_pdf, is_indirect_bounce, material, p_rng);
+				light_select_pdf, is_indirect_bounce, material);
 	}
 	// === CONE LIGHT PATH (directional) ===
 	else {
