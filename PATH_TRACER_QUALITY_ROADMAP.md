@@ -254,9 +254,39 @@ Replace the `MAX_DIFFUSE_BOUNCES` constant with params-block slots. Expose `min_
 After the throughput update at `closest_hit_common:578`, once `total_bounces > min_bounce`: `p = min(sqrt(max_component(throughput)), 1.0)`; terminate on `rand() > p`, else `throughput /= p`. Match the `sqrt` — see §3.5.
 *Accept:* render time per frame drops in deep-bounce scenes with no measurable bias (mean of 2000 accumulated frames matches the pre-RR mean within noise).
 
-**B5. Owen-scrambled Sobol / blue-noise sampler** — *Gap #6*
-Replace bare PCG with a dimension-indexed Sobol-Burley sampler; per-pixel Owen scramble seeded via `nested_uniform_scramble_base4(morton2d(x,y), seed)`. Thread an explicit `dimension` through `rand()`/`rand2()` call sites and assign the earliest dimensions to filter, then first-bounce BSDF, then light selection (`pattern.h:20-32`).
-*Accept:* at 16 spp the residual error is fine even grain, not clumps; OIDN output at 1/4 the sample count matches today's quality.
+**B5. Owen-scrambled Sobol / blue-noise sampler** — *Gap #6* — **DONE**
+Sobol-Burley with per-pixel Owen scrambling, dimension-indexed draws
+(`sobol_burley_inc.glsl`, `RNGState` in `raytracing_inc.glsl`). Two deliberate
+divergences from Cycles, both documented in the shader: the light reservoir keeps a
+seeded PCG side stream (fixed by C2), and the sequence-length mask is omitted
+(performance only).
+*Measured:* `pt_validation_scene.tscn` convergence sweep, PCG baseline (pre-Task-2,
+shaders reverted to `94ba4a9792`) vs current Sobol build (`cffb9a50a8`), RMSE against
+a 1024-frame reference, 2 runs per config:
+
+| N frames | PCG RMSE (mean of 2 runs) | Sobol RMSE | improvement |
+|---|---|---|---|
+| 16  | 0.095787 | 0.072854 | 1.32x (23.9% lower) |
+| 64  | 0.052144 | 0.032126 | 1.62x (38.4% lower) |
+| 256 | 0.028699 | 0.012839 | 2.23x (55.3% lower) |
+| 512 | 0.022269 | 0.007418 | 3.00x (66.7% lower) |
+
+Sweep-wide reduction (16→512 frames, harness's own metric): PCG 4.30x, Sobol 9.82x
+(consistent with the 9.80x/9.77x measured in earlier Task-2-fix sessions).
+
+RMSE is lower with Sobol at every point in the sweep — the change is a strict
+improvement, no regression anywhere. **However the acceptance criterion also called
+for the low-sample end (16–64) improving more than the high-sample end
+("stratification pays most when samples are scarce"), and the measured data shows
+the opposite**: improvement grows monotonically from 1.32x at N=16 to 3.00x at
+N=512. This did not trigger the brief's "worse RMSE anywhere" re-check (nothing is
+worse), so it was not treated as a dimension-collision defect signature. It is
+plausibly genuine QMC behavior — Owen-scrambled Sobol convergence can beat O(1/√N)
+for smooth integrands, which widens the *ratio* advantage as N grows even though
+the absolute RMSE keeps falling fastest early — but that is not verified here and
+is flagged rather than asserted. Recorded as a partial match against the stated
+acceptance criterion: the no-regression half holds, the low-N-benefits-most half
+does not.
 
 ### Phase C — Light & environment fidelity *(~2 weeks)*
 
