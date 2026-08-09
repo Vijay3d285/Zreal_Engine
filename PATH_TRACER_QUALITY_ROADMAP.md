@@ -266,41 +266,54 @@ a 1024-frame reference, 2 runs per config:
 
 | N frames | PCG RMSE (mean of 2 runs) | Sobol RMSE | improvement |
 |---|---|---|---|
-| 16  | 0.095787 | 0.072854 | 1.32x (23.9% lower) |
+| 16  | 0.095787 | 0.072854 | 1.31x (23.9% lower) |
 | 64  | 0.052144 | 0.032126 | 1.62x (38.4% lower) |
-| 256 | 0.028699 | 0.012839 | 2.23x (55.3% lower) |
+| 256 | 0.028699 | 0.012839 | 2.24x (55.3% lower) |
 | 512 | 0.022269 | 0.007418 | 3.00x (66.7% lower) |
 
 Sweep-wide reduction (16→512 frames, harness's own metric): PCG 4.30x, Sobol 9.82x
 (consistent with the 9.80x/9.77x measured in earlier Task-2-fix sessions).
 
 **Passes.** RMSE is lower with Sobol than PCG at every point in the sweep, and the
-fitted end-to-end convergence exponent is clearly steeper for Sobol than for PCG.
-Fitting `p = log(RMSE_first / RMSE_last) / log(N_last / N_first)` over the sweep
-(N=16 → N=512, so `N_last/N_first = 32`):
+fitted convergence exponent is clearly steeper for Sobol than for PCG. These two
+facts (no regression anywhere; a steeper exponent) are what justify "Passes" — no
+further corroboration is claimed beyond them.
+
+Fitting `p = log(RMSE_16 / RMSE_512) / log(512 / 16)` — a **two-point secant slope
+over N=16..512 only**, not a regression across all four sampled points:
 
 - PCG:   `log(4.301) / log(32)` = `1.4589 / 3.4657` = **p ≈ 0.421**
 - Sobol: `log(9.821) / log(32)` = `2.2845 / 3.4657` = **p ≈ 0.659**
 
-Consistency check: the fitted exponents predict an end-to-end improvement ratio of
-`32^(0.659 − 0.421) = 32^0.238 ≈ 2.28x`; the directly measured ratio-of-ratios
-(N=512 improvement 3.00x ÷ N=16 improvement 1.32x) is **2.28x** — agreement to
-better than 1%, which is the strongest evidence in this measurement that the
-sampler is behaving as a well-formed QMC estimator rather than exhibiting a
-dimension-collision artifact (which would show up as RMSE worse somewhere, not
-observed here).
+Because the fit uses only the two endpoints, it can be validated against the two
+middle points it does *not* use — predicting `RMSE(N) = RMSE_16 * (N/16)^-p` and
+comparing to what was actually measured at N=64 and N=256:
 
-Both fitted exponents sit below their theoretical ideals (white-noise Monte Carlo
-p=0.5; QMC methods can reach up to p=1.5 for smooth integrands) because the
-1024-frame reference is itself a finite, noisy sample, and adaptive sampling is
-disabled but its absence still compresses the measured tail — these are
-*relative-comparison* figures (Sobol vs PCG on identical harness conditions), not
-absolute convergence-rate measurements. Note also: white-noise RMSE converges as
-`N^-0.5`; any working QMC sampler converges at least that fast, so the
-PCG-to-Sobol *ratio* necessarily grows with N (`N^(p−0.5)`, p>0.5) rather than
-shrinking — a shrinking ratio would itself be the signature of a broken sampler.
-This is a single-scene measurement (a diffuse three-wall room, one omni light, no
-occlusion complexity); it has not been repeated on a higher-variance scene.
+- PCG: N=64 predicts 0.05344 vs measured 0.052144 (-2.4%); N=256 predicts 0.02981
+  vs measured 0.028699 (-3.7%). PCG tracks a single power law closely across the
+  whole sweep.
+- Sobol: N=64 predicts 0.02921 vs measured 0.032126 (+10.0%); N=256 predicts
+  0.01171 vs measured 0.012839 (+9.6%). Sobol's measured RMSE sits consistently
+  ~10% *above* its own two-point fit at both middle points — its curve is concave
+  in log-log space, meaning its local convergence rate keeps improving as N rises.
+  This is legitimate QMC behavior, but it means the single fitted exponent is a
+  crude two-point summary of the curve, not a law the data obeys exactly.
+
+Caveats:
+- The harness itself warns on every run: *"reference (1024) is less than 4x the
+  longest run (512); the measured reduction will read low."* The 1024-frame
+  reference carries its own residual noise, which puts a floor under how low RMSE
+  can read and compresses the measured curve — most severely at the N=512
+  endpoint, which is one of the two points both exponents are anchored to. The
+  true asymptotic exponents for both samplers are plausibly higher than measured
+  here.
+- Adaptive sampling (noise-threshold early-termination) was explicitly disabled
+  for every run — `_render_accum` in `pt_validation.gd` unconditionally sets
+  `pathtracing_noise_threshold = 0.0` before each accumulation — so the harness
+  measures the un-accelerated estimator by design. This is an experimental
+  control, not a source of distortion in these figures.
+- Single-scene measurement (a diffuse three-wall room, one omni light, no
+  occlusion complexity); it has not been repeated on a higher-variance scene.
 
 ### Phase C — Light & environment fidelity *(~2 weeks)*
 
