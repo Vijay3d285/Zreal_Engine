@@ -1117,13 +1117,41 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float3 Vlocal = rotatePoint(qRotationToZ, V);
 	const BrdfData data = prepareBRDFData(float3(0.0f, 0.0f, 1.0f), Llocal, Vlocal, material);
 
-	float3 Hlocal = normalize(Vlocal + Llocal);
+	// V ~= -L (near-mirror-degenerate incident/outgoing pair) leaves no stable
+	// half-vector to normalize. clampShadingNormal only REDUCES backfacing V,
+	// it does not eliminate it, so this is reachable in production, not just a
+	// theoretical edge case. Treat it the same as the NdotL <= 0 early-out
+	// above: return 0.0f rather than a NaN that would poison mis_ray_pdf --
+	// the caller (shade_and_bounce) already falls back to RT_MIS_PDF_NONE
+	// whenever this function returns a non-positive value (Task 1 review
+	// round 1, findings 1/2/9).
+	float3 VplusL = Vlocal + Llocal;
+	if (length(VplusL) < 0.000001f) {
+		return 0.0f;
+	}
+	float3 Hlocal = normalize(VplusL);
 	float NdotH = max(0.00001f, Hlocal.z);
 	float NdotV = max(0.00001f, Vlocal.z);
 	float LdotH = max(0.00001f, dot(Llocal, Hlocal));
-	float pdfSpecular = specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH);
 
-	return pSpec * pdfSpecular + (1.0f - pSpec) * pdfDiffuse;
+	// Near-delta specular lobes (see RT_MIS_DELTA_ROUGHNESS) have no meaningful
+	// continuous density. specularPdf's GGX_D call floors alphaSquared to
+	// ~1e-5 (sampleGGXVNDFReflectionPdf), which turns what should be a true
+	// Dirac delta into a razor-narrow but FINITE spike of order
+	// 1/(pi*alphaSquared) ~ 3e4. A direction sampled from the DIFFUSE lobe
+	// that happens to land inside that spike's tiny cone would otherwise make
+	// this function return a wildly inflated mixture pdf for a strategy that
+	// was never actually near-delta at the direction that matters here (Task
+	// 1 review round 1, finding 3). Zeroing the specular contribution --
+	// rather than skipping the setup above -- is the deliberately
+	// conservative, minimal fix; an optimization to also skip the unused
+	// quaternion/prepareBRDFData work in this regime is deferred, not part of
+	// this fix.
+	float specularContribution = (material.roughness < RT_MIS_DELTA_ROUGHNESS)
+			? 0.0f
+			: specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH);
+
+	return pSpec * specularContribution + (1.0f - pSpec) * pdfDiffuse;
 }
 
 // Version that returns diffuse and specular separately.

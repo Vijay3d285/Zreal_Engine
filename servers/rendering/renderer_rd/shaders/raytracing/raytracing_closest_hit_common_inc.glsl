@@ -570,6 +570,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec2 u = rng_2d(rng, RT_PRNG_SURFACE_BSDF);
 	vec3 next_dir;
 	vec3 brdf_weight;
+	// Tracks whether next_dir ended up being the mirrored recovery direction
+	// rather than evalIndirectCombinedBRDF's direct sample -- see the
+	// mis_ray_pdf assignment below (Task 1 review round 1, finding 2).
+	bool recovered_sample = false;
 	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
@@ -585,6 +589,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			return;
 		}
 		next_dir = recovered_dir;
+		recovered_sample = true;
 	}
 
 	ps.throughput *= brdf_weight;
@@ -611,9 +616,26 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Near-delta specular lobes cannot be reached by environment sampling at all,
 	// so anything this ray hits must take the FULL contribution rather than a MIS
 	// share. Mirrors Cycles' PATH_RAY_MIS_SKIP.
-	ps.mis_ray_pdf = (brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)
-			? RT_MIS_PDF_NONE
-			: combinedPdf(N, next_dir, V, brdf_mat);
+	//
+	// Two more cases fall back to the same RT_MIS_PDF_NONE sentinel rather than
+	// a computed pdf (Task 1 review round 1, findings 1/2):
+	//   - A recovered/mirrored sample (recovered_sample): the true generating
+	//     density lives at the pre-image direction that got mirrored, not at
+	//     next_dir itself. combinedPdf(N, next_dir, ...) would describe the
+	//     wrong direction's density, not an absent one, so it cannot be used
+	//     as-is; RT_MIS_PDF_NONE is the conservative, unbiased fallback.
+	//   - combinedPdf() legitimately returns exactly 0.0 for directions it
+	//     cannot describe (e.g. NdotL <= 0, or the V ~= -L degenerate case in
+	//     brdf_inc.glsl). 0.0 must NOT be stored as a real pdf: a future MIS
+	//     consumer would read "this strategy assigns zero density here" and
+	//     silently drop the ray's contribution, when the correct reading is
+	//     "we can't describe this direction, so don't apply MIS to it at all".
+	if (recovered_sample || (brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)) {
+		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+	} else {
+		float bsdf_pdf = combinedPdf(N, next_dir, V, brdf_mat);
+		ps.mis_ray_pdf = (bsdf_pdf > 0.0) ? bsdf_pdf : RT_MIS_PDF_NONE;
+	}
 
 	path_pack(payload, ps);
 }

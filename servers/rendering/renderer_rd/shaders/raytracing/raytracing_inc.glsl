@@ -64,8 +64,31 @@ struct PathPayload {
 const float RT_MIS_PDF_NONE = -1.0;
 
 /// Below this roughness a specular lobe is treated as delta for MIS purposes.
-/// Matches the existing MAX_DENOISER_SPECULAR_HIT_THRESHOLD family of cutoffs.
+/// An independent, tighter cutoff than MAX_DENOISER_SPECULAR_HIT_THRESHOLD
+/// (0.25, used for the DLSS-RR specular-hit-distance query) -- the two are not
+/// related and do not need to match.
 const float RT_MIS_DELTA_ROUGHNESS = 0.03;
+
+/// Upper bound applied to radiance/throughput when packing the payload. The
+/// old fp16 packing pinned values at 65504 as an (unintentional) side effect;
+/// fp32 packing has no such firewall. Without one, a single NaN/Inf sample
+/// (e.g. from a degenerate BRDF evaluation) propagates unclamped into
+/// rt_accum's running average (scene_raytracing_raygen.glsl) and poisons that
+/// pixel for the rest of the accumulation, since one bad sample never decays
+/// out of a mean. 1e6 is far above any plausible legitimate radiance in this
+/// renderer but far below the range where downstream math (squaring,
+/// tonemapping) would itself start overflowing.
+const float RT_PAYLOAD_VALUE_CLAMP = 1e6;
+
+/// Sanitizes a radiance/throughput value before it is packed into the
+/// payload: NaN -> 0 (clamp()'s behavior on NaN is implementation-defined per
+/// the GLSL spec, so NaN must be scrubbed explicitly before clamping), then
+/// clamped to [0, RT_PAYLOAD_VALUE_CLAMP] (also catches +/-Inf, since Inf
+/// compares greater/less than any finite bound).
+vec3 sanitize_payload_value(vec3 v) {
+	vec3 safe = mix(v, vec3(0.0), isnan(v));
+	return clamp(safe, vec3(0.0), vec3(RT_PAYLOAD_VALUE_CLAMP));
+}
 
 /// Unpacked working copy of the payload.
 struct PathState {
@@ -93,8 +116,8 @@ PathState path_unpack(PathPayload p) {
 }
 
 void path_pack(inout PathPayload p, PathState s) {
-	p.radiance = max(s.radiance, vec3(0.0));
-	p.throughput = max(s.throughput, vec3(0.0));
+	p.radiance = sanitize_payload_value(s.radiance);
+	p.throughput = sanitize_payload_value(s.throughput);
 	p.packed_bounces_flags = s.packed_bounces_flags;
 	p.rng_packed = s.rng_packed;
 	p.hit_t = s.hit_t;
