@@ -246,9 +246,16 @@ One struct change: fp32 radiance/throughput plus a `mis_ray_pdf` float. Profile 
 Both sides, power heuristic, mirroring `light/sample.h:344` and `:469`. Weight the NEE estimate by `power_heuristic(light_pdf, bsdf_pdf)`; store the BSDF pdf on the payload and weight emissive hits by `power_heuristic(bsdf_pdf, light_pdf)`.
 *Accept:* a small bright area light reflected in a glossy floor — specular highlight variance drops sharply, no over-bright ring near the light. Compare to a Cycles EXR of the same setup.
 
-**B3. Per-type bounce controls** — *Gap #4*
-Replace the `MAX_DIFFUSE_BOUNCES` constant with params-block slots. Expose `min_bounce`, `max_diffuse_bounce`, `max_glossy_bounce`, `max_transmission_bounce` on `Environment` following the existing `set_pathtracing_max_bounces` pattern. Default diffuse ≥4.
-*Accept:* sun→floor→wall→ceiling color bleeding is visible; diffuse cap at 2 vs 4 produces a clearly different, warmer interior.
+**B3. Per-type bounce controls** — *Gap #4* — **DONE**
+`MAX_DIFFUSE_BOUNCES 2u` is gone. Diffuse and glossy counters now live in
+`packed_bounces_flags` bits 8-15 and 16-23, capped by `PT_PARAM_MAX_DIFFUSE_BOUNCE`
+(12) and `PT_PARAM_MAX_GLOSSY_BOUNCE` (13) and exposed as
+`Environment.pathtracing_max_diffuse_bounce` / `_max_glossy_bounce` (default 4/4,
+Blender's shipped values). The total ceiling rose 8 -> 16.
+**Deferred on purpose:** `min_bounce` (no consumer until B4 Russian Roulette) and
+`max_transmission_bounce` (no transmission path until E1). Both would be dead
+params, and **slots 0-15 are now fully allocated** -- either one needs the params
+UBO resized first.
 
 **B4. Russian Roulette** — *Gap #8*
 After the throughput update at `closest_hit_common:578`, once `total_bounces > min_bounce`: `p = min(sqrt(max_component(throughput)), 1.0)`; terminate on `rand() > p`, else `throughput /= p`. Match the `sqrt` — see §3.5.
@@ -389,4 +396,4 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
-Ordering summary: **A1 → A2/A3/A4 → B1/B2 → B3/B4/B5 → C → D → E → F.**
+Ordering summary: **A1 → A2/A3/A4 → B1 → B2 → B4 (B3, B5 done) → C → D → E → F.**

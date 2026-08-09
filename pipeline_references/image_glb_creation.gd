@@ -803,12 +803,25 @@ func setup_lighting(data, geom_data = {}):
 	# nothing new to accumulate → passthrough/no denoise, which is the Phase F2 dead end).
 	# Day: 12 bounces (interior GI off the sun), night: 8 (mostly emissive). SPP stays moderate;
 	# DLSS-RR temporally integrates 1 sample/frame across the drive-frame count.
+	#
+	# NOTE: before Phase B3 max_bounces was clamped to 8 in two places (the Environment
+	# setter and, independently, a 3-bit spec-constant field in the GLSL), so the 12
+	# requested below was never honoured. Both clamps were widened to a 16 ceiling and
+	# this line now means what it says.
 	if day_render:
 		env.set_pathtracing_max_bounces(12)
 		env.set_pathtracing_samples_per_pixel(20)
 	else:
 		env.set_pathtracing_max_bounces(8)
 		env.set_pathtracing_samples_per_pixel(10)
+
+	# Per-lobe bounce limits (Phase B3). Before this the integrator hardcoded a cap of
+	# TWO diffuse bounces regardless of max_bounces, which is why interior corners and
+	# ceilings read flat and lifeless: light could not make three diffuse hops to reach
+	# them. Blender's shipped defaults are 4 diffuse / 4 glossy; raising diffuse costs
+	# render time roughly linearly and buys softer, warmer indirect light.
+	env.set_pathtracing_max_diffuse_bounce(4)
+	env.set_pathtracing_max_glossy_bounce(4)
 
 	# ── ROUTE SELECT: realtime DLSS-RR (default) vs Phase A offline accumulation ──
 	#
