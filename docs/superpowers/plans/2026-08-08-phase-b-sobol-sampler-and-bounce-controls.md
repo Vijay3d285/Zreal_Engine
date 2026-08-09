@@ -767,14 +767,37 @@ In `scene_raytracing_raygen.glsl`, replace line 54:
 
 with:
 
+> **CORRECTED 2026-08-08 after review.** This step originally specified
+> `rng_init(p_pixel, p_frame_index * RT_GET_SAMPLE_COUNT() + p_sample_idx)` for both
+> modes. That is **wrong in accumulate mode**: `p_frame_index` comes from
+> `p_state->frame_counter++` (`render_raytracing.cpp:3080`), which increments on every
+> dispatch and is never reset when accumulation resets — only `accum_frame` is. The
+> compound index therefore (a) is not the contiguous power-of-two prefix Sobol's
+> stratification guarantee requires, (b) makes renders non-reproducible run to run,
+> breaking the guarantee `RT_SAMPLER_SEED` advertises and the validation harness relies
+> on, and (c) saturates the 20-bit packed field in long sessions, stalling convergence.
+> Measured effect of the correction: validation-scene convergence reduction rose from
+> 5.99x to 9.80x. The corrected form is below.
+
+Make the sequence index mode-dependent by computing it at each call site rather than
+inside `trace_one_sample`. Replace the `(p_frame_index, p_sample_idx)` parameter pair
+with a single `uint p_rng_sample_index`, and initialize from it:
+
 ```glsl
-	// One continuous Sobol sequence per pixel. In accumulate mode p_sample_idx is
-	// the accumulation frame index, so consecutive frames are consecutive points
-	// of the same sequence and the stratification compounds as it converges. In
-	// one-shot mode the frame index offsets the block so successive frames do not
+	// One continuous Sobol sequence per pixel. The caller supplies the sequence
+	// index because only it knows the mode: the accumulate branch passes the
+	// accumulation frame index (contiguous, and reset with the accumulator, so a
+	// given frame always reproduces the same image), while the one-shot branch
+	// passes frame_index * spp + sample_idx so successive realtime frames do not
 	// replay the same points.
-	ps.rng_packed = rng_pack(rng_init(p_pixel, p_frame_index * RT_GET_SAMPLE_COUNT() + p_sample_idx));
+	ps.rng_packed = rng_pack(rng_init(p_pixel, p_rng_sample_index));
 ```
+
+Accumulate call site: pass `accum_frame` — the same value
+`camera_filter_jitter(pixel, accum_frame)` already uses one line above.
+One-shot call site: pass `frame_index * samples_per_pixel + sample_idx`. That path can
+still in principle saturate the 20-bit field in a very long session; say so in the
+comment rather than implying it cannot.
 
 Note: `init_rng` no longer exists after Step 1 — this is its only call site.
 
