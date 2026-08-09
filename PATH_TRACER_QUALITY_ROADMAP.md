@@ -257,6 +257,14 @@ Blender's shipped values). The total ceiling rose 8 -> 16.
 params, and **slots 0-15 are now fully allocated** -- either one needs the params
 UBO resized first.
 
+**Compatibility note:** `Environment.pathtracing_max_bounces`'s field default also
+changed, from `3` to `8` (`scene/resources/environment.h`), as part of this work.
+This is a silent behavior change for any existing scene that never explicitly calls
+`set_pathtracing_max_bounces()` and relied on the old default -- it now gets
+noticeably more indirect bounces (and a proportionally higher per-frame render cost)
+than before. `doc/classes/Environment.xml` previously still documented `default="3"`
+and did not mention it; both are corrected as of this fix wave.
+
 **B4. Russian Roulette** — *Gap #8*
 After the throughput update at `closest_hit_common:578`, once `total_bounces > min_bounce`: `p = min(sqrt(max_component(throughput)), 1.0)`; terminate on `rand() > p`, else `throughput /= p`. Match the `sqrt` — see §3.5.
 *Accept:* render time per frame drops in deep-bounce scenes with no measurable bias (mean of 2000 accumulated frames matches the pre-RR mean within noise).
@@ -267,6 +275,22 @@ Sobol-Burley with per-pixel Owen scrambling, dimension-indexed draws
 divergences from Cycles, both documented in the shader: the light reservoir keeps a
 seeded PCG side stream (fixed by C2), and the sequence-length mask is omitted
 (performance only).
+**Scope of the measurement below:** it was captured at `cffb9a50a8`, before the B3
+per-lobe bounce work landed, so the integrator both baselines ran against still had
+the hardcoded `MAX_DIFFUSE_BOUNCES 2u` ceiling (uncapped glossy, total capped by
+`max_bounces=6` from `run_pt_validation.gd`). Today the same harness instead applies
+`pathtracing_max_diffuse_bounce`/`_max_glossy_bounce` at their `Environment` class
+defaults of 4/4 (the harness never calls their setters, but `Environment::new()`
+still carries the 4/4 field defaults into `_update_pathtracing()`), so
+`resolve_bounce_cap` now resolves the diffuse cap to 4 rather than 2 -- a materially
+different integrator, allowing diffuse light two more bounces of travel within the
+same `max_bounces=6` budget. Re-running the harness unmodified will therefore not
+reproduce the absolute RMSE figures below; only a config pinned to the historical
+diffuse-2/glossy-uncapped behavior would. Separately, this sweep is accumulate-mode
+only (`_render_accum` in `pt_validation.gd`), which is the aligned Sobol-prefix best
+case -- see the one-shot stride note in `raytracing_inc.glsl`/`scene_raytracing_raygen.glsl`
+for why the one-shot path does not inherit this figure as-is.
+
 *Measured:* `pt_validation_scene.tscn` convergence sweep, PCG baseline (pre-Task-2,
 shaders reverted to `94ba4a9792`) vs current Sobol build (`cffb9a50a8`), RMSE against
 a 1024-frame reference, 2 runs per config:

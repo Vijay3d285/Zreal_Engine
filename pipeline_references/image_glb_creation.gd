@@ -801,13 +801,21 @@ func setup_lighting(data, geom_data = {}):
 	# to converge to a clean, detail-reconstructed still — DLSS-RR IS the temporal accumulator,
 	# so no separate Phase-A running-average is wanted (feeding DLSS a converged image gives it
 	# nothing new to accumulate → passthrough/no denoise, which is the Phase F2 dead end).
-	# Day: 12 bounces (interior GI off the sun), night: 8 (mostly emissive). SPP stays moderate;
-	# DLSS-RR temporally integrates 1 sample/frame across the drive-frame count.
+	# Day: max_bounces 12, night: 8. SPP stays moderate; DLSS-RR temporally integrates
+	# 1 sample/frame across the drive-frame count.
 	#
-	# NOTE: before Phase B3 max_bounces was clamped to 8 in two places (the Environment
-	# setter and, independently, a 3-bit spec-constant field in the GLSL), so the 12
-	# requested below was never honoured. Both clamps were widened to a 16 ceiling and
-	# this line now means what it says.
+	# NOTE on what max_bounces below actually caps: the integrator terminates a path
+	# as soon as EITHER its diffuse or its glossy lobe count reaches its own cap (set
+	# below), not when the combined total reaches max_bounces. Every surviving bounce
+	# increments exactly one of the two counters, so with per-lobe caps D and G the
+	# longest reachable path is D + G - 1 bounces, independent of max_bounces --
+	# with the 4/4 caps set below that ceiling is 7. So max_bounces=12 (day) and
+	# max_bounces=8 (night) are both headroom above a bound that per-lobe caps reach
+	# first, not targets this scene will ever hit. This is not a bug to "fix" by
+	# raising max_bounces: Blender Cycles ships the identical 4 diffuse / 4 glossy /
+	# 12 total defaults (intern/cycles/blender/addon/properties.py) and terminates
+	# paths the same way, so stock Cycles is effectively bounded near 7 too --
+	# matching that is the point, not a coincidence to route around.
 	if day_render:
 		env.set_pathtracing_max_bounces(12)
 		env.set_pathtracing_samples_per_pixel(20)
@@ -818,8 +826,12 @@ func setup_lighting(data, geom_data = {}):
 	# Per-lobe bounce limits (Phase B3). Before this the integrator hardcoded a cap of
 	# TWO diffuse bounces regardless of max_bounces, which is why interior corners and
 	# ceilings read flat and lifeless: light could not make three diffuse hops to reach
-	# them. Blender's shipped defaults are 4 diffuse / 4 glossy; raising diffuse costs
-	# render time roughly linearly and buys softer, warmer indirect light.
+	# them. Blender's shipped defaults are 4 diffuse / 4 glossy, matched here. Raising
+	# diffuse buys softer, warmer indirect light, but its render-time cost is
+	# scene-dependent, not a guaranteed linear scaling: this engine has no Russian
+	# Roulette path termination yet (roadmap item B4), so a higher cap can cost more
+	# or less than proportionally depending on how much throughput has already decayed
+	# by the time paths reach it.
 	env.set_pathtracing_max_diffuse_bounce(4)
 	env.set_pathtracing_max_glossy_bounce(4)
 
