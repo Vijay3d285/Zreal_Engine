@@ -260,8 +260,16 @@ uint rng_side_stream(RNGState p_rng, uint p_dim) {
 /// Pack the travelling part of the state into the payload's 32 bits:
 /// [sample_index:20][offset:12]. `pixel` is not packed -- every ray-tracing stage
 /// can recompute it from gl_LaunchIDEXT, so it costs nothing to carry.
-/// 20 bits covers 1,048,575 samples (the accumulation target caps at 8192) and
-/// 12 bits covers 4095 dimensions (16 bounces x 8 = 128).
+/// 20 bits covers 1,048,575 samples and 12 bits covers 4095 dimensions
+/// (16 bounces x 8 = 128). In accumulate mode the caller passes the raw
+/// accum_frame (scene_raytracing_raygen.glsl), which the accumulation target
+/// caps at 8192, so that mode is nowhere near the limit. In one-shot mode the
+/// caller passes frame_index * SPP + sample_idx, and frame_index is a
+/// session-lifetime dispatch counter that never resets -- it CAN in principle
+/// exceed 0xFFFFF on a long-running realtime session, at which point the
+/// clamp below saturates and every subsequent draw for that pixel reuses one
+/// Sobol point. Accepted for now: one-shot mode is the realtime preview path,
+/// not the still/accumulate path the validation harness measures.
 uint rng_pack(RNGState p_rng) {
 	return (min(p_rng.sample_index, 0xFFFFFu) << 12u) | (p_rng.offset & 0xFFFu);
 }

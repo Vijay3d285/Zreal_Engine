@@ -38,25 +38,23 @@ layout(set = 0, binding = 33, rg32f) uniform image2D rt_variance;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
 
-// Traces a single camera path for `p_sample_idx` and returns the accumulated
-// radiance. Shared by the one-shot SPP loop and the Phase A accumulator
-// (which calls this once per launch with the running-average frame index as
-// the sample seed so frames decorrelate). File-scope because GLSL forbids
-// nested function definitions.
+// Traces a single camera path and returns the accumulated radiance. Shared by
+// the one-shot SPP loop and the Phase A accumulator. File-scope because GLSL
+// forbids nested function definitions.
+// `p_rng_sample_index` is the point in the per-pixel Sobol sequence this path
+// draws from. The caller computes it, because only the caller knows which mode
+// it is in and Sobol's stratification guarantee needs a contiguous 0,1,2,...
+// prefix -- it cannot be reconstructed correctly inside this function from a
+// frame counter and a sample index alone (see rng_init call sites in main()).
 // When `p_is_sample_zero` is true, the primary-ray G-buffer / depth /
 // velocity / DLSS-RR writes fire (matches the original SAMPLE_ZERO_FLAG).
-vec3 trace_one_sample(uvec2 p_pixel, uint p_frame_index, uint p_sample_idx, bool p_is_sample_zero,
+vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_zero,
 		uint p_max_bounces, vec3 p_origin, vec3 p_dir) {
 	PathState ps;
 	ps.radiance = vec3(0.0);
 	ps.throughput = vec3(1.0);
 	ps.packed_bounces_flags = p_is_sample_zero ? set_sample_zero(0u) : 0u;
-	// One continuous Sobol sequence per pixel. In accumulate mode p_sample_idx is
-	// the accumulation frame index, so consecutive frames are consecutive points
-	// of the same sequence and the stratification compounds as it converges. In
-	// one-shot mode the frame index offsets the block so successive frames do not
-	// replay the same points.
-	ps.rng_packed = rng_pack(rng_init(p_pixel, p_frame_index * RT_GET_SAMPLE_COUNT() + p_sample_idx));
+	ps.rng_packed = rng_pack(rng_init(p_pixel, p_rng_sample_index));
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
@@ -153,7 +151,13 @@ void main() {
 		vec3 origin, direction;
 		camera_ray(pixel, camera_filter_jitter(pixel, accum_frame), origin, direction);
 
-		vec3 sample_rad = trace_one_sample(pixel, frame_index, accum_frame, true,
+		// accum_frame alone: contiguous, resets with the accumulator (unlike
+		// frame_index, which is a session-lifetime dispatch counter and never
+		// resets -- see render_raytracing.cpp frame_counter). This keeps the
+		// Sobol sample index matching the pixel filter's index above and makes
+		// a given accum_frame draw the same point every time it recurs, which
+		// is what makes the render reproducible across accumulation cycles.
+		vec3 sample_rad = trace_one_sample(pixel, accum_frame, true,
 				max_bounces, origin, direction);
 
 		float w = 1.0 / (n + 1.0);
@@ -179,7 +183,10 @@ void main() {
 			bool sz = (sample_idx == 0u);
 			vec3 origin, direction;
 			camera_ray(pixel, camera_filter_jitter(pixel, sample_idx), origin, direction);
-			total_radiance += trace_one_sample(pixel, frame_index, sample_idx, sz,
+			// frame_index * SPP + sample_idx: frame_index is the session-lifetime
+			// dispatch counter (never resets in this mode either), so successive
+			// realtime frames do not replay the same SPP points.
+			total_radiance += trace_one_sample(pixel, frame_index * samples_per_pixel + sample_idx, sz,
 					max_bounces, origin, direction);
 		}
 		vec3 final_radiance = total_radiance / float(samples_per_pixel);
