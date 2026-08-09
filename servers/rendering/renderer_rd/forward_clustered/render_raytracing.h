@@ -39,6 +39,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/env_cdf.h"
 #include "servers/rendering/renderer_rd/storage_rd/ies_manager.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -396,6 +397,12 @@ class RenderRaytracing {
 		RID version_shader[MODE_MAX];
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
+
+	// Environment sampling distribution over the sky (sky NEE / MIS). Owned here
+	// rather than per-viewport: the distribution depends only on the sky's
+	// radiance octmap, not on viewport visibility, and the shader + pipeline are
+	// worth sharing. Rebuilt when the bound radiance texture changes.
+	EnvCDF env_cdf;
 
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.

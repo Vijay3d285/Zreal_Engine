@@ -3201,17 +3201,51 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 		RID radiance_texture;
 
+		// Version token for the environment sampling distribution's rebuild
+		// trigger; see the env_cdf block below.
+		uint64_t sky_source_version = 0;
+		bool sky_regenerating = false;
+
 		// Try to get radiance texture from sky
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			RID sky_rid = owner->environment_get_sky(p_render_data->environment);
 			if (sky_rid.is_valid()) {
 				radiance_texture = owner->sky.sky_get_radiance_texture_rd(sky_rid);
+
+				RendererRD::SkyRD::Sky *sky = owner->sky.get_sky(sky_rid);
+				if (sky) {
+					sky_regenerating = sky->reflection.dirty;
+					sky_source_version = (uint64_t(uint32_t(sky->processing_layer)) << 1) |
+							(sky_regenerating ? 1ull : 0ull);
+				}
 			}
 		}
 
 		// Fall back to default black texture if no sky
 		if (!radiance_texture.is_valid()) {
 			radiance_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		}
+
+		// Rebuild the environment sampling distribution when the sky's radiance
+		// octmap changes. There is no "the octmap changed" callback in the RD sky
+		// code, but SkyRD::Sky exposes the state that drives regeneration:
+		// `reflection.dirty` is raised whenever the sky material / time / camera
+		// position changes and cleared once the octmap has been re-rendered, and
+		// `processing_layer` counts up while SKY_MODE_INCREMENTAL refines the mip
+		// chain. Rebuilding whenever that pair changes -- and every frame while it
+		// is still dirty -- covers the first-frame case (the octmap is still empty
+		// the first time the raytracer resolves it, so an RID-only trigger would
+		// bake an all-zero distribution and never revisit it) as well as animated
+		// and incrementally-refined skies. `update()` is a cheap no-op otherwise.
+		{
+			RID env_sampler = RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(
+					RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+			if (sky_regenerating) {
+				env_cdf.mark_dirty();
+			} else {
+				env_cdf.mark_dirty_if_source_changed(radiance_texture, sky_source_version);
+			}
+			env_cdf.update(radiance_texture, env_sampler, sky_source_version);
 		}
 
 		RD::Uniform u;
@@ -3365,6 +3399,19 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 33;
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rb_data->rt_get_variance_texture());
+		uniforms.push_back(u);
+	}
+
+	// Binding 34: environment sampling distribution (env NEE).
+	{
+		RD::Uniform u;
+		u.binding = 34;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (env_cdf.is_valid()) {
+			u.append_id(env_cdf.get_buffer());
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
 		uniforms.push_back(u);
 	}
 
