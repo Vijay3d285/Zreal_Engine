@@ -69,9 +69,12 @@ public:
 	};
 
 	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines).
-	// Bits 0-20:  Feature flags
-	// Bits 21-28: Sample count
-	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
+	// Bits 0-19:  Feature flags
+	// Bits 20-27: Sample count
+	// Bits 28-31: Max bounce count (offset by 1: 0=1 bounce, 15=16 bounces)
+	// Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
+	// 16; sample count's shift moved down by one to make room without touching
+	// its own 8-bit width (the feature-flags region only ever used bits 0-3).
 	enum RaytracingFlags {
 		RT_FLAG_NONE = 0,
 		RT_FLAG_DEBUG_VIS_ENABLED = (1 << 0),
@@ -80,11 +83,11 @@ public:
 		RT_FLAG_SER_ENABLED = (1 << 3),
 	};
 
-	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;
+	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
 	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0xFF;
 
-	constexpr static uint32_t RT_MAX_BOUNCES_SHIFT = 29;
-	constexpr static uint32_t RT_MAX_BOUNCES_MASK = 0x7;
+	constexpr static uint32_t RT_MAX_BOUNCES_SHIFT = 28;
+	constexpr static uint32_t RT_MAX_BOUNCES_MASK = 0xF;
 
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).
 	// 1: primary/bounce from raygen
@@ -104,14 +107,16 @@ public:
 	static constexpr int RT_PARAM_CLAMP_DIRECT = RSE::PT_PARAM_CLAMP_DIRECT;
 	static constexpr int RT_PARAM_CLAMP_INDIRECT = RSE::PT_PARAM_CLAMP_INDIRECT;
 	static constexpr int RT_PARAM_NOISE_THRESHOLD = RSE::PT_PARAM_NOISE_THRESHOLD;
+	static constexpr int RT_PARAM_MAX_DIFFUSE_BOUNCE = RSE::PT_PARAM_MAX_DIFFUSE_BOUNCE;
+	static constexpr int RT_PARAM_MAX_GLOSSY_BOUNCE = RSE::PT_PARAM_MAX_GLOSSY_BOUNCE;
 	static constexpr int RT_PARAM_LIGHT_COUNT = RSE::PT_PARAM_LIGHT_COUNT;
 	static constexpr int RT_PARAM_FRAME_INDEX = RSE::PT_PARAM_FRAME_INDEX;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
 		uint32_t result = p_flags;
 		result |= (p_sample_count & RT_SAMPLE_COUNT_MASK) << RT_SAMPLE_COUNT_SHIFT;
-		// Max bounces is offset by 1 (0=1 bounce, 7=8 bounces)
-		result |= (MAX(1u, MIN(8u, p_max_bounces)) - 1u) << RT_MAX_BOUNCES_SHIFT;
+		// Max bounces is offset by 1 (0=1 bounce, 15=16 bounces)
+		result |= (MAX(1u, MIN(16u, p_max_bounces)) - 1u) << RT_MAX_BOUNCES_SHIFT;
 		return result;
 	}
 

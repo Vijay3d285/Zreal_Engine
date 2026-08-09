@@ -194,7 +194,10 @@ private:
 	bool pathtracing_enabled = false;
 	PathtracingDebugMode pathtracing_debug_mode = RT_DEBUG_DISABLED;
 	int pathtracing_samples_per_pixel = 1;
-	int pathtracing_max_bounces = 3;
+	int pathtracing_max_bounces = 8;
+	// Cycles' shipped defaults (blender/addon/properties.py:765, :771).
+	int pathtracing_max_diffuse_bounce = 4;
+	int pathtracing_max_glossy_bounce = 4;
 	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
 	// When true, the RT driver accumulates 1-SPP renders across frames into a
 	// persistent buffer so a still image converges (noise ~1/sqrt(N)). Off = the
@@ -439,6 +442,10 @@ public:
 	float get_pathtracing_clamp_indirect() const;
 	void set_pathtracing_noise_threshold(float p_threshold);
 	float get_pathtracing_noise_threshold() const;
+	void set_pathtracing_max_diffuse_bounce(int p_bounces);
+	int get_pathtracing_max_diffuse_bounce() const;
+	void set_pathtracing_max_glossy_bounce(int p_bounces);
+	int get_pathtracing_max_glossy_bounce() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

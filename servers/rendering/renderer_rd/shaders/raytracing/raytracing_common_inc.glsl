@@ -2,18 +2,21 @@
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
-// Specialization constant (bits 0-20: flags, 21-28: samples, 29-31: bounces).
+// Specialization constant (bits 0-19: flags, 20-27: samples, 28-31: bounces).
+// Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
+// 16; sample count's shift moved down by one to make room without touching
+// its own 8-bit width (the feature-flags region only ever used bits 0-3).
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 #define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
 #define RT_FLAG_FOG_ENABLED (1u << 2)
 
-#define RT_SAMPLE_COUNT_SHIFT 21u
+#define RT_SAMPLE_COUNT_SHIFT 20u
 #define RT_SAMPLE_COUNT_MASK 0xFFu
 #define RT_GET_SAMPLE_COUNT() max(1u, (RT_FLAGS >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK)
 
-#define RT_MAX_BOUNCES_SHIFT 29u
-#define RT_MAX_BOUNCES_MASK 0x7u
+#define RT_MAX_BOUNCES_SHIFT 28u
+#define RT_MAX_BOUNCES_MASK 0xFu
 #define RT_GET_MAX_BOUNCES() (((RT_FLAGS >> RT_MAX_BOUNCES_SHIFT) & RT_MAX_BOUNCES_MASK) + 1u)
 
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.

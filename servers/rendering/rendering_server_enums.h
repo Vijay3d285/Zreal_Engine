@@ -768,6 +768,10 @@ enum PathtracingDenoiser {
 
 // Pathtracing parameter indices for the float[16] params buffer.
 // Must match RT_PARAM_* defines in raytracing_inc.glsl.
+// NOTE: slots 0-15 are ALL allocated. `rt_params` is a vec4[4] in GLSL and
+// `float pathtracing_params[16]` in environment_storage.h; adding a 17th param
+// means resizing the UBO, the storage array, the rt_ubo static_assert in
+// render_raytracing.cpp, and the GLSL declaration together.
 enum PathtracingParamIndex {
 	PT_PARAM_VIS_MODE = 0,
 	PT_PARAM_SAMPLE_COUNT = 1,
@@ -809,7 +813,15 @@ enum PathtracingParamIndex {
 	// budget goes elsewhere. 0.0 = disabled (sample every pixel every frame).
 	// Mirrors Cycles adaptive sampling (intern/cycles/kernel/film/adaptive_sampling.h).
 	PT_PARAM_NOISE_THRESHOLD = 11,
-	// Indices 12-13 reserved for future use.
+	// PT_PARAM_MAX_DIFFUSE_BOUNCE: maximum number of diffuse reflection bounces a
+	// path may take before it terminates, independent of the total bounce limit.
+	// Mirrors Cycles' `max_diffuse_bounce` (kernel/integrator/path_state.h:183);
+	// Blender ships 4. 0 means "unset" and falls back to PT_PARAM_MAX_BOUNCES so a
+	// raw RenderingServer environment that never wrote these params still renders.
+	PT_PARAM_MAX_DIFFUSE_BOUNCE = 12,
+	// PT_PARAM_MAX_GLOSSY_BOUNCE: same, for glossy/specular reflection bounces
+	// (Cycles `max_glossy_bounce`, path_state.h:190). Blender ships 4.
+	PT_PARAM_MAX_GLOSSY_BOUNCE = 13,
 	PT_PARAM_LIGHT_COUNT = 14,
 	PT_PARAM_FRAME_INDEX = 15,
 };

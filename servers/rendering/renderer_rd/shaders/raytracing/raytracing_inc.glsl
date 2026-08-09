@@ -29,7 +29,8 @@
 #define RT_PARAM_CLAMP_DIRECT 9 // rt_params[2].y - Max direct contribution (0 = off)
 #define RT_PARAM_CLAMP_INDIRECT 10 // rt_params[2].z - Max indirect contribution (0 = off)
 #define RT_PARAM_NOISE_THRESHOLD 11 // rt_params[2].w - Adaptive sampling relative-error target (0 = off)
-// Indices 12-13 reserved for future use
+#define RT_PARAM_MAX_DIFFUSE_BOUNCE 12 // rt_params[3].x - Diffuse bounce cap (0 = use MAX_BOUNCES)
+#define RT_PARAM_MAX_GLOSSY_BOUNCE 13 // rt_params[3].y - Glossy bounce cap (0 = use MAX_BOUNCES)
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
@@ -94,22 +95,41 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
 }
 
-// Bounce count helpers (bits 0-7: total, bits 8-15: diffuse)
+// Bounce count helpers.
+// Layout: bits 0-7 total, bits 8-15 diffuse, bits 16-23 glossy, bits 24+ flags.
 uint get_total_bounces(uint packed) {
 	return packed & 0xFFu;
 }
 uint get_diffuse_bounces(uint packed) {
 	return (packed >> 8u) & 0xFFu;
 }
+uint get_glossy_bounces(uint packed) {
+	return (packed >> 16u) & 0xFFu;
+}
 uint pack_bounces(uint total, uint diffuse) {
 	return total | (diffuse << 8u);
 }
+// NOTE: retained for debug_visualize()'s single-bounce debug-ray flag (below),
+// which is unrelated to the diffuse/glossy lobe accounting this task adds --
+// it is not a call site this task's bounce-limit rework touches.
 uint inc_total_bounce(uint packed) {
 	return packed + 1u;
 }
 uint inc_diffuse_bounce(uint packed) {
 	return packed + 0x101u;
 } // +1 to both total and diffuse
+uint inc_glossy_bounce(uint packed) {
+	return packed + 0x10001u;
+} // +1 to both total and glossy
+
+/// Resolve a per-lobe cap, treating 0 as "unset" and falling back to the total
+/// limit. Environment always writes >= 1; 0 only arrives from a raw
+/// RenderingServer environment that never set the pathtracing params, and
+/// terminating those paths immediately would render the scene black.
+uint resolve_bounce_cap(float p_param, uint p_max_total) {
+	uint cap = uint(max(p_param, 0.0));
+	return (cap == 0u) ? p_max_total : cap;
+}
 
 // Sample 0 flag (bit 24) - only write DLSS RR outputs on first sample
 const uint SAMPLE_ZERO_FLAG = (1u << 24);
@@ -141,7 +161,6 @@ bool is_path_terminated(uint packed) {
 }
 
 // Bounce limits
-#define MAX_DIFFUSE_BOUNCES 2u
 #define MAX_DENOISER_SPECULAR_HIT_THRESHOLD 0.25
 
 // ============================================================================

@@ -452,6 +452,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
 	uint diffuse_bounces = get_diffuse_bounces(ps.packed_bounces_flags);
+	uint glossy_bounces = get_glossy_bounces(ps.packed_bounces_flags);
 
 	// Environment fog for this ray segment (before surface contribution).
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
@@ -462,8 +463,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			: get_rt_param(RT_PARAM_CLAMP_INDIRECT);
 	ps.radiance += clamp_contribution(ps.throughput * m.emissive, clamp_limit);
 
-	// Bounce limit check.
-	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
+	// Per-lobe limits, matching Cycles: a path stops when the lobe it has been
+	// taking exceeds its own cap, not when every budget is exhausted
+	// (kernel/integrator/path_state.h:183, :190). This is what replaces the old
+	// hardcoded 2-diffuse-bounce ceiling that flattened interior GI.
+	const uint max_total = RT_GET_MAX_BOUNCES();
+	const uint max_diffuse = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_DIFFUSE_BOUNCE), max_total);
+	const uint max_glossy = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_GLOSSY_BOUNCE), max_total);
+	if (total_bounces >= max_total || diffuse_bounces >= max_diffuse || glossy_bounces >= max_glossy) {
 		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 		path_pack(payload, ps);
 		return;
@@ -585,7 +592,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	if (brdfType == DIFFUSE_TYPE) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {
-		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
+		ps.packed_bounces_flags = inc_glossy_bounce(ps.packed_bounces_flags);
 	}
 
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so

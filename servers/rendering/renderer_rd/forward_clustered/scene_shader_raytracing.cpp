@@ -648,7 +648,10 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 			flags |= RT_FLAG_DEBUG_VIS_ENABLED;
 		}
 		sample_count = MAX(1u, (uint32_t)p_env_params[RT_PARAM_SAMPLE_COUNT]);
-		max_bounces = MAX(1u, MIN(8u, (uint32_t)p_env_params[RT_PARAM_MAX_BOUNCES]));
+		// Cycles' shipped default total is 12 (blender/addon/properties.py); 8 was
+		// clipping requests the pipeline already makes. This is a specialization
+		// constant, so a higher ceiling costs nothing until a scene asks for it.
+		max_bounces = MAX(1u, MIN(16u, (uint32_t)p_env_params[RT_PARAM_MAX_BOUNCES]));
 		if ((uint32_t)p_env_params[RT_PARAM_DENOISER] == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION) {
 			flags |= RT_FLAG_DLSS_RR_ENABLED;
 		}
