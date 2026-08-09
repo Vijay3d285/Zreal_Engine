@@ -40,9 +40,13 @@ dist;
 
 layout(push_constant, std430) uniform Params {
 	uint mode; // 0 = rows, 1 = marginal
+	// Padding of the radiance octmap in UV space (SkyRD::sky_get_uv_border_size).
+	// The octahedron occupies only uv in [border, 1 - border]; sampling with a
+	// plain [0,1] mapping reads mirrored padding for directions it does not
+	// correspond to, which points the whole distribution at the wrong sky.
+	float border;
 	uint pad0;
 	uint pad1;
-	uint pad2;
 }
 params;
 
@@ -61,7 +65,11 @@ float cell_raw(uint x, uint y) {
 	float u = (float(x) + 0.5) / float(N_U);
 	float v = (float(y) + 0.5) / float(N_V);
 	vec3 d = dir_from_uv(u, v);
-	vec3 rad = textureLod(sampler2D(radiance_octmap, radiance_sampler), vec3_to_oct(d), 0.0).rgb;
+	// Same bordered mapping every other consumer of this texture uses
+	// (scene_raytracing_raygen.glsl, raytracing_closest_hit_common_inc.glsl,
+	// scene_forward_clustered.glsl, sdfgi_integrate.glsl).
+	vec2 oct_uv = vec3_to_oct_with_border(d, vec2(params.border, 1.0 - params.border * 2.0));
+	vec3 rad = textureLod(sampler2D(radiance_octmap, radiance_sampler), oct_uv, 0.0).rgb;
 	float lum = dot(rad, vec3(0.2126, 0.7152, 0.0722));
 	// sin(theta) converts the (u,v) density to a solid-angle density.
 	return max(lum, 0.0) * sin(v * 3.141592653589);

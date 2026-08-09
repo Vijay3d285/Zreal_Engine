@@ -33,6 +33,8 @@
 TEST_FORCE_LINK(test_pt_env_cdf)
 
 #include "core/math/math_funcs.h"
+#include "core/math/vector2.h"
+#include "core/math/vector3.h"
 #include <vector>
 
 namespace TestPTEnvCDF {
@@ -41,6 +43,14 @@ namespace TestPTEnvCDF {
 // The invariant these tests protect: the pdf used to SAMPLE and the pdf used to
 // EVALUATE must be the same function. If they drift apart, MIS produces a
 // biased result that still looks like a plausible image.
+//
+// The mirror covers three levels, because the algebra being right is not enough:
+//   1. direction  <- (u, v)          dir_from_uv(), mirrors env_cdf_build.glsl
+//   2. octmap uv  <- direction       the BORDERED mapping, mirrors oct_inc.glsl
+//   3. the prefix-sum / floor / pdf algebra itself
+// Level 3 alone cannot catch a wrong direction convention or a dropped octmap
+// border: both still produce a perfectly valid pdf that integrates to 1 and just
+// points at the wrong sky.
 
 static const int N_U = 256;
 static const int N_V = 128;
@@ -53,8 +63,110 @@ struct Dist {
 	std::vector<float> marginal_prefix; // N_V
 };
 
+// ---------------------------------------------------------------------------
+// Level 1: direction from grid cell centre. Mirrors dir_from_uv() in
+// env_cdf_build.glsl. Engine is Y-up.
+// ---------------------------------------------------------------------------
+
+static Vector3 dir_from_uv(float p_u, float p_v) {
+	const float phi = p_u * 2.0f * float(Math::PI);
+	const float theta = p_v * float(Math::PI);
+	const float st = Math::sin(theta);
+	return Vector3(st * Math::sin(phi), Math::cos(theta), st * Math::cos(phi));
+}
+
+// ---------------------------------------------------------------------------
+// Level 2: octahedral mapping. Mirrors oct_inc.glsl. The radiance octmap the
+// shader samples is PADDED, so the bordered variants are the ones that matter.
+// ---------------------------------------------------------------------------
+
+static Vector2 oct_wrap(const Vector2 &p_v) {
+	const float sx = (p_v.x >= 0.0f) ? 1.0f : -1.0f;
+	const float sy = (p_v.y >= 0.0f) ? 1.0f : -1.0f;
+	return Vector2((1.0f - Math::abs(p_v.y)) * sx, (1.0f - Math::abs(p_v.x)) * sy);
+}
+
+static Vector2 vec3_to_oct(Vector3 p_n) {
+	p_n /= (Math::abs(p_n.x) + Math::abs(p_n.y) + Math::abs(p_n.z));
+	Vector2 xy(p_n.x, p_n.y);
+	if (p_n.z < 0.0f) {
+		xy = oct_wrap(xy);
+	}
+	return xy * 0.5f + Vector2(0.5f, 0.5f);
+}
+
+// p_border.x = padding in UV space, p_border.y = 1 - padding * 2.
+static Vector2 vec3_to_oct_with_border(const Vector3 &p_n, const Vector2 &p_border) {
+	return vec3_to_oct(p_n) * p_border.y + Vector2(p_border.x, p_border.x);
+}
+
+static Vector3 oct_to_vec3(const Vector2 &p_e) {
+	Vector3 v(p_e.x, p_e.y, 1.0f - Math::abs(p_e.x) - Math::abs(p_e.y));
+	const float t = MAX(-v.z, 0.0f);
+	v.x += t * ((v.x >= 0.0f) ? -1.0f : 1.0f);
+	v.y += t * ((v.y >= 0.0f) ? -1.0f : 1.0f);
+	return v.normalized();
+}
+
+// p_border_size = 1 - padding_in_uv_space * 2.
+static Vector3 oct_to_vec3_with_border(Vector2 p_uv, float p_border_size) {
+	p_uv = (p_uv - Vector2(0.5f, 0.5f)) * (2.0f / p_border_size);
+	const bool mask_x = Math::abs(p_uv.x) >= 1.0f;
+	const bool mask_y = Math::abs(p_uv.y) >= 1.0f;
+	Vector2 c(2.0f * CLAMP(p_uv.x, -1.0f, 1.0f) - p_uv.x, 2.0f * CLAMP(p_uv.y, -1.0f, 1.0f) - p_uv.y);
+	// GLSL: uv = mix(uv, -uv, mask.yx)
+	return oct_to_vec3(Vector2(mask_y ? -c.x : c.x, mask_x ? -c.y : c.y));
+}
+
+// A synthetic stand-in for SkyRD's padded radiance octmap: the octahedron
+// occupies only uv in [border, 1 - border], the rest is mirrored padding.
+struct OctMap {
+	int w = 0;
+	float border = 0.0f;
+	std::vector<float> texels;
+};
+
+// Bright narrow lobe around a fixed direction plus a dim background, evaluated
+// in DIRECTION space so the texture genuinely encodes "where the sun is".
+static Vector3 sun_dir() {
+	return Vector3(0.4f, 0.7f, 0.6f).normalized();
+}
+
+static float sun_lum_dir(const Vector3 &p_d) {
+	return (p_d.dot(sun_dir()) > 0.995f) ? 800.0f : 0.05f;
+}
+
+static OctMap make_padded_octmap(int p_w, float p_border) {
+	OctMap m;
+	m.w = p_w;
+	m.border = p_border;
+	m.texels.assign(size_t(p_w) * size_t(p_w), 0.0f);
+	const float border_size = 1.0f - p_border * 2.0f;
+	for (int py = 0; py < p_w; py++) {
+		for (int px = 0; px < p_w; px++) {
+			const Vector2 uv((px + 0.5f) / float(p_w), (py + 0.5f) / float(p_w));
+			m.texels[size_t(py) * size_t(p_w) + size_t(px)] = sun_lum_dir(oct_to_vec3_with_border(uv, border_size));
+		}
+	}
+	return m;
+}
+
+// Nearest-texel fetch, with the border convention supplied by the caller so a
+// test can contrast the correct mapping against the unbordered one.
+static float octmap_fetch(const OctMap &p_m, const Vector3 &p_d, float p_border_used) {
+	const Vector2 uv = vec3_to_oct_with_border(p_d, Vector2(p_border_used, 1.0f - p_border_used * 2.0f));
+	const int px = CLAMP(int(uv.x * p_m.w), 0, p_m.w - 1);
+	const int py = CLAMP(int(uv.y * p_m.w), 0, p_m.w - 1);
+	return p_m.texels[size_t(py) * size_t(p_m.w) + size_t(px)];
+}
+
+// ---------------------------------------------------------------------------
+// Level 3: the distribution itself.
+// ---------------------------------------------------------------------------
+
 // Build from a luminance function of (u, v) in [0,1).
-static Dist build(float (*p_lum)(float, float)) {
+template <typename F>
+static Dist build(F p_lum) {
 	Dist d;
 	d.prefix_raw.assign(N_V * N_U, 0.0f);
 	d.rowsum_adj.assign(N_V, 0.0f);
@@ -67,7 +179,8 @@ static Dist build(float (*p_lum)(float, float)) {
 		const float sin_theta = Math::sin(v * float(Math::PI));
 		for (int x = 0; x < N_U; x++) {
 			const float u = (x + 0.5f) / float(N_U);
-			const float f = p_lum(u, v) * sin_theta;
+			// max(lum, 0.0) mirrors cell_raw() in env_cdf_build.glsl.
+			const float f = MAX(p_lum(u, v), 0.0f) * sin_theta;
 			raw[y * N_U + x] = f;
 			total_raw += f;
 		}
@@ -217,6 +330,85 @@ TEST_CASE("[PathTracer][EnvCDF] sampled cells round-trip through the pdf lookup"
 				(double(d.marginal_total) / double(N_U * N_V)) /
 				(2.0 * Math::PI * Math::PI * MAX(Math::sin(double(v) * Math::PI), 1e-6))));
 	}
+}
+
+TEST_CASE("[PathTracer][EnvCDF] dir_from_uv matches the documented Y-up convention") {
+	// The buffer contract promises theta = acos(dir.y), phi = atan(dir.x, dir.z).
+	// Task 3 inverts exactly this to evaluate the pdf for a given direction, so a
+	// silent change of convention here would desynchronise sample from evaluate.
+	for (int y = 0; y < N_V; y += 7) {
+		const float v = (y + 0.5f) / float(N_V);
+		for (int x = 0; x < N_U; x += 11) {
+			const float u = (x + 0.5f) / float(N_U);
+			const Vector3 d = dir_from_uv(u, v);
+
+			CHECK(d.length() == doctest::Approx(1.0f).epsilon(1e-4));
+
+			// Polar angle round-trips with no wrapping.
+			const float theta = Math::acos(CLAMP(d.y, -1.0f, 1.0f));
+			CHECK(theta == doctest::Approx(v * float(Math::PI)).epsilon(1e-4));
+
+			// Azimuth returns (-PI, PI], so the inverse needs fract(), not a bare
+			// divide -- a bare divide gives a NEGATIVE u for half the sphere.
+			const float phi = Math::atan2(d.x, d.z);
+			float u_back = phi / (2.0f * float(Math::PI));
+			u_back = u_back - Math::floor(u_back); // fract()
+			// u == 0.5 sits exactly on the atan2 branch cut; accept either end.
+			const float err = MIN(Math::abs(u_back - u), 1.0f - Math::abs(u_back - u));
+			CHECK(err < 1e-3f);
+		}
+	}
+}
+
+TEST_CASE("[PathTracer][EnvCDF] the octmap fetch must use the padded mapping") {
+	// SkyRD's radiance octmap is padded: the octahedron occupies only the middle
+	// (1 - 2b) of the texture. At the default radiance_size = 256 the single-
+	// texture path gives b = 128 / 768 = 0.167, so a plain [0,1] uv reads
+	// mirrored padding for directions it does not correspond to. The resulting
+	// distribution is still a VALID pdf -- it integrates to 1, every cell is
+	// positive, sampling still concentrates somewhere -- it just concentrates on
+	// the wrong directions, which is worse than no importance sampling at all.
+	const float b = 128.0f / 768.0f;
+	const OctMap map = make_padded_octmap(768, b);
+	const Vector3 sun = sun_dir();
+
+	// Correct: same bordered mapping the shader and every other consumer use.
+	const Dist d_ok = build([&](float u, float v) {
+		return octmap_fetch(map, dir_from_uv(u, v), b);
+	});
+	// The bug: unbordered mapping against the same padded texture.
+	const Dist d_bad = build([&](float u, float v) {
+		return octmap_fetch(map, dir_from_uv(u, v), 0.0f);
+	});
+
+	// Both are well-formed distributions; that is exactly why this fails quietly.
+	CHECK(d_ok.marginal_total > 0.0f);
+	CHECK(d_bad.marginal_total > 0.0f);
+
+	int hits_ok = 0;
+	int hits_bad = 0;
+	const int N = 4096;
+	for (int i = 0; i < N; i++) {
+		const float r0 = (i % 64 + 0.5f) / 64.0f;
+		const float r1 = (i / 64 + 0.5f) / 64.0f;
+		float u, v;
+
+		sample_uv(d_ok, r0, r1, u, v);
+		if (dir_from_uv(u, v).dot(sun) > 0.99f) {
+			hits_ok++;
+		}
+
+		sample_uv(d_bad, r0, r1, u, v);
+		if (dir_from_uv(u, v).dot(sun) > 0.99f) {
+			hits_bad++;
+		}
+	}
+
+	// With the border, the sun dominates the sampled directions.
+	CHECK(hits_ok > N / 2);
+	// Without it, the samples pile onto some other direction entirely. This is
+	// the assertion that would have caught the original defect.
+	CHECK(hits_bad < N / 10);
 }
 
 } // namespace TestPTEnvCDF

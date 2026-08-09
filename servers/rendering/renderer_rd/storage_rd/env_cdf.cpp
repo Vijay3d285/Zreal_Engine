@@ -44,24 +44,25 @@ EnvCDF::~EnvCDF() {
 			rd->free_rid(buffer);
 			buffer = RID();
 		}
-	}
-	// `shader` is owned by the version, not by us; version_free releases both.
-	if (shader_initialized && version.is_valid()) {
-		shader_rd.version_free(version);
-		version = RID();
+		// `shader` is owned by the version, not by us; version_free releases both.
+		// It drives RenderingDevice internally, so it belongs inside this guard
+		// alongside the free_rid calls above.
+		if (shader_initialized && version.is_valid()) {
+			shader_rd.version_free(version);
+			version = RID();
+		}
 	}
 	shader = RID();
 }
 
-bool EnvCDF::mark_dirty_if_source_changed(RID p_radiance_texture, uint64_t p_source_version) {
+void EnvCDF::mark_dirty_if_source_changed(RID p_radiance_texture, uint64_t p_source_version) {
 	if (has_source && p_radiance_texture == last_radiance_texture && p_source_version == last_source_version) {
-		return false;
+		return;
 	}
 	mark_dirty();
-	return true;
 }
 
-void EnvCDF::update(RID p_radiance_texture, RID p_sampler, uint64_t p_source_version) {
+void EnvCDF::update(RID p_radiance_texture, RID p_sampler, float p_border, uint64_t p_source_version) {
 	// Called every frame; the common case is "nothing changed".
 	if (!dirty) {
 		return;
@@ -134,9 +135,9 @@ void EnvCDF::update(RID p_radiance_texture, RID p_sampler, uint64_t p_source_ver
 	ERR_FAIL_COND_MSG(!uniform_set.is_valid(), "EnvCDF: Failed to create the env_cdf_build uniform set.");
 
 	PushConstant pc = {};
+	pc.border = p_border;
 	pc.pad0 = 0;
 	pc.pad1 = 0;
-	pc.pad2 = 0;
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);

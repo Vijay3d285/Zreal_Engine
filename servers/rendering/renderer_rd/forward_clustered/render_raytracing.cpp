@@ -3205,17 +3205,28 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// trigger; see the env_cdf block below.
 		uint64_t sky_source_version = 0;
 		bool sky_regenerating = false;
+		// UV padding of the radiance octmap. 0.0 is the correct value for the
+		// unpadded default-black fallback texture used when there is no sky.
+		float sky_uv_border_size = 0.0f;
 
 		// Try to get radiance texture from sky
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			RID sky_rid = owner->environment_get_sky(p_render_data->environment);
 			if (sky_rid.is_valid()) {
 				radiance_texture = owner->sky.sky_get_radiance_texture_rd(sky_rid);
+				sky_uv_border_size = owner->sky.sky_get_uv_border_size(sky_rid);
 
 				RendererRD::SkyRD::Sky *sky = owner->sky.get_sky(sky_rid);
 				if (sky) {
 					sky_regenerating = sky->reflection.dirty;
-					sky_source_version = (uint64_t(uint32_t(sky->processing_layer)) << 1) |
+					// The border size only changes when the radiance texture is
+					// reallocated (radiance size / sky mode change), which also
+					// changes the texture RID -- but fold it in explicitly rather
+					// than relying on that coincidence.
+					uint32_t border_bits = 0;
+					memcpy(&border_bits, &sky_uv_border_size, sizeof(float));
+					sky_source_version = (uint64_t(border_bits) << 32) |
+							(uint64_t(uint32_t(sky->processing_layer)) << 1) |
 							(sky_regenerating ? 1ull : 0ull);
 				}
 			}
@@ -3245,7 +3256,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			} else {
 				env_cdf.mark_dirty_if_source_changed(radiance_texture, sky_source_version);
 			}
-			env_cdf.update(radiance_texture, env_sampler, sky_source_version);
+			env_cdf.update(radiance_texture, env_sampler, sky_uv_border_size, sky_source_version);
 		}
 
 		RD::Uniform u;
