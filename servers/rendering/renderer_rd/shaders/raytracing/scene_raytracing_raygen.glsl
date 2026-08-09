@@ -20,6 +20,7 @@
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
 #include "raytracing_common_inc.glsl"
+#include "raytracing_env_sampling_inc.glsl"
 
 layout(set = 0, binding = 0, rgba32f) uniform image2D image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
@@ -226,6 +227,7 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 layout(location = 0) rayPayloadInEXT PathPayload payload;
@@ -357,6 +359,7 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 #define attribs hit_attribs.bary_or_uv
@@ -539,6 +542,7 @@ void main() {
 #include "raytracing_inc.glsl"
 #include "../scene_data_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 #define attribs hit_attribs.bary_or_uv
@@ -651,6 +655,7 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "raytracing_data_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 // Write all attributes and report the intersection. Transparently delta-compresses
