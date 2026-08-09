@@ -33,27 +33,41 @@
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
 // ============================================================================
-// PATHTRACING PAYLOAD (32 bytes, fp16/unorm-packed)
+// PATHTRACING PAYLOAD (48 bytes nominal, fp32 radiance/throughput)
 // ============================================================================
-// Radiance (r) and throughput (T) interleaved as fp16 into 3 uints:
-//   [0]=rg, [1]=bR, [2]=GB  (packHalf2x16 pairs).
-// The next-bounce origin is not stored: raygen reconstructs it from the
-// current ray and hit_t as `offset_ray_origin(ray_origin + ray_dir * hit_t,
-// offset_normal)`. The offset normal and next direction are stored as
-// 16-bit unorm octahedral pairs (effective angular error <~0.001 deg,
-// below the 8-bit normal quantization baked into offset_ray_origin).
-// Use PathState + path_pack/path_unpack for fp32 working copies.
+// Radiance and throughput are fp32: the previous fp16 packing clamped radiance
+// at 65504 and banded in deep specular tails. `mis_ray_pdf` carries the BSDF pdf
+// of the ray that produced this segment, so the miss shader can form a MIS
+// weight against the environment pdf. A NEGATIVE value means "no MIS, use
+// weight 1" -- see RT_MIS_PDF_NONE below.
+//
+// NOTE ON SIZE: 48 bytes assumes vec3 packs at 12 bytes in the payload. Some
+// drivers pad vec3 to 16, making the effective size 56. Either way both stages
+// declare the identical struct so they agree; the frame-time measurement in
+// Step 8 is what tells us whether the growth cost anything.
 
 struct PathPayload {
-	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
-	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:8][diffuse:8][total:8]
+	vec3 radiance; // 12 bytes
+	vec3 throughput; // 12 bytes
+	uint packed_bounces_flags; //  4 bytes - [flags:8][glossy:8][diffuse:8][total:8]
 	uint rng_packed; //  4 bytes - packed [sample_index:20][dimension offset:12]
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
 	uint oct_next_dir; //  4 bytes - packUnorm2x16(vec3_to_oct(next direction))
+	float mis_ray_pdf; //  4 bytes - BSDF pdf of this segment, <0 = no MIS
 };
 
-/// Unpacked fp32 working copy of the payload.
+/// Sentinel: this ray has no meaningful BSDF pdf, so anything it hits takes the
+/// full contribution (MIS weight 1). Used for primary camera rays and for
+/// near-delta specular lobes that environment sampling can never reach.
+/// Mirrors Cycles' PATH_RAY_MIS_SKIP.
+const float RT_MIS_PDF_NONE = -1.0;
+
+/// Below this roughness a specular lobe is treated as delta for MIS purposes.
+/// Matches the existing MAX_DENOISER_SPECULAR_HIT_THRESHOLD family of cutoffs.
+const float RT_MIS_DELTA_ROUGHNESS = 0.03;
+
+/// Unpacked working copy of the payload.
 struct PathState {
 	vec3 radiance;
 	vec3 throughput;
@@ -62,35 +76,31 @@ struct PathState {
 	float hit_t;
 	vec3 offset_normal;
 	vec3 next_ray_dir;
+	float mis_ray_pdf;
 };
 
 PathState path_unpack(PathPayload p) {
 	PathState s;
-	vec2 rg = unpackHalf2x16(p.packed_rt[0]);
-	vec2 bR = unpackHalf2x16(p.packed_rt[1]);
-	vec2 GB = unpackHalf2x16(p.packed_rt[2]);
-	s.radiance = max(vec3(rg.x, rg.y, bR.x), vec3(0.0));
-	s.throughput = max(vec3(bR.y, GB.x, GB.y), vec3(0.0));
+	s.radiance = max(p.radiance, vec3(0.0));
+	s.throughput = max(p.throughput, vec3(0.0));
 	s.packed_bounces_flags = p.packed_bounces_flags;
 	s.rng_packed = p.rng_packed;
 	s.hit_t = p.hit_t;
 	s.offset_normal = oct_to_vec3(unpackUnorm2x16(p.oct_offset_nrm) * 2.0 - 1.0);
 	s.next_ray_dir = oct_to_vec3(unpackUnorm2x16(p.oct_next_dir) * 2.0 - 1.0);
+	s.mis_ray_pdf = p.mis_ray_pdf;
 	return s;
 }
 
 void path_pack(inout PathPayload p, PathState s) {
-	const float FP16_MAX = 65504.0;
-	vec3 r = clamp(s.radiance, vec3(0.0), vec3(FP16_MAX));
-	vec3 t = clamp(s.throughput, vec3(0.0), vec3(FP16_MAX));
-	p.packed_rt[0] = packHalf2x16(vec2(r.r, r.g));
-	p.packed_rt[1] = packHalf2x16(vec2(r.b, t.r));
-	p.packed_rt[2] = packHalf2x16(vec2(t.g, t.b));
+	p.radiance = max(s.radiance, vec3(0.0));
+	p.throughput = max(s.throughput, vec3(0.0));
 	p.packed_bounces_flags = s.packed_bounces_flags;
 	p.rng_packed = s.rng_packed;
 	p.hit_t = s.hit_t;
 	p.oct_offset_nrm = packUnorm2x16(vec3_to_oct(s.offset_normal));
 	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
+	p.mis_ray_pdf = s.mis_ray_pdf;
 }
 
 // Bounce count helpers.
@@ -224,6 +234,9 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 #define RT_PRNG_LOBE 4u // 1D: diffuse-vs-specular lobe choice.
 #define RT_PRNG_TERMINATE 5u // 1D: reserved for B4 Russian Roulette.
 #define RT_PRNG_RESERVOIR 6u // 1D: seeds the reservoir's PCG side stream.
+#define RT_PRNG_ENV 7u // 2D: direction sample on the environment. LAST FREE SLOT
+                       // in the 8-dimension per-bounce block; anything added
+                       // after this must widen RT_PRNG_BOUNCE_NUM (Cycles uses 16).
 
 /// Sampler state for one path. `pixel` is the per-pixel Owen scramble seed,
 /// `sample_index` selects the point in the sequence, and `offset` is the base
@@ -405,6 +418,21 @@ vec3 clamp_contribution(vec3 p_c, float p_limit) {
 	}
 	float m = max(p_c.r, max(p_c.g, p_c.b));
 	return (m > p_limit) ? p_c * (p_limit / m) : p_c;
+}
+
+// ============================================================================
+// MULTIPLE IMPORTANCE SAMPLING
+// ============================================================================
+
+/// Power heuristic with beta = 2, matching Cycles (intern/cycles/kernel/light/sample.h).
+/// power_heuristic(a, b) + power_heuristic(b, a) == 1 exactly, which is what makes
+/// the combined estimator unbiased: the two strategies' weights partition the
+/// contribution rather than scaling it.
+float power_heuristic(float p_a, float p_b) {
+	float a2 = p_a * p_a;
+	float b2 = p_b * p_b;
+	float denom = a2 + b2;
+	return (denom > 0.0) ? (a2 / denom) : 0.0;
 }
 
 // ============================================================================

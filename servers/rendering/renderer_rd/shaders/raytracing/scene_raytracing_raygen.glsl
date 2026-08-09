@@ -55,6 +55,9 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	ps.throughput = vec3(1.0);
 	ps.packed_bounces_flags = p_is_sample_zero ? set_sample_zero(0u) : 0u;
 	ps.rng_packed = rng_pack(rng_init(p_pixel, p_rng_sample_index));
+	// The camera ray has no preceding BSDF sample, so sky seen directly through a
+	// window takes its full contribution.
+	ps.mis_ray_pdf = RT_MIS_PDF_NONE;
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;

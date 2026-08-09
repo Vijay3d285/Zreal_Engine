@@ -1075,6 +1075,57 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 #endif
 }
 
+// PDF that the combined diffuse+specular sampler in evalIndirectCombinedBRDF
+// would assign to an arbitrary direction L.
+//
+// The sampler picks ONE lobe stochastically, so the effective density of any
+// direction it returns is the mixture of both lobes weighted by their selection
+// probabilities. Using only the selected lobe's term underestimates the density
+// and loses energy through the MIS weight -- see the plan's Task 1 preamble.
+//
+// The lobe split here MUST stay identical to the one in shade_and_bounce
+// (raytracing_closest_hit_common_inc.glsl). If they drift, MIS weights become
+// inconsistent with how directions are actually generated.
+float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
+	float NdotL = dot(N, L);
+	if (NdotL <= 0.0f) {
+		return 0.0f;
+	}
+
+	// Lobe selection probability, mirroring shade_and_bounce.
+	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
+	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness);
+	float specularLum = luminance(specularF0);
+	float diffuseLum = luminance(diffuseReflectance);
+
+	float pSpec;
+	if (diffuseLum < 0.0001f) {
+		pSpec = 1.0f;
+	} else if (specularLum < 0.0001f) {
+		pSpec = 0.0f;
+	} else {
+		pSpec = clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
+	}
+
+	// Diffuse lobe: cosine-weighted hemisphere.
+	float pdfDiffuse = diffusePdf(NdotL);
+
+	// Specular lobe: VNDF reflection pdf. Built in the local frame where N = +Z,
+	// matching how sampleSpecular generates directions.
+	float4 qRotationToZ = getRotationToZAxis(N);
+	float3 Llocal = rotatePoint(qRotationToZ, L);
+	float3 Vlocal = rotatePoint(qRotationToZ, V);
+	const BrdfData data = prepareBRDFData(float3(0.0f, 0.0f, 1.0f), Llocal, Vlocal, material);
+
+	float3 Hlocal = normalize(Vlocal + Llocal);
+	float NdotH = max(0.00001f, Hlocal.z);
+	float NdotV = max(0.00001f, Vlocal.z);
+	float LdotH = max(0.00001f, dot(Llocal, Hlocal));
+	float pdfSpecular = specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH);
+
+	return pSpec * pdfSpecular + (1.0f - pSpec) * pdfDiffuse;
+}
+
 // Version that returns diffuse and specular separately.
 void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties material, OUT_PARAMETER(float3) outDiffuse, OUT_PARAMETER(float3) outSpecular) {
 	outDiffuse = float3(0.0f, 0.0f, 0.0f);

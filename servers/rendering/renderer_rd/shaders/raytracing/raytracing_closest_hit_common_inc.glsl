@@ -603,5 +603,17 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Next bounce gets its own dimension block, so decision k at depth d always
 	// draws from the same dimension across every path in the frame.
 	ps.rng_packed = rng_pack(rng_next_bounce(rng));
+
+	// Density the BSDF strategy assigned to the direction we just chose. This is
+	// the mixture over both lobes, not just the one that was selected -- see
+	// combinedPdf in brdf_inc.glsl.
+	//
+	// Near-delta specular lobes cannot be reached by environment sampling at all,
+	// so anything this ray hits must take the FULL contribution rather than a MIS
+	// share. Mirrors Cycles' PATH_RAY_MIS_SKIP.
+	ps.mis_ray_pdf = (brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)
+			? RT_MIS_PDF_NONE
+			: combinedPdf(N, next_dir, V, brdf_mat);
+
 	path_pack(payload, ps);
 }
