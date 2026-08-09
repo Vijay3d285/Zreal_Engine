@@ -1103,9 +1103,9 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	if day_render:
 		env.adjustment_brightness = 0.95
 		# Contrast 1.25 deepens the gap between lit and shadow areas.
-		# 1.05 was too flat — shadow under sofa/plants looked same as lit floor.
-		env.adjustment_contrast = 1.25
-		env.adjustment_saturation = 1.08
+		# 1.05 was too flat — shadow under sofa/plants looked same as lit floor. so 1.08
+		env.adjustment_contrast = 1.10
+		env.adjustment_saturation = 1.05
 	else:
 		env.adjustment_brightness = 0.92 # Slightly lower exposure → darks get darker (Coohom-match)
 		env.adjustment_contrast = 1.35 # S-curve depth — was 1.06 (flat), Coohom is ~1.35
