@@ -985,7 +985,19 @@ Record the RMSE at each sample count in the sweep.
 
 - [ ] **Step 3: Check the acceptance criterion**
 
-Accept when RMSE at a given sample count is **lower with Sobol than with PCG at every point in the sweep**, and the low-sample end (16-64) improves by more than the high-sample end — stratification pays most when samples are scarce. If RMSE is *worse* anywhere, stop and re-check the dimension allocation before recording anything: two decisions sharing a dimension index is the usual cause, and it produces correlation that is worse than white noise.
+> **CORRECTED 2026-08-08 after measurement.** The second half of this criterion
+> originally read "and the low-sample end (16-64) improves by more than the high-sample
+> end — stratification pays most when samples are scarce." **That is backwards and was a
+> defect in this plan.** White-noise Monte Carlo converges at RMSE ∝ N^-0.5. Any working
+> QMC sampler converges faster, so the *ratio* between them, ∝ N^(p-0.5) with p > 0.5,
+> necessarily **grows** with N. A shrinking ratio would mean Sobol was converging
+> *slower* than white noise — the signature of a broken sampler, not a healthy one. The
+> original wording confused the perceptual argument (blue-noise-like error is less
+> objectionable at low spp) with RMSE-ratio behaviour. Corrected criterion below.
+
+Accept when RMSE at a given sample count is **lower with Sobol than with PCG at every point in the sweep**, and the fitted convergence exponent is steeper for Sobol than for PCG. Fit each end-to-end by `p = log(RMSE_first / RMSE_last) / log(N_last / N_first)`; expect PCG near 0.5 and Sobol clearly above it. As a consistency check, the improvement ratio between the ends of the sweep should equal `(N_last / N_first)^(p_sobol - p_pcg)` — if the measured ratio and that prediction disagree materially, the measurement is unsound and the sweep should be re-run before anything is recorded.
+
+If RMSE is *worse* anywhere, stop and re-check the dimension allocation before recording anything: two decisions sharing a dimension index is the usual cause, and it produces correlation that is worse than white noise.
 
 - [ ] **Step 4: Update the roadmap**
 
