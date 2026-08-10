@@ -20,7 +20,6 @@
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
 #include "raytracing_common_inc.glsl"
-#include "raytracing_env_sampling_inc.glsl"
 
 layout(set = 0, binding = 0, rgba32f) uniform image2D image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
@@ -227,7 +226,6 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
-#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 layout(location = 0) rayPayloadInEXT PathPayload payload;
@@ -280,8 +278,9 @@ void main() {
 		}
 	}
 
-	mat3 camera_basis = mat3(scene_data_block.data.inv_view_matrix);
-	mat3 world_to_sky = scene_data_block.data.radiance_inverse_xform * camera_basis;
+	// Shared with env_sample()/env_pdf() (raytracing_env_sampling_inc.glsl) so the
+	// sky lookup here and the environment-NEE pdf can never drift apart.
+	mat3 world_to_sky = env_world_to_sky();
 	vec3 sky_dir = world_to_sky * gl_WorldRayDirectionEXT;
 
 	vec2 border = vec2(scene_data_block.data.radiance_border_size,
@@ -359,7 +358,6 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
-#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 #define attribs hit_attribs.bary_or_uv
@@ -542,7 +540,6 @@ void main() {
 #include "raytracing_inc.glsl"
 #include "../scene_data_inc.glsl"
 #include "raytracing_common_inc.glsl"
-#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 #define attribs hit_attribs.bary_or_uv
@@ -655,7 +652,6 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "raytracing_data_inc.glsl"
 #include "raytracing_common_inc.glsl"
-#include "raytracing_env_sampling_inc.glsl"
 // clang-format on
 
 // Write all attributes and report the intersection. Transparently delta-compresses

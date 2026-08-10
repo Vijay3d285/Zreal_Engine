@@ -3421,6 +3421,18 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		if (env_cdf.is_valid()) {
 			u.append_id(env_cdf.get_buffer());
 		} else {
+			// Unreachable today: env_cdf.update() (binding-7 block above, same
+			// function) allocates and zero-fills its buffer unconditionally on
+			// first use, so is_valid() is already true by this point every frame.
+			// The fallback buffer is 16 UNINITIALISED bytes (mesh_storage.cpp,
+			// storage_buffer_create with no initial data) -- if it were ever bound
+			// here, a garbage-positive `marginal_total` read from those bytes would
+			// let the GLSL EnvDistRO SSBO (raytracing_env_sampling_inc.glsl)
+			// binary-search and index `data[]` far past this buffer's end. Keep the
+			// fallback so the uniform set still builds, but DEV_ASSERT so a future
+			// reordering that breaks the "update() always ran first" invariant is
+			// caught immediately instead of silently reading out of bounds.
+			DEV_ASSERT(false && "EnvCDF buffer should already be valid here; update() runs unconditionally above.");
 			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
 		}
 		uniforms.push_back(u);

@@ -79,3 +79,12 @@ struct HitAttribs {
 };
 hitAttributeEXT HitAttribs hit_attribs;
 #endif
+
+// Environment (sky) importance sampling (Task 3). Included here, unconditionally
+// and outside every stage-specific #if above, so every stage that includes this
+// file -- present and any added later -- gets env_sample()/env_pdf() automatically.
+// scene_data_block (declared above at binding 2) is in scope by construction: this
+// line is textually after it. See raytracing_env_sampling_inc.glsl's header for why
+// it cannot live in raytracing_inc.glsl instead (that file precedes scene_data_block's
+// declaration in every stage).
+#include "raytracing_env_sampling_inc.glsl"

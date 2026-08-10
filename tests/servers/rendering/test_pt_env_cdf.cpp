@@ -32,6 +32,7 @@
 
 TEST_FORCE_LINK(test_pt_env_cdf)
 
+#include "core/math/basis.h"
 #include "core/math/math_funcs.h"
 #include "core/math/vector2.h"
 #include "core/math/vector3.h"
@@ -221,13 +222,25 @@ static double pdf_omega(const Dist &p_d, float p_u, float p_v) {
 	return pdf_uv / (2.0 * Math::PI * Math::PI * MAX(sin_theta, 1e-6));
 }
 
-// Sample (u, v) by inverting the marginal then the row conditional.
+// Sample (u, v) by inverting the marginal then the row conditional, then
+// interpolating CONTINUOUSLY within the selected cell (mirrors env_sample() in
+// raytracing_env_sampling_inc.glsl). Returning the cell centre unconditionally
+// (the original form of this function) made the sampled measure a sum of
+// N_V*N_U Dirac deltas while pdf_omega() reports a continuous density -- not the
+// same measure, so the estimator silently stopped being Monte Carlo. The
+// `hi > lo` guards are load-bearing: at fp32 precision consecutive prefix-sum
+// entries can be bit-identical (see the task report), which would divide by
+// zero without them.
 static void sample_uv(const Dist &p_d, float p_r0, float p_r1, float &r_u, float &r_v) {
 	const float target_v = p_r1 * p_d.marginal_total;
 	int y = 0;
 	while (y < N_V - 1 && p_d.marginal_prefix[y] < target_v) {
 		y++;
 	}
+	const float m_lo = (y == 0) ? 0.0f : p_d.marginal_prefix[y - 1];
+	const float m_hi = p_d.marginal_prefix[y];
+	const float dv = (m_hi > m_lo) ? CLAMP((target_v - m_lo) / (m_hi - m_lo), 0.0f, 1.0f) : 0.5f;
+
 	const float target_u = p_r0 * p_d.rowsum_adj[y];
 	int x = 0;
 	while (x < N_U - 1) {
@@ -237,8 +250,12 @@ static void sample_uv(const Dist &p_d, float p_r0, float p_r1, float &r_u, float
 		}
 		x++;
 	}
-	r_u = (x + 0.5f) / float(N_U);
-	r_v = (y + 0.5f) / float(N_V);
+	const float cdf_lo = (x == 0) ? 0.0f : p_d.prefix_raw[y * N_U + x - 1] + float(x) * p_d.floor_value;
+	const float cdf_hi = p_d.prefix_raw[y * N_U + x] + float(x + 1) * p_d.floor_value;
+	const float du = (cdf_hi > cdf_lo) ? CLAMP((target_u - cdf_lo) / (cdf_hi - cdf_lo), 0.0f, 1.0f) : 0.5f;
+
+	r_u = (float(x) + du) / float(N_U);
+	r_v = (float(y) + dv) / float(N_V);
 }
 
 static float lum_constant(float, float) {
@@ -409,6 +426,137 @@ TEST_CASE("[PathTracer][EnvCDF] the octmap fetch must use the padded mapping") {
 	// Without it, the samples pile onto some other direction entirely. This is
 	// the assertion that would have caught the original defect.
 	CHECK(hits_bad < N / 10);
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1, Critical 1: env_sample() must draw from a CONTINUOUS density,
+// not a lattice of cell centres, or the reported pdf and the actual sampling
+// measure disagree and the estimator quietly stops being Monte Carlo.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("[PathTracer][EnvCDF] env_sample converges to the analytic sphere integral for a constant sky") {
+	// For a spatially-CONSTANT L, unbiased importance sampling requires
+	// E[L / pdf(X)] == integral of L over the sphere == 4*PI exactly (up to fp
+	// rounding), for ANY resolution of the underlying grid, PROVIDED the reported
+	// pdf is the true density of the distribution X is actually drawn from.
+	//
+	// Returning only the N_U*N_V cell CENTRES (a finite lattice) while reporting
+	// a continuous density is a measure mismatch: the estimator degenerates into
+	// a fixed midpoint-rule quadrature of theta. That quadrature has a real,
+	// nonzero, RESOLUTION-dependent error (not a sample-count-dependent one --
+	// more samples do not shrink it): measured directly against THIS test (by
+	// temporarily forcing sample_uv() back to cell-centre-only) at
+	// +2.423049e-05 relative. With the continuous remap the same test measures
+	// -1.150619e-06 relative (residual floor: fp32 storage of the CDF data plus
+	// this test's own SUB=4096 per-row quadrature, not the algorithm, which is
+	// exact in the continuous limit -- see the task report for the closed-form
+	// derivation and both raw numbers). Small enough that the existing
+	// "integrates to 1" / "round-trips" tests never see it (both are
+	// self-consistent with whatever single point pdf_omega is evaluated at),
+	// but real and systematic. The epsilon below (5e-6) sits between the two
+	// measured values with margin on both sides.
+	//
+	// SUB is deliberately enumerated PER ROW against that row's own exact
+	// marginal_prefix boundary (not a global r0/r1 grid): a global grid spreads
+	// its resolution unevenly across rows and, empirically, its OWN
+	// discretization noise (~7e-5 relative at 131072 total samples) swamped the
+	// ~2.4e-5 defect it was meant to catch. Per-row enumeration gives every row
+	// the same SUB=4096 evenly-spaced coverage of its dv range regardless of the
+	// row's probability mass, driving the test's own residual well below the
+	// defect size instead of comparable to it. r0 is fixed (0.5): du does not
+	// affect pdf_omega() for lum_constant (cell_value is identical across every
+	// x in a row when the luminance function does not depend on u), so varying
+	// it would add sampling cost without adding precision for this specific L.
+	//
+	// A first draft of this test averaged (row, dv) pairs with EQUAL weight per
+	// row instead of weighting by each row's actual probability mass. That is a
+	// different bug from the one under test, but it produced its own spurious
+	// error of comparable size (rows near the poles carry much less probability
+	// than equatorial rows, so equal weighting over-represents them) -- a
+	// reminder that a measurement's own bias can rival the defect it is meant to
+	// catch, and is worth checking independently before trusting a pass/fail.
+	const Dist d = build(lum_constant);
+
+	// E[1/pdf] = sum_row P(row) * E[1/pdf | row]: each row's contribution MUST be
+	// weighted by that row's own probability mass (rowsum_adj[y] / marginal_total)
+	// -- rows near the poles carry much less weight than equatorial rows, so
+	// averaging (row, dv) pairs with equal weight (one earlier draft of this test
+	// did exactly that) over-represents the poles and produces its own, different,
+	// spurious bias. Enumerating per row and weighting explicitly avoids both that
+	// mistake and the global-r-grid sample imbalance noted above.
+	double weighted_avg = 0.0;
+	const int SUB = 4096;
+	for (int y = 0; y < N_V; y++) {
+		const float m_lo = (y == 0) ? 0.0f : d.marginal_prefix[y - 1];
+		const float m_hi = d.marginal_prefix[y];
+		if (m_hi <= m_lo) {
+			continue; // Degenerate row (possible only if floor_value == 0); skip like the dv guard would.
+		}
+		const double row_prob = double(m_hi - m_lo) / double(d.marginal_total);
+		double row_sum_inv_pdf = 0.0;
+		for (int k = 0; k < SUB; k++) {
+			const float frac = (k + 0.5f) / float(SUB);
+			const float target_v = m_lo + frac * (m_hi - m_lo);
+			const float r1 = target_v / d.marginal_total;
+			float u, v;
+			sample_uv(d, 0.5f, r1, u, v);
+			const double pdf = pdf_omega(d, u, v);
+			REQUIRE(pdf > 0.0); // Every cell has positive pdf (floor); guards the division below.
+			row_sum_inv_pdf += 1.0 / pdf; // L == 1 everywhere, so the estimator is just 1/pdf.
+		}
+		weighted_avg += row_prob * (row_sum_inv_pdf / double(SUB));
+	}
+	CHECK(weighted_avg == doctest::Approx(4.0 * Math::PI).epsilon(5e-6));
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1, Important 4: the world<->sky transform pair (env_world_to_sky(),
+// used by both env_sample() and env_pdf() in raytracing_env_sampling_inc.glsl)
+// has zero coverage from the rest of this file, which only ever exercises
+// SKY-space math. This cannot execute the GLSL directly -- there is no shader
+// execution in this test binary -- but it validates the mathematical pattern
+// the GLSL depends on: applying an orthonormal matrix W one way and its
+// TRANSPOSE (its inverse, since it is orthonormal) the other way must be a
+// no-op on the round trip, and therefore leave the pdf unchanged. Using W on
+// BOTH legs (the transposed-side bug this guards against -- e.g. sky->world
+// implemented as `W * sky_dir` instead of `transpose(W) * sky_dir`) rotates
+// the round-tripped direction into the wrong cell and would fail this check.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("[PathTracer][EnvCDF] pdf is invariant under an arbitrary orthonormal world<->sky transform") {
+	const Dist d = build(lum_sun);
+
+	// An arbitrary orthonormal rotation, unrelated to any specific camera
+	// transform -- the invariant under test holds for ANY orthonormal matrix,
+	// which is the whole point of using transpose() as the inverse in the GLSL.
+	const Basis w = Basis::from_euler(Vector3(0.37f, -1.21f, 0.58f));
+	REQUIRE(w.is_orthogonal());
+
+	for (int i = 0; i < 64; i++) {
+		const float r0 = (i % 8 + 0.5f) / 8.0f;
+		const float r1 = (i / 8 + 0.5f) / 8.0f;
+		float u, v;
+		sample_uv(d, r0, r1, u, v);
+		const Vector3 sky_dir = dir_from_uv(u, v);
+		const double pdf_before = pdf_omega(d, u, v);
+
+		// sky -> "world": mirrors env_sample()'s `transpose(world_to_sky) * sky_dir`.
+		const Vector3 world_dir = w.transposed().xform(sky_dir);
+		// "world" -> sky: mirrors env_pdf()'s `world_to_sky * p_dir`.
+		const Vector3 sky_dir_back = w.xform(world_dir);
+
+		CHECK(sky_dir_back.distance_to(sky_dir) < 1e-5f);
+
+		// Evaluate the pdf at the round-tripped direction the way env_pdf() does:
+		// invert dir_from_uv, then look up through the same pdf_omega() (mirrors
+		// env_pdf_from_uv(), the single shared formula).
+		const float theta = Math::acos(CLAMP(sky_dir_back.y, -1.0f, 1.0f));
+		float u_back = Math::atan2(sky_dir_back.x, sky_dir_back.z) / (2.0f * float(Math::PI));
+		u_back -= Math::floor(u_back); // fract()
+		const float v_back = theta / float(Math::PI);
+
+		CHECK(pdf_omega(d, u_back, v_back) == doctest::Approx(pdf_before).epsilon(1e-3));
+	}
 }
 
 } // namespace TestPTEnvCDF
