@@ -40,6 +40,16 @@
 #define ENV_N_V 128
 #define ENV_PI 3.141592653589
 
+// Upper clamp for the continuous intra-cell (du, dv) remap in env_sample(). Both
+// brackets are half-open on the low side by construction (lower-bound search), so
+// `target == cdf_hi` (or `== m_hi`) is reachable in fp32, which would otherwise
+// produce du/dv == 1.0 exactly -- landing uv on the boundary shared with the NEXT
+// cell, so env_pdf_from_uv()'s `int(uv * N)` reports that neighbour's pdf for a
+// sample whose mass came from THIS cell. Clamping to the float immediately below
+// 1.0 keeps the sample strictly inside the intended cell. (1.0 - 2^-24, the
+// largest float32 < 1.0.)
+#define ENV_UV_MAX 0.99999994
+
 layout(set = 0, binding = 34, std430) restrict readonly buffer EnvDistRO {
 	float floor_value;
 	float marginal_total;
@@ -168,7 +178,7 @@ bool env_sample(vec2 p_rand, out vec3 r_dir, out float r_pdf) {
 	// without the guard -- fall back to the cell centre (dv = 0.5) in that case.
 	float m_lo = (y == 0) ? 0.0 : env_dist.data[ENV_MARGINAL_PREFIX_OFFSET + y - 1];
 	float m_hi = env_dist.data[ENV_MARGINAL_PREFIX_OFFSET + y];
-	float dv = (m_hi > m_lo) ? clamp((target_v - m_lo) / (m_hi - m_lo), 0.0, 1.0) : 0.5;
+	float dv = (m_hi > m_lo) ? clamp((target_v - m_lo) / (m_hi - m_lo), 0.0, ENV_UV_MAX) : 0.5;
 
 	// Invert the row conditional. The stored prefixes are of the RAW f, so the
 	// floor is added arithmetically here -- see the layout note in the plan.
@@ -195,7 +205,7 @@ bool env_sample(vec2 p_rand, out vec3 r_dir, out float r_pdf) {
 			float(x) * env_dist.floor_value;
 	float cdf_hi = env_dist.data[ENV_PREFIX_RAW_OFFSET + y * ENV_N_U + x] +
 			float(x + 1) * env_dist.floor_value;
-	float du = (cdf_hi > cdf_lo) ? clamp((target_u - cdf_lo) / (cdf_hi - cdf_lo), 0.0, 1.0) : 0.5;
+	float du = (cdf_hi > cdf_lo) ? clamp((target_u - cdf_lo) / (cdf_hi - cdf_lo), 0.0, ENV_UV_MAX) : 0.5;
 
 	vec2 uv = vec2((float(x) + du) / float(ENV_N_U), (float(y) + dv) / float(ENV_N_V));
 	vec3 sky_dir = env_direction_from_uv(uv);

@@ -56,6 +56,12 @@ namespace TestPTEnvCDF {
 static const int N_U = 256;
 static const int N_V = 128;
 
+// Mirrors ENV_UV_MAX in raytracing_env_sampling_inc.glsl: both brackets in
+// sample_uv() are half-open on the low side, so `target == hi` is reachable in
+// fp32 and would otherwise produce du/dv == 1.0 exactly, landing uv on the
+// neighbouring cell's boundary. Clamp to the float below 1.0 instead.
+static const float UV_MAX = 0.99999994f;
+
 struct Dist {
 	float floor_value = 0.0f;
 	float marginal_total = 0.0f;
@@ -239,7 +245,7 @@ static void sample_uv(const Dist &p_d, float p_r0, float p_r1, float &r_u, float
 	}
 	const float m_lo = (y == 0) ? 0.0f : p_d.marginal_prefix[y - 1];
 	const float m_hi = p_d.marginal_prefix[y];
-	const float dv = (m_hi > m_lo) ? CLAMP((target_v - m_lo) / (m_hi - m_lo), 0.0f, 1.0f) : 0.5f;
+	const float dv = (m_hi > m_lo) ? CLAMP((target_v - m_lo) / (m_hi - m_lo), 0.0f, UV_MAX) : 0.5f;
 
 	const float target_u = p_r0 * p_d.rowsum_adj[y];
 	int x = 0;
@@ -252,7 +258,7 @@ static void sample_uv(const Dist &p_d, float p_r0, float p_r1, float &r_u, float
 	}
 	const float cdf_lo = (x == 0) ? 0.0f : p_d.prefix_raw[y * N_U + x - 1] + float(x) * p_d.floor_value;
 	const float cdf_hi = p_d.prefix_raw[y * N_U + x] + float(x + 1) * p_d.floor_value;
-	const float du = (cdf_hi > cdf_lo) ? CLAMP((target_u - cdf_lo) / (cdf_hi - cdf_lo), 0.0f, 1.0f) : 0.5f;
+	const float du = (cdf_hi > cdf_lo) ? CLAMP((target_u - cdf_lo) / (cdf_hi - cdf_lo), 0.0f, UV_MAX) : 0.5f;
 
 	r_u = (float(x) + du) / float(N_U);
 	r_v = (float(y) + dv) / float(N_V);
@@ -447,10 +453,15 @@ TEST_CASE("[PathTracer][EnvCDF] env_sample converges to the analytic sphere inte
 	// more samples do not shrink it): measured directly against THIS test (by
 	// temporarily forcing sample_uv() back to cell-centre-only) at
 	// +2.423049e-05 relative. With the continuous remap the same test measures
-	// -1.150619e-06 relative (residual floor: fp32 storage of the CDF data plus
-	// this test's own SUB=4096 per-row quadrature, not the algorithm, which is
-	// exact in the continuous limit -- see the task report for the closed-form
-	// derivation and both raw numbers). Small enough that the existing
+	// -1.150619e-06 relative. CORRECTION (fix round 2): that residual is NOT
+	// from this test's own SUB=4096 per-row quadrature -- composite-midpoint
+	// error at that resolution is ~(pi*h)^2/24 ~= 1.5e-12, twelve orders below
+	// the measured floor, so improving the test's own resolution cannot move
+	// it. It is essentially all fp32: recovering a row's mass by differencing
+	// two `marginal_prefix` entries of magnitude ~2.09e+04 (ulp ~1.95e-3) to
+	// get a row mass of ~3.16 loses precision in the SAMPLER's stored data, not
+	// in this measurement -- see the task report for the fix-round-2 detail.
+	// Small enough that the existing
 	// "integrates to 1" / "round-trips" tests never see it (both are
 	// self-consistent with whatever single point pdf_omega is evaluated at),
 	// but real and systematic. The epsilon below (5e-6) sits between the two
@@ -557,6 +568,196 @@ TEST_CASE("[PathTracer][EnvCDF] pdf is invariant under an arbitrary orthonormal 
 
 		CHECK(pdf_omega(d, u_back, v_back) == doctest::Approx(pdf_before).epsilon(1e-3));
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 2, Finding 1: the round-1 convergence test used L === 1, which
+// turns out to have NO statistical power over the u/du remap at all. The
+// proof is in the round-1 report's own derivation ("cell-value cancels out
+// entirely, leaving a pure function of y"): for L === 1,
+// P(cell)/pdf_uv(cell) == area exactly regardless of L, and the only
+// surviving factor, sin(pi*v), has no u dependence. Discarding the ENTIRE u
+// remap moves that test's number by ~3e-7 -- invisible against its 5e-6
+// epsilon. Every u-side failure mode (du computed then dropped, wrong
+// bracket, off-by-one on the floor multiplier, unclamped, 1-du) passes it
+// silently. This section adds two axis-targeted probes with a resonant,
+// non-resolution-decaying signal instead.
+// ---------------------------------------------------------------------------
+
+// sample_uv() with the u-remap intentionally discarded (forced to the cell
+// centre): a deliberately-broken negative control, kept ONLY so the tests
+// below can prove they have power over du at all. Derives x from the REAL
+// sample_uv()'s continuous u rather than reimplementing the search, so the
+// only thing this changes is the intra-cell position.
+static void sample_uv_du_discarded(const Dist &p_d, float p_r0, float p_r1, float &r_u, float &r_v) {
+	float u, v;
+	sample_uv(p_d, p_r0, p_r1, u, v);
+	const int x = CLAMP(int(u * N_U), 0, N_U - 1);
+	r_u = (float(x) + 0.5f) / float(N_U);
+	r_v = v;
+}
+
+// Same, for the v-remap.
+static void sample_uv_dv_discarded(const Dist &p_d, float p_r0, float p_r1, float &r_u, float &r_v) {
+	float u, v;
+	sample_uv(p_d, p_r0, p_r1, u, v);
+	const int y = CLAMP(int(v * N_V), 0, N_V - 1);
+	r_u = u;
+	r_v = (float(y) + 0.5f) / float(N_V);
+}
+
+typedef void (*SampleFn)(const Dist &, float, float, float &, float &);
+
+// Estimates E[(1 + a*cos(2*PI*K*u)) / pdf] against build(lum_constant) via
+// `p_sample_fn` (the real sample_uv(), or one of the discarded-axis negative
+// controls above). Exact closed-form target: 4*PI for ANY integer K >= 1 and
+// ANY a, because integral(cos(2*pi*K*u), u, 0, 1) == 0 -- a full number of
+// periods over the FULL u domain always cancels, independent of the
+// sin(theta) weighting (which carries no u dependence).
+//
+// FACTORIZATION (exact, not an approximation, specifically for
+// build(lum_constant)): P(cell=(x,y)) == P(row_y)/N_U, uniform across x,
+// because raw luminance does not depend on u for a constant sky. And for a
+// constant per-cell raw weight, the row-conditional CDF is exactly LINEAR in
+// x, so inverting it returns u == r0 identically (mod float rounding) --
+// independent of which row was selected. That means
+// E[L(u)/pdf(u,v)] == E_v[the sin(theta) factor] * E_u[L(u)] exactly, so it
+// is computed here as two independently-measured components (both driven by
+// the REAL p_sample_fn) multiplied together, rather than a full 2D sweep --
+// efficient, and exact for this specific distribution, not a shortcut that
+// trades away precision.
+static double estimate_periodic_u(const Dist &p_d, int p_k, float p_a, SampleFn p_sample_fn) {
+	// Component 1: the v-weighted 1/pdf average, identical machinery to the
+	// round-1 convergence test (which is exactly this computation at a == 0).
+	double vbar = 0.0;
+	const int SUB_V = 4096;
+	for (int y = 0; y < N_V; y++) {
+		const float m_lo = (y == 0) ? 0.0f : p_d.marginal_prefix[y - 1];
+		const float m_hi = p_d.marginal_prefix[y];
+		if (m_hi <= m_lo) {
+			continue;
+		}
+		const double row_prob = double(m_hi - m_lo) / double(p_d.marginal_total);
+		double row_sum = 0.0;
+		for (int k = 0; k < SUB_V; k++) {
+			const float frac = (k + 0.5f) / float(SUB_V);
+			const float target_v = m_lo + frac * (m_hi - m_lo);
+			const float r1 = target_v / p_d.marginal_total;
+			float u, v;
+			p_sample_fn(p_d, 0.5f, r1, u, v);
+			row_sum += 1.0 / pdf_omega(p_d, u, v);
+		}
+		vbar += row_prob * (row_sum / double(SUB_V));
+	}
+
+	// Component 2: u-average of L via a fine r0 sweep. r1 is fixed (0.5): L
+	// does not depend on v, and the factorization above shows du's
+	// distribution does not depend on which row r1 selects, so a fixed
+	// representative r1 costs nothing here.
+	double ubar = 0.0;
+	const int SUB_U = 65536;
+	for (int i = 0; i < SUB_U; i++) {
+		const float r0 = (i + 0.5f) / float(SUB_U);
+		float u, v;
+		p_sample_fn(p_d, r0, 0.5f, u, v);
+		ubar += 1.0 + double(p_a) * Math::cos(2.0 * Math::PI * double(p_k) * double(u));
+	}
+	ubar /= double(SUB_U);
+
+	return vbar * ubar;
+}
+
+TEST_CASE("[PathTracer][EnvCDF] env_sample's u/du remap has a resonant regression guard") {
+	const Dist d = build(lum_constant);
+	const double target = 4.0 * Math::PI;
+
+	// K = ENV_N_U: exactly one period of the perturbation per cell. This is
+	// the resonant case -- discarding du forces every cell's u to its own
+	// centre, and cos(2*PI*K*(x+0.5)/K) == cos(2*PI*x + PI) == -1 for EVERY
+	// integer x, collapsing L to the SAME constant (1 - a) in every cell
+	// instead of averaging to 1 over each cell's true width. With a = 0.5
+	// that is exactly a 2x (50%) drop -- large, and independent of N_V.
+	// Measured (fix round 2): correct rel. error +2.083715e-06 (pass),
+	// discarded rel. error -5.000006e-01 (fails hard, as expected).
+	{
+		const double correct = estimate_periodic_u(d, N_U, 0.5f, sample_uv);
+		const double discarded = estimate_periodic_u(d, N_U, 0.5f, sample_uv_du_discarded);
+		CHECK(correct == doctest::Approx(target).epsilon(1e-5));
+		CHECK(Math::abs((discarded - target) / target) > 0.1); // Must actually be broken.
+	}
+
+	// K well below N_U (non-resonant): the discrete sum
+	// sum_x cos(2*PI*K*(x+0.5)/N_U) vanishes for any integer K not a multiple
+	// of N_U, so even the discarded-du variant should still land close to
+	// target here -- this is what the reviewer's reference table shows (K in
+	// 1..128 pass under both variants) and it is worth asserting explicitly so
+	// a reader does not mistake "passes even when broken" for a test bug.
+	{
+		const double correct = estimate_periodic_u(d, 1, 0.5f, sample_uv);
+		const double discarded = estimate_periodic_u(d, 1, 0.5f, sample_uv_du_discarded);
+		CHECK(correct == doctest::Approx(target).epsilon(1e-5));
+		CHECK(discarded == doctest::Approx(target).epsilon(1e-5));
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v-axis analogue. Unlike the u case, the sin(theta) weighting means a
+// cos(2*PI*K*v) perturbation does NOT integrate to exactly zero against the
+// true target (theta and the perturbation both live on the v axis), so the
+// exact closed form is used instead of assuming 4*PI:
+//
+//   integral(cos(2*K*theta) * sin(theta), theta, 0, PI) == 2 / (1 - 4*K^2)
+//
+// (product-to-sum: sin(A)cos(B) = 0.5*[sin(A+B) + sin(A-B)], then
+// integral(sin(m*theta), 0, PI) == (1 - cos(m*PI))/m, which is 2/m for odd m
+// and 0 for even m; here m = 1 +/- 2*K is always odd.) So
+//   target(K, a) = 4*PI + 4*PI*a / (1 - 4*K^2).
+// Same resonance argument as the u case: discarding dv forces every row's v
+// to its own centre, and cos(2*PI*K*(y+0.5)/K) == -1 for every integer y when
+// K == ENV_N_V, collapsing L to the same (1 - a) constant per row instead of
+// its true per-row average -- a large, non-1/N_V^2-decaying signal.
+// ---------------------------------------------------------------------------
+
+static double estimate_periodic_v(const Dist &p_d, int p_k, float p_a, SampleFn p_sample_fn) {
+	double total = 0.0;
+	const int SUB_V = 4096;
+	for (int y = 0; y < N_V; y++) {
+		const float m_lo = (y == 0) ? 0.0f : p_d.marginal_prefix[y - 1];
+		const float m_hi = p_d.marginal_prefix[y];
+		if (m_hi <= m_lo) {
+			continue;
+		}
+		const double row_prob = double(m_hi - m_lo) / double(p_d.marginal_total);
+		double row_sum = 0.0;
+		for (int k = 0; k < SUB_V; k++) {
+			const float frac = (k + 0.5f) / float(SUB_V);
+			const float target_v = m_lo + frac * (m_hi - m_lo);
+			const float r1 = target_v / p_d.marginal_total;
+			float u, v;
+			p_sample_fn(p_d, 0.5f, r1, u, v);
+			const double L = 1.0 + double(p_a) * Math::cos(2.0 * Math::PI * double(p_k) * double(v));
+			row_sum += L / pdf_omega(p_d, u, v);
+		}
+		total += row_prob * (row_sum / double(SUB_V));
+	}
+	return total;
+}
+
+TEST_CASE("[PathTracer][EnvCDF] env_sample's v/dv remap has a resonant regression guard") {
+	const Dist d = build(lum_constant);
+	const int K = N_V; // One period per row: the resonant case.
+	const float a = 0.5f;
+	const double target = 4.0 * Math::PI + 4.0 * Math::PI * double(a) / (1.0 - 4.0 * double(K) * double(K));
+
+	// Measured (fix round 2): correct rel. error -1.150731e-06 (pass, matching
+	// the round-1 convergence test's fp32 floor almost exactly, since a=0.5's
+	// closed-form target correction here is itself ~7.6e-6 of 4*PI), discarded
+	// rel. error -4.999842e-01 (fails hard, as expected).
+	const double correct = estimate_periodic_v(d, K, a, sample_uv);
+	const double discarded = estimate_periodic_v(d, K, a, sample_uv_dv_discarded);
+
+	CHECK(correct == doctest::Approx(target).epsilon(1e-5));
+	CHECK(Math::abs((discarded - target) / target) > 0.1); // Must actually be broken.
 }
 
 } // namespace TestPTEnvCDF
