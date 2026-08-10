@@ -323,22 +323,25 @@ void main() {
 	// contribution instead of duplicating it.
 	//
 	// A negative mis_ray_pdf is the RT_MIS_PDF_NONE sentinel, meaning environment
-	// NEE could not have produced this direction at all: a primary camera ray, a
-	// near-delta specular bounce, a below-hemisphere recovered sample, or a
-	// direction combinedPdf() cannot describe. Those take the full contribution --
-	// halving them would lose energy with no other strategy to make it up.
+	// NEE contributes nothing here, so this strategy must take the full
+	// contribution -- weighting it down would lose energy with no other strategy to
+	// make it up. See the governing rule at shade_and_bounce's mis_ray_pdf
+	// assignment for the full case list and the measurements behind it: a primary
+	// camera ray, a backfacing-V shading point, a mirrored/recovered sample, a
+	// near-delta specular bounce, and a direction combinedPdf() cannot describe.
 	float mis_w = 1.0;
 	if (ps.mis_ray_pdf >= 0.0) {
 		float e_pdf = env_pdf(gl_WorldRayDirectionEXT);
-		// The e_pdf > 0.0 guard is load-bearing, not defensive. Environment NEE
-		// contributes w_env = power_heuristic(0, x) = 0 for any direction it
-		// assigns zero density -- including EVERY direction in a scene with no sky
-		// at all, where marginal_total == 0 makes env_pdf() return 0 outright. This
-		// strategy must therefore take the whole contribution there. Without the
-		// guard, a stored mis_ray_pdf of 0.0 (which shade_and_bounce now writes
-		// verbatim rather than replacing with the RT_MIS_PDF_NONE sentinel) meets
-		// e_pdf == 0.0 and power_heuristic(0, 0) returns 0 for a zero denominator,
-		// silently deleting the sky from those paths.
+		// The e_pdf > 0.0 guard covers a scene with no sky at all: marginal_total
+		// == 0 makes env_pdf() return 0 for every direction, env NEE therefore
+		// contributes w_env = 0 everywhere, and this strategy must take the whole
+		// contribution. Without the guard power_heuristic(x, 0) is fine but
+		// power_heuristic(0, 0) returns 0 for a zero denominator, so a
+		// mis_ray_pdf that was itself 0 would silently delete the sky. Note this
+		// guard does NOT rescue the mis_ray_pdf == 0 case in a scene that HAS a
+		// sky: env_cdf_build.glsl floors every cell at 1e-4 * mean, so e_pdf is
+		// strictly positive everywhere and the guard never fires. That case is
+		// handled at the source, by mapping a zero pdf to the sentinel above.
 		mis_w = (e_pdf > 0.0) ? power_heuristic(ps.mis_ray_pdf, e_pdf) : 1.0;
 	}
 	vec3 sky_contribution = ps.throughput * sky_color * mis_w;

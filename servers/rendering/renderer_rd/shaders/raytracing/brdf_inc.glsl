@@ -1122,9 +1122,19 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// it does not eliminate it, so this is reachable in production, not just a
 	// theoretical edge case. Treat it the same as the NdotL <= 0 early-out
 	// above: return 0.0f rather than a NaN that would poison mis_ray_pdf --
-	// the caller (shade_and_bounce) already falls back to RT_MIS_PDF_NONE
-	// whenever this function returns a non-positive value (Task 1 review
-	// round 1, findings 1/2/9).
+	// the caller (shade_and_bounce) falls back to RT_MIS_PDF_NONE whenever this
+	// function returns a non-positive value (Task 1 review round 1, findings
+	// 1/2/9). That fallback is load-bearing and must stay: storing the 0.0 as a
+	// live pdf makes the miss stage weight the ray by power_heuristic(0, e_pdf)
+	// = 0 and delete its sky contribution outright.
+	//
+	// The OTHER consumer, environment NEE (raytracing_closest_hit_common_inc.glsl),
+	// uses the 0.0 directly rather than through that fallback, and is safe doing so
+	// because its own BRDF value is zero at every direction for which this function
+	// returns zero: NdotL <= 0 is exactly evalCombinedBRDFSeparate's Lbackfacing
+	// rejection, and the V ~= -L case below is caught by that block's dot(N,V)
+	// guard. So it multiplies a weight of 1 by an estimator of 0. Any future
+	// consumer must check that property for itself before trusting a zero here.
 	float3 VplusL = Vlocal + Llocal;
 	if (length(VplusL) < 0.000001f) {
 		return 0.0f;

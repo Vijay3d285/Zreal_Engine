@@ -39,13 +39,31 @@ extends "res://tests/pt_validation.gd"
 ## lookup, so it is blind to every direction-dependent defect -- including the
 ## whole class of bugs fixed earlier in this phase. Gate 2 uses a high-contrast
 ## sky (a bright patch of ~4.6% solid angle at radiance 20 against a 0.02 base,
-## 1000:1) and measures two surfaces:
+## 1000:1) and measures four surfaces:
 ##
-##   smooth  - a roughness-0.02 metallic sphere. This is the one that matters.
-##             Near-delta specular lobes are unreachable by environment sampling,
-##             so the sky reflection must come from the BSDF strategy ALONE. If
-##             environment NEE also contributes there, the highlight is counted
-##             twice and the sphere renders up to 2x too bright.
+##   smooth  - a roughness-0.02 metallic sphere. Near-delta specular lobes are
+##             unreachable by environment sampling, so the sky reflection must
+##             come from the BSDF strategy ALONE. If environment NEE also
+##             contributes there, the highlight is counted twice and the sphere
+##             renders up to 2x too bright.
+##   rough   - a roughness-0.6 METALLIC sphere, which probes the opposite failure:
+##             energy DELETED rather than doubled. Every direction for which
+##             combinedPdf() returns 0 must be handed the full BSDF weight, because
+##             environment NEE's own value is zero there too and cannot collect it.
+##             Metal makes pSpec = 1, so every sample is specular and maximally
+##             exposed to the dot(N,L) <= 0 band that sampleSpecularMicrofacet
+##             CLAMPS into rather than rejecting (evalIndirectCombinedBRDF only
+##             tests the GEOMETRY plane, and a smooth-shaded sphere has
+##             N != geometry_normal). Roughness 0.6 keeps it out of the delta
+##             branch, which is what makes this case distinct from `smooth`.
+##             Reported over the full disc AND over a silhouette annulus, where
+##             grazing angles concentrate the effect.
+##   bumpy   - the same rough metal plus a steep normal map. Drives the shading
+##             normal far off the geometry normal, so below-geometry rejection and
+##             the mirrored-sample recovery path fire constantly, and dot(N,V) <= 0
+##             becomes common. This is the ONLY surface here that reacts to the
+##             recovery / backfacing-V policies: it moved 1.415 -> 0.836 (-41%)
+##             when they were mishandled.
 ##   diffuse - the Lambertian plane again, as a control: it must NOT move.
 ##
 ## A SPHERE rather than a flat smooth plane is deliberate. `env_world_to_sky()`
@@ -72,6 +90,9 @@ const TOLERANCE := 0.01 # 1 percent, per the brief.
 # independent sanity check on any future re-capture.
 const REF_SMOOTH := 1.48904
 const REF_DIFFUSE := 0.37311
+const REF_ROUGH := 1.70870 # full disc
+const REF_ROUGH_RIM := 1.22400 # silhouette annulus
+const REF_BUMPY := 1.41451 # normal-mapped rough metal
 const REF_TOLERANCE := 0.02 # 2 percent; gate 2 is a stochastic comparison.
 
 var _plane: MeshInstance3D
@@ -202,6 +223,38 @@ func _gate_directional(p_frames: int) -> void:
 	print("  [smooth ] mirror sphere mean : %.5f   (max pixel %.4f over %d px)"
 			% [smooth["mean"], smooth["max"], smooth["n"]])
 
+	# Rough-metal pass: the zero-pdf probe. Same sphere, roughness 0.6.
+	_sphere.material_override = _rough_material()
+	for _i in range(4):
+		await get_tree().process_frame
+	var r_img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), p_frames)
+	_sphere.material_override = _smooth_material()
+	if r_img == null:
+		_failures.append("gate 2: accumulator readback returned null (rough pass)")
+		return
+	var rough := _measure_disc(r_img, 0.45)
+	var rough_rim := _measure_annulus(r_img, 0.34, 0.45)
+	print("  [rough  ] metal sphere mean  : %.5f   (silhouette annulus %.5f over %d px)"
+			% [rough["mean"], rough_rim["mean"], rough_rim["n"]])
+
+	# Bumpy pass: the recovery probe. Same rough metal plus a steep tangent-space
+	# normal map, so the shading normal tilts far off the geometry normal and
+	# evalIndirectCombinedBRDF's below-geometry rejection (and therefore
+	# recoverBelowHemisphereSample) fires constantly. That is the case that
+	# actually carries throughput into the combinedPdf() == 0 path -- the plain
+	# rough sphere does not, because there the specular sample weight vanishes on
+	# the same NdotL -> 0 limit that drives the pdf to zero.
+	_sphere.material_override = _bumpy_material()
+	for _i in range(4):
+		await get_tree().process_frame
+	var b_img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), p_frames)
+	_sphere.material_override = _smooth_material()
+	if b_img == null:
+		_failures.append("gate 2: accumulator readback returned null (bumpy pass)")
+		return
+	var bumpy := _measure_disc(b_img, 0.45)
+	print("  [bumpy  ] normal-mapped mean : %.5f" % bumpy["mean"])
+
 	# Diffuse pass: the Lambertian plane, as a control.
 	_sphere.visible = false
 	_plane.visible = true
@@ -223,6 +276,27 @@ func _gate_directional(p_frames: int) -> void:
 	var d_err: float = absf(diffuse["mean"] - REF_DIFFUSE) / REF_DIFFUSE
 	print("  smooth  vs reference %.5f : ratio %.4f  (%.2f%% off)" % [REF_SMOOTH, smooth["mean"] / REF_SMOOTH, s_err * 100.0])
 	print("  diffuse vs reference %.5f : ratio %.4f  (%.2f%% off)" % [REF_DIFFUSE, diffuse["mean"] / REF_DIFFUSE, d_err * 100.0])
+	if REF_BUMPY > 0.0:
+		var b_err: float = absf(bumpy["mean"] - REF_BUMPY) / REF_BUMPY
+		print("  bumpy   vs reference %.5f : ratio %.4f  (%.2f%% off)" % [REF_BUMPY, bumpy["mean"] / REF_BUMPY, b_err * 100.0])
+		if b_err > REF_TOLERANCE:
+			_failures.append("gate 2 bumpy: %.5f vs reference %.5f, ratio %.4f. This surface is the recovery / backfacing-V probe."
+					% [bumpy["mean"], REF_BUMPY, bumpy["mean"] / REF_BUMPY])
+
+	if REF_ROUGH > 0.0:
+		var r_err: float = absf(rough["mean"] - REF_ROUGH) / REF_ROUGH
+		var rr_err: float = absf(rough_rim["mean"] - REF_ROUGH_RIM) / REF_ROUGH_RIM
+		print("  rough   vs reference %.5f : ratio %.4f  (%.2f%% off)" % [REF_ROUGH, rough["mean"] / REF_ROUGH, r_err * 100.0])
+		print("  rim     vs reference %.5f : ratio %.4f  (%.2f%% off)" % [REF_ROUGH_RIM, rough_rim["mean"] / REF_ROUGH_RIM, rr_err * 100.0])
+		if r_err > REF_TOLERANCE:
+			_failures.append("gate 2 rough: %.5f vs reference %.5f, ratio %.4f. Below 1.0 means sky contribution is being DELETED where combinedPdf() returns 0 (no strategy collects it); above means it is double counted."
+					% [rough["mean"], REF_ROUGH, rough["mean"] / REF_ROUGH])
+		if rr_err > REF_TOLERANCE:
+			_failures.append("gate 2 rough rim: %.5f vs reference %.5f, ratio %.4f (grazing/silhouette band)."
+					% [rough_rim["mean"], REF_ROUGH_RIM, rough_rim["mean"] / REF_ROUGH_RIM])
+	else:
+		print("  (no rough reference captured yet - record REF_ROUGH / REF_ROUGH_RIM)")
+
 	if s_err > REF_TOLERANCE:
 		_failures.append("gate 2 smooth: %.5f vs reference %.5f, ratio %.4f. A ratio near 2 means the near-delta specular sky highlight is being counted by BOTH strategies."
 				% [smooth["mean"], REF_SMOOTH, smooth["mean"] / REF_SMOOTH])
@@ -281,6 +355,32 @@ func _measure_disc(p_img: Image, p_radius: float) -> Dictionary:
 			peak = maxf(peak, v)
 			n += 1
 	return { "mean": acc / float(maxi(n, 1)), "max": peak, "n": n }
+
+
+## Mean over a centred annulus, radii in units of half the smaller image
+## dimension. On the sphere this is the grazing/silhouette band, where a
+## shading-normal-vs-geometry-normal disagreement is largest.
+func _measure_annulus(p_img: Image, p_r_lo: float, p_r_hi: float) -> Dictionary:
+	var w := p_img.get_width()
+	var h := p_img.get_height()
+	var cx := float(w) * 0.5
+	var cy := float(h) * 0.5
+	var half := float(mini(w, h)) * 0.5
+	var lo2 := (p_r_lo * half) * (p_r_lo * half)
+	var hi2 := (p_r_hi * half) * (p_r_hi * half)
+	var acc := 0.0
+	var n := 0
+	for y in range(h):
+		for x in range(w):
+			var dx := float(x) + 0.5 - cx
+			var dy := float(y) + 0.5 - cy
+			var d2 := dx * dx + dy * dy
+			if d2 < lo2 or d2 > hi2:
+				continue
+			var c := p_img.get_pixel(x, y)
+			acc += (c.r + c.g + c.b) / 3.0
+			n += 1
+	return { "mean": acc / float(maxi(n, 1)), "n": n }
 
 
 func _stddev_crop(p_img: Image, p_mean: float, p_lo: float, p_hi: float) -> float:
@@ -410,12 +510,56 @@ func _build_scene(p_panorama: ImageTexture) -> Environment:
 	sm.rings = 48
 	_sphere.mesh = sm
 	_sphere.position = Vector3.ZERO
-	var smat := StandardMaterial3D.new()
-	smat.albedo_color = Color(1.0, 1.0, 1.0)
-	smat.metallic = 1.0
-	smat.roughness = 0.02
-	_sphere.material_override = smat
+	_sphere.material_override = _smooth_material()
 	add_child(_sphere)
 	_sphere.visible = false
 
 	return env
+
+
+## metallic = 1 makes specularF0 = albedo and diffuseReflectance = 0, so the
+## surface is reached ONLY through the specular lobe. roughness 0.02 is below
+## RT_MIS_DELTA_ROUGHNESS (0.03): the regime environment sampling must not
+## contribute to at all.
+func _smooth_material() -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = Color(1.0, 1.0, 1.0)
+	m.metallic = 1.0
+	m.roughness = 0.02
+	return m
+
+
+## Same metal, but roughness 0.6 -- ABOVE RT_MIS_DELTA_ROUGHNESS, so it takes the
+## ordinary MIS branch rather than the delta branch. This is the configuration
+## that exercises directions where combinedPdf() returns 0 while the sample was
+## still generated and is still carrying throughput.
+func _rough_material() -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = Color(1.0, 1.0, 1.0)
+	m.metallic = 1.0
+	m.roughness = 0.6
+	return m
+
+
+## The rough metal plus a steep tangent-space normal map. Drives the shading
+## normal far off the geometry normal so below-geometry rejection and the
+## mirrored-sample recovery path fire heavily.
+func _bumpy_material() -> StandardMaterial3D:
+	var m := _rough_material()
+	m.normal_enabled = true
+	m.normal_scale = 1.0
+	m.normal_texture = _bump_normal_map()
+	return m
+
+
+func _bump_normal_map() -> ImageTexture:
+	var n := 128
+	var img := Image.create(n, n, false, Image.FORMAT_RGB8)
+	for y in range(n):
+		for x in range(n):
+			# Steep slopes: z = 0.45 keeps the tilt near 65 degrees at the extremes.
+			var u := float(x) / float(n) * TAU * 8.0
+			var v := float(y) / float(n) * TAU * 8.0
+			var nv := Vector3(0.85 * sin(u), 0.85 * sin(v), 0.45).normalized()
+			img.set_pixel(x, y, Color(nv.x * 0.5 + 0.5, nv.y * 0.5 + 0.5, nv.z * 0.5 + 0.5))
+	return ImageTexture.create_from_image(img)

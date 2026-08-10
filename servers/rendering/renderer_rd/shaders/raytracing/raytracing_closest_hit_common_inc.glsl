@@ -654,6 +654,31 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 				if (dot(N, V) > 0.0) {
 					vec3 f_diff, f_spec;
 					evalCombinedBRDFSeparate(N, env_dir, V, brdf_mat, f_diff, f_spec);
+
+					// GGX multiple-scattering compensation. sampleSpecularMicrofacet
+					// folds `ms` into the weight it hands back (brdf_inc.glsl:905),
+					// so the BSDF strategy's realised integrand is ms * f_spec --
+					// but evalMicrofacet (:918), which is what
+					// evalCombinedBRDFSeparate calls, applies no such factor. Two
+					// strategies whose weights sum to 1 must estimate the SAME
+					// integrand; without this the env half pays the
+					// single-scattering value while the BSDF half pays the
+					// compensated one, and the difference is lost in proportion to
+					// w_env. Measured on a roughness-0.6 metal sphere: 1.344
+					// against a BSDF-only reference of 1.708, a 21% energy loss.
+					// ms is 1 + F0 * Ems, which is ~1.22-1.37 in that configuration.
+					//
+					// Note the same asymmetry exists between sampling and evaluation
+					// for the ANALYTIC light path (raytracing_lights_inc.glsl also
+					// calls evalCombinedBRDFSeparate). That is a pre-existing engine
+					// inconsistency and NOT an MIS partition bug -- analytic lights
+					// have no second strategy to disagree with -- so it is reported
+					// rather than changed here.
+#if MICROFACET_DISTRIBUTION == GGX
+					float ms_alpha = brdf_mat.roughness * brdf_mat.roughness;
+					f_spec *= evalMultiScatterApproximation(ms_alpha, NdotV, specularF0);
+#endif
+
 					bsdf_val = (brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)
 							? f_diff
 							: (f_diff + f_spec);
@@ -692,6 +717,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec2 u = rng_2d(rng, RT_PRNG_SURFACE_BSDF);
 	vec3 next_dir;
 	vec3 brdf_weight;
+	bool recovered_sample = false;
 	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
@@ -706,10 +732,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			path_pack(payload, ps);
 			return;
 		}
-		// next_dir is now the MIRRORED direction. Its MIS density is evaluated at
-		// this final direction, not at the pre-image -- see the mis_ray_pdf
-		// assignment below for why the partition requires that.
+		// next_dir is now the MIRRORED direction, carrying the REJECTED sample's
+		// brdf_weight. That makes it density-matched to nothing this code can
+		// evaluate, which is why it takes MIS weight 1 -- see the mis_ray_pdf
+		// assignment below, where both candidate policies are measured.
 		next_dir = recovered_dir;
+		recovered_sample = true;
 	}
 
 	ps.throughput *= brdf_weight;
@@ -737,45 +765,67 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// so anything this ray hits must take the FULL contribution rather than a MIS
 	// share. Mirrors Cycles' PATH_RAY_MIS_SKIP.
 	//
-	// TASK 4 REVISION of Task 1's sentinel policy for the two remaining cases.
+	// THE GOVERNING RULE, of which every branch below is an instance: this ray may
+	// be weighted DOWN only where environment NEE actually pays something. Wherever
+	// env NEE's estimator is structurally zero, the BSDF strategy is the only one
+	// there is and must take weight 1 -- otherwise the contribution is deleted with
+	// nothing to collect it. Each case was measured against a BSDF-only reference
+	// build on the gate's directional scene (pipeline_references/tests).
 	//
-	// Task 1 routed BOTH `recovered_sample` and `combinedPdf() == 0.0` to
-	// RT_MIS_PDF_NONE as the "conservative" choice. That was sound while the
-	// sentinel had no consumer. It is not sound now that environment NEE exists,
-	// because the two sides' weights only partition the contribution if they are
-	// the SAME function of the SAME direction:
+	//   - dot(N, V) <= 0. A property of the SHADING POINT, not of any one
+	//     direction: the env-NEE block above is gated on it (reproducing
+	//     evalCombinedBRDF's Vbackfacing early-out), so at such a vertex env NEE
+	//     contributes nothing in EVERY direction -- while combinedPdf, which never
+	//     tests V against the hemisphere, returns a positive density that would
+	//     scale this ray down. clampShadingNormal only REDUCES backfacing V, it does
+	//     not eliminate it, so on strongly normal-mapped geometry this is common:
+	//     without this guard, 0.836 against a reference of 1.415, a 41% loss.
 	//
-	//     env NEE evaluates   w_env  = power_heuristic(p_env(w), combinedPdf(w))
-	//     the miss stage must evaluate
-	//                         w_bsdf = power_heuristic(combinedPdf(w), p_env(w))
+	//   - recovered_sample (a mirrored below-hemisphere sample). Task 4 fix round 1
+	//     replaced this sentinel with combinedPdf(next_dir), reasoning that both
+	//     sides must evaluate one function at one direction for w_env + w_bsdf to
+	//     equal 1. That reasoning is sound as far as it goes, and it does remove a
+	//     genuine double count -- but it rests on an assumption that is false here:
+	//     that this ray's estimator is density-matched to combinedPdf and merely
+	//     needs the right weight. It is not. Recovery MIRRORS the direction while
+	//     keeping the REJECTED sample's brdf_weight, so the ray is not drawn from
+	//     combinedPdf(next_dir), nor from any density this code knows. No weight
+	//     function turns it into a correct estimator of its share, so the choice is
+	//     empirical rather than principled -- and it is not close:
+	//         sentinel (full weight)      1.42042 vs reference 1.41451  (+0.42%)
+	//         combinedPdf(next_dir)       0.94549 vs reference 1.41451  (-33%)
+	//     The +0.42% IS the double count, and it is real; it is simply two orders of
+	//     magnitude smaller than the loss incurred by "fixing" it. Reverted to the
+	//     sentinel deliberately. The real repair is to make recovery produce a
+	//     density-matched sample, which is Task 1's mechanism to change, not this
+	//     one's.
 	//
-	// and those sum to exactly 1. RT_MIS_PDF_NONE forces w_bsdf = 1 instead, so
-	// wherever env NEE already paid out w_env > 0 for the same direction the sky
-	// gets counted 1 + w_env times. Recovery fires on normal-mapped geometry --
-	// most of a real scene -- so this was not a rare-case rounding matter.
+	//   - combinedPdf() == 0.0. Also full weight, and it is easy to talk yourself
+	//     out of this one: w_bsdf = ph(0, p_env) = 0 supposedly hands the direction
+	//     to env NEE, which takes w_env = ph(p_env, 0) = 1. But that w_env = 1
+	//     multiplies a ZERO ESTIMATOR -- every direction for which combinedPdf
+	//     returns 0 is one where env NEE's own VALUE is zero too (dot(N,L) <= 0 is
+	//     exactly evalCombinedBRDFSeparate's Lbackfacing rejection, and the V ~= -L
+	//     branch is caught by the env-NEE block's dot(N,V) guard). Both strategies
+	//     pay nothing and the throughput is discarded. Nor does the miss stage's
+	//     `e_pdf > 0.0` guard rescue it: env_cdf_build.glsl floors every cell at
+	//     1e-4 * mean, so env_pdf() is strictly positive everywhere a sky exists.
+	//     These directions are reachable -- sampleSpecularMicrofacet CLAMPS NdotL to
+	//     1e-5 rather than rejecting, while evalIndirectCombinedBRDF rejects only
+	//     against the GEOMETRY plane. Measured energy difference on the gate is
+	//     below its noise floor (1.70843 vs 1.70802) because the specular sample
+	//     weight vanishes on the same NdotL -> 0 limit, but the deletion is real and
+	//     the guard is free.
 	//
-	//   - recovered_sample: the pre-image density is genuinely the right answer
-	//     to "how likely was this sampler to produce this ray", but it is the
-	//     WRONG answer here, because env NEE has no way to know a mirroring
-	//     happened and evaluates combinedPdf at the final direction. Feeding the
-	//     pre-image density in would leave w_env + w_bsdf != 1. Evaluating
-	//     combinedPdf(next_dir) on this side too restores the partition. The
-	//     recovery hack's own bias (it reuses the rejected sample's BRDF weight)
-	//     is pre-existing, orthogonal, and untouched by this.
-	//   - combinedPdf() == 0.0 is now stored AS 0.0 and is the correct value:
-	//     w_bsdf = ph(0, p_env) = 0 hands the direction entirely to env NEE,
-	//     which takes w_env = ph(p_env, 0) = 1. Complementary, so no energy is
-	//     lost -- the other strategy collects it. This depends on the miss
-	//     stage's `e_pdf > 0.0` guard; see the note there.
-	//
-	// The delta-specular case keeps RT_MIS_PDF_NONE, and is now genuinely
-	// consistent: env NEE drops its specular VALUE in exactly that regime (see
-	// the env-NEE block above), so the BSDF strategy owns delta lobes outright
-	// and full weight is right.
-	if (brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS) {
+	//   - near-delta specular. Env NEE drops its specular VALUE in exactly that
+	//     regime (see the env-NEE block above), so the BSDF strategy owns delta
+	//     lobes outright. Mirrors Cycles' PATH_RAY_MIS_SKIP.
+	if (recovered_sample || dot(N, V) <= 0.0 ||
+			(brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)) {
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
 	} else {
-		ps.mis_ray_pdf = combinedPdf(N, next_dir, V, brdf_mat);
+		float bsdf_pdf = combinedPdf(N, next_dir, V, brdf_mat);
+		ps.mis_ray_pdf = (bsdf_pdf > 0.0) ? bsdf_pdf : RT_MIS_PDF_NONE;
 	}
 
 	path_pack(payload, ps);
