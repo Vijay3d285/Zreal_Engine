@@ -330,7 +330,16 @@ void main() {
 	float mis_w = 1.0;
 	if (ps.mis_ray_pdf >= 0.0) {
 		float e_pdf = env_pdf(gl_WorldRayDirectionEXT);
-		mis_w = power_heuristic(ps.mis_ray_pdf, e_pdf);
+		// The e_pdf > 0.0 guard is load-bearing, not defensive. Environment NEE
+		// contributes w_env = power_heuristic(0, x) = 0 for any direction it
+		// assigns zero density -- including EVERY direction in a scene with no sky
+		// at all, where marginal_total == 0 makes env_pdf() return 0 outright. This
+		// strategy must therefore take the whole contribution there. Without the
+		// guard, a stored mis_ray_pdf of 0.0 (which shade_and_bounce now writes
+		// verbatim rather than replacing with the RT_MIS_PDF_NONE sentinel) meets
+		// e_pdf == 0.0 and power_heuristic(0, 0) returns 0 for a zero denominator,
+		// silently deleting the sky from those paths.
+		mis_w = (e_pdf > 0.0) ? power_heuristic(ps.mis_ray_pdf, e_pdf) : 1.0;
 	}
 	vec3 sky_contribution = ps.throughput * sky_color * mis_w;
 
