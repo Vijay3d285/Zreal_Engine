@@ -263,6 +263,51 @@ float specular_to_f0(float specular) {
 }
 
 // ============================================================================
+// ENVIRONMENT RADIANCE (must match the miss stage exactly)
+// ============================================================================
+
+/// Sky radiance arriving from a WORLD-space direction, computed exactly the way
+/// the miss stage computes it (scene_raytracing_raygen.glsl, `sky_color` block).
+///
+/// MIS combines two estimators of ONE integral. If this function and the miss
+/// stage disagreed about L_env for the same direction, the two weighted halves
+/// would stop summing to the true contribution and the image would gain or lose
+/// energy with nothing to flag it -- the weights would still sum to 1, they would
+/// just be multiplying different numbers. So every step is mirrored:
+///   - the world -> sky rotation via the shared env_world_to_sky(), NOT a
+///     locally rebuilt matrix;
+///   - vec3_to_oct_with_border() against `radiance_border_size`. `sky->radiance`
+///     is a PADDED octmap; the unbordered vec3_to_oct() misses by up to ~14
+///     degrees near a sun (that is the defect fixed in 5b89e45501 for the CDF
+///     build, and every other octmap consumer in the engine uses the bordered
+///     mapping);
+///   - IBL_exposure_normalization;
+///   - the fog sky-affect mix, which is a pure function of the direction here and
+///     therefore reproduces the miss stage's value identically.
+vec3 env_sky_radiance(vec3 p_world_dir) {
+	vec2 border = vec2(scene_data_block.data.radiance_border_size,
+			1.0 - scene_data_block.data.radiance_border_size * 2.0);
+	vec2 sky_uv = vec3_to_oct_with_border(env_world_to_sky() * p_world_dir, border);
+
+	vec3 sky_color = textureLod(sampler2D(radiance_octmap, radiance_sampler), sky_uv, 0.0).rgb;
+	sky_color *= scene_data_block.data.IBL_exposure_normalization;
+
+	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) != 0u) {
+		vec3 fog_color = scene_data_block.data.fog_light_color;
+
+		if (scene_data_block.data.fog_aerial_perspective > 0.0) {
+			vec3 sky_fog = textureLod(sampler2D(radiance_octmap, radiance_sampler), sky_uv, 1.0).rgb;
+			sky_fog *= scene_data_block.data.IBL_exposure_normalization;
+			fog_color = mix(fog_color, sky_fog, scene_data_block.data.fog_aerial_perspective);
+		}
+
+		sky_color = mix(sky_color, fog_color, scene_data_block.data.fog_sky_affect);
+	}
+
+	return sky_color;
+}
+
+// ============================================================================
 // DEBUG VISUALIZATION
 // ============================================================================
 
@@ -543,6 +588,50 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		vec3 direct_light = lights_evaluate_direct_lighting(
 				hit_pos_offset, N, V, brdf_mat, rng, is_indirect, rt_light_count);
 		ps.radiance += clamp_contribution(ps.throughput * direct_light, clamp_limit);
+	}
+
+	// =================================================================
+	// Environment NEE (roadmap C3), MIS-combined with BSDF sky hits.
+	//
+	// A SEPARATE strategy from the analytic-light reservoir above, which stays
+	// exactly as it was and carries NO MIS weight. Two reasons, both from the
+	// design spec: the reservoir's selection pdf is a stochastic estimate rather
+	// than the exact density MIS requires, and analytic lights are unreachable by
+	// BSDF rays in the first place -- there is no second strategy to share with,
+	// so weighting them down would simply lose that energy.
+	//
+	// Deliberately outside the `rt_light_count > 0` guard above: a scene lit only
+	// by its sky has no analytic lights at all and is precisely the case this
+	// exists for.
+	// =================================================================
+	{
+		vec3 env_dir;
+		float env_pdf_val;
+		// env_sample() returns r_dir in WORLD space already -- it applies
+		// transpose(env_world_to_sky()) internally (Task 3). Rotating it again here
+		// would trace into a direction whose pdf is the one reported for a
+		// different direction, which is exactly the silent MIS bias the env
+		// sampling header warns about.
+		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && dot(env_dir, N) > 0.0) {
+			vec3 env_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
+			if (lights_trace_shadow_ray(env_origin, env_dir, 10000.0)) {
+				// Same fetch the miss stage performs for this direction: bordered
+				// octmap lookup after the shared world -> sky rotation.
+				vec3 sky_rad = env_sky_radiance(env_dir);
+
+				// evalCombinedBRDF returns f * cos(theta). combinedPdf is the
+				// MIXTURE density over both lobes -- the very same function whose
+				// value gets stored in ps.mis_ray_pdf at the bottom of this
+				// function, so the miss stage's weight and this one are two
+				// evaluations of one formula and provably sum to 1.
+				vec3 bsdf_val = evalCombinedBRDF(N, env_dir, V, brdf_mat);
+				float bsdf_pdf_for_dir = combinedPdf(N, env_dir, V, brdf_mat);
+
+				float w = power_heuristic(env_pdf_val, bsdf_pdf_for_dir);
+				vec3 contrib = ps.throughput * bsdf_val * sky_rad * (w / env_pdf_val);
+				ps.radiance += clamp_contribution(contrib, clamp_limit);
+			}
+		}
 	}
 
 	// =================================================================

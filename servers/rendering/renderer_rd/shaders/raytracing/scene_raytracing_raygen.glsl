@@ -315,19 +315,38 @@ void main() {
 	}
 #endif
 
+	// MIS: this ray reached the sky by BSDF sampling. Environment NEE
+	// (shade_and_bounce, raytracing_closest_hit_common_inc.glsl) fires an
+	// independent shadow ray at the sky from every shading point, so without a
+	// weight the same light path would be counted twice. power_heuristic(a, b) and
+	// power_heuristic(b, a) sum to exactly 1, so the two strategies partition this
+	// contribution instead of duplicating it.
+	//
+	// A negative mis_ray_pdf is the RT_MIS_PDF_NONE sentinel, meaning environment
+	// NEE could not have produced this direction at all: a primary camera ray, a
+	// near-delta specular bounce, a below-hemisphere recovered sample, or a
+	// direction combinedPdf() cannot describe. Those take the full contribution --
+	// halving them would lose energy with no other strategy to make it up.
+	float mis_w = 1.0;
+	if (ps.mis_ray_pdf >= 0.0) {
+		float e_pdf = env_pdf(gl_WorldRayDirectionEXT);
+		mis_w = power_heuristic(ps.mis_ray_pdf, e_pdf);
+	}
+	vec3 sky_contribution = ps.throughput * sky_color * mis_w;
+
 #ifdef RT_DEBUG_ENABLED
 	{
 		int VIS_MODE = int(get_rt_param(RT_PARAM_VIS_MODE));
 		if (VIS_MODE == 20) {
 			ps.radiance = vec3(1.0);
 		} else if (VIS_MODE == 0) {
-			ps.radiance += ps.throughput * sky_color;
+			ps.radiance += sky_contribution;
 		} else {
 			ps.radiance = sky_color;
 		}
 	}
 #else
-	ps.radiance += ps.throughput * sky_color;
+	ps.radiance += sky_contribution;
 #endif // RT_DEBUG_ENABLED
 
 	path_pack(payload, ps);

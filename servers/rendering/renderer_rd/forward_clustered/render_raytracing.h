@@ -404,6 +404,19 @@ class RenderRaytracing {
 	// worth sharing. Rebuilt when the bound radiance texture changes.
 	EnvCDF env_cdf;
 
+	// Stand-in bound at set 0 binding 34 when `env_cdf` has no buffer yet.
+	// MeshStorage's shared default storage buffer is created WITHOUT initial data
+	// (mesh_storage.cpp), so its bytes are undefined -- and the GLSL EnvDistRO
+	// block's second float is `marginal_total`, the single value both env_sample()
+	// and env_pdf_from_uv() gate on. A garbage-positive pattern there would let the
+	// shader binary-search `data[]` past the end of a 16-byte buffer. This one is
+	// zero-filled at creation, so `marginal_total == 0.0` and both entry points
+	// return before touching `data[]`. 16 bytes is deliberately the minimum the RD
+	// backend will allocate, not FLOAT_COUNT floats: the shader never reads past
+	// the two scalars when the gate fails.
+	RID env_dist_fallback_buffer;
+	RID _get_env_dist_fallback_buffer();
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.

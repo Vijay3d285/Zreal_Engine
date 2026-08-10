@@ -75,6 +75,11 @@ RenderRaytracing::~RenderRaytracing() {
 		mat_ubo_pool_buffer = RID();
 	}
 
+	if (env_dist_fallback_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(env_dist_fallback_buffer);
+		env_dist_fallback_buffer = RID();
+	}
+
 	if (bindless_block) {
 		memdelete(bindless_block);
 		bindless_block = nullptr;
@@ -85,6 +90,19 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
+}
+
+RID RenderRaytracing::_get_env_dist_fallback_buffer() {
+	if (env_dist_fallback_buffer.is_valid()) {
+		return env_dist_fallback_buffer;
+	}
+	// Explicit zeros: `floor_value` and, crucially, `marginal_total`. Both GLSL
+	// entry points (env_sample / env_pdf_from_uv) return early on
+	// `marginal_total <= 0.0`, so a zeroed pair is sufficient to make this buffer
+	// safe to bind without matching EnvCDF's real size or layout.
+	const uint8_t zeros[16] = {};
+	env_dist_fallback_buffer = RD::get_singleton()->storage_buffer_create(sizeof(zeros), Span<uint8_t>(zeros, sizeof(zeros)));
+	return env_dist_fallback_buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -3424,16 +3442,19 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			// Unreachable today: env_cdf.update() (binding-7 block above, same
 			// function) allocates and zero-fills its buffer unconditionally on
 			// first use, so is_valid() is already true by this point every frame.
-			// The fallback buffer is 16 UNINITIALISED bytes (mesh_storage.cpp,
-			// storage_buffer_create with no initial data) -- if it were ever bound
-			// here, a garbage-positive `marginal_total` read from those bytes would
-			// let the GLSL EnvDistRO SSBO (raytracing_env_sampling_inc.glsl)
-			// binary-search and index `data[]` far past this buffer's end. Keep the
-			// fallback so the uniform set still builds, but DEV_ASSERT so a future
-			// reordering that breaks the "update() always ran first" invariant is
-			// caught immediately instead of silently reading out of bounds.
+			// Keep the DEV_ASSERT so a future reordering that breaks the "update()
+			// always ran first" invariant is caught immediately in a dev build.
+			//
+			// The fallback is an OWNED, ZERO-FILLED buffer rather than MeshStorage's
+			// shared default: that one is created with no initial data
+			// (mesh_storage.cpp), so a garbage-positive `marginal_total` read from
+			// its undefined bytes would let the GLSL EnvDistRO SSBO
+			// (raytracing_env_sampling_inc.glsl) binary-search and index `data[]`
+			// far past a 16-byte buffer's end. DEV_ASSERT compiles to nothing in a
+			// production build, so the guard has to be in the data, not just the
+			// assert.
 			DEV_ASSERT(false && "EnvCDF buffer should already be valid here; update() runs unconditionally above.");
-			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+			u.append_id(_get_env_dist_fallback_buffer());
 		}
 		uniforms.push_back(u);
 	}
