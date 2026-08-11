@@ -431,6 +431,12 @@ func setup_lighting(data, geom_data = {}):
 		dir_light.directional_shadow_max_distance = 120.0
 	dir_light.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
 	dir_light.directional_shadow_blend_splits = true
+	# LOAD-BEARING as of Phase B's environment-NEE: Godot's default sky_mode is
+	# SKY_MODE_LIGHT_AND_SKY, which draws this light's disc into the sky texture. That
+	# disc would then be both NEE-sampled analytically AND importance-sampled by
+	# env_sample(), double-counting the scene's brightest emitter -- previously buried
+	# in noise, now the one feature the environment CDF concentrates on. Do not change
+	# this to SKY_MODE_LIGHT_AND_SKY without emissive/analytic reconciliation (roadmap C1).
 	dir_light.sky_mode = DirectionalLight3D.SKY_MODE_LIGHT_ONLY
 
 	# CRITICAL: add_child BEFORE look_at
@@ -800,7 +806,7 @@ func setup_lighting(data, geom_data = {}):
 	#
 	# The practical consequence for this script: DO NOT ADD A FILL LIGHT to
 	# compensate for sky noise. Measured on a sky-lit scene with real occluders,
-	# RMSE at matched sample counts fell 6.6x-9.5x (5.3x-6.9x once the extra
+	# RMSE at matched sample counts fell 6.6x-9.5x (4.8x-6.9x once the extra
 	# shadow ray's frame-time cost is priced in), so the grain that a fill light
 	# used to paper over is largely gone. Adding one now just flattens the
 	# lighting and costs frames.
@@ -895,6 +901,14 @@ func setup_lighting(data, geom_data = {}):
 	#   ZR_PT_CLAMP_INDIRECT firefly clamp, 0 = off     (default 0; Blender's is 10)
 	#   ZR_PT_NOISE_THRESH   adaptive sampling, 0 = off (default 0 for a pure reference)
 	#   ZR_PT_FINAL          "oidn" | "dlssrr" | "none" (default "oidn")
+	#
+	# KNOWN OPEN ITEM if CLAMP_INDIRECT is enabled: it only clamps the environment-NEE
+	# half of a sky hit (raytracing_closest_hit_common_inc.glsl clamp_contribution on the
+	# env_sample() contribution); the BSDF/miss half that reaches the sky is added raw
+	# (scene_raytracing_raygen.glsl sky_contribution). The two MIS strategies then
+	# estimate different integrands, so the sky darkens where the env-NEE weight is high
+	# while BSDF-sampled sun fireflies pass through unclamped. This is inert at the
+	# default (clamp is 0 = off); it is not intended behaviour, just not yet fixed.
 	var phase_a_offline := PHASE_A_OFFLINE_STILL or OS.get_environment("ZR_PHASE_A") == "1"
 
 	if phase_a_offline:

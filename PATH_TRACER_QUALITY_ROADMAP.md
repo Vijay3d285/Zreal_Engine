@@ -464,6 +464,19 @@ is shared with analytic-light NEE, so it changes analytic-light shading engine-w
 - The energy gates (`pipeline_references/tests/pt_energy_gate.gd`) assert
   energy-neutrality **against the current renderer**, never physical correctness.
   There is still no Cycles reference EXR in this project.
+- **`SKY_MODE_LIGHT_AND_SKY` double-counts an analytic light against environment
+  NEE.** Every measurement in this phase used a scene with zero analytic lights,
+  so none of them exercised a light that is both NEE-sampled and drawn into the
+  sky texture. Godot's default `sky_mode` is `SKY_MODE_LIGHT_AND_SKY`, which
+  draws a `DirectionalLight3D`'s disc into the sky; that disc is then both
+  NEE-sampled analytically and importance-sampled by `env_sample()` —
+  double-counting the brightest emitter in the scene. Pre-existing in the
+  converged mean (BSDF rays already hit that disc), but previously buried in
+  noise; the environment CDF now concentrates samples on it, so it converges
+  quickly to the doubled value. `SKY_MODE_LIGHT_AND_SKY` is therefore
+  unsupported alongside environment NEE until emissive/analytic reconciliation
+  lands (C1); `pipeline_references/image_glb_creation.gd` works around this by
+  setting `SKY_MODE_LIGHT_ONLY` on its sun.
 
 ### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)*
 
