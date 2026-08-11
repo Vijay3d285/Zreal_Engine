@@ -303,9 +303,111 @@ noticeably more indirect bounces (and a proportionally higher per-frame render c
 than before. `doc/classes/Environment.xml` previously still documented `default="3"`
 and did not mention it; both are corrected as of this fix wave.
 
-**B4. Russian Roulette** — *Gap #8*
-After the throughput update at `closest_hit_common:578`, once `total_bounces > min_bounce`: `p = min(sqrt(max_component(throughput)), 1.0)`; terminate on `rand() > p`, else `throughput /= p`. Match the `sqrt` — see §3.5.
-*Accept:* render time per frame drops in deep-bounce scenes with no measurable bias (mean of 2000 accumulated frames matches the pre-RR mean within noise).
+**B4. Russian Roulette** — *Gap #8* — **DONE**
+In `raytracing_closest_hit_common_inc.glsl`, immediately after the bounce
+counters are incremented: once `get_total_bounces() > min_bounce`,
+`p = min(sqrt(max(max(abs(t.r), abs(t.g)), abs(t.b))), 1.0)`; terminate on
+`rng_1d(rng, RT_PRNG_TERMINATE) >= p`, else `throughput /= p`. The `sqrt` and the
+max-component reduction match Cycles (`path_state.h:296-305`) — see §3.5. The
+`>=` comparison sense is the correct one because `rng_1d`'s divisor is `2^32+512`,
+so its result is strictly below 1.0; with a `2^32` divisor a `p == 1` path could
+be killed uncompensated.
+
+*Measured — `pipeline_references/tests/pt_sky_rmse_scene.tscn` (sky-lit
+courtyard, slatted canopy, spheres), 256×256, `max_bounces = 6`, clamps and
+adaptive sampling off, denoisers off.* Baseline is the **same build** with the
+project setting raised to `16`, which disables the roulette without touching the
+shader (`RT_GET_MAX_BOUNCES()` is structurally capped at 16 and the bounce-cap
+early-out fires on the pre-increment count, so `rr_depth > 16` is unreachable).
+Three invocations per configuration, interleaved.
+
+**Bias — none detected.** Converged mean radiance over **2048 accumulated
+frames** (full-image mean of R, G, B):
+
+| roulette | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| off (`min_bounce=16`) | 0.124735 | 0.124733 | 0.124728 | **0.1247320** |
+| on (`min_bounce=3`)   | 0.124736 | 0.124736 | 0.124728 | **0.1247333** |
+
+Shift **+1.3e-6, i.e. +0.0011%**, judged against a **measured** radiance noise
+band of **±0.0064%** (widest within-configuration spread over three repeats,
+8e-6 on a 0.12473 mean; 1 sd ≈ 0.003%). The shift is 0.4 standard errors — below
+the resolution of the measurement. The band was established by repeated runs
+here, not inherited; it is ~5× tighter than the ~0.03% figure quoted earlier in
+this phase because that one came from shorter runs and a stride-sampled probe.
+A bias smaller than ~0.006% is not ruled out.
+
+**Frame time — 16.1% faster, on means.** 512 accumulated frames per pass, 3
+passes × 3 invocations = 9 passes per configuration:
+
+| roulette | mean ± sd (n=9) | median | range |
+|---|---|---|---|
+| off | **1.2788 ± 0.0370 ms/frame** | 1.2658 | 1.2330 – 1.3433 |
+| on  | **1.0733 ± 0.0210 ms/frame** | 1.0663 | 1.0413 – 1.1086 |
+
+16.1% reduction on means (15.8% on medians). The groups are fully disjoint — the
+slowest roulette-on pass beats the fastest roulette-off pass. **Mean/median with
+spread is quoted deliberately: "best of N" is an extreme order statistic and is
+not a defensible performance statistic.** Note also that the frame-time noise
+floor on this harness is **~4–6% between invocations**, not the ~1.4%
+within-invocation spread quoted mid-phase; the 16.1% delta clears it, but future
+single-invocation timing comparisons should use the larger figure.
+
+**Equal-time RMSE — 6% to 8% better.** RMSE at matched sample counts, every run
+cross-scored against one common 8192-frame roulette-off reference:
+
+| frames | off (mean of 3) | on (mean of 3) | matched-sample ratio | equal-time ratio |
+|---|---|---|---|---|
+| 64  | 0.013428 | 0.013756 | 1.0244 | **0.9385** (6.1% lower) |
+| 256 | 0.006111 | 0.006134 | 1.0038 | **0.9196** (8.0% lower) |
+
+Equal-time ratio is the matched-sample ratio divided by `sqrt(time_ratio)`, with
+`time_ratio = 1.1914` (means), as in the B2 measurement. The matched-sample
+ratios are inside their own run-to-run noise (sd is 2–6% of the value), so the
+honest reading is that the roulette adds **no measurable variance** at matched
+sample count in this scene — an upper bound of roughly ±5%, not a demonstration
+of exact equality. Deeper transport, or a lower `min_bounce`, would be expected
+to show a real variance increase; that regime is not covered here. Separately,
+the `RMSE ∝ N^-0.5` law this conversion assumes does not hold exactly on this
+scene (the measured exponent is 0.568, the error being partly tail-dominated);
+using the empirical exponent would give 9.1% rather than 8.0% at 256 frames, so
+the prescribed `sqrt` form is the conservative one.
+
+**Exposure is a project setting, not an `Environment` property.**
+`rendering/pathtracer/russian_roulette_min_bounce` (`PROPERTY_HINT_RANGE`
+"0,16,1", default 3), read in `scene_shader_raytracing.cpp` and packed into the
+raytracing specialization word at bits 4-8 with a `+1` bias so a stored 0 means
+"unset". **It is therefore global rather than per-`Environment`.** The reason is
+mechanical, not a design preference: `compute_rt_flags` reads only
+`pathtracing_params[16]`, and B3 already allocated slots 0-15 in full (see the
+B3 entry's "Deferred on purpose" note), so there was no transport channel from an
+`Environment` property down to the shader without resizing the params UBO. The
+project setting is the same mechanism already used five lines away in the same
+function. See the design spec's §3.1a. Making this per-`Environment` requires the
+UBO resize B3 flagged.
+
+**Compatibility note — this is on by default for every existing project.** The
+default is 3, so any project that never touches the setting now gets Russian
+Roulette: renders get faster and marginally noisier at equal sample count with
+nobody opting in. This is the same class of silent behavior change as
+`pathtracing_max_bounces`'s default moving 3 → 8 in B3, documented in that entry.
+Converged output is unaffected (see the bias figure above); what changes is the
+speed/noise tradeoff at any fixed sample count.
+
+**To disable it, set `min_bounce >= max_bounces`** — the guard is
+`rr_depth > min_bounce` and `rr_depth` can never exceed the bounce cap, so the
+roulette never fires. Setting it to 16 disables it unconditionally, which is
+exactly how the baseline above was taken.
+
+**Caveat on the performance figure: the two configurations ran separately
+specialized pipelines.** `min_bounce` lives in `RT_FLAGS`, which is bound as
+`constant_id = 0`, so changing it recompiles the raygen pipeline and different
+register allocation is possible in principle, independent of any algorithmic
+difference. A 16% delta dwarfs anything plausible from that source, but the
+pipelines were not identical and the figure should not be read as if they were.
+
+**Scope.** One scene, one resolution, one bounce budget, one GPU. The scene was
+not tuned after any number was seen.
 
 **B5. Owen-scrambled Sobol / blue-noise sampler** — *Gap #6* — **DONE**
 Sobol-Burley with per-pixel Owen scrambling, dimension-indexed draws
@@ -538,9 +640,18 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
-Ordering summary: **A1 → A2/A3/A4 → B4 (B1, B2, B3, B5 done) → C1 → C2 (C3 done) → D → E → F.**
+Ordering summary: **A1 → A2/A3/A4 → C1 → C2 (Phase B complete; C3 done) → D → E → F.**
 
-Remaining in **Phase B: B4** (Russian Roulette) only.
+**Phase B is complete** — B1, B2, B3, B4 and B5 have all landed. "Complete" here
+means every listed item is implemented and measured; it does **not** mean Phase B
+is free of known defects. The open items recorded in this document stand
+unchanged and none of them is resolved by B4: the **+2.4% converged-mean shift on
+dielectric specular surfaces** from B2's `COMBINE_BRDFS_WITH_FRESNEL` integrand
+mismatch, the **asymmetric firefly clamping** across the MIS partition, the
+**untested zero-pdf sentinel**, and the fact that **the doctest binary never
+executes the GLSL** — the shader-side tests mirror the shader in C++ rather than
+running it.
+
 Remaining in **Phase C: C1** (emissive-mesh light sampling) and **C2**
 (power-weighted light selection). **C1 is the gate on extending MIS weights
 beyond the environment** — until emissive meshes are NEE-sampleable and analytic
