@@ -56,7 +56,7 @@ Grid is `N_U = 256` (azimuth) × `N_V = 128` (polar). All floats, one SSBO:
 [.. +N_V-1]                  marginal_prefix inclusive prefix of rowsum_adj
 ```
 
-Total `2 + 128*256 + 128 + 128 = 32898` floats ≈ 132 KB.
+Total `2 + 128*256 + 128 + 128 = 33026` floats ≈ 132 KB.
 
 **Why prefix sums of the *raw* f, with the floor applied arithmetically:** the floor is defined relative to the grid mean, which is not known until every cell has been summed. Storing raw prefixes lets the floor be folded in at lookup time — `adjusted_prefix(y,x) = prefix_raw[y][x] + (x+1)*floor` — so the build needs two dispatches instead of four, and no cell is ever rebuilt.
 

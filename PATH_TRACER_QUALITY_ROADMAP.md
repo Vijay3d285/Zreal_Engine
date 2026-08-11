@@ -238,13 +238,50 @@ Per-pixel variance in the spare `rt_accum_n` channels; stop sampling converged p
 
 ### Phase B — Integrator correctness *(~2 weeks)*
 
-**B1. Widen the payload: fp32 + `mis_ray_pdf`** — *Gaps #14, prerequisite for B2*
-One struct change: fp32 radiance/throughput plus a `mis_ray_pdf` float. Profile RT-core occupancy; if it regresses badly, keep radiance fp16 but carry throughput and pdf at fp32.
-*Accept:* a sun-at-1000× test no longer bands in specular tails; frame time regression stays within budget.
+**B1. Widen the payload: fp32 + `mis_ray_pdf`** — *Gaps #14, prerequisite for B2* — **DONE**
+`PathPayload` went from three fp16-packed `uint`s to fp32 radiance/throughput plus
+a `mis_ray_pdf` float: **32 → 48 bytes nominal**. `maxPipelineRayPayloadSize` is
+unset in `drivers/vulkan/`, so no host-side constant tracks the size.
+**Measured cost of the widening alone: +3.4%** wall clock (98.99 s → 102.38 s on a
+1872-frame validation render), a single A/B pair — a real,
+reproducible-direction increase that one pair cannot statistically separate from
+run noise. It is a small fraction of the B2 shadow-ray cost below.
+`mis_ray_pdf` carries a negative sentinel `RT_MIS_PDF_NONE` for directions the
+BSDF strategy must own outright (camera ray, delta specular lobes, `combinedPdf`
+zero, backfacing V). **The sentinel has no test coverage** and stands on an
+argument, not a number: the specular sample weight (`G2/G1`) vanishes on the same
+`NdotL → 0` limit that zeroes the pdf, so the affected rays carry almost no
+throughput. Attempts to make it measurable on the rough-metal and normal-mapped
+gate surfaces moved them by 0.002% and 0.01% — noise.
 
-**B2. Multiple Importance Sampling** — *Gap #2*
-Both sides, power heuristic, mirroring `light/sample.h:344` and `:469`. Weight the NEE estimate by `power_heuristic(light_pdf, bsdf_pdf)`; store the BSDF pdf on the payload and weight emissive hits by `power_heuristic(bsdf_pdf, light_pdf)`.
-*Accept:* a small bright area light reflected in a glossy floor — specular highlight variance drops sharply, no over-bright ring near the light. Compare to a Cycles EXR of the same setup.
+**B2. Multiple Importance Sampling** — *Gap #2* — **DONE for the environment only**
+Power heuristic on both sides: environment NEE is weighted by
+`power_heuristic(env_pdf, combinedPdf)` at the shading point, and the miss stage
+weights BSDF sky hits by `power_heuristic(mis_ray_pdf, env_pdf)`.
+
+**MIS weights must stay OFF for analytic lights and emissive meshes until C1
+lands.** MIS is only valid where two strategies can both reach the same
+direction. Analytic lights are unreachable by BSDF rays (they are delta or
+implicit geometry the ray never hits), and emissive meshes are unreachable by
+NEE (nothing samples them yet). Weighting either one down would multiply a real
+contribution by `w < 1` with no second strategy to supply the complement, i.e.
+delete energy. The analytic-light NEE path is therefore byte-for-byte untouched
+and carries no MIS weight; its reservoir selection pdf is a stochastic estimate
+rather than the exact density MIS requires, which is a second reason.
+
+*Measured (sky-lit courtyard, sky-only lighting, `pipeline_references/tests/pt_sky_rmse_scene.tscn`):*
+RMSE against a high-sample reference, environment NEE off vs on, at matched
+sample counts — **6.6× to 9.5× lower with NEE at every sample count from 16 to
+16384**, and 8.9× on a control build that isolates the Fresnel defect below.
+Frame time cost is real: **+90% at 256×256, +144% at 512×512** (3.1× per-pixel
+shading cost) because every shading vertex now fires one extra shadow ray, and
+this scene's baseline fired none. **Equal-time, the advantage is 5.3× to 6.9×** —
+still far above the ≥2× C3 bar.
+
+*Open, and the reason this is not an unqualified success:* **the converged mean
+moved +2.4% on dielectric specular surfaces.** MIS must redistribute variance,
+not energy. The cause is isolated and confirmed by controlled experiment, not
+suspected — see the C3 entry below.
 
 **B3. Per-type bounce controls** — *Gap #4* — **DONE**
 `MAX_DIFFUSE_BOUNCES 2u` is gone. Diffuse and glossy counters now live in
@@ -356,9 +393,75 @@ Build an emissive-triangle buffer alongside `gather_lights` in `render_raytracin
 Replace uniform reservoir candidate selection with importance proportional to `energy / distance²` × angular falloff, following `light_tree_node_importance` (`tree.h:304`). A flat power-weighted CDF captures most of the benefit; the full tree is optional.
 *Accept:* one bright key among 40 dim fills converges at several× the current rate.
 
-**C3. Environment importance sampling** — *Gap #11*
-Build marginal + conditional CDFs over the sky octmap on environment update (`background.h:29` `background_map_sample`, `:118` `background_map_pdf`). Sample the env for NEE; MIS against the BSDF sky bounce.
-*Accept:* a sunset-HDRI window reflection converges at ≥2× the uniform-sampling rate.
+**C3. Environment importance sampling** — *Gap #11* — **DONE, with one open defect**
+Marginal + conditional CDFs are built over the sky octmap by a compute pass
+(`shaders/raytracing/env_cdf_build.glsl`, `storage_rd/env_cdf.h`), rebuilt on a
+(radiance RID, sky-state version) token rather than the RID alone — the RID is
+stable and the octmap is still empty the first frame the raytracer resolves it,
+so an RID trigger builds one all-zero distribution and never revisits.
+`env_sample` / `env_pdf` live in `raytracing_env_sampling_inc.glsl`; the sampler
+remaps continuously *within* a cell (pbrt/Cycles style), because returning cell
+centres makes the estimator a fixed 256×128 Riemann quadrature whose error does
+not shrink with more samples. MIS-combined against the BSDF sky bounce as in B2.
+
+*Accept criterion (≥2× on a sunset-HDRI-style reflection): **met, by 6.6-9.5×
+on samples and 5.3-6.9× equal-time.*** Full numbers and method in
+`.superpowers/sdd/2026-08-09-sky-nee-and-mis/task-5-report.md`.
+
+> **MEASUREMENT CAVEAT — do not reuse `pt_validation_scene.tscn` for this.**
+> `run_pt_validation.gd:186` sets `BG_COLOR` and assigns no `Sky`, so the
+> radiance texture falls back to black, every CDF cell has luminance 0,
+> `marginal_total == 0`, and `env_sample()` returns false on its first branch.
+> Environment NEE is **inert** in that scene by construction and any before/after
+> figure taken there means nothing. Use `pt_sky_rmse_scene.tscn`.
+
+**OPEN: +2.4% converged-mean shift on dielectric specular surfaces.**
+A fully converged render (65536 frames) is 2.38% brighter with environment NEE
+than without it. Pinned to `COMBINE_BRDFS_WITH_FRESNEL` (`brdf_inc.glsl:158`,
+value 1): the sampler attenuates the diffuse lobe by `1 - F(V·H_random)` with
+`H_random` drawn from VNDF **independently of L** (`:1211-1215`), while
+`evalCombinedBRDFSeparate` attenuates by `1 - F(L·H(L,V))` with the deterministic
+half-vector (`:1182-1185`). Different functions of L, so the two MIS strategies
+estimate different integrands — structurally the same defect as the multi-scatter
+asymmetry already fixed during this phase, one level down. Confirmed by building
+with the macro at 0: the shift collapses from **+2.38% to -0.007%** on the scene
+and from +0.90%/+2.30% to -0.06%/-0.002% on the gate's rough-dielectric sphere.
+A pure-Lambertian control (specular lobe killed) agrees to 0.003% either way.
+Pre-existing — invisible with a single strategy, because `f/p` cancels whatever
+the attenuation is — but MIS is what puts the two on opposite sides of a weight
+that must sum to 1. **The repair is not local to the env-NEE site:** the two
+attenuations must be made the same function of L, and `evalCombinedBRDFSeparate`
+is shared with analytic-light NEE, so it changes analytic-light shading engine-wide.
+
+*Other known-open items carried out of this phase:*
+- **Residual +0.42% double count on recovered (normal-mapped) samples**,
+  deliberately accepted: the measured alternative remedy cost −33.1%. Note the
+  recovery-off control revised this — only about a third of the residual is the
+  recovery double count; **+0.28% survives with recovery compiled out**, so
+  something else on normal-mapped geometry also fails to partition exactly. The
+  real repair belongs to the recovery mechanism (F1), not to MIS.
+- **Firefly clamping is asymmetric across the MIS partition**: environment NEE
+  passes through `clamp_contribution`
+  (`raytracing_closest_hit_common_inc.glsl:690`), the miss half is not clamped
+  there. Invisible today only because clamping defaults to disabled.
+- **Analytic-light NEE uses uncompensated `f_spec`** while indirect bounces get
+  `ms·f_spec`, so one surface is shaded by two different specular integrands
+  depending on light type. Pre-existing, not an MIS bug.
+- **Indoors, many environment samples are occluded by walls.** The distribution
+  is over the sky, not over what is visible from the shading point, so a large
+  fraction of NEE rays are traced and thrown away. **Portal sampling** is the
+  technique that addresses this; it is not implemented.
+- Half of every environment sample is discarded by `dot(env_dir, N) > 0` because
+  the distribution covers the whole sphere (Cycles does the same), and the shadow
+  ray is traced *before* `bsdf_val` is known, so shading points with a
+  provably-zero BRDF value still pay for one. Both are frame-time recoveries, not
+  correctness issues.
+- **The test binary never executes the GLSL.** Every "CPU mirror" test in this
+  project would still pass if the shader were reverted and the mirror left
+  untouched. All shader-level evidence for this phase is from rendered images.
+- The energy gates (`pipeline_references/tests/pt_energy_gate.gd`) assert
+  energy-neutrality **against the current renderer**, never physical correctness.
+  There is still no Cycles reference EXR in this project.
 
 ### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)*
 
@@ -420,4 +523,11 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
-Ordering summary: **A1 → A2/A3/A4 → B1 → B2 → B4 (B3, B5 done) → C → D → E → F.**
+Ordering summary: **A1 → A2/A3/A4 → B4 (B1, B2, B3, B5 done) → C1 → C2 (C3 done) → D → E → F.**
+
+Remaining in **Phase B: B4** (Russian Roulette) only.
+Remaining in **Phase C: C1** (emissive-mesh light sampling) and **C2**
+(power-weighted light selection). **C1 is the gate on extending MIS weights
+beyond the environment** — until emissive meshes are NEE-sampleable and analytic
+lights are BSDF-reachable, weighting either one is energy deletion, not variance
+reduction.

@@ -64,6 +64,17 @@ extends "res://tests/pt_validation.gd"
 ##             becomes common. This is the ONLY surface here that reacts to the
 ##             recovery / backfacing-V policies: it moved 1.415 -> 0.836 (-41%)
 ##             when they were mishandled.
+##   plastic - a rough DIELECTRIC sphere (roughness 0.4, metallic 0). Every other
+##             surface here is either metallic = 1, which makes pSpec = 1 and kills
+##             the diffuse lobe outright, or near-Lambertian, which leaves the
+##             specular lobe carrying almost nothing. Neither exercises the regime
+##             where pSpec is strictly between 0 and 1 and BOTH lobes carry real
+##             energy -- which is where the lobe-selection split in combinedPdf()
+##             has to agree with the one in shade_and_bounce(), and where the open
+##             COMBINE_BRDFS_WITH_FRESNEL integrand mismatch (the sampler
+##             attenuates diffuse by 1 - F(V.H_random) with H_random drawn from
+##             VNDF independently of L; evalCombinedBRDFSeparate attenuates by
+##             1 - F(L.H(L,V))) could first become visible.
 ##   diffuse - the Lambertian plane again, as a control: it must NOT move.
 ##
 ## A SPHERE rather than a flat smooth plane is deliberate. `env_world_to_sky()`
@@ -93,6 +104,36 @@ const REF_DIFFUSE := 0.37311
 const REF_ROUGH := 1.70870 # full disc
 const REF_ROUGH_RIM := 1.22400 # silhouette annulus
 const REF_BUMPY := 1.41451 # normal-mapped rough metal
+# Rough DIELECTRIC (roughness 0.4, metallic 0), added in Task 5.
+#
+# THIS SURFACE IS THE ONE EXCEPTION TO "reference == BSDF-only build". Every
+# other REF_* above is captured from the pre-MIS build, so the gate asserts
+# energy neutrality. On the rough dielectric the two builds genuinely DO NOT
+# agree, and the cause was isolated by a controlled experiment (Task 5):
+#
+#   COMBINE_BRDFS_WITH_FRESNEL (brdf_inc.glsl:158)   disc      silhouette rim
+#     = 1 (shipped)   BSDF-only  0.46667 / 0.41831
+#                     with MIS   0.47089 / 0.42792   +0.91%    +2.30%
+#     = 0 (control)   BSDF-only  0.48868 / 0.44464
+#                     with MIS   0.48837 / 0.44463   -0.06%    -0.002%
+#
+# Turning the macro off collapses the deviation to noise, so the whole of it is
+# the known integrand mismatch: the sampler attenuates the diffuse lobe by
+# 1 - F(V.H_random) with H_random drawn from VNDF INDEPENDENTLY of L
+# (brdf_inc.glsl:1211-1215), while evalCombinedBRDFSeparate attenuates by
+# 1 - F(L.H(L,V)) with the deterministic half-vector (:1182-1185). Different
+# functions of L, so the two MIS strategies estimate different integrands. It is
+# an OPEN defect, not fixed by this phase; it needs the two attenuations made
+# identical, which changes the analytic-light path too.
+#
+# So REF_PLASTIC is captured from the CURRENT build and guards against drift
+# from today's state. REF_PLASTIC_BSDF_ONLY is printed alongside so the size of
+# the open defect stays visible instead of being absorbed into a tolerance.
+# Run-to-run spread on this surface is ~0.03%.
+const REF_PLASTIC := 0.47089
+const REF_PLASTIC_RIM := 0.42792
+const REF_PLASTIC_BSDF_ONLY := 0.46667
+const REF_PLASTIC_RIM_BSDF_ONLY := 0.41831
 const REF_TOLERANCE := 0.02 # 2 percent; gate 2 is a stochastic comparison.
 
 var _plane: MeshInstance3D
@@ -255,6 +296,23 @@ func _gate_directional(p_frames: int) -> void:
 	var bumpy := _measure_disc(b_img, 0.45)
 	print("  [bumpy  ] normal-mapped mean : %.5f" % bumpy["mean"])
 
+	# Plastic pass: rough DIELECTRIC. The only surface here with pSpec strictly
+	# between 0 and 1, i.e. where the stochastic lobe choice in shade_and_bounce
+	# and the mixture density in combinedPdf must agree term for term, and where
+	# both lobes carry energy that MIS has to split correctly.
+	_sphere.material_override = _plastic_material()
+	for _i in range(4):
+		await get_tree().process_frame
+	var p_img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), p_frames)
+	_sphere.material_override = _smooth_material()
+	if p_img == null:
+		_failures.append("gate 2: accumulator readback returned null (plastic pass)")
+		return
+	var plastic := _measure_disc(p_img, 0.45)
+	var plastic_rim := _measure_annulus(p_img, 0.34, 0.45)
+	print("  [plastic] rough dielectric   : %.5f   (silhouette annulus %.5f)"
+			% [plastic["mean"], plastic_rim["mean"]])
+
 	# Diffuse pass: the Lambertian plane, as a control.
 	_sphere.visible = false
 	_plane.visible = true
@@ -282,6 +340,26 @@ func _gate_directional(p_frames: int) -> void:
 		if b_err > REF_TOLERANCE:
 			_failures.append("gate 2 bumpy: %.5f vs reference %.5f, ratio %.4f. This surface is the recovery / backfacing-V probe."
 					% [bumpy["mean"], REF_BUMPY, bumpy["mean"] / REF_BUMPY])
+
+	if REF_PLASTIC > 0.0:
+		var p_err: float = absf(plastic["mean"] - REF_PLASTIC) / REF_PLASTIC
+		var pr_err: float = absf(plastic_rim["mean"] - REF_PLASTIC_RIM) / REF_PLASTIC_RIM
+		print("  plastic vs reference %.5f : ratio %.4f  (%.2f%% off)" % [REF_PLASTIC, plastic["mean"] / REF_PLASTIC, p_err * 100.0])
+		print("  plas.rim vs reference %.5f: ratio %.4f  (%.2f%% off)" % [REF_PLASTIC_RIM, plastic_rim["mean"] / REF_PLASTIC_RIM, pr_err * 100.0])
+		print("  KNOWN OPEN DEFECT: this surface sits %+.2f%% (disc) / %+.2f%% (rim) above the"
+				% [(REF_PLASTIC / REF_PLASTIC_BSDF_ONLY - 1.0) * 100.0,
+				(REF_PLASTIC_RIM / REF_PLASTIC_RIM_BSDF_ONLY - 1.0) * 100.0])
+		print("    BSDF-only build (%.5f / %.5f) because of the COMBINE_BRDFS_WITH_FRESNEL"
+				% [REF_PLASTIC_BSDF_ONLY, REF_PLASTIC_RIM_BSDF_ONLY])
+		print("    integrand mismatch. See the REF_PLASTIC comment block.")
+		if p_err > REF_TOLERANCE:
+			_failures.append("gate 2 plastic: %.5f vs reference %.5f, ratio %.4f. This is the only surface with pSpec strictly between 0 and 1 (both BRDF lobes live)."
+					% [plastic["mean"], REF_PLASTIC, plastic["mean"] / REF_PLASTIC])
+		if pr_err > REF_TOLERANCE:
+			_failures.append("gate 2 plastic rim: %.5f vs reference %.5f, ratio %.4f (grazing band, where the two diffuse-Fresnel attenuations differ most)."
+					% [plastic_rim["mean"], REF_PLASTIC_RIM, plastic_rim["mean"] / REF_PLASTIC_RIM])
+	else:
+		print("  (no plastic reference captured yet - record REF_PLASTIC)")
 
 	if REF_ROUGH > 0.0:
 		var r_err: float = absf(rough["mean"] - REF_ROUGH) / REF_ROUGH
@@ -549,6 +627,19 @@ func _bumpy_material() -> StandardMaterial3D:
 	m.normal_enabled = true
 	m.normal_scale = 1.0
 	m.normal_texture = _bump_normal_map()
+	return m
+
+
+## A rough DIELECTRIC: metallic 0 with the engine default specular 0.5, so
+## F0 = 0.16 * 0.5^2 = 0.04 and diffuseReflectance = albedo. Roughness 0.4 keeps
+## the specular lobe broad enough to be reachable by environment sampling while
+## the diffuse lobe still carries most of the energy, which is what puts pSpec
+## strictly between 0 and 1 -- unlike every other surface in this gate.
+func _plastic_material() -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = Color(0.5, 0.5, 0.5)
+	m.metallic = 0.0
+	m.roughness = 0.4
 	return m
 
 

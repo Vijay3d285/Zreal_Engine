@@ -793,6 +793,30 @@ func setup_lighting(data, geom_data = {}):
 	#   PT_DENOISER_NONE = 0
 	#   PT_DENOISER_DLSS_RAY_RECONSTRUCTION = 1
 	env.set_pathtracing_enabled(true)
+	# SKY LIGHTING IS NOW IMPORTANCE-SAMPLED (roadmap C3 / Phase B). There is no
+	# knob for it and none is wanted: the integrator builds a CDF over the sky
+	# octmap whenever an Environment with a Sky exists, samples it for next-event
+	# estimation, and MIS-combines that against BSDF rays that reach the sky.
+	#
+	# The practical consequence for this script: DO NOT ADD A FILL LIGHT to
+	# compensate for sky noise. Measured on a sky-lit scene with real occluders,
+	# RMSE at matched sample counts fell 6.6x-9.5x (5.3x-6.9x once the extra
+	# shadow ray's frame-time cost is priced in), so the grain that a fill light
+	# used to paper over is largely gone. Adding one now just flattens the
+	# lighting and costs frames.
+	#
+	# Two caveats worth knowing before tuning anything here:
+	#   * INDOORS the win is smaller. The distribution is over the sky, not over
+	#     what is actually visible from a shading point, so behind walls most
+	#     environment samples are occluded and thrown away. Portal sampling is
+	#     the technique for that and is not implemented.
+	#   * There is an OPEN +2.4% brightening on dielectric specular surfaces --
+	#     which is most materials this script renders -- traced to the
+	#     COMBINE_BRDFS_WITH_FRESNEL integrand mismatch in brdf_inc.glsl. If a
+	#     day render reads slightly hot against an older reference, that is the
+	#     likely cause; see PATH_TRACER_QUALITY_ROADMAP.md item C3 before
+	#     "correcting" it with an exposure tweak here.
+	#
 	# Pathtracer config. DLSS Ray Reconstruction (DLSS-RR) is a NEURAL TEMPORAL denoiser:
 	# it cleans noise by ACCUMULATING INFORMATION ACROSS FRAMES (per RenderingServer docs: "a
 	# low sample count (1-2) is typically sufficient since the denoiser accumulates information
