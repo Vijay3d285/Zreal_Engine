@@ -117,4 +117,99 @@ TEST_CASE("[PathTracer][RussianRoulette] min_bounce occupies only bits 4-8") {
 	}
 }
 
+// CPU mirror of the Russian Roulette block in
+// servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl.
+//
+// The property these tests exist to protect is UNBIASEDNESS: terminating a path
+// with probability (1 - p) while scaling survivors by 1/p leaves the expected
+// contribution unchanged. A wrong 1/p still produces a plausible image -- it just
+// converges to the wrong answer, which no convergence test detects.
+
+struct RRResult {
+	bool terminated;
+	double throughput;
+};
+
+// Mirrors: p = min(sqrt(max_component(throughput)), 1.0);
+//          if (p <= 0 || rand >= p) terminate; else throughput /= p;
+static RRResult rr_apply(double p_throughput, double p_rand, uint32_t p_depth, uint32_t p_min_bounce) {
+	RRResult r;
+	r.terminated = false;
+	r.throughput = p_throughput;
+	if (p_depth <= p_min_bounce) {
+		return r; // Never rouletted below the threshold.
+	}
+	const double p = MIN(Math::sqrt(p_throughput), 1.0);
+	if (p <= 0.0 || p_rand >= p) {
+		r.terminated = true;
+		r.throughput = 0.0;
+		return r;
+	}
+	r.throughput = p_throughput / p;
+	return r;
+}
+
+TEST_CASE("[PathTracer][RussianRoulette] the estimator is unbiased") {
+	// Sweep rand uniformly over [0,1) and average the outcome. The mean must come
+	// back to the original throughput: survivors scaled by 1/p exactly compensate
+	// for the paths that were killed.
+	const uint32_t N = 100000;
+	for (double t : { 0.01, 0.05, 0.25, 0.5, 0.81 }) {
+		double sum = 0.0;
+		for (uint32_t i = 0; i < N; i++) {
+			const double u = (i + 0.5) / double(N);
+			sum += rr_apply(t, u, 8u, 3u).throughput;
+		}
+		CHECK((sum / double(N)) == doctest::Approx(t).epsilon(0.001));
+	}
+}
+
+TEST_CASE("[PathTracer][RussianRoulette] paths at or below min_bounce are never terminated") {
+	for (uint32_t depth = 0; depth <= 3; depth++) {
+		// Throughput near zero and the worst possible roll -- still must survive.
+		const RRResult r = rr_apply(1e-6, 0.999999, depth, 3u);
+		CHECK(r.terminated == false);
+		CHECK(r.throughput == doctest::Approx(1e-6));
+	}
+	// One bounce past the threshold, the same path is terminated.
+	CHECK(rr_apply(1e-6, 0.999999, 4u, 3u).terminated == true);
+}
+
+TEST_CASE("[PathTracer][RussianRoulette] a zero-throughput path terminates and never divides") {
+	// p == 0 here. A naive `rand > p` test would let rand == 0.0 through and then
+	// divide by zero, producing an Inf that the accumulator never washes out.
+	const RRResult r = rr_apply(0.0, 0.0, 8u, 3u);
+	CHECK(r.terminated == true);
+	CHECK(r.throughput == doctest::Approx(0.0));
+}
+
+TEST_CASE("[PathTracer][RussianRoulette] bright paths are never terminated and never rescaled") {
+	// sqrt(throughput) >= 1 clamps p to 1, so every roll survives with throughput
+	// unchanged -- the roulette must cost nothing where it can save nothing.
+	for (double t : { 1.0, 4.0, 100.0 }) {
+		for (double u : { 0.0, 0.5, 0.999999 }) {
+			const RRResult r = rr_apply(t, u, 8u, 3u);
+			CHECK(r.terminated == false);
+			CHECK(r.throughput == doctest::Approx(t));
+		}
+	}
+}
+
+TEST_CASE("[PathTracer][RussianRoulette] termination probability follows sqrt, not luminance") {
+	// Cycles uses sqrt(max_component) deliberately -- it terminates LATER than a
+	// naive luminance-based rule, to better match the view transform. An earlier
+	// revision of PATH_TRACER_QUALITY_ROADMAP.md specified
+	// clamp(luminance, 0.05, 0.95) and that was wrong. This pins the reference.
+	// At throughput 0.25, sqrt gives p = 0.5; the naive rule would give 0.25.
+	const uint32_t N = 100000;
+	uint32_t survived = 0;
+	for (uint32_t i = 0; i < N; i++) {
+		const double u = (i + 0.5) / double(N);
+		if (!rr_apply(0.25, u, 8u, 3u).terminated) {
+			survived++;
+		}
+	}
+	CHECK((double(survived) / double(N)) == doctest::Approx(0.5).epsilon(0.01));
+}
+
 } // namespace TestPTRussianRoulette

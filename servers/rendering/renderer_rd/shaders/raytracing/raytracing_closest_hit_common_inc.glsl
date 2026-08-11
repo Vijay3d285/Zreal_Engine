@@ -748,6 +748,43 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ps.packed_bounces_flags = inc_glossy_bounce(ps.packed_bounces_flags);
 	}
 
+	// =================================================================
+	// Russian Roulette (roadmap B4).
+	// =================================================================
+	// Terminates low-throughput paths with probability (1 - p) and scales the
+	// survivors by 1/p, so the expected contribution is unchanged and the average
+	// path gets shorter.
+	//
+	// sqrt() is deliberate and matches Cycles (kernel/integrator/path_state.h:296-305):
+	// it terminates LATER than naive luminance-based roulette, which better matches
+	// the view transform. max_component, NOT luminance -- an earlier revision of
+	// PATH_TRACER_QUALITY_ROADMAP.md specified clamp(luminance, 0.05, 0.95) and that
+	// was wrong.
+	//
+	// The bounce counters were incremented just above, so min_bounce = 3 means the
+	// first three bounces are never rouletted -- the part of the path carrying the
+	// most energy is left alone.
+	//
+	// Environment NEE for this vertex was already paid further up; that contribution
+	// is valid whether or not the path continues. Roulette governs only the
+	// continuation, and it scales throughput only -- mis_ray_pdf is a directional
+	// density and is unaffected, so no MIS weight changes.
+	{
+		uint rr_depth = get_total_bounces(ps.packed_bounces_flags);
+		if (rr_depth > RT_GET_MIN_BOUNCE()) {
+			float rr_p = min(sqrt(max(max(ps.throughput.r, ps.throughput.g), ps.throughput.b)), 1.0);
+			// p == 0 is reachable (a fully absorbed path). rng_1d can return exactly
+			// 0.0, which a naive `> p` test would let through and then divide by zero,
+			// producing an Inf the accumulator never washes out.
+			if (rr_p <= 0.0 || rng_1d(rng, RT_PRNG_TERMINATE) >= rr_p) {
+				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+				path_pack(payload, ps);
+				return;
+			}
+			ps.throughput /= rr_p;
+		}
+	}
+
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.
 	ps.hit_t = gl_HitTEXT;
