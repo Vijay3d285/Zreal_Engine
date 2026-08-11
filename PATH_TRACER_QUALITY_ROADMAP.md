@@ -437,8 +437,9 @@ is shared with analytic-light NEE, so it changes analytic-light shading engine-w
 *Other known-open items carried out of this phase:*
 - **Residual +0.42% double count on recovered (normal-mapped) samples**,
   deliberately accepted: the measured alternative remedy cost −33.1%. Note the
-  recovery-off control revised this — only about a third of the residual is the
-  recovery double count; **+0.28% survives with recovery compiled out**, so
+  recovery-off control revised this — only **~23%** of the residual is the
+  recovery double count (0.083 of the 0.36 percentage points); **+0.28% survives
+  with recovery compiled out**, so
   something else on normal-mapped geometry also fails to partition exactly. The
   real repair belongs to the recovery mechanism (F1), not to MIS.
 - **Firefly clamping is asymmetric across the MIS partition**: environment NEE
