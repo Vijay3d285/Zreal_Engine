@@ -265,4 +265,31 @@ TEST_CASE("[PathTracer][RussianRoulette] the reduction is max-component, not lum
 	CHECK(p_luminance < 0.9); // Sanity: the luminance rule WOULD have killed this at u = 0.9.
 }
 
+TEST_CASE("[PathTracer][RussianRoulette] the reduction is max-component, not the red channel alone") {
+	// (0.9, 0.02, 0.02) above does NOT close the reduction: red happens to BE
+	// the maximum there, so max_component and ".r alone" agree by
+	// construction -- replacing the shader's max(max(r,g),b) with a bare .r
+	// would still pass every other case in this file (every other vector is
+	// isotropic, where .r is indistinguishable from any reduction at all).
+	// Putting the maximum in a NON-red channel separates them:
+	//   max_component: p = sqrt(max(0.02, 0.9, 0.02)) = sqrt(0.9) ~= 0.9487.
+	//   .r alone:      p = sqrt(0.02) ~= 0.1414.
+	// At u = 0.9: max_component survives (0.9 < 0.9487); ".r alone" would have
+	// terminated (0.9 >= 0.1414).
+	{
+		const RRResult r = rr_apply(0.02, 0.9, 0.02, 0.9, 8u, 3u);
+		CHECK(r.terminated == false);
+		const double p_red_only = Math::sqrt(0.02);
+		CHECK(p_red_only < 0.9); // Sanity: ".r alone" WOULD have killed this at u = 0.9.
+	}
+	// Blue-max as a third data point pins the reduction on all three channels,
+	// not just red vs. green.
+	{
+		const RRResult r = rr_apply(0.02, 0.02, 0.9, 0.9, 8u, 3u);
+		CHECK(r.terminated == false);
+		const double p_red_only = Math::sqrt(0.02);
+		CHECK(p_red_only < 0.9); // Sanity: ".r alone" WOULD have killed this at u = 0.9.
+	}
+}
+
 } // namespace TestPTRussianRoulette
