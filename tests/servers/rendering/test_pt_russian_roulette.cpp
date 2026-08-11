@@ -95,13 +95,20 @@ TEST_CASE("[PathTracer][RussianRoulette] stored zero resolves to the default of 
 }
 
 TEST_CASE("[PathTracer][RussianRoulette] min_bounce does not collide with its neighbours") {
-	// Feature flags occupy bits 0-3, sample count 20-27, max bounces 28-31.
-	// Writing min_bounce must leave all three intact, and writing them must
-	// leave min_bounce intact.
-	const uint32_t feature_flags = 0xFu; // all four feature bits set
+	// Feature flags occupy bits 0-3 today, bits 9-19 are free (reserved for
+	// future flags), sample count 20-27, max bounces 28-31. min_bounce occupies
+	// bits 4-8 and must never be claimed by a feature flag -- see the RT_FLAG_*
+	// static_assert in scene_shader_raytracing.h.
+	//
+	// Exercising only bits 0-3 here (the ones already in use) would pass even if
+	// a future flag were added inside the min_bounce field, because nothing in
+	// that scenario touches bits 0-3. Exercising the full non-min_bounce space
+	// (0-3 AND 9-19) is what makes this test able to catch an encroaching flag:
+	// any bit placed in 4-8 corrupts the min_bounce readback checked below.
+	const uint32_t feature_flags = 0x000FFFFFu & ~(RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT); // bits 0-19, min_bounce field excluded
 	for (uint32_t mb = 0; mb <= 16; mb++) {
 		const uint32_t packed = flags_pack(feature_flags, 255u, 16u, mb);
-		CHECK((packed & 0xFu) == feature_flags);
+		CHECK((packed & feature_flags) == feature_flags);
 		CHECK(get_sample_count(packed) == 255u);
 		CHECK(get_max_bounces(packed) == 16u);
 		CHECK(get_min_bounce(packed) == mb);
@@ -290,6 +297,25 @@ TEST_CASE("[PathTracer][RussianRoulette] the reduction is max-component, not the
 		const double p_red_only = Math::sqrt(0.02);
 		CHECK(p_red_only < 0.9); // Sanity: ".r alone" WOULD have killed this at u = 0.9.
 	}
+}
+
+TEST_CASE("[PathTracer][RussianRoulette] the reduction does not over-estimate via summing") {
+	// Every discrimination case above asserts terminated == false at u = 0.9, so
+	// an over-estimating reduction (e.g. r+g+b, or length()) that produces a
+	// HIGHER p than max_component would silently pass all of them -- a bigger p
+	// only ever makes survival MORE likely, never less. This case closes the
+	// other side: an isotropic throughput where max_component gives a LOW p
+	// (path terminates) but a summing reduction would give a HIGH p (path would
+	// survive).
+	//   max_component: p = sqrt(max(0.3, 0.3, 0.3)) = sqrt(0.3) ~= 0.5477.
+	//   r+g+b:         p = sqrt(min(0.3+0.3+0.3, 1.0)) = sqrt(0.9) ~= 0.9487.
+	// At u = 0.9: max_component terminates (0.9 >= 0.5477); a summing reduction
+	// would have survived (0.9 < 0.9487).
+	const RRResult r = rr_apply(0.3, 0.3, 0.3, 0.9, 8u, 3u);
+	CHECK(r.terminated == true);
+
+	const double p_sum = Math::sqrt(MIN(0.3 + 0.3 + 0.3, 1.0));
+	CHECK(p_sum > 0.9); // Sanity: a summing reduction would NOT have killed this at u = 0.9.
 }
 
 } // namespace TestPTRussianRoulette

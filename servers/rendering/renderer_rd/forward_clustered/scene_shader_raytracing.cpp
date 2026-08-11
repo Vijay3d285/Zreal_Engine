@@ -671,7 +671,14 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 	}
 
 	{
-		const int raw = (int)GLOBAL_GET("rendering/pathtracer/russian_roulette_min_bounce");
+		// (int)Variant on a nil/non-numeric value converts to 0 -- the MOST
+		// aggressive setting (roulette from the first bounce), not a safe
+		// fallback. GLOBAL_DEF runs in RenderingServer::init() before any frame
+		// reaches this function, so the setting is unreachable-nil today, but
+		// fall back to the same default 3 the initializer above documents rather
+		// than trust the Variant-to-int coercion.
+		const Variant raw_variant = GLOBAL_GET("rendering/pathtracer/russian_roulette_min_bounce");
+		const int raw = raw_variant.is_num() ? (int)raw_variant : 3;
 		min_bounce = (uint32_t)CLAMP(raw, 0, 16);
 	}
 

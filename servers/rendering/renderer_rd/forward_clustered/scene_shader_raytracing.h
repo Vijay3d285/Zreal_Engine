@@ -69,7 +69,9 @@ public:
 	};
 
 	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines).
-	// Bits 0-19:  Feature flags
+	// Bits 0-3:   Feature flags
+	// Bits 4-8:   Russian Roulette min_bounce (roadmap B4, biased +1; see RT_MIN_BOUNCE_SHIFT)
+	// Bits 9-19:  Free
 	// Bits 20-27: Sample count
 	// Bits 28-31: Max bounce count (offset by 1: 0=1 bounce, 15=16 bounces)
 	// Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
@@ -97,6 +99,13 @@ public:
 	// max_bounces = 16. Bits 4-19 of the flags word are otherwise unused.
 	constexpr static uint32_t RT_MIN_BOUNCE_SHIFT = 4;
 	constexpr static uint32_t RT_MIN_BOUNCE_MASK = 0x1F;
+
+	// Compile-time guard: a new RT_FLAG_* added at (1 << 4) or above would silently
+	// alias the Russian Roulette min_bounce field, corrupt the readback, and leave
+	// the rendered image merely plausible instead of visibly wrong. Keep this in
+	// sync whenever RT_FLAG_* gains a member.
+	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
+			"RT_FLAG_* bit overlaps the Russian Roulette min_bounce field (bits 4-8)");
 
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).
 	// 1: primary/bounce from raygen

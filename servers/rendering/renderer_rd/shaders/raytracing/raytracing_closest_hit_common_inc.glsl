@@ -773,8 +773,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		uint rr_depth = get_total_bounces(ps.packed_bounces_flags);
 		if (rr_depth > RT_GET_MIN_BOUNCE()) {
 			// abs() matches Cycles' reduce_max(fabs(throughput)) (path_state.h:296-305).
-			// Throughput is non-negative on entry and only ever scaled by positive
-			// factors today, so this is a near-zero-risk guard -- but sqrt() of a
+			// This is a genuine guard, not a no-op: apply_segment_fog() (above) does
+			// `throughput *= (1.0 - fog.a)`, and with fog_mode = DEPTH, fog.a =
+			// pow(fog_z, fog_depth_curve) * fog_density (fog_inc.glsl) can exceed 1.0
+			// because fog_density's property hint is "0,1,0.0001,or_greater"
+			// (environment.cpp) -- so throughput can go negative here. sqrt() of a
 			// negative is undefined in GLSL, and the NaN it would produce flows
 			// through both comparisons below as false (survive), then
 			// `throughput /= rr_p` propagates it until sanitize_payload_value()

@@ -2,7 +2,8 @@
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
-// Specialization constant (bits 0-19: flags, 20-27: samples, 28-31: bounces).
+// Specialization constant. Bits 0-3: feature flags, 4-8: Russian Roulette
+// min_bounce (roadmap B4), 9-19: free, 20-27: sample count, 28-31: max bounces.
 // Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
 // 16; sample count's shift moved down by one to make room without touching
 // its own 8-bit width (the feature-flags region only ever used bits 0-3).

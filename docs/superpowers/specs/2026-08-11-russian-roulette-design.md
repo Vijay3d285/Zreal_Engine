@@ -257,5 +257,7 @@ measure itself).
 - `min_bounce` is a spec constant, so changing it triggers a pipeline recompile.
   Correct for a per-render setting, but it is not something to animate.
 - RR interacts with `PT_PARAM_NOISE_THRESHOLD` adaptive sampling: higher per-sample
-  variance means converged pixels take longer to converge. Not coupled in code, and
-  the equal-time measurement captures the net effect.
+  variance means converged pixels take longer to converge. Not coupled in code, but
+  the equal-time measurement in §8 does **not** capture the net effect — it ran with
+  adaptive sampling off (`PATH_TRACER_QUALITY_ROADMAP.md`, B4 measurement scope).
+  The interaction is a Phase C item, not measured here.

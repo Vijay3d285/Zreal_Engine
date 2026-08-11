@@ -340,6 +340,15 @@ separate 8192-frame roulette-off reference used for the RMSE cross-scoring below
 gives 0.124740, inside the same band — so that single shared reference is not
 itself carrying a bias into the equal-time comparison.
 
+This bias claim holds **in the absence of contribution clamping** (`clamp_direct`/
+`clamp_indirect`, both off in this measurement — see the firefly-clamping bias
+note above). RR boosts a surviving vertex's throughput from `m` to `sqrt(m)` —
+up to 2× at `m = 0.25` — so with clamping enabled, more post-roulette
+contributions cross `clamp_contribution`'s cap than would without RR, and the
+`1/p` compensation is partly clipped away on those. RR's compensation is subject
+to the same clip as any other contribution; it does not get special treatment.
+This is invisible in the measurement above because clamps default to disabled.
+
 **Frame time — 16.1% faster, on means.** 512 accumulated frames per pass, 3
 passes × 3 invocations = 9 passes per configuration:
 
@@ -419,7 +428,12 @@ difference. A 16% delta dwarfs anything plausible from that source, but the
 pipelines were not identical and the figure should not be read as if they were.
 
 **Scope.** One scene, one resolution, one bounce budget, one GPU. The scene was
-not tuned after any number was seen.
+not tuned after any number was seen. All figures above are for
+`noise_threshold = 0` (adaptive sampling off); RR makes the per-sample
+distribution heavier-tailed by construction (most contributions vanish, rare
+survivors are boosted by `1/p`), which increases the tail weight the adaptive
+estimator would have to observe with adaptive sampling on — that interaction is
+not measured here and is deferred to Phase C.
 
 **B5. Owen-scrambled Sobol / blue-noise sampler** — *Gap #6* — **DONE**
 Sobol-Burley with per-pixel Owen scrambling, dimension-indexed draws

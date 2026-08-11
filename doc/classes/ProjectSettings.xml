@@ -3266,6 +3266,11 @@
 			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. When the combined triangle count exceeds this value, the path tracer falls back to one TLAS entry per instance sharing a common BLAS instead. Lower this value to reduce peak GPU memory for large MultiMeshes; raise it to prefer the merged path (which avoids per-instance TLAS overhead).
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracer/russian_roulette_min_bounce" type="int" setter="" getter="" default="3">
+			Minimum bounce index at which Russian Roulette path termination becomes eligible in the path tracer. Paths shorter than this many bounces are never stochastically terminated, so direct light and the first indirect bounces are always fully sampled. Setting this value greater than or equal to the path tracer's maximum bounce count disables Russian Roulette entirely.
+			[b]Note:[/b] This is a specialization constant baked into the raytracing pipeline; changing it recompiles the pipeline.
+			[b]Note:[/b] This setting is global and applies to all path-traced viewports; it is not configurable per [Environment].
+		</member>
 		<member name="rendering/pathtracer/use_shader_execution_reordering" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SET.
 		</member>
