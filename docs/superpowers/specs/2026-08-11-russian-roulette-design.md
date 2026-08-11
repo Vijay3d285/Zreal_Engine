@@ -54,6 +54,38 @@ Three homes were considered:
 `min_bounce` changes recompile the pipeline, which is correct — it is a per-render
 setting, not a per-frame one, exactly like `max_bounces` and SPP.
 
+#### 3.1a Transport: a project setting, not an `Environment` property
+
+**Correction made while writing the implementation plan.** Packing into the flags
+word solves shader-side *storage* and nothing else. The value still has to travel
+from configuration into `SceneShaderRaytracing::compute_rt_flags`
+(`scene_shader_raytracing.cpp:641-669`), and that function reads **only**
+`p_env_params` — the `pathtracing_params` float array, which is full.
+
+This is why `PT_PARAM_SAMPLE_COUNT` and `PT_PARAM_MAX_BOUNCES` occupy param slots
+even though the shader reads their specialization constants rather than those
+slots: the array does double duty as a GPU UBO *and* as the CPU-side transport for
+spec-constant values. A `grep` for `RT_PARAM_MAX_BOUNCES` across the shaders returns
+only the `#define`, never a `get_rt_param` read.
+
+**Chosen: a project setting**, `rendering/pathtracer/russian_roulette_min_bounce`,
+read with `GLOBAL_GET` inside `compute_rt_flags`. There is direct precedent five
+lines away — `RT_FLAG_SER_ENABLED` comes from
+`GLOBAL_GET("rendering/pathtracer/use_shader_execution_reordering")`
+(`scene_shader_raytracing.cpp:664`).
+
+| Rejected alternative | Why |
+|---|---|
+| Resize `pathtracing_params` 16 → 32 | Changes the GPU UBO layout (4 vec4s → 8) with matching C++/GLSL edits and every consumer agreeing on the size. Worth doing when a *second* param needs a slot — E1's `max_transmission_bounce` is the likely trigger. |
+| Dedicated storage field + `environment_get_pathtracing_min_bounce(RID)` | Per-scene, no parity risk, but full 5-layer Godot plumbing for one integer *and* a second transport mechanism alongside the params array. |
+| Hardcoded GLSL constant | No transport at all, but not tunable without a rebuild. |
+
+**Accepted trade-off:** the setting is **global, not per-`Environment`**. Two
+environments in one project cannot use different `min_bounce` values. For a
+single-script capture pipeline this is not a practical limit, and it is recorded
+here so a future per-scene requirement is recognised as a change of decision rather
+than a bug.
+
 **Free off-switch.** `min_bounce >= max_bounces` means the RR branch is never
 reached, so no separate enable flag is needed.
 
@@ -81,11 +113,15 @@ Matches Cycles' historical Min Bounces. Direct lighting and the first two indire
 bounces are never terminated, so the part of the path carrying the most energy is
 untouched.
 
-**This is a silent behavior change** for any scene that never sets the property:
-renders get faster and marginally noisier at equal sample count. The roadmap
+**This is a silent behavior change** for every existing project: renders get faster
+and marginally noisier at equal sample count, with nobody opting in. The roadmap
 records `pathtracing_max_bounces` going 3 → 8 in B3 as exactly this class of
 change, and it gets the same treatment here — an explicit compatibility note in
-`PATH_TRACER_QUALITY_ROADMAP.md` and in `doc/classes/Environment.xml`.
+`PATH_TRACER_QUALITY_ROADMAP.md`, and the project setting registered with a
+`PROPERTY_HINT_RANGE` and a description stating the effect.
+
+No `doc/classes/Environment.xml` change: per §3.1a this is a project setting, not an
+`Environment` property.
 
 ### 3.3 `sqrt(max_component(throughput))`, not luminance
 
@@ -159,13 +195,14 @@ Five layers, the pattern this codebase requires:
 
 | Layer | Change |
 |---|---|
-| Spec constant | `RT_MIN_BOUNCE_SHIFT = 4`, `RT_MIN_BOUNCE_MASK = 0x1F` in `scene_shader_raytracing.h`, packed alongside sample count and max bounces, storing `min_bounce + 1` per §3.1 |
+| Project setting | `rendering/pathtracer/russian_roulette_min_bounce`, `int`, default 3, `PROPERTY_HINT_RANGE "0,16,1"`, registered beside the existing `rendering/pathtracer/*` settings |
+| Spec constant | `RT_MIN_BOUNCE_SHIFT = 4`, `RT_MIN_BOUNCE_MASK = 0x1F` in `scene_shader_raytracing.h`, packed by `rt_flags_pack` alongside sample count and max bounces, storing `min_bounce + 1` per §3.1 |
+| Transport | `compute_rt_flags` reads the setting with `GLOBAL_GET` and passes it to `rt_flags_pack`, mirroring how `RT_FLAG_SER_ENABLED` is read at `scene_shader_raytracing.cpp:664` |
 | GLSL twin | `RT_GET_MIN_BOUNCE()` in `raytracing_common_inc.glsl:14-20` alongside the existing shift defines, mirroring `RT_GET_MAX_BOUNCES()`'s biased form and resolving stored `0` to the default 3 |
-| Scene | `Environment.pathtracing_min_bounce`, default 3, clamped 0-16 |
-| Binding | ClassDB getter/setter in `scene/resources/environment.cpp` |
-| Docs | `doc/classes/Environment.xml`, including the compatibility note from §3.2 |
 
-No params-UBO change, no new descriptor binding, no struct-parity risk.
+**No `Environment` property, no ClassDB binding, no `Environment.xml` change, no
+params-UBO change, no new descriptor binding, no struct-parity risk.** The
+`RendererEnvironmentStorage` and `RenderingServer` layers are untouched.
 
 ## 7. Testing
 
