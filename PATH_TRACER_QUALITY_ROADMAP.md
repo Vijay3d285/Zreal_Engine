@@ -273,10 +273,11 @@ rather than the exact density MIS requires, which is a second reason.
 RMSE against a high-sample reference, environment NEE off vs on, at matched
 sample counts — **6.6× to 9.5× lower with NEE at every sample count from 16 to
 16384**, and 8.9× on a control build that isolates the Fresnel defect below.
-Frame time cost is real: **+90% at 256×256, +144% at 512×512** (3.1× per-pixel
-shading cost) because every shading vertex now fires one extra shadow ray, and
-this scene's baseline fired none. **Equal-time, the advantage is 5.3× to 6.9×** —
-still far above the ≥2× C3 bar.
+Frame time cost is real: **+90% at 256×256, +144% at 512×512** (2.96× per-pixel
+shading cost, 3.63 → 10.75 ns/px) because every shading vertex now fires one
+extra shadow ray, and this scene's baseline fired none. **Equal-time, the
+advantage is 4.8× to 6.9×** across the sweep (each sample-count ratio divided by
+`sqrt(1.8966)`; the floor is the 4096-frame row) — still far above the ≥2× C3 bar.
 
 *Open, and the reason this is not an unqualified success:* **the converged mean
 moved +2.4% on dielectric specular surfaces.** MIS must redistribute variance,
@@ -405,7 +406,7 @@ centres makes the estimator a fixed 256×128 Riemann quadrature whose error does
 not shrink with more samples. MIS-combined against the BSDF sky bounce as in B2.
 
 *Accept criterion (≥2× on a sunset-HDRI-style reflection): **met, by 6.6-9.5×
-on samples and 5.3-6.9× equal-time.*** Full numbers and method in
+on samples and 4.8-6.9× equal-time.*** Full numbers and method in
 `.superpowers/sdd/2026-08-09-sky-nee-and-mis/task-5-report.md`.
 
 > **MEASUREMENT CAVEAT — do not reuse `pt_validation_scene.tscn` for this.**
@@ -519,7 +520,7 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase A alone** — jitter, EXR, clamp, adaptive — converts the already-built accumulator from "converges shading noise at fixed aliasing" into a genuine offline renderer. A1 in particular is a handful of lines against machinery that already works, and it is currently the most visible defect in any still.
 
-**Phase B** makes the converged image *correct* rather than merely stable: MIS and real bounce counts are what separate "a path tracer" from "a reference path tracer."
+**Phase B** makes the converged image *correct* rather than merely stable: MIS and real bounce counts are what separate "a path tracer" from "a reference path tracer." **With one live exception as of B2:** environment MIS shipped a **+2.4% converged-mean error on dielectric specular surfaces** — i.e. most ordinary materials — traced to the `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch and left open. Variance is where it should be; the mean is not yet. See the B2 and C3 entries before treating Phase B as a ship verdict.
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
