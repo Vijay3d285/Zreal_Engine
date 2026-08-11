@@ -335,7 +335,10 @@ band of **±0.0064%** (widest within-configuration spread over three repeats,
 the resolution of the measurement. The band was established by repeated runs
 here, not inherited; it is ~5× tighter than the ~0.03% figure quoted earlier in
 this phase because that one came from shorter runs and a stride-sampled probe.
-A bias smaller than ~0.006% is not ruled out.
+A bias smaller than ~0.006% is not ruled out. Independent corroboration: the
+separate 8192-frame roulette-off reference used for the RMSE cross-scoring below
+gives 0.124740, inside the same band — so that single shared reference is not
+itself carrying a bias into the equal-time comparison.
 
 **Frame time — 16.1% faster, on means.** 512 accumulated frames per pass, 3
 passes × 3 invocations = 9 passes per configuration:
@@ -353,8 +356,14 @@ floor on this harness is **~4–6% between invocations**, not the ~1.4%
 within-invocation spread quoted mid-phase; the 16.1% delta clears it, but future
 single-invocation timing comparisons should use the larger figure.
 
-**Equal-time RMSE — 6% to 8% better.** RMSE at matched sample counts, every run
-cross-scored against one common 8192-frame roulette-off reference:
+**Equal-time RMSE — nominally 6% to 8% better, though the underlying
+matched-sample ratio is within run-to-run noise, so the headline number carries
+that imprecision too — see below.** RMSE at matched sample counts, every run
+cross-scored against one common 8192-frame roulette-off reference. A
+roulette-*off* reference is a sound common yardstick precisely because the bias
+check above shows the two configurations are statistically equivalent at
+convergence: cross-scoring both arms against it is symmetric and favours
+neither.
 
 | frames | off (mean of 3) | on (mean of 3) | matched-sample ratio | equal-time ratio |
 |---|---|---|---|---|
@@ -366,7 +375,10 @@ Equal-time ratio is the matched-sample ratio divided by `sqrt(time_ratio)`, with
 ratios are inside their own run-to-run noise (sd is 2–6% of the value), so the
 honest reading is that the roulette adds **no measurable variance** at matched
 sample count in this scene — an upper bound of roughly ±5%, not a demonstration
-of exact equality. Deeper transport, or a lower `min_bounce`, would be expected
+of exact equality. The equal-time figure is therefore a well-separated ~16% time
+win multiplied by a *noisy* ratio near 1.0: the **direction** of the result is
+solid, its **magnitude** inherits that ratio's uncertainty, and 6-8% should be
+read as nominal rather than settled. Deeper transport, or a lower `min_bounce`, would be expected
 to show a real variance increase; that regime is not covered here. Separately,
 the `RMSE ∝ N^-0.5` law this conversion assumes does not hold exactly on this
 scene (the measured exponent is 0.568, the error being partly tail-dominated);
