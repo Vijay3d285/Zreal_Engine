@@ -3835,6 +3835,12 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracer/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);
+	// Russian Roulette (roadmap B4): paths shorter than this many bounces are never
+	// terminated, so direct light and the first indirect bounces are never rouletted.
+	// 3 matches Cycles' historical Min Bounces. Setting this >= max_bounces disables
+	// Russian Roulette entirely. This is a SPECIALIZATION CONSTANT -- changing it
+	// recompiles the raytracing pipeline, which is correct for a per-render setting.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/russian_roulette_min_bounce", PROPERTY_HINT_RANGE, "0,16,1"), 3);
 
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);

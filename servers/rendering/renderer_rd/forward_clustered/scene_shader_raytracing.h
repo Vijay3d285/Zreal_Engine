@@ -89,6 +89,15 @@ public:
 	constexpr static uint32_t RT_MAX_BOUNCES_SHIFT = 28;
 	constexpr static uint32_t RT_MAX_BOUNCES_MASK = 0xF;
 
+	// Russian Roulette minimum bounce (roadmap B4). Stored BIASED by +1 so that a
+	// stored 0 means "unset" and resolves to the default: 0 is a legitimate
+	// min_bounce (roulette from the first bounce), so it cannot double as the
+	// sentinel the way PT_PARAM_MAX_DIFFUSE_BOUNCE's 0 does.
+	// 5 bits so the range reaches 16 and Russian Roulette can be fully disabled at
+	// max_bounces = 16. Bits 4-19 of the flags word are otherwise unused.
+	constexpr static uint32_t RT_MIN_BOUNCE_SHIFT = 4;
+	constexpr static uint32_t RT_MIN_BOUNCE_MASK = 0x1F;
+
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).
 	// 1: primary/bounce from raygen
 	// 2: shadow ray from closest_hit (NEE)
@@ -112,11 +121,13 @@ public:
 	static constexpr int RT_PARAM_LIGHT_COUNT = RSE::PT_PARAM_LIGHT_COUNT;
 	static constexpr int RT_PARAM_FRAME_INDEX = RSE::PT_PARAM_FRAME_INDEX;
 
-	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
+	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces, uint32_t p_min_bounce) {
 		uint32_t result = p_flags;
 		result |= (p_sample_count & RT_SAMPLE_COUNT_MASK) << RT_SAMPLE_COUNT_SHIFT;
 		// Max bounces is offset by 1 (0=1 bounce, 15=16 bounces)
 		result |= (MAX(1u, MIN(16u, p_max_bounces)) - 1u) << RT_MAX_BOUNCES_SHIFT;
+		// Min bounce is offset by 1 so stored 0 can mean "unset" -- see above.
+		result |= ((MIN(16u, p_min_bounce) + 1u) & RT_MIN_BOUNCE_MASK) << RT_MIN_BOUNCE_SHIFT;
 		return result;
 	}
 

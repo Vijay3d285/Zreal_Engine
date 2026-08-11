@@ -642,6 +642,11 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 	uint32_t flags = RT_FLAG_NONE;
 	uint32_t sample_count = 1;
 	uint32_t max_bounces = 8;
+	// Russian Roulette threshold (roadmap B4). A project setting rather than an
+	// Environment param because pathtracing_params[16] is full and this value is
+	// only ever needed CPU-side, to build the specialization constant -- see the
+	// spec's section 3.1a.
+	uint32_t min_bounce = 3;
 
 	if (p_env_params) {
 		if (p_env_params[RT_PARAM_VIS_MODE] != 0.0f) {
@@ -665,7 +670,12 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		flags |= RT_FLAG_SER_ENABLED;
 	}
 
-	return rt_flags_pack(flags, sample_count, max_bounces);
+	{
+		const int raw = (int)GLOBAL_GET("rendering/pathtracer/russian_roulette_min_bounce");
+		min_bounce = (uint32_t)CLAMP(raw, 0, 16);
+	}
+
+	return rt_flags_pack(flags, sample_count, max_bounces, min_bounce);
 }
 
 SceneShaderRaytracing *SceneShaderRaytracing::get_singleton() {

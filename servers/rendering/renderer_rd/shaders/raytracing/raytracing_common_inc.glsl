@@ -19,6 +19,15 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_MAX_BOUNCES_MASK 0xFu
 #define RT_GET_MAX_BOUNCES() (((RT_FLAGS >> RT_MAX_BOUNCES_SHIFT) & RT_MAX_BOUNCES_MASK) + 1u)
 
+// Russian Roulette minimum bounce (roadmap B4). MUST match RT_MIN_BOUNCE_SHIFT /
+// RT_MIN_BOUNCE_MASK in scene_shader_raytracing.h -- these are hand-maintained
+// twins and a drift makes the shader read the wrong field with no failing test.
+// Stored biased by +1: stored 0 means "unset" and resolves to the default 3,
+// because 0 is a legitimate min_bounce (roulette from the first bounce).
+#define RT_MIN_BOUNCE_SHIFT 4u
+#define RT_MIN_BOUNCE_MASK 0x1Fu
+#define RT_GET_MIN_BOUNCE() (((RT_FLAGS >> RT_MIN_BOUNCE_SHIFT) & RT_MIN_BOUNCE_MASK) == 0u ? 3u : ((((RT_FLAGS >> RT_MIN_BOUNCE_SHIFT) & RT_MIN_BOUNCE_MASK)) - 1u))
+
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
 
