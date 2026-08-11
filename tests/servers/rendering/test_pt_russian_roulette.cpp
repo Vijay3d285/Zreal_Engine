@@ -124,41 +124,62 @@ TEST_CASE("[PathTracer][RussianRoulette] min_bounce occupies only bits 4-8") {
 // with probability (1 - p) while scaling survivors by 1/p leaves the expected
 // contribution unchanged. A wrong 1/p still produces a plausible image -- it just
 // converges to the wrong answer, which no convergence test detects.
+//
+// rr_apply takes the throughput as three components, not a scalar: the shader
+// reduces over vec3 (max_component, not luminance), and a scalar mirror cannot
+// discriminate between the two reductions -- an isotropic (r==g==b) throughput
+// gives the same result under EITHER rule, so a scalar-only mirror would pass
+// even if the shader's max(max(r,g),b) were silently replaced by luminance().
+// See "the reduction is max-component, not luminance" below.
 
 struct RRResult {
 	bool terminated;
-	double throughput;
+	// NOT a literal transcription of the shader: on termination, the real
+	// ps.throughput is left at its PRE-roulette value (path_pack() + return
+	// happen immediately after; raygen only reads .radiance from a terminated
+	// payload, so the field is dead there). This mirror zeroes r/g/b on
+	// termination instead, purely so tests have a definite value to assert
+	// against -- a terminated path contributes nothing further, which is the
+	// fact that matters for the unbiasedness sum below.
+	double r, g, b;
 };
 
-// Mirrors: p = min(sqrt(max_component(throughput)), 1.0);
+// Mirrors: p = min(sqrt(max_component(abs(throughput))), 1.0);
 //          if (p <= 0 || rand >= p) terminate; else throughput /= p;
-static RRResult rr_apply(double p_throughput, double p_rand, uint32_t p_depth, uint32_t p_min_bounce) {
-	RRResult r;
-	r.terminated = false;
-	r.throughput = p_throughput;
+static RRResult rr_apply(double p_r, double p_g, double p_b, double p_rand, uint32_t p_depth, uint32_t p_min_bounce) {
+	RRResult res;
+	res.terminated = false;
+	res.r = p_r;
+	res.g = p_g;
+	res.b = p_b;
 	if (p_depth <= p_min_bounce) {
-		return r; // Never rouletted below the threshold.
+		return res; // Never rouletted below the threshold.
 	}
-	const double p = MIN(Math::sqrt(p_throughput), 1.0);
+	const double max_component = MAX(MAX(Math::abs(p_r), Math::abs(p_g)), Math::abs(p_b));
+	const double p = MIN(Math::sqrt(max_component), 1.0);
 	if (p <= 0.0 || p_rand >= p) {
-		r.terminated = true;
-		r.throughput = 0.0;
-		return r;
+		res.terminated = true;
+		res.r = res.g = res.b = 0.0;
+		return res;
 	}
-	r.throughput = p_throughput / p;
-	return r;
+	res.r = p_r / p;
+	res.g = p_g / p;
+	res.b = p_b / p;
+	return res;
 }
 
 TEST_CASE("[PathTracer][RussianRoulette] the estimator is unbiased") {
 	// Sweep rand uniformly over [0,1) and average the outcome. The mean must come
 	// back to the original throughput: survivors scaled by 1/p exactly compensate
-	// for the paths that were killed.
+	// for the paths that were killed. Isotropic colour here (r == g == b == t) --
+	// the reduction rule does not matter for this property, only the sqrt/divide
+	// arithmetic does.
 	const uint32_t N = 100000;
 	for (double t : { 0.01, 0.05, 0.25, 0.5, 0.81 }) {
 		double sum = 0.0;
 		for (uint32_t i = 0; i < N; i++) {
 			const double u = (i + 0.5) / double(N);
-			sum += rr_apply(t, u, 8u, 3u).throughput;
+			sum += rr_apply(t, t, t, u, 8u, 3u).r;
 		}
 		CHECK((sum / double(N)) == doctest::Approx(t).epsilon(0.001));
 	}
@@ -167,20 +188,25 @@ TEST_CASE("[PathTracer][RussianRoulette] the estimator is unbiased") {
 TEST_CASE("[PathTracer][RussianRoulette] paths at or below min_bounce are never terminated") {
 	for (uint32_t depth = 0; depth <= 3; depth++) {
 		// Throughput near zero and the worst possible roll -- still must survive.
-		const RRResult r = rr_apply(1e-6, 0.999999, depth, 3u);
+		const RRResult r = rr_apply(1e-6, 1e-6, 1e-6, 0.999999, depth, 3u);
 		CHECK(r.terminated == false);
-		CHECK(r.throughput == doctest::Approx(1e-6));
+		CHECK(r.r == doctest::Approx(1e-6));
 	}
 	// One bounce past the threshold, the same path is terminated.
-	CHECK(rr_apply(1e-6, 0.999999, 4u, 3u).terminated == true);
+	CHECK(rr_apply(1e-6, 1e-6, 1e-6, 0.999999, 4u, 3u).terminated == true);
 }
 
-TEST_CASE("[PathTracer][RussianRoulette] a zero-throughput path terminates and never divides") {
-	// p == 0 here. A naive `rand > p` test would let rand == 0.0 through and then
-	// divide by zero, producing an Inf that the accumulator never washes out.
-	const RRResult r = rr_apply(0.0, 0.0, 8u, 3u);
+TEST_CASE("[PathTracer][RussianRoulette] a zero-throughput path terminates cleanly") {
+	// p == 0 here. `rand >= p` alone already terminates for every rand in
+	// [0, 1) -- rng_1d's divisor is 2^32 + 512 (sobol_burley_inc.glsl:89-91), so
+	// rand is strictly below 1.0 and can never fail to be >= 0. The `p <= 0.0`
+	// clause is therefore belt-and-braces, not the deciding clause today: this
+	// case checks termination is clean (no NaN, no Inf, no divide) either way,
+	// not that the clause specifically fires -- see the shader comment for when
+	// it would start mattering (comparison sense flipped to `>`).
+	const RRResult r = rr_apply(0.0, 0.0, 0.0, 0.0, 8u, 3u);
 	CHECK(r.terminated == true);
-	CHECK(r.throughput == doctest::Approx(0.0));
+	CHECK(r.r == doctest::Approx(0.0));
 }
 
 TEST_CASE("[PathTracer][RussianRoulette] bright paths are never terminated and never rescaled") {
@@ -188,28 +214,55 @@ TEST_CASE("[PathTracer][RussianRoulette] bright paths are never terminated and n
 	// unchanged -- the roulette must cost nothing where it can save nothing.
 	for (double t : { 1.0, 4.0, 100.0 }) {
 		for (double u : { 0.0, 0.5, 0.999999 }) {
-			const RRResult r = rr_apply(t, u, 8u, 3u);
+			const RRResult r = rr_apply(t, t, t, u, 8u, 3u);
 			CHECK(r.terminated == false);
-			CHECK(r.throughput == doctest::Approx(t));
+			CHECK(r.r == doctest::Approx(t));
+			CHECK(r.g == doctest::Approx(t));
+			CHECK(r.b == doctest::Approx(t));
 		}
 	}
 }
 
-TEST_CASE("[PathTracer][RussianRoulette] termination probability follows sqrt, not luminance") {
-	// Cycles uses sqrt(max_component) deliberately -- it terminates LATER than a
-	// naive luminance-based rule, to better match the view transform. An earlier
-	// revision of PATH_TRACER_QUALITY_ROADMAP.md specified
-	// clamp(luminance, 0.05, 0.95) and that was wrong. This pins the reference.
-	// At throughput 0.25, sqrt gives p = 0.5; the naive rule would give 0.25.
+TEST_CASE("[PathTracer][RussianRoulette] termination probability is sqrt of the reduction, not the reduction itself") {
+	// Cycles applies sqrt() on top of the reduced value deliberately -- it
+	// terminates LATER than a naive linear rule, to better match the view
+	// transform. An earlier revision of PATH_TRACER_QUALITY_ROADMAP.md specified
+	// clamp(luminance, 0.05, 0.95) (linear, no sqrt) and that was wrong.
+	// Isotropic colour (r==g==b==0.25): the reduction rule is not under test
+	// here (any of max_component/luminance/min_component give 0.25 for a grey
+	// value) -- only the sqrt non-linearity is. At throughput 0.25, sqrt gives
+	// p = 0.5; a linear (non-sqrt) rule would give p = 0.25.
 	const uint32_t N = 100000;
 	uint32_t survived = 0;
 	for (uint32_t i = 0; i < N; i++) {
 		const double u = (i + 0.5) / double(N);
-		if (!rr_apply(0.25, u, 8u, 3u).terminated) {
+		if (!rr_apply(0.25, 0.25, 0.25, u, 8u, 3u).terminated) {
 			survived++;
 		}
 	}
-	CHECK((double(survived) / double(N)) == doctest::Approx(0.5).epsilon(0.01));
+	// The stratified sweep is deterministic -- exactly 50000/100000 samples fall
+	// below p = 0.5 -- so this is not a statistical tolerance.
+	CHECK((double(survived) / double(N)) == doctest::Approx(0.5).epsilon(1e-9));
+}
+
+TEST_CASE("[PathTracer][RussianRoulette] the reduction is max-component, not luminance") {
+	// A scalar (isotropic) throughput cannot discriminate max_component from
+	// luminance -- both reduce a grey value to the same number. This uses a
+	// strongly-coloured throughput, which the two rules disagree on sharply:
+	//   max_component: p = sqrt(max(0.9, 0.02, 0.02)) = sqrt(0.9) ~= 0.9487.
+	//   luminance (Rec.709 weights, matching brdf_inc.glsl's luminance()):
+	//     dot((0.9,0.02,0.02), (0.2126,0.7152,0.0722)) ~= 0.2071, sqrt ~= 0.4551.
+	// At u = 0.9: max_component survives (0.9 < 0.9487); a luminance-reduced
+	// rule would have terminated (0.9 >= 0.4551). Both reductions are
+	// individually unbiased -- swapping one for the other would still pass
+	// every other test in this file. The damage a wrong reduction does is
+	// variance and path length, which no convergence test catches either.
+	const RRResult r = rr_apply(0.9, 0.02, 0.02, 0.9, 8u, 3u);
+	CHECK(r.terminated == false);
+
+	const double luminance = 0.9 * 0.2126 + 0.02 * 0.7152 + 0.02 * 0.0722;
+	const double p_luminance = Math::sqrt(luminance);
+	CHECK(p_luminance < 0.9); // Sanity: the luminance rule WOULD have killed this at u = 0.9.
 }
 
 } // namespace TestPTRussianRoulette

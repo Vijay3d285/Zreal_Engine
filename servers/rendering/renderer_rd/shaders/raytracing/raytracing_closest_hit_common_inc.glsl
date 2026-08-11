@@ -772,10 +772,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	{
 		uint rr_depth = get_total_bounces(ps.packed_bounces_flags);
 		if (rr_depth > RT_GET_MIN_BOUNCE()) {
-			float rr_p = min(sqrt(max(max(ps.throughput.r, ps.throughput.g), ps.throughput.b)), 1.0);
-			// p == 0 is reachable (a fully absorbed path). rng_1d can return exactly
-			// 0.0, which a naive `> p` test would let through and then divide by zero,
-			// producing an Inf the accumulator never washes out.
+			// abs() matches Cycles' reduce_max(fabs(throughput)) (path_state.h:296-305).
+			// Throughput is non-negative on entry and only ever scaled by positive
+			// factors today, so this is a near-zero-risk guard -- but sqrt() of a
+			// negative is undefined in GLSL, and the NaN it would produce flows
+			// through both comparisons below as false (survive), then
+			// `throughput /= rr_p` propagates it until sanitize_payload_value()
+			// (path_pack, above) zeroes the path out silently.
+			float rr_p = min(sqrt(max(max(abs(ps.throughput.r), abs(ps.throughput.g)), abs(ps.throughput.b))), 1.0);
+			// rng_1d's divisor is 2^32 + 512 (sobol_burley_inc.glsl), so its result is
+			// strictly < 1.0 -- `rand >= p` alone already terminates every path with
+			// p == 0. The `rr_p <= 0.0` clause is therefore belt-and-braces, not
+			// load-bearing today: it only matters if the comparison sense above is
+			// ever changed from `>=` to `>`, which would otherwise let rand == 0.0
+			// through at p == 0 and divide by zero.
 			if (rr_p <= 0.0 || rng_1d(rng, RT_PRNG_TERMINATE) >= rr_p) {
 				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 				path_pack(payload, ps);
