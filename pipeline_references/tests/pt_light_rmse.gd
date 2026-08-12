@@ -87,7 +87,15 @@ func _ready() -> void:
 
 	print("\n=== ANALYTIC LIGHT SELECTION measurement (tag '%s') ===" % _tag)
 	print("viewport render size: %s" % str(get_viewport().get_visible_rect().size))
-	print("light sources: 1 key (energy 200) + 40 fills (energy 0.15), no sky")
+	# Derived from the mode, never hardcoded: a fixed string here cannot tell you
+	# whether ZR_LIGHT_SHADOW_MODE actually engaged, and a timing number recorded
+	# against a scene you did not confirm you built is worthless.
+	if OS.get_environment("ZR_LIGHT_SHADOW_MODE") == "mixed":
+		print("light sources: MIXED -- 1 directional sun + 2 spots (shadow_enabled=true)")
+		print("               + 38 omni fills (shadow_enabled=FALSE), 41 total, no sky")
+	else:
+		print("light sources: ALL-SHADOW -- 1 key (energy 200) + 40 fills (energy 0.15),")
+		print("               41 total, every light shadow_enabled=true (default), no sky")
 
 	if OS.get_environment("ZR_LIGHT_SKIP_SWEEP") != "1":
 		await _sweep(env)
@@ -340,6 +348,10 @@ func _build_scene() -> Environment:
 ## contribute ~3% of the light -- and with k = 16 it fails to CONSIDER the key at
 ## all at roughly (1 - 1/41)^16 = 67% of shading points.
 func _build_lights(root: Node) -> void:
+	if OS.get_environment("ZR_LIGHT_SHADOW_MODE") == "mixed":
+		_build_lights_mixed(root)
+		return
+
 	var key := OmniLight3D.new()
 	key.position = Vector3(0.0, 5.0, 0.0)
 	key.light_energy = 200.0
@@ -354,6 +366,73 @@ func _build_lights(root: Node) -> void:
 		f.light_energy = 0.15
 		f.omni_range = 100.0
 		f.light_color = Color(1, 1, 1)
+		root.add_child(f)
+
+
+## ZR_LIGHT_SHADOW_MODE=mixed -- the configuration the default scene above is
+## STRUCTURALLY BLIND TO, and the one a real interior actually has.
+##
+## Every light in the default scene leaves shadow_enabled at its default of true,
+## so the control and the treatment trace the SAME number of shadow rays and the
+## only thing that build differs in is the weight arithmetic. That is why the
+## default scene measured C2 at +50.8% frame time while the production pipeline
+## measured +128% on the same change: the pipeline's lights are not shaped like
+## this one's.
+##
+## In the production scene (image_glb_creation.gd) roughly 35 of ~40 lights are
+## shadowless fills -- fill/fill_front/fill_back per room, ceiling and decor
+## spots -- and only the sun and the two window portal spots set
+## shadow_enabled = true. In the shader, shadow_enabled == 0.0 skips the shadow
+## ray ENTIRELY. So:
+##
+##   * uniform selection picks a shadow-casting light ~3/41 = 7% of the time and
+##     almost never pays for a traversal;
+##   * power-weighted selection concentrates on the brightest emitters, which are
+##     exactly the three that DO trace -- and a directional light takes no
+##     distance attenuation at all, so the sun dominates the CDF outright.
+##
+## The shadow-ray rate therefore jumps by roughly an order of magnitude, and in a
+## scene with real occluders that traversal, not the CDF scan, is the dominant
+## cost. This mode reproduces that shape at the same total light count (41) so the
+## scan cost is held constant and the ray-count change is what is being measured.
+##
+## It is also the only rendered measurement in this project that exercises the
+## SPOT and DIRECTIONAL branches of lights_select_weight -- the default scene is
+## omni-only, which the C2 final review recorded as an open coverage gap.
+func _build_lights_mixed(root: Node) -> void:
+	# The sun. Dominates the CDF: directional lights return `mag * indirect_factor`
+	# with attenuation pinned at 1.0, so no distance falloff discounts it.
+	var sun := DirectionalLight3D.new()
+	sun.rotation_degrees = Vector3(-62.0, 34.0, 0.0)
+	sun.light_energy = 1.6
+	sun.light_color = Color(1.0, 0.96, 0.9)
+	sun.shadow_enabled = true
+	root.add_child(sun)
+
+	# Two window portal spots, shadow-casting, matching the pipeline's pattern.
+	for i in range(2):
+		var s := SpotLight3D.new()
+		var sx := -7.0 if i == 0 else 7.0
+		s.position = Vector3(sx, 4.5, 0.0)
+		s.look_at_from_position(s.position, Vector3(0.0, 0.5, 0.0), Vector3.UP)
+		s.light_energy = 22.0
+		s.spot_range = 20.0
+		s.spot_angle = 60.0
+		s.spot_angle_attenuation = 0.4
+		s.spot_attenuation = 1.0
+		s.light_color = Color(1.0, 0.97, 0.92)
+		s.shadow_enabled = true
+		root.add_child(s)
+
+	# 38 shadowless fills, as the pipeline builds per room.
+	for i in range(38):
+		var f := OmniLight3D.new()
+		var a := TAU * float(i) / 38.0
+		f.position = Vector3(cos(a) * 6.0, 2.0 + float(i % 4), sin(a) * 6.0)
+		f.light_energy = 0.15
+		f.omni_range = 100.0
+		f.light_color = Color(1, 1, 1)
+		f.shadow_enabled = false
 		root.add_child(f)
 
 

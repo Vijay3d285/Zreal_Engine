@@ -79,7 +79,9 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 		return 0.0;
 	}
 
-	float atten = lights_attenuation_from_dist_sq(dist_sq, p_light.inv_max_range, p_light.attenuation);
+	// _from_dist, not _from_dist_sq: `dist` is already in hand above, and the
+	// _sq entry point would take a second sqrt of a value already rooted.
+	float atten = lights_attenuation_from_dist(dist, p_light.inv_max_range, p_light.attenuation);
 
 	float spot_factor = 1.0;
 	// Gated on type, NOT on the falloff fields being populated: RECT lights also
@@ -110,7 +112,18 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 		// making 1 - pow(ratio, k) NEGATIVE. A negative weight corrupts the CDF
 		// walk far worse than the zero the widening exists to prevent.
 		float spot_rim = clamp((1.0 - scos) / (1.0 - p_light.cos_spot_angle), 1e-4, 1.0);
-		spot_factor = 1.0 - pow(spot_rim, p_light.inv_spot_attenuation);
+
+		// LINEAR, where the shading path raises spot_rim to inv_spot_attenuation.
+		// pow() is a transcendental and this runs 2N times per shading point; the
+		// exponent only reshapes how samples are distributed INSIDE the cone, and
+		// cannot introduce bias, because the ONLY thing that can zero a spot's
+		// weight is the widened cone test above, which is preserved exactly.
+		// Both forms are 1 on the axis and 0 at the rim, so the floor still takes
+		// over in the same place. Off-axis points whose true falloff is steeper
+		// than linear are oversampled relative to their contribution -- variance,
+		// bought for two fewer pow() per spot light per pass.
+		// Exact when inv_spot_attenuation == 1.0.
+		spot_factor = 1.0 - spot_rim;
 	}
 
 	// HAZARD 3 -- both continuous factors decay smoothly to zero at a boundary

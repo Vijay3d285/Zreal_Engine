@@ -86,17 +86,35 @@ layout(set = 0, binding = RT_LIGHT_BUFFER_BINDING, std430) readonly buffer Light
 // light-selection weight (lights_select_weight). These MUST stay one function:
 // if the weight's falloff drifts from the contribution's falloff, the estimator
 // divides by a pdf that does not match the density it sampled from.
-float lights_attenuation_from_dist_sq(float p_dist_sq, float p_inv_max_range, float p_decay) {
-	if (p_dist_sq <= 0.0) {
+// Distance form. Callers that already hold the distance use this directly:
+// lights_select_weight needs `dist` anyway (for the rect half-diagonal bound and
+// the spot cone), and routing it through the _from_dist_sq entry point made it
+// pay a second sqrt of a value it had already taken the root of.
+float lights_attenuation_from_dist(float p_dist, float p_inv_max_range, float p_decay) {
+	if (p_dist <= 0.0) {
 		return 1.0; // Directional: no distance attenuation.
 	}
 
-	float distance = sqrt(p_dist_sq);
-	float atten = min(pow(max(distance, 0.0001), -p_decay), 1.0);
+	// Clamped only for the decay term, matching the original expression exactly:
+	// the window below uses the RAW distance.
+	float safe_distance = max(p_dist, 0.0001);
+
+	// Fast path for the inverse-square default. pow() is a transcendental and
+	// lights_select_weight evaluates this 2N times per shading point, so on a
+	// 40-light scene the exponent form costs 80 pow() where the scene almost
+	// always wants exactly 1/d^2. Godot's LIGHT_PARAM_ATTENUATION defaults to 2.0
+	// and the offline pipeline never overrides it. Any other exponent falls
+	// through to pow() unchanged, so this is a speed path, not a behaviour change.
+	float atten;
+	if (p_decay == 2.0) {
+		atten = min(1.0 / (safe_distance * safe_distance), 1.0);
+	} else {
+		atten = min(pow(safe_distance, -p_decay), 1.0);
+	}
 
 	// Windowed falloff if range is finite (inv_max_range >= 0).
 	if (p_inv_max_range >= 0.0) {
-		float nd = distance * p_inv_max_range;
+		float nd = p_dist * p_inv_max_range;
 		nd *= nd;
 		nd *= nd; // nd^4
 		nd = max(1.0 - nd, 0.0);
@@ -105,6 +123,13 @@ float lights_attenuation_from_dist_sq(float p_dist_sq, float p_inv_max_range, fl
 	}
 
 	return atten;
+}
+
+float lights_attenuation_from_dist_sq(float p_dist_sq, float p_inv_max_range, float p_decay) {
+	if (p_dist_sq <= 0.0) {
+		return 1.0; // Directional: no distance attenuation.
+	}
+	return lights_attenuation_from_dist(sqrt(p_dist_sq), p_inv_max_range, p_decay);
 }
 
 // Importance-weighted selection (roadmap C2). Included here, after RTLightData
@@ -480,6 +505,26 @@ vec3 lights_evaluate_direct_lighting(
 			}
 			float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - light.cos_spot_angle));
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
+		}
+
+		// Below-horizon early-out, BEFORE the shadow ray. evalCombinedBRDFSeparate
+		// rejects on data.Lbackfacing, which is defined as exactly `NdotL <= 0.0`
+		// (prepareBRDFData in brdf_inc.glsl), and returns (0,0,0) for BOTH lobes --
+		// so this branch and the full path already produce an identical vec3(0.0).
+		// The only difference is that the full path pays a complete BVH traversal
+		// first. This is one dot product.
+		//
+		// The RECT and DIRECTIONAL branches of this function already gate this way;
+		// only the positional branch traced first and asked afterwards. On a diffuse
+		// surface roughly half of all selected directions land below the horizon, so
+		// this removes about half the shadow rays outright.
+		//
+		// C2 is what made this worth doing. Uniform selection mostly picked the many
+		// cheap shadowless fill lights, so few samples reached a traversal at all;
+		// power-weighted selection concentrates on the few bright lights, which in a
+		// typical interior are exactly the ones with shadow_enabled = true.
+		if (dot(N, L) <= 0.0) {
+			return vec3(0.0);
 		}
 
 		// Shadow test — skipped entirely when shadow_enabled == 0.0 (shadowless fill light).

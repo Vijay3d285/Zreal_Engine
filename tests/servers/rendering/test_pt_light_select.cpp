@@ -82,15 +82,26 @@ static float mirror_luminance(const Vector3 &p_c) {
 	return p_c.x * 0.2126f + p_c.y * 0.7152f + p_c.z * 0.0722f;
 }
 
-// Mirror of lights_attenuation_from_dist_sq().
-static float mirror_attenuation(float p_dist_sq, float p_inv_max_range, float p_decay) {
-	if (p_dist_sq <= 0.0f) {
+// Mirror of lights_attenuation_from_dist(). The shader's _from_dist_sq entry
+// point is just sqrt() plus this; the weight calls the distance form directly
+// because it already holds the distance.
+static float mirror_attenuation_from_dist(float p_dist, float p_inv_max_range, float p_decay) {
+	if (p_dist <= 0.0f) {
 		return 1.0f;
 	}
-	const float distance = Math::sqrt(p_dist_sq);
-	float atten = MIN(Math::pow(MAX(distance, 0.0001f), -p_decay), 1.0f);
+	// Clamped only for the decay term — the window below uses the raw distance.
+	const float safe_distance = MAX(p_dist, 0.0001f);
+	// Inverse-square fast path. pow() is a transcendental and the shader
+	// evaluates this 2N times per shading point; decay is 2.0 for effectively
+	// every light Godot builds. Any other exponent falls through to pow().
+	float atten;
+	if (p_decay == 2.0f) {
+		atten = MIN(1.0f / (safe_distance * safe_distance), 1.0f);
+	} else {
+		atten = MIN(Math::pow(safe_distance, -p_decay), 1.0f);
+	}
 	if (p_inv_max_range >= 0.0f) {
-		float nd = distance * p_inv_max_range;
+		float nd = p_dist * p_inv_max_range;
 		nd *= nd;
 		nd *= nd;
 		nd = MAX(1.0f - nd, 0.0f);
@@ -127,7 +138,7 @@ static float mirror_weight(const Vector3 &p_hit_pos, const MirrorLight &p_light,
 		return 0.0f;
 	}
 
-	const float atten = mirror_attenuation(dist_sq, p_light.inv_max_range, p_light.attenuation);
+	const float atten = mirror_attenuation_from_dist(dist, p_light.inv_max_range, p_light.attenuation);
 
 	float spot_factor = 1.0f;
 	if (p_light.type == LIGHT_TYPE_SPOT) {
@@ -147,7 +158,12 @@ static float mirror_weight(const Vector3 &p_hit_pos, const MirrorLight &p_light,
 		// A negative weight corrupts the CDF far worse than the zero this
 		// widening exists to avoid.
 		const float spot_rim = CLAMP((1.0f - scos) / (1.0f - p_light.cos_spot_angle), 1e-4f, 1.0f);
-		spot_factor = 1.0f - Math::pow(spot_rim, p_light.inv_spot_attenuation);
+		// LINEAR, where the shading path raises spot_rim to inv_spot_attenuation.
+		// The exponent only reshapes sample distribution INSIDE the cone and cannot
+		// introduce bias — the widened cone test above is the only thing that can
+		// zero a spot's weight, and it is preserved exactly. Exact when
+		// inv_spot_attenuation == 1.0. See the matching note in the GLSL.
+		spot_factor = 1.0f - spot_rim;
 	}
 
 	const float spatial = MAX(atten * spot_factor, RT_LIGHT_WEIGHT_FLOOR);
@@ -616,6 +632,50 @@ TEST_CASE("[PathTracer][LightSelect] all-zero weights returns false, not index 0
 	// Empty is the same case.
 	std::vector<float> empty;
 	CHECK_FALSE(mirror_select(empty, 0.5f, idx, pdf));
+}
+
+TEST_CASE("[PathTracer][LightSelect] the inverse-square fast path agrees with pow") {
+	// lights_attenuation_from_dist() special-cases decay == 2.0 to 1/d^2 instead
+	// of pow(d, -2), because pow() is a transcendental and the selection weight
+	// evaluates it 2N times per shading point. The two must agree: this function
+	// is shared VERBATIM with the shading path, so a divergence here would move
+	// the rendered image, not just the sample distribution.
+	//
+	// Both finite and infinite range are covered. The windowed term is a pure
+	// multiplier on top and is identical in both branches, but a range-limited
+	// case is included so a future edit that moves the window inside the branch
+	// is caught.
+	const float distances[] = { 0.01f, 0.5f, 1.0f, 2.0f, 7.3f, 100.0f, 1000.0f };
+	for (float d : distances) {
+		const float fast = mirror_attenuation_from_dist(d, -1.0f, 2.0f);
+		const float slow = MIN(Math::pow(MAX(d, 0.0001f), -2.0f), 1.0f);
+		CHECK(fast == doctest::Approx(slow).epsilon(1e-6));
+
+		const float fast_r = mirror_attenuation_from_dist(d, 1.0f / 1200.0f, 2.0f);
+		float nd = d / 1200.0f;
+		nd *= nd;
+		nd *= nd;
+		nd = MAX(1.0f - nd, 0.0f);
+		nd *= nd;
+		CHECK(fast_r == doctest::Approx(slow * nd).epsilon(1e-6));
+	}
+}
+
+TEST_CASE("[PathTracer][LightSelect] a non-default decay still goes through pow") {
+	// The fast path is an exact-equality branch on 2.0. Every other exponent must
+	// fall through unchanged -- a test that only ever passes decay == 2.0 would
+	// keep passing if the else-branch were deleted outright.
+	const float decays[] = { 0.0f, 0.5f, 1.0f, 1.5f, 3.0f, 2.0001f };
+	for (float k : decays) {
+		const float got = mirror_attenuation_from_dist(4.0f, -1.0f, k);
+		const float want = MIN(Math::pow(4.0f, -k), 1.0f);
+		CHECK(got == doctest::Approx(want).epsilon(1e-6));
+	}
+	// And the branch genuinely discriminates: at decay 3 the inverse-square form
+	// would read 1/16, the correct answer is 1/64. If this ever compares equal,
+	// the else-branch stopped being reached.
+	CHECK(mirror_attenuation_from_dist(4.0f, -1.0f, 3.0f) == doctest::Approx(1.0f / 64.0f));
+	CHECK(mirror_attenuation_from_dist(4.0f, -1.0f, 2.0f) == doctest::Approx(1.0f / 16.0f));
 }
 
 } // namespace TestPTLightSelect
