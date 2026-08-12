@@ -2,6 +2,7 @@
 // Requires: GL_EXT_buffer_reference, GL_ARB_gpu_shader_int64, oct_inc.glsl, raytracing_inc.glsl
 
 #include "raytracing_data_inc.glsl"
+#include "raytracing_vertex_inc.glsl"
 
 // ============================================================================
 // VERTEX ATTRIBUTES
