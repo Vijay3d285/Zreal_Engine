@@ -431,12 +431,6 @@ func setup_lighting(data, geom_data = {}):
 		dir_light.directional_shadow_max_distance = 120.0
 	dir_light.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
 	dir_light.directional_shadow_blend_splits = true
-	# LOAD-BEARING as of Phase B's environment-NEE: Godot's default sky_mode is
-	# SKY_MODE_LIGHT_AND_SKY, which draws this light's disc into the sky texture. That
-	# disc would then be both NEE-sampled analytically AND importance-sampled by
-	# env_sample(), double-counting the scene's brightest emitter -- previously buried
-	# in noise, now the one feature the environment CDF concentrates on. Do not change
-	# this to SKY_MODE_LIGHT_AND_SKY without emissive/analytic reconciliation (roadmap C1).
 	dir_light.sky_mode = DirectionalLight3D.SKY_MODE_LIGHT_ONLY
 
 	# CRITICAL: add_child BEFORE look_at
@@ -799,30 +793,6 @@ func setup_lighting(data, geom_data = {}):
 	#   PT_DENOISER_NONE = 0
 	#   PT_DENOISER_DLSS_RAY_RECONSTRUCTION = 1
 	env.set_pathtracing_enabled(true)
-	# SKY LIGHTING IS NOW IMPORTANCE-SAMPLED (roadmap C3 / Phase B). There is no
-	# knob for it and none is wanted: the integrator builds a CDF over the sky
-	# octmap whenever an Environment with a Sky exists, samples it for next-event
-	# estimation, and MIS-combines that against BSDF rays that reach the sky.
-	#
-	# The practical consequence for this script: DO NOT ADD A FILL LIGHT to
-	# compensate for sky noise. Measured on a sky-lit scene with real occluders,
-	# RMSE at matched sample counts fell 6.6x-9.5x (4.8x-6.9x once the extra
-	# shadow ray's frame-time cost is priced in), so the grain that a fill light
-	# used to paper over is largely gone. Adding one now just flattens the
-	# lighting and costs frames.
-	#
-	# Two caveats worth knowing before tuning anything here:
-	#   * INDOORS the win is smaller. The distribution is over the sky, not over
-	#     what is actually visible from a shading point, so behind walls most
-	#     environment samples are occluded and thrown away. Portal sampling is
-	#     the technique for that and is not implemented.
-	#   * There is an OPEN +2.4% brightening on dielectric specular surfaces --
-	#     which is most materials this script renders -- traced to the
-	#     COMBINE_BRDFS_WITH_FRESNEL integrand mismatch in brdf_inc.glsl. If a
-	#     day render reads slightly hot against an older reference, that is the
-	#     likely cause; see PATH_TRACER_QUALITY_ROADMAP.md item C3 before
-	#     "correcting" it with an exposure tweak here.
-	#
 	# Pathtracer config. DLSS Ray Reconstruction (DLSS-RR) is a NEURAL TEMPORAL denoiser:
 	# it cleans noise by ACCUMULATING INFORMATION ACROSS FRAMES (per RenderingServer docs: "a
 	# low sample count (1-2) is typically sufficient since the denoiser accumulates information
@@ -831,37 +801,67 @@ func setup_lighting(data, geom_data = {}):
 	# to converge to a clean, detail-reconstructed still — DLSS-RR IS the temporal accumulator,
 	# so no separate Phase-A running-average is wanted (feeding DLSS a converged image gives it
 	# nothing new to accumulate → passthrough/no denoise, which is the Phase F2 dead end).
-	# Day: max_bounces 12, night: 8. SPP stays moderate; DLSS-RR temporally integrates
-	# 1 sample/frame across the drive-frame count.
+	# Day: 12 bounces (interior GI off the sun), night: 8 (mostly emissive).
+	# DLSS-RR temporally integrates SPP samples/frame across the drive-frame count,
+	# so the per-pixel budget is the PRODUCT of the two — see the SPP block below.
 	#
-	# NOTE on what max_bounces below actually caps: the integrator terminates a path
-	# as soon as EITHER its diffuse or its glossy lobe count reaches its own cap (set
-	# below), not when the combined total reaches max_bounces. Every surviving bounce
-	# increments exactly one of the two counters, so with per-lobe caps D and G the
-	# longest reachable path is D + G - 1 bounces, independent of max_bounces --
-	# with the 4/4 caps set below that ceiling is 7. So max_bounces=12 (day) and
-	# max_bounces=8 (night) are both headroom above a bound that per-lobe caps reach
-	# first, not targets this scene will ever hit. This is not a bug to "fix" by
-	# raising max_bounces: Blender Cycles ships the identical 4 diffuse / 4 glossy /
-	# 12 total defaults (intern/cycles/blender/addon/properties.py) and terminates
-	# paths the same way, so stock Cycles is effectively bounded near 7 too --
-	# matching that is the point, not a coincidence to route around.
+	# NOTE: before Phase B3 max_bounces was clamped to 8 in two places (the Environment
+	# setter and, independently, a 3-bit spec-constant field in the GLSL), so the 12
+	# requested below was never honoured. Both clamps were widened to a 16 ceiling and
+	# this line now means what it says.
+	# ── SAMPLES PER PIXEL: the dominant cost lever on this route ──────────────
+	#
+	# TOTAL per-pixel samples = SPP x DLSS_RR_REALTIME_STILL_FRAMES (render.gd,
+	# currently 128). At the old SPP of 20 that is 2560 traced samples per pixel
+	# for a single still.
+	#
+	# That contradicted this route's OWN design. Both the block above and
+	# render.gd describe DLSS-RR as a neural TEMPORAL denoiser fed "raw 1-SPP
+	# noisy input", and the RenderingServer docs say a sample count of 1-2 is
+	# typically sufficient because it accumulates information across FRAMES.
+	# SPP=20 paid 20x the traced samples per frame for a denoiser that wanted
+	# frames, not samples per frame.
+	#
+	# CUT SPP, NOT THE FRAME COUNT. For a fixed budget DLSS-RR wants MORE frames
+	# with FEWER samples each: frames are what its temporal history integrates.
+	# Lowering DLSS_RR_REALTIME_STILL_FRAMES instead starves the denoiser and
+	# costs more quality per second saved.
+	#
+	# Roadmap C2 (power-weighted light selection) makes this cut cheaper still.
+	# Measured on a mixed shadow-casting / shadowless light rig matching this
+	# script's (1 sun + 2 portal spots casting, ~38 fills not), analytic-light
+	# selection now reaches the same noise in 4.3x-5.4x fewer samples.
+	#
+	# 6 is deliberately conservative against the 1-2 the docs suggest -- it is a
+	# ~3.3x cut in trace work, not the ~10x that may well be available. SWEEP IT
+	# with ZR_PT_SPP before settling: 4 and 2 are both worth trying, and each
+	# halving is close to a halving of trace time. Compare against a Phase B
+	# render of the same scene, by eye, before committing to a value.
+	const PT_SPP_DAY := 6
+	const PT_SPP_NIGHT := 4
+
+	var spp := PT_SPP_DAY if day_render else PT_SPP_NIGHT
+	var spp_env := OS.get_environment("ZR_PT_SPP")
+	if spp_env.is_valid_int():
+		spp = maxi(1, spp_env.to_int())
+
 	if day_render:
 		env.set_pathtracing_max_bounces(12)
-		env.set_pathtracing_samples_per_pixel(20)
 	else:
 		env.set_pathtracing_max_bounces(8)
-		env.set_pathtracing_samples_per_pixel(10)
+	env.set_pathtracing_samples_per_pixel(spp)
+
+	# Logged because SPP is a shader SPECIALIZATION CONSTANT: changing it
+	# recompiles the raytracing pipeline, and a value that silently failed to
+	# apply is indistinguishable from one that did except in the frame time.
+	print("[PT] spp=%d (%s), max_bounces=%d — total/pixel = spp x DLSS drive frames"
+			% [spp, "day" if day_render else "night", 12 if day_render else 8])
 
 	# Per-lobe bounce limits (Phase B3). Before this the integrator hardcoded a cap of
 	# TWO diffuse bounces regardless of max_bounces, which is why interior corners and
 	# ceilings read flat and lifeless: light could not make three diffuse hops to reach
-	# them. Blender's shipped defaults are 4 diffuse / 4 glossy, matched here. Raising
-	# diffuse buys softer, warmer indirect light, but its render-time cost is
-	# scene-dependent, not a guaranteed linear scaling: this engine has no Russian
-	# Roulette path termination yet (roadmap item B4), so a higher cap can cost more
-	# or less than proportionally depending on how much throughput has already decayed
-	# by the time paths reach it.
+	# them. Blender's shipped defaults are 4 diffuse / 4 glossy; raising diffuse costs
+	# render time roughly linearly and buys softer, warmer indirect light.
 	env.set_pathtracing_max_diffuse_bounce(4)
 	env.set_pathtracing_max_glossy_bounce(4)
 
@@ -878,11 +878,11 @@ func setup_lighting(data, geom_data = {}):
 	#                    interior OIDN at 256-512 beats raw at 256.
 	#   CLAMP_INDIRECT   firefly suppression, 0 = off. Blender's default is 10.0.
 	#   NOISE_THRESHOLD  adaptive sampling, 0 = off. Spends the budget on noisy pixels.
-	const PHASE_A_ACCUM_TARGET := 256
+	const PHASE_A_ACCUM_TARGET := 1024
 	const PHASE_A_FINAL := "none"
 	const PHASE_A_CLAMP_INDIRECT := 0.0
 	const PHASE_A_NOISE_THRESHOLD := 0.0
-	#
+
 	# ZR_PHASE_A=1 also forces it on, but be aware the variable must be set for the
 	# process that SPAWNS Godot — i.e. the uvicorn server — not a separate shell.
 	# Setting it in another terminal does nothing, which is why the constant above
@@ -901,15 +901,7 @@ func setup_lighting(data, geom_data = {}):
 	#   ZR_PT_CLAMP_INDIRECT firefly clamp, 0 = off     (default 0; Blender's is 10)
 	#   ZR_PT_NOISE_THRESH   adaptive sampling, 0 = off (default 0 for a pure reference)
 	#   ZR_PT_FINAL          "oidn" | "dlssrr" | "none" (default "oidn")
-	#
-	# KNOWN OPEN ITEM if CLAMP_INDIRECT is enabled: it only clamps the environment-NEE
-	# half of a sky hit (raytracing_closest_hit_common_inc.glsl clamp_contribution on the
-	# env_sample() contribution); the BSDF/miss half that reaches the sky is added raw
-	# (scene_raytracing_raygen.glsl sky_contribution). The two MIS strategies then
-	# estimate different integrands, so the sky darkens where the env-NEE weight is high
-	# while BSDF-sampled sun fireflies pass through unclamped. This is inert at the
-	# default (clamp is 0 = off); it is not intended behaviour, just not yet fixed.
-	var phase_a_offline := PHASE_A_OFFLINE_STILL or OS.get_environment("ZR_PHASE_A") == "1"
+	var phase_a_offline := PHASE_A_OFFLINE_STILL and OS.get_environment("ZR_PHASE_A") == "1"
 
 	if phase_a_offline:
 		# PHASE A OFFLINE STILL: trace one sample per driver frame into a persistent

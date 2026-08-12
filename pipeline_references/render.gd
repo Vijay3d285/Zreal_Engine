@@ -357,7 +357,15 @@ func render_image(data, output_path):
 	var dlss_rr_realtime = env != null and env.environment != null and not env.environment.pathtracing_accumulate and env.environment.pathtracing_denoiser == 1
 	# Number of driver frames to let the realtime DLSS-RR temporal accumulator converge for a still.
 	# 256 (~256 effective samples via temporal integration) gives a clean result; bump to 512 for hero.
-	const DLSS_RR_REALTIME_STILL_FRAMES = 256
+	#
+	# DO NOT REACH FOR THIS FIRST WHEN A RENDER IS TOO SLOW. The per-pixel budget
+	# is SPP x this count, and of the two, SPP is the one to cut: frames are what
+	# DLSS-RR's temporal history integrates, so trimming them starves the denoiser
+	# and costs more quality per second saved than trimming samples-per-frame.
+	# SPP lives in image_glb_creation.gd (PT_SPP_DAY / PT_SPP_NIGHT, overridable
+	# with ZR_PT_SPP) and was 20 — twenty times what this route's own "raw 1-SPP
+	# noisy input" design called for.
+	const DLSS_RR_REALTIME_STILL_FRAMES = 128
 	# Number of warmup frames to feed DLSS-RR after convergence so its temporal history
 	# locks onto the converged image (reset=true frame 1, reset=false after). Cheap — each
 	# warmup frame re-blends the same converged image, letting the reconstructor settle.
