@@ -3252,6 +3252,9 @@
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracer/emissive_mesh_lights" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], meshes with emissive materials are sampled directly as light sources by the path tracer's next-event estimation, and multiple importance sampling combines that against BSDF rays that reach them. Defaults to [code]false[/code] because a scene that already places an analytic light at the same position as an emissive fixture mesh would then be lit twice.
+		</member>
 		<member name="rendering/pathtracer/multimesh_blas_cache_ttl_frames" type="int" setter="" getter="" default="3600">
 			Number of frames a merged MultiMesh BLAS is kept alive in the path tracer cache after its last visible frame. At 60 fps, the default of 3600 corresponds to approximately one minute. Once this threshold is exceeded the BLAS and all merged vertex, attribute, and index buffers are freed. Decrease this value to reclaim GPU memory when MultiMeshes disappear from the scene.
 			[b]Note:[/b] Requires a restart to take effect.

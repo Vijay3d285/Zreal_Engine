@@ -29,37 +29,12 @@ struct TBNResult {
 // ============================================================================
 // TRIANGLE INDEX FETCHING
 // ============================================================================
-
-/// Core implementation taking an explicit primitive ID (works in any shader stage).
-void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i0, out uint i1, out uint i2) {
-	if (geom.index_format == 2u) {
-		i0 = primitive_id * 3u;
-		i1 = primitive_id * 3u + 1u;
-		i2 = primitive_id * 3u + 2u;
-	} else if (geom.index_address != 0ul) {
-		Uint32Buffer idx = Uint32Buffer(geom.index_address);
-		if (geom.index_format == 0u) {
-			uint byte_off = primitive_id * 6u;
-			uint word0 = idx.v[byte_off >> 2];
-			uint word1 = idx.v[(byte_off >> 2) + 1u];
-			if ((byte_off & 3u) == 0u) {
-				i0 = word0 & 0xFFFFu;
-				i1 = word0 >> 16;
-				i2 = word1 & 0xFFFFu;
-			} else {
-				i0 = word0 >> 16;
-				i1 = word1 & 0xFFFFu;
-				i2 = word1 >> 16;
-			}
-		} else {
-			i0 = idx.v[primitive_id * 3u];
-			i1 = idx.v[primitive_id * 3u + 1u];
-			i2 = idx.v[primitive_id * 3u + 2u];
-		}
-	} else {
-		i0 = i1 = i2 = 0u;
-	}
-}
+//
+// get_triangle_indices_ex() itself now lives in raytracing_data_inc.glsl
+// (included above). It moved there so the emissive area-reduction COMPUTE pass
+// (emissive_area_build.glsl) can decode the same indices: this file cannot be
+// included from a compute stage because the wrapper below references
+// gl_PrimitiveID, which no compute shader declares.
 
 /// Convenience wrapper using gl_PrimitiveID (hit shaders only).
 void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {

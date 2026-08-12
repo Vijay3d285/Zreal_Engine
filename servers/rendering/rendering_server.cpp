@@ -3841,6 +3841,11 @@ void RenderingServer::init() {
 	// Russian Roulette entirely. This is a SPECIALIZATION CONSTANT -- changing it
 	// recompiles the raytracing pipeline, which is correct for a per-render setting.
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/russian_roulette_min_bounce", PROPERTY_HINT_RANGE, "0,16,1"), 3);
+	// Emissive-mesh light sampling (roadmap C1): makes geometry with an emissive
+	// material directly sampleable by next-event estimation. Default OFF because a
+	// scene that already places an analytic light inside an emissive fixture mesh
+	// would then be lit twice.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/emissive_mesh_lights"), false);
 
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);

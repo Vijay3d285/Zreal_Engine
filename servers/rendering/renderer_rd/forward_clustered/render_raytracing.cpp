@@ -80,6 +80,13 @@ RenderRaytracing::~RenderRaytracing() {
 		env_dist_fallback_buffer = RID();
 	}
 
+	if (emissive_fallback_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(emissive_fallback_buffer);
+		emissive_fallback_buffer = RID();
+	}
+
+	emissive_lights.free_resources();
+
 	if (bindless_block) {
 		memdelete(bindless_block);
 		bindless_block = nullptr;
@@ -103,6 +110,20 @@ RID RenderRaytracing::_get_env_dist_fallback_buffer() {
 	const uint8_t zeros[16] = {};
 	env_dist_fallback_buffer = RD::get_singleton()->storage_buffer_create(sizeof(zeros), Span<uint8_t>(zeros, sizeof(zeros)));
 	return env_dist_fallback_buffer;
+}
+
+RID RenderRaytracing::_get_emissive_fallback_buffer() {
+	if (emissive_fallback_buffer.is_valid()) {
+		return emissive_fallback_buffer;
+	}
+	// Explicit zeros. The load-bearing one is the first float of the CDF block,
+	// `total_power`: every consumer of the emissive distribution gates on it being
+	// positive before it walks `prefix[]` or indexes `emissive_slot[]`, so a
+	// zeroed word is sufficient to make this buffer safe to bind at all three
+	// bindings without matching EmissiveLights' real sizes or layouts.
+	const uint8_t zeros[16] = {};
+	emissive_fallback_buffer = RD::get_singleton()->storage_buffer_create(sizeof(zeros), Span<uint8_t>(zeros, sizeof(zeros)));
+	return emissive_fallback_buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -2731,6 +2752,24 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
 	finalize_buffers(state);
 
+	// Emissive-mesh light distribution (C1). This runs here rather than in
+	// update_uniform_set() -- where env_cdf is driven from -- for two reasons: it
+	// consumes the per-frame instance scratch arrays (geometry_data /
+	// material_data / blas_transforms) that this function just filled and that
+	// prepare_frame() clears at the start of the next one, and it reads vertex
+	// data through the geometry SSBO that finalize_buffers() uploaded one line
+	// above. update_uniform_set() only binds the results.
+	//
+	// The feature ships default-OFF. When off nothing is gathered, nothing is
+	// built, and update_uniform_set() binds the zero-filled fallback instead.
+	emissive_active = GLOBAL_GET("rendering/pathtracer/emissive_mesh_lights");
+	if (emissive_active) {
+		uint64_t emissive_token = 0;
+		gather_emissive_instances(emissive_inputs, emissive_slots, emissive_token);
+		emissive_lights.mark_dirty_if_token_changed(emissive_token);
+		emissive_lights.update(emissive_inputs, state->geometry_buffer, emissive_slots, emissive_token);
+	}
+
 	return state;
 }
 
@@ -2973,6 +3012,168 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	}
 
 	return rt_light_count;
+}
+
+// ---------------------------------------------------------------------------
+// Emissive-mesh light gathering (roadmap C1)
+// ---------------------------------------------------------------------------
+
+uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::EmissiveLights::InstanceInput> &r_out,
+		LocalVector<int32_t> &r_slots, uint64_t &r_token) {
+	r_out.clear();
+	r_token = 0;
+
+	// The slot table is indexed by gl_InstanceCustomIndex, so it is sized to the
+	// FULL instance count -- not to the emissive count and not to INSTANCES_MAX.
+	// Anything smaller is an out-of-bounds read for every non-emissive instance
+	// past the end, and that read does not fault reliably.
+	const uint32_t instance_count = geometry_data.size();
+	r_slots.clear();
+	r_slots.resize(instance_count);
+	for (uint32_t i = 0; i < instance_count; i++) {
+		r_slots[i] = -1;
+	}
+	if (instance_count == 0) {
+		return 0;
+	}
+
+	// geometry_data / material_data / blas_transforms are filled in lockstep by
+	// build_tlas() -- one push per TLAS instance at every site, including both
+	// MultiMesh branches (one entry for a merged BLAS, one per instance for the
+	// expanded fallback). So index i means the same instance in all three, and
+	// i is also the `geometries[]` index the shader sees as
+	// gl_InstanceCustomIndex.
+	DEV_ASSERT(material_data.size() == instance_count);
+	DEV_ASSERT(blas_transforms.size() == instance_count);
+	if (material_data.size() != instance_count || blas_transforms.size() != instance_count) {
+		return 0;
+	}
+
+	struct Candidate {
+		uint32_t instance_index;
+		float key;
+		RendererRD::EmissiveLights::InstanceInput input;
+	};
+	LocalVector<Candidate> candidates;
+
+	for (uint32_t i = 0; i < instance_count; i++) {
+		const RT_GeometryData &geom = geometry_data[i];
+		// Procedural instances have no triangles to integrate over (their
+		// primitive_count is 0 and their vertex address points at AABB data, not
+		// positions), so they can never contribute area.
+		if ((geom.flags & RT_GEOM_FLAG_PROCEDURAL) != 0 || geom.primitive_count == 0) {
+			continue;
+		}
+
+		const RT_MaterialData &mat = material_data[i];
+		const bool textured = (mat.flags & RT_MAT_FLAG_HAS_EMISSION_TEX) != 0;
+		const float lum = mat.emission_color[0] * 0.2126f + mat.emission_color[1] * 0.7152f + mat.emission_color[2] * 0.0722f;
+		if (!textured && lum * mat.emission_strength <= 1e-4f) {
+			continue;
+		}
+
+		// The transform handed to the build maps rt_fetch_vertex_position()'s
+		// OBJECT-space output to world. For an uncompressed surface that is just
+		// the TLAS instance transform. For a COMPRESSED one it is not: the BLAS is
+		// built on the raw UNORM16 data, so blas_transforms[i] carries the AABB
+		// de-normalisation (see the `instance_transform * aabb_transform` lines in
+		// build_tlas) -- and rt_fetch_vertex_position() already applies that same
+		// AABB itself. Passing the raw transform would apply it twice and inflate
+		// every compressed emitter's area. Divide it back out.
+		Transform3D obj_to_world = blas_transforms[i];
+		if ((geom.flags & RT_GEOM_FLAG_COMPRESSED) != 0) {
+			const Vector3 aabb_size(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z);
+			// The engine clamps the compression AABB away from zero
+			// (rendering_server.cpp, `r_aabb.size.max(SMALL_VEC3)`), so this should
+			// not trip; a degenerate box would make the inverse non-finite, and a
+			// non-finite transform would poison the whole CDF, so skip rather than
+			// risk it.
+			if (!(aabb_size.x > 0.0f) || !(aabb_size.y > 0.0f) || !(aabb_size.z > 0.0f)) {
+				continue;
+			}
+			Transform3D aabb_xform;
+			aabb_xform.basis = Basis::from_scale(aabb_size);
+			aabb_xform.origin = Vector3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z);
+			obj_to_world = obj_to_world * aabb_xform.affine_inverse();
+		}
+
+		Candidate c;
+		c.instance_index = i;
+		c.input.geometry_index = i;
+		c.input.prim_count = geom.primitive_count;
+		c.input.xform = obj_to_world;
+		// The GPU pass only takes the luminance of this to form power, so fold the
+		// strength in here rather than shipping a second scalar.
+		c.input.emission = Color(
+				mat.emission_color[0] * mat.emission_strength,
+				mat.emission_color[1] * mat.emission_strength,
+				mat.emission_color[2] * mat.emission_strength);
+
+		// Ranking key, used ONLY to decide who survives when a scene has more than
+		// INSTANCES_MAX emitters. The real area is not known until the GPU pass
+		// runs, so approximate it with the instance's squared scale -- an area-like
+		// factor -- times the emitted luminance.
+		const float scale_sq = MAX(obj_to_world.basis.get_scale().length_squared(), 0.0f);
+		c.key = MAX(lum, 0.0f) * mat.emission_strength * scale_sq;
+		candidates.push_back(c);
+	}
+
+	if (candidates.is_empty()) {
+		return 0;
+	}
+
+	if (candidates.size() > RendererRD::EmissiveLights::INSTANCES_MAX) {
+		struct CandidateSorter {
+			_FORCE_INLINE_ bool operator()(const Candidate &a, const Candidate &b) const {
+				return a.key > b.key; // Descending: brightest and largest first.
+			}
+		};
+		candidates.sort_custom<CandidateSorter>();
+		candidates.resize(RendererRD::EmissiveLights::INSTANCES_MAX);
+	}
+
+	// The rebuild trigger is a TOKEN over the instance SET, their TRANSFORMS and
+	// their EMISSION -- never a single RID or handle, which stays stable while the
+	// data behind it changes (see EmissiveLights::mark_dirty_if_token_changed).
+	// The full instance count is folded in as well: appending a NON-emissive
+	// instance at the end leaves every emitter's index, transform and emission
+	// untouched, but the slot table still has to grow to cover the new index.
+	uint32_t h = hash_murmur3_one_32(instance_count);
+	h = hash_murmur3_one_32(candidates.size(), h);
+	uint32_t h2 = hash_murmur3_one_32(instance_count, 0x9E3779B9u);
+	h2 = hash_murmur3_one_32(candidates.size(), h2);
+
+	const uint32_t kept = candidates.size();
+	r_out.resize(kept);
+	for (uint32_t s = 0; s < kept; s++) {
+		const Candidate &c = candidates[s];
+		r_out[s] = c.input;
+		r_slots[c.instance_index] = (int32_t)s;
+
+		float xf[12];
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(c.input.xform, xf);
+
+		h = hash_murmur3_one_32(c.input.geometry_index, h);
+		h = hash_murmur3_one_32(c.input.prim_count, h);
+		h2 = hash_murmur3_one_32(c.input.geometry_index, h2);
+		h2 = hash_murmur3_one_32(c.input.prim_count, h2);
+		for (int k = 0; k < 12; k++) {
+			h = hash_murmur3_one_float(xf[k], h);
+			h2 = hash_murmur3_one_float(xf[k], h2);
+		}
+		h = hash_murmur3_one_float(c.input.emission.r, h);
+		h = hash_murmur3_one_float(c.input.emission.g, h);
+		h = hash_murmur3_one_float(c.input.emission.b, h);
+		h2 = hash_murmur3_one_float(c.input.emission.r, h2);
+		h2 = hash_murmur3_one_float(c.input.emission.g, h2);
+		h2 = hash_murmur3_one_float(c.input.emission.b, h2);
+	}
+
+	// Two independently seeded 32-bit hashes rather than one: the token is
+	// compared for equality every frame, and a 32-bit collision on a scene that
+	// animates an emitter would freeze the distribution at a stale build.
+	r_token = (uint64_t(hash_fmix32(h2)) << 32) | uint64_t(hash_fmix32(h));
+	return kept;
 }
 
 // ---------------------------------------------------------------------------
@@ -3457,6 +3658,48 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			u.append_id(_get_env_dist_fallback_buffer());
 		}
 		uniforms.push_back(u);
+	}
+
+	// Bindings 35-37: emissive-mesh light distribution (C1) -- the instance
+	// records, the power CDF, and the per-instance slot table.
+	//
+	// `emissive_active` is this frame's read of
+	// `rendering/pathtracer/emissive_mesh_lights`, taken in build_tlas(). It is
+	// false by default, so the fallback path below is the one every existing scene
+	// takes: it must bind something valid, and it must read as an EMPTY
+	// distribution rather than as undefined bytes. That is why it is an owned,
+	// zero-filled buffer and not MeshStorage's shared default (see
+	// _get_emissive_fallback_buffer). All three bindings share it: consumers gate
+	// on the CDF's `total_power` before touching the other two, so their contents
+	// are unreachable while it reads zero.
+	{
+		const bool emissive_ready = emissive_active && emissive_lights.is_valid();
+		const RID fallback = emissive_ready ? RID() : _get_emissive_fallback_buffer();
+		{
+			RD::Uniform u;
+			u.binding = 35;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.append_id(emissive_ready ? emissive_lights.get_instance_buffer() : fallback);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.binding = 36;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.append_id(emissive_ready ? emissive_lights.get_cdf_buffer() : fallback);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u;
+			u.binding = 37;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			// get_slot_buffer() is allocated by the same update() call that
+			// allocates the instance buffer, so is_valid() covers both; guard
+			// anyway rather than bind a null RID if that ever stops holding.
+			const RID slot = emissive_lights.get_slot_buffer();
+			u.append_id((emissive_ready && slot.is_valid()) ? slot : _get_emissive_fallback_buffer());
+			uniforms.push_back(u);
+		}
 	}
 
 	// Use the pipeline-side shader so UniformSetFormat matches at bind time.

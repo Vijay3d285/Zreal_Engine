@@ -51,6 +51,44 @@ struct GeometryData {
 	uint _pad[5];
 };
 
+// ============================================================================
+// TRIANGLE INDEX FETCHING
+// ============================================================================
+
+/// Core implementation taking an explicit primitive ID (works in any shader
+/// stage -- hit shaders reach it through the get_triangle_indices() wrapper in
+/// raytracing_hit_inc.glsl, the emissive area-reduction compute pass calls it
+/// directly).
+void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i0, out uint i1, out uint i2) {
+	if (geom.index_format == 2u) {
+		i0 = primitive_id * 3u;
+		i1 = primitive_id * 3u + 1u;
+		i2 = primitive_id * 3u + 2u;
+	} else if (geom.index_address != 0ul) {
+		Uint32Buffer idx = Uint32Buffer(geom.index_address);
+		if (geom.index_format == 0u) {
+			uint byte_off = primitive_id * 6u;
+			uint word0 = idx.v[byte_off >> 2];
+			uint word1 = idx.v[(byte_off >> 2) + 1u];
+			if ((byte_off & 3u) == 0u) {
+				i0 = word0 & 0xFFFFu;
+				i1 = word0 >> 16;
+				i2 = word1 & 0xFFFFu;
+			} else {
+				i0 = word0 >> 16;
+				i1 = word1 & 0xFFFFu;
+				i2 = word1 >> 16;
+			}
+		} else {
+			i0 = idx.v[primitive_id * 3u];
+			i1 = idx.v[primitive_id * 3u + 1u];
+			i2 = idx.v[primitive_id * 3u + 2u];
+		}
+	} else {
+		i0 = i1 = i2 = 0u;
+	}
+}
+
 void get_aabb_compression_xforms(GeometryData geom, out mat4 aabb_xform, out mat4 inv_aabb_xform) {
 	if ((geom.flags & FLAG_COMPRESSED) == 0u) {
 		aabb_xform = mat4(1.0);

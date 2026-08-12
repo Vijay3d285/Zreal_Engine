@@ -36,6 +36,7 @@ TEST_FORCE_LINK(test_pt_emissive)
 #include "core/math/transform_3d.h"
 #include "core/math/vector3.h"
 
+#include <algorithm>
 #include <vector>
 
 namespace TestPTEmissive {
@@ -196,6 +197,243 @@ TEST_CASE("[PathTracer][Emissive] a degenerate triangle has zero area") {
 	// Collinear, not coincident -- the cross product must still vanish.
 	CHECK(mirror_triangle_area_world(Transform3D(), Vector3(0, 0, 0), Vector3(1, 1, 1), Vector3(2, 2, 2))
 					== doctest::Approx(0.0f));
+}
+
+// ---------------------------------------------------------------------------
+// C1 Task 3: the emissive-instance distribution.
+// ---------------------------------------------------------------------------
+
+static const uint32_t MAT_FLAG_HAS_EMISSION_TEX = 2u;
+static const uint32_t EMISSIVE_INSTANCES_MAX = 256;
+
+static float mirror_luminance(const Vector3 &p_c) {
+	return p_c.x * 0.2126f + p_c.y * 0.7152f + p_c.z * 0.0722f;
+}
+
+// Mirror of the CPU-side qualification test in gather_emissive_instances().
+static bool mirror_is_emissive(uint32_t p_flags, const Vector3 &p_emission_color, float p_strength) {
+	if ((p_flags & MAT_FLAG_HAS_EMISSION_TEX) != 0u) {
+		return true;
+	}
+	return mirror_luminance(p_emission_color) * p_strength > 1e-4f;
+}
+
+// Mirror of the CDF walk in emissive_select_instance(). Returns the selected
+// slot and rescales the remainder within its bucket to [0,1) for the triangle
+// draw. r_remap MUST span the full unit interval across a bucket or the
+// triangle choice becomes correlated with the instance choice.
+static bool mirror_select_instance(const std::vector<float> &p_cdf, float p_total,
+		float p_u, uint32_t &r_slot, float &r_prob, float &r_remap) {
+	r_slot = 0;
+	r_prob = 0.0f;
+	r_remap = 0.0f;
+	if (!(p_total > 0.0f) || p_cdf.empty()) {
+		return false;
+	}
+	const float target = p_u * p_total;
+	float lo = 0.0f;
+	for (uint32_t i = 0; i < (uint32_t)p_cdf.size(); i++) {
+		const float hi = p_cdf[i];
+		const float w = hi - lo;
+		if (w > 0.0f && target < hi) {
+			r_slot = i;
+			r_prob = w / p_total;
+			r_remap = CLAMP((target - lo) / w, 0.0f, 0.99999994f);
+			return true;
+		}
+		lo = hi;
+	}
+	// Drift guard: fall back to the last positive-weight bucket.
+	lo = 0.0f;
+	for (uint32_t i = 0; i < (uint32_t)p_cdf.size(); i++) {
+		const float w = p_cdf[i] - lo;
+		if (w > 0.0f) {
+			r_slot = i;
+			r_prob = w / p_total;
+			r_remap = 0.0f;
+		}
+		lo = p_cdf[i];
+	}
+	return r_prob > 0.0f;
+}
+
+// Mirror of the object->world transform gather_emissive_instances() uploads per
+// instance. This is NOT simply blas_transforms[i].
+//
+// For a COMPRESSED surface the BLAS is built on the raw UNORM16 vertex data, so
+// its coordinates live in the mesh's normalised [0,1]^3 box and the TLAS instance
+// transform carries the AABB de-normalisation:
+//     blas_transform = instance * aabb        (render_raytracing.cpp:2514, :2668)
+// But rt_fetch_vertex_position() already applies `aabb` itself on the compressed
+// branch (raytracing_vertex_inc.glsl, via get_aabb_compression_xforms), so it
+// returns OBJECT space. Handing the compute pass blas_transform would therefore
+// apply the AABB scale and offset TWICE and inflate every compressed emitter's
+// area by the AABB volume factor. The transform that maps
+// rt_fetch_vertex_position()'s output to world is blas_transform * aabb^-1.
+//
+// For an uncompressed surface the engine writes aabb_size = (1,1,1) and
+// aabb_pos = (0,0,0) (render_raytracing.cpp:885-892), so `aabb` is the identity
+// and the correction is a no-op -- which is exactly why a suite that only ever
+// tested uncompressed geometry would not notice the bug.
+static Transform3D mirror_object_to_world(const Transform3D &p_blas_xform, bool p_compressed,
+		const Vector3 &p_aabb_pos, const Vector3 &p_aabb_size) {
+	if (!p_compressed) {
+		return p_blas_xform;
+	}
+	Transform3D aabb;
+	aabb.basis = Basis::from_scale(p_aabb_size);
+	aabb.origin = p_aabb_pos;
+	return p_blas_xform * aabb.affine_inverse();
+}
+
+TEST_CASE("[PathTracer][Emissive] qualification covers textured and coloured emitters") {
+	// A texture-only emitter has emission_color forced to (1,1,1) and strength 1
+	// by the C++ material fill, but qualification must not depend on that -- an
+	// emitter whose colour is black and whose light comes entirely from a texture
+	// must still qualify, or its energy is silently lost.
+	CHECK(mirror_is_emissive(MAT_FLAG_HAS_EMISSION_TEX, Vector3(0, 0, 0), 0.0f));
+	CHECK(mirror_is_emissive(0u, Vector3(1, 1, 1), 1.0f));
+	CHECK_FALSE(mirror_is_emissive(0u, Vector3(1, 1, 1), 0.0f));
+	CHECK_FALSE(mirror_is_emissive(0u, Vector3(0, 0, 0), 100.0f));
+	// Just under and just over the 1e-4 threshold on luminance x strength.
+	CHECK_FALSE(mirror_is_emissive(0u, Vector3(1, 1, 1), 5e-5f));
+	CHECK(mirror_is_emissive(0u, Vector3(1, 1, 1), 5e-4f));
+	// The luminance weights are per-channel and must not be interchangeable: a
+	// pure-blue emitter is 0.0722 of a pure-green one, so a swapped or averaged
+	// weight vector changes which side of the threshold each lands on.
+	CHECK(mirror_is_emissive(0u, Vector3(0, 1, 0), 2e-4f)); // 0.7152 * 2e-4 > 1e-4
+	CHECK_FALSE(mirror_is_emissive(0u, Vector3(0, 0, 1), 2e-4f)); // 0.0722 * 2e-4 < 1e-4
+}
+
+TEST_CASE("[PathTracer][Emissive] instance selection frequency matches power") {
+	// Prefix sums of powers {1, 7, 0, 2}: a zero-power instance must never be
+	// selected, and the rest in proportion.
+	std::vector<float> cdf = { 1.0f, 8.0f, 8.0f, 10.0f };
+	const float total = 10.0f;
+
+	const int N = 100000;
+	int counts[4] = { 0, 0, 0, 0 };
+	for (int i = 0; i < N; i++) {
+		const float u = (float(i) + 0.5f) / float(N);
+		uint32_t slot = 0;
+		float prob = 0.0f, remap = 0.0f;
+		REQUIRE(mirror_select_instance(cdf, total, u, slot, prob, remap));
+		REQUIRE(slot < 4);
+		counts[slot]++;
+		CHECK(prob > 0.0f);
+		CHECK(remap >= 0.0f);
+		CHECK(remap < 1.0f);
+	}
+	CHECK(counts[2] == 0);
+	CHECK(float(counts[0]) / float(N) == doctest::Approx(0.1f).epsilon(0.005));
+	CHECK(float(counts[1]) / float(N) == doctest::Approx(0.7f).epsilon(0.005));
+	CHECK(float(counts[3]) / float(N) == doctest::Approx(0.2f).epsilon(0.005));
+}
+
+TEST_CASE("[PathTracer][Emissive] the bucket remainder spans the unit interval") {
+	// If the remap does not cover [0,1), the triangle drawn from it is correlated
+	// with WHICH instance was picked -- a whole region of triangles becomes
+	// unreachable on some instances. Sweep one bucket and check coverage.
+	std::vector<float> cdf = { 1.0f, 8.0f, 10.0f };
+	const float total = 10.0f;
+
+	float lo_seen = 1.0f, hi_seen = 0.0f;
+	int in_bucket = 0;
+	for (int i = 0; i < 20000; i++) {
+		const float u = (float(i) + 0.5f) / 20000.0f;
+		uint32_t slot = 0;
+		float prob = 0.0f, remap = 0.0f;
+		REQUIRE(mirror_select_instance(cdf, total, u, slot, prob, remap));
+		if (slot == 1) { // the wide middle bucket
+			in_bucket++;
+			lo_seen = MIN(lo_seen, remap);
+			hi_seen = MAX(hi_seen, remap);
+		}
+	}
+	REQUIRE(in_bucket > 1000);
+	CHECK(lo_seen < 0.01f);
+	CHECK(hi_seen > 0.99f);
+}
+
+TEST_CASE("[PathTracer][Emissive] the slot table round-trips and is sized by INSTANCE count") {
+	// emissive_slot[] is indexed by gl_InstanceCustomIndex, so it must be sized to
+	// the FULL instance count -- not to INSTANCES_MAX. Sizing it to the emissive
+	// count would read out of bounds for any scene with more instances than
+	// emitters, which is every scene, and the read would not fault reliably.
+	const uint32_t instance_count = 9;
+	const std::vector<uint32_t> emissive_instances = { 2, 5, 8 };
+
+	std::vector<int32_t> slots(instance_count, -1);
+	for (uint32_t s = 0; s < (uint32_t)emissive_instances.size(); s++) {
+		slots[emissive_instances[s]] = (int32_t)s;
+	}
+
+	CHECK(slots.size() == instance_count);
+	// Sized by the instance count, and by neither of the two wrong things it
+	// could plausibly be sized by.
+	CHECK(slots.size() != emissive_instances.size());
+	CHECK(slots.size() != (size_t)EMISSIVE_INSTANCES_MAX);
+	for (uint32_t i = 0; i < instance_count; i++) {
+		const bool is_emissive =
+				std::find(emissive_instances.begin(), emissive_instances.end(), i) != emissive_instances.end();
+		if (is_emissive) {
+			REQUIRE(slots[i] >= 0);
+			CHECK(emissive_instances[slots[i]] == i); // round-trips to its own slot
+		} else {
+			CHECK(slots[i] == -1);
+		}
+	}
+}
+
+TEST_CASE("[PathTracer][Emissive] an all-zero distribution selects nothing") {
+	std::vector<float> cdf = { 0.0f, 0.0f };
+	uint32_t slot = 99;
+	float prob = -1.0f, remap = -1.0f;
+	CHECK_FALSE(mirror_select_instance(cdf, 0.0f, 0.5f, slot, prob, remap));
+	CHECK(prob == 0.0f);
+
+	std::vector<float> empty;
+	CHECK_FALSE(mirror_select_instance(empty, 1.0f, 0.5f, slot, prob, remap));
+}
+
+TEST_CASE("[PathTracer][Emissive] compressed emitters use blas_transform x aabb^-1") {
+	// The area pass multiplies rt_fetch_vertex_position()'s OBJECT-space output by
+	// the transform this mirror produces. Passing blas_transforms[i] straight
+	// through would double-apply the AABB de-normalisation on compressed meshes.
+	const Vector3 aabb_pos(-2.0f, 5.0f, 0.25f);
+	const Vector3 aabb_size(4.0f, 1.0f, 8.0f); // deliberately non-uniform
+
+	Transform3D instance;
+	instance.basis = Basis(Vector3(0, 1, 0), Math::PI / 3.0f).scaled(Vector3(1.5f, 2.5f, 0.5f));
+	instance.origin = Vector3(7.0f, -3.0f, 11.0f);
+
+	Transform3D aabb;
+	aabb.basis = Basis::from_scale(aabb_size);
+	aabb.origin = aabb_pos;
+
+	// What build_tlas() pushes into blas_transforms for a compressed surface.
+	const Transform3D blas_xform = instance * aabb;
+
+	const Transform3D recovered = mirror_object_to_world(blas_xform, true, aabb_pos, aabb_size);
+	CHECK(recovered.is_equal_approx(instance));
+	// And it is genuinely different from the raw BLAS transform, so the case
+	// would fail against an implementation that skipped the correction.
+	CHECK_FALSE(blas_xform.is_equal_approx(instance));
+
+	// The end-to-end invariant: the world triangle must be the same whether it is
+	// reached from normalised BLAS coordinates or from object space.
+	const Vector3 n0(0.1f, 0.8f, 0.35f), n1(0.9f, 0.2f, 0.6f), n2(0.4f, 0.45f, 0.95f);
+	const Vector3 o0 = aabb.xform(n0), o1 = aabb.xform(n1), o2 = aabb.xform(n2);
+	const float area_via_object = mirror_triangle_area_world(recovered, o0, o1, o2);
+	const float area_via_blas = mirror_triangle_area_world(blas_xform, n0, n1, n2);
+	CHECK(area_via_object > 0.0f);
+	CHECK(area_via_object == doctest::Approx(area_via_blas));
+	// The uncorrected path is not merely different, it is wrong by a large factor.
+	CHECK(mirror_triangle_area_world(blas_xform, o0, o1, o2) != doctest::Approx(area_via_object));
+
+	// Uncompressed geometry carries an identity AABB, so the correction is inert.
+	CHECK(mirror_object_to_world(instance, false, Vector3(0, 0, 0), Vector3(1, 1, 1))
+					.is_equal_approx(instance));
 }
 
 } // namespace TestPTEmissive

@@ -39,6 +39,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/emissive_lights.h"
 #include "servers/rendering/renderer_rd/storage_rd/env_cdf.h"
 #include "servers/rendering/renderer_rd/storage_rd/ies_manager.h"
 #include "servers/rendering/rendering_device.h"
@@ -417,6 +418,32 @@ class RenderRaytracing {
 	RID env_dist_fallback_buffer;
 	RID _get_env_dist_fallback_buffer();
 
+	// Power-weighted sampling distribution over emissive mesh instances (C1).
+	// Owned here alongside `env_cdf` so the shader and pipeline are shared, even
+	// though the instance set itself is viewport-dependent: with more than one
+	// path-traced viewport the rebuild token simply alternates and the (cheap,
+	// <= 256-instance) build runs once per viewport per frame.
+	RendererRD::EmissiveLights emissive_lights;
+	// Result of this frame's `rendering/pathtracer/emissive_mesh_lights` read.
+	// The feature ships default-OFF, so the false path is the one that runs in
+	// every existing scene: it skips the gather and the build entirely and binds
+	// the zero-filled fallback below.
+	bool emissive_active = false;
+	LocalVector<RendererRD::EmissiveLights::InstanceInput> emissive_inputs;
+	LocalVector<int32_t> emissive_slots;
+
+	// Stand-in bound at set 0 bindings 35-37 when emissive-mesh lights are off (or
+	// the distribution has not been built yet). Same reasoning as
+	// `env_dist_fallback_buffer` above: MeshStorage's shared default storage
+	// buffer is created WITHOUT initial data, so its bytes are undefined -- and
+	// the first float of the CDF block is `total_power`, the single value every
+	// consumer gates on. A garbage-positive pattern there would let the shader
+	// walk `prefix[]` and index `emissive_slot[]` past the end of a 16-byte
+	// buffer. This one is zero-filled at creation, so `total_power == 0.0` and
+	// consumers return before touching either array.
+	RID emissive_fallback_buffer;
+	RID _get_emissive_fallback_buffer();
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.
@@ -530,6 +557,12 @@ public:
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);
+	/// Walks this frame's per-instance arrays and collects the emissive ones.
+	/// Returns the number kept (<= EmissiveLights::INSTANCES_MAX). `r_slots` is
+	/// sized to the FULL instance count, -1 where the instance is not emissive.
+	/// `r_token` is the rebuild trigger; see the comment on the implementation.
+	uint32_t gather_emissive_instances(LocalVector<RendererRD::EmissiveLights::InstanceInput> &r_out,
+			LocalVector<int32_t> &r_slots, uint64_t &r_token);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);
