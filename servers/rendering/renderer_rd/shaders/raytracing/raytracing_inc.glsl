@@ -258,6 +258,14 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 // dimension of the sequence is equidistributed -- but the image changes at any
 // finite sample count, and the converged mean must not. That is gated
 // separately (pt_emissive_gate.gd, gate 3) before any lighting change lands.
+//
+// A 2D draw occupies exactly ONE slot in this numbering, not two. rng_2d passes a single
+// `p_rng.offset + p_dim` as sobol_burley_sample_2D's p_dimension_set argument, and that
+// function produces both vec2 components by varying the internal sb_sobol_burley axis
+// (0u/1u) -- it never reads p_dimension_set+1 (sobol_burley_inc.glsl). So RT_PRNG_LIGHT
+// (2D) and RT_PRNG_ENV (2D) each still reserve only their own listed value. Slot 3 is
+// simply unused (RT_PRNG_LIGHT is 2u, RT_PRNG_LOBE is 4u) -- that gap is leftover headroom
+// from an earlier layout, not evidence of a two-slot-per-2D-draw convention.
 #define RT_PRNG_BOUNCE_NUM 16u
 #define RT_PRNG_FILTER 0u // 2D, init block only: sub-pixel reconstruction filter.
 #define RT_PRNG_SURFACE_BSDF 0u // 2D: BSDF direction sample.
@@ -330,9 +338,9 @@ uint rng_side_stream(RNGState p_rng, uint p_dim) {
 /// [sample_index:20][offset:12]. `pixel` is not packed -- every ray-tracing stage
 /// can recompute it from gl_LaunchIDEXT, so it costs nothing to carry.
 /// 20 bits covers 1,048,575 samples and 12 bits covers 4095 dimensions
-/// (16 bounces x 8 = 128). In accumulate mode the caller passes the raw
-/// accum_frame (scene_raytracing_raygen.glsl), which the accumulation target
-/// caps at 8192, so that mode is nowhere near the limit.
+/// (16 bounces x 16 = 256, ample headroom below the 4095 cap). In accumulate
+/// mode the caller passes the raw accum_frame (scene_raytracing_raygen.glsl),
+/// which the accumulation target caps at 8192, so that mode is nowhere near the limit.
 ///
 /// In one-shot mode the caller passes frame_index * stride + sample_idx, where
 /// stride is rt_next_pow2_ge(samples_per_pixel) and frame_index is a
