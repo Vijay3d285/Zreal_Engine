@@ -552,11 +552,14 @@ gates are `pipeline_references/tests/pt_light_gate_scene.tscn` and
 > `valid_count_estimate` (it divides by its reciprocal), and given
 > `valid_found = m > 0` the reservoir's pick is uniform over the valid lights
 > independently of `m`, so `E[f·N·m/k] = mean(f) · V` exactly. Jensen never
-> enters. The pre-C2 path's only true energy defect is the `valid_found == 0`
-> dropout, of relative size `(1 − V/N)^k` — 2⁻¹⁶ in the gate scene, 0 when
-> nothing is culled. **The justification for C2 is variance, not bias**, and the
-> variance result above stands on its own. Code comments corrected; the spec is
-> left as the historical record.
+> enters. **The pre-C2 estimator is exactly unbiased, culling or not** — including
+> the `valid_found == 0` early-out, which is not a defect either: the estimator's
+> value is `f·N·m/k`, which is 0 when `m = 0`, so `m·1{m≥1} = m` identically and
+> `E[N·m/k] = V` with no dropout term. (An earlier revision of this block claimed
+> a residual `(1 − V/N)^k` energy loss; there is none.) **The justification for C2
+> is variance, not bias**, and the variance result above stands on its own. Code
+> comments corrected; the spec carries a dated correction marker over an
+> unrevised body.
 
 **OPEN (efficiency, not correctness): the surface-normal cosine is deliberately
 excluded from the weight** (design spec §3.5). Roughly half of all selection

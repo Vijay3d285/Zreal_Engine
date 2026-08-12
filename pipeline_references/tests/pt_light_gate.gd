@@ -38,19 +38,36 @@ extends "res://tests/pt_validation.gd"
 ## to the thing it is gating.
 ##
 ## ---------------------------------------------------------------------------
-## GATE 2 - "culled". NEUTRALITY IS *NOT* ASSERTED, ON PURPOSE.
+## GATE 2 - "culled". Half the lights are out of range at the floor.
 ##
-## Half the lights are out of range at the floor. The pre-C2 pdf was genuinely
-## BIASED in that configuration -- valid_found is a random variable and
-## E[1/X] != 1/E[X] -- so the converged mean SHOULD move, and asserting
-## neutrality here would be asserting the bug. This gate REPORTS the signed shift
-## and never fails on it. The direction was predicted before it was measured:
-## see .superpowers/sdd/2026-08-11-power-weighted-light-selection/gate2-prediction.md
+## NO SHIFT IS EXPECTED HERE EITHER, and that finding is the whole reason this
+## gate is worth keeping. It was built to measure a predicted few-percent shift:
+## the design spec argued that the pre-C2 pdf was BIASED under range culling
+## because valid_found is a random variable and E[1/X] != 1/E[X]. It measured
+## -0.003%, smaller than the in_range gate's own finite-sample residual, and the
+## premise turned out to be wrong. The pre-C2 estimator MULTIPLIES the
+## contribution by valid_count_estimate rather than dividing by it, the
+## reservoir's pick is uniform over the valid lights independently of how many it
+## found, and the m == 0 early-out contributes exactly zero to both sides; so it
+## is EXACTLY UNBIASED, culling or not, and Jensen never applies. See the C2
+## CORRECTION block in PATH_TRACER_QUALITY_ROADMAP.md, and
+## docs/superpowers/specs/2026-08-11-power-weighted-light-selection-gate2-prediction.md
+## for the sealed prediction that this refuted.
 ##
-## Gate 2 doubles as the LIVENESS PROBE for the A/B: it is a configuration where
-## the two builds must read DIFFERENTLY. Two identical readings mean the macro
-## edit never reached the shader (stale .glsl.gen.h from an incremental build),
-## not that the change is neutral.
+## So why keep gate 2? Because it is the only gate that exercises the
+## range-culling path at all -- lights_select_weight's early return at
+## max_range_squared, and the pre-C2 valid-count machinery it replaced. It guards
+## against a FUTURE change breaking energy there. It reports the signed shift and
+## never fails on it, because the correct expectation is now "no shift", and
+## asserting that at a tolerance this measurement cannot resolve (~0.004%) would
+## produce a flaky gate rather than an informative one.
+##
+## NOT A LIVENESS PROBE. Gate 2's mean was pre-registered as the A/B liveness
+## probe, on the assumption that the two builds must read differently here. They
+## do not -- the means agree to ~3e-5 -- so that probe is void, and the warning
+## printed below fires on a correct pair of builds. The load-bearing liveness
+## evidence is the RMSE sweep in pt_light_rmse.gd (13.90 vs 1.32 at 16 frames
+## against a shared reference), with per-pixel spread here as a secondary signal.
 
 const ALBEDO := 0.5 # LINEAR reflectance.
 const TOLERANCE := 0.01 # 1 percent, matching pt_energy_gate.gd's gate 1.
@@ -151,9 +168,12 @@ func _gate(p_mode: String, p_frames: int, p_ref: float) -> void:
 		print("  every light in range -- the pre-C2 estimator was EXACT here, so the")
 		print("  converged mean MUST NOT move. A shift is a bug, not a finding.")
 	else:
-		print("  %d of %d lights out of range at the floor -- the pre-C2 pdf was BIASED"
+		print("  %d of %d lights out of range at the floor. The pre-C2 estimator is"
 				% [LIGHT_COUNT / 2, LIGHT_COUNT])
-		print("  here, so the mean SHOULD move. Neutrality is NOT asserted.")
+		print("  exactly unbiased here too (measured, contradicting the design spec), so")
+		print("  NO shift is expected. Reported, not asserted -- the true difference is")
+		print("  below what this gate resolves. This gate exists to exercise the")
+		print("  range-culling path, not to detect a bias.")
 
 	var t0 := Time.get_ticks_msec()
 	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), p_frames)
@@ -189,8 +209,10 @@ func _gate(p_mode: String, p_frames: int, p_ref: float) -> void:
 	else:
 		print("  gate 2 does not assert. Direction only:")
 		if absf(rel) < 1e-4:
-			print("    NO MEASURABLE SHIFT - if these are two different builds, suspect a")
-			print("    stale .glsl.gen.h: the A/B macro may not have reached the shader.")
+			print("    NO MEASURABLE SHIFT - which is the EXPECTED result across the A/B,")
+			print("    not a symptom. Do NOT read it as a stale .glsl.gen.h: both")
+			print("    estimators are unbiased here. To prove two builds really differ,")
+			print("    use pt_light_rmse_scene.tscn (13.90 vs 1.32 at 16 frames).")
 		elif d < 0.0:
 			print("    this build reads LOWER than the reference.")
 		else:

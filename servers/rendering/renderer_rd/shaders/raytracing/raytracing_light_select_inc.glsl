@@ -5,17 +5,18 @@
 // (luminance). Include it AFTER those.
 //
 // Replaces the uniform k=16 mini-batch reservoir, whose defect is VARIANCE: with
-// 41 lights it never even considered the brightest one at ~60% of shading
-// points, and compensated by scaling up the draws that did find it, producing a
-// heavy-tailed estimator. Measured at 9.8x-16.5x the equal-time RMSE of this
-// selector on that configuration (task-3 report).
+// 41 lights it never even considered the brightest one at 67.4% of shading
+// points ((40/41)^16), and compensated by scaling up the draws that did find it,
+// producing a heavy-tailed estimator. Measured at 9.8x-16.5x the equal-time RMSE
+// of this selector on that configuration (task-3 report).
 //
 // Its pdf was also ESTIMATED rather than known (valid_count_estimate is a random
 // variable). The design spec expected that to BIAS the converged image under
 // range culling via E[1/X] != 1/E[X]; the culled energy gate measured no shift,
-// and the reason is that the reciprocal is never taken -- the estimator
-// multiplies by valid_count_estimate, whose expectation is exactly the valid
-// count. See raytracing_lights_inc.glsl's control-path comment for the argument.
+// because the reciprocal is never taken -- the estimator multiplies by
+// valid_count_estimate, whose expectation is exactly the valid count. The pre-C2
+// estimator is exactly unbiased, culling or not; see raytracing_lights_inc.glsl's
+// control-path comment for the full argument.
 // An exactly-known pdf is still worth having: it is what lets the selection
 // density be chosen freely (by power) instead of being pinned to uniform.
 //

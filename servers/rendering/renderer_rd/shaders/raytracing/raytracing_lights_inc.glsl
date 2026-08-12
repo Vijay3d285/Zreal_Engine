@@ -374,20 +374,28 @@ vec3 lights_evaluate_direct_lighting(
 #if RT_LIGHT_SELECT_UNIFORM
 	// PRE-C2 CONTROL PATH. Uniform mini-batch reservoir. Its defect is VARIANCE,
 	// not bias: with 41 lights and k=16 the brightest light is never even
-	// considered at ~60% of shading points, and every draw that does find it is
-	// scaled up to compensate, so the estimator is heavy-tailed. Measured at
-	// 9.8x-16.5x the equal-time RMSE of the production path below (task-3 report).
+	// considered at 67.4% of shading points ((40/41)^16), and every draw that does
+	// find it is scaled up to compensate, so the estimator is heavy-tailed.
+	// Measured at 9.8x-16.5x the equal-time RMSE of the production path below
+	// (task-3 report).
 	//
 	// NOTE, corrected by measurement: light_select_pdf here is ESTIMATED rather
 	// than known, and the design spec expected that to BIAS the converged image
-	// whenever range culling rejected anything. It does not, and the gate showed
-	// no shift. The estimator MULTIPLIES the contribution by valid_count_estimate
-	// (contribution / pdf), never by its reciprocal, and given valid_found = m > 0
-	// the reservoir's pick is uniform over the VALID lights regardless of m; so
-	// E[f(L_sel) * N*m/k] = mean(f over valid) * E[N*m/k] = sum over valid f,
-	// exactly. Jensen never enters. The only real energy defect is the
-	// valid_found == 0 dropout below, of relative size (1 - V/N)^k -- 2^-16 in the
-	// gate scene, 0 when nothing is culled. Kept only to A/B the change.
+	// whenever range culling rejected anything. It does not, and the culled gate
+	// showed no shift. This estimator is EXACTLY UNBIASED, culling or not:
+	//
+	//   * it MULTIPLIES the contribution by valid_count_estimate = N*m/k
+	//     (contribution / pdf), never by its reciprocal, so Jensen never enters;
+	//   * given valid_found = m > 0 the reservoir's pick is uniform over the VALID
+	//     lights, and that conditional law does not depend on m, so
+	//     E[f(L_sel) | m] = mean(f over valid) for every m > 0;
+	//   * the m == 0 early-out below does NOT bias it either. The estimator's
+	//     value is f(L_sel) * N*m/k, which is 0 when m == 0, so
+	//     m * 1{m >= 1} == m identically and E[N*m/k] = V with no dropout term.
+	//
+	//   => E[estimator] = mean(f over valid) * V = sum over valid f, exactly.
+	//
+	// Kept only to A/B the change.
 	const uint k = uint(min(RT_LIGHT_RESERVOIR_SIZE, int(light_count)));
 	uint valid_found = 0u;
 	uint selected_idx = 0u;

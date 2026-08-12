@@ -1,8 +1,19 @@
 # Power-Weighted Light Selection (Roadmap C2) — Design
 
-**Status:** approved, not yet implemented
-**Roadmap item:** C2, *Gap #7* (`PATH_TRACER_QUALITY_ROADMAP.md:521-523`)
+**Status:** implemented and measured (2026-08-11). Accept criterion met at
+10.5-16.9× per-sample / 9.8-16.5× equal-time, for +50.8% frame time at 41 lights.
+**Roadmap item:** C2, *Gap #7* (see the C2 entry in `PATH_TRACER_QUALITY_ROADMAP.md`)
 **Branch context:** follows Phase B (complete) and C3 (environment importance sampling, done).
+
+> **SUPERSEDED IN PART (2026-08-11):** §1's "A biased pdf" claim was refuted by
+> measurement. The pre-C2 estimator multiplies by `valid_count_estimate` rather
+> than dividing by it, so it is exactly unbiased and Jensen never applies. The
+> coverage argument in §1 stands and is what the measured 10-17× comes from. See
+> the C2 CORRECTION block in `PATH_TRACER_QUALITY_ROADMAP.md` and §4 of the
+> task-3 report.
+>
+> The body below is left **unrevised on purpose**: a rationale edited to match
+> its own result is worthless as a record.
 
 ---
 
