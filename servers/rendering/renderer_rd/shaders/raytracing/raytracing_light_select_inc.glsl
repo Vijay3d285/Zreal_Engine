@@ -33,7 +33,7 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 	}
 
 	// indirect_energy multiplies the contribution for every type on indirect
-	// bounces (raytracing_lights_inc.glsl:321, :447, :490), so zero here means
+	// bounces (raytracing_lights_inc.glsl:336, :462, :505), so zero here means
 	// zero contribution there -- matched, no bias.
 	float indirect_factor = p_is_indirect_bounce ? p_light.indirect_energy : 1.0;
 	if (indirect_factor <= 0.0) {
@@ -50,12 +50,12 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 	float dist = sqrt(dist_sq);
 
 	// HAZARD 1 -- rect range. Shading range-tests the SAMPLED point on the quad
-	// (:300) while this knows only the centre, so a rect straddling the boundary
+	// (:315) while this knows only the centre, so a rect straddling the boundary
 	// would weigh 0 with part of it still lit. Expand by a conservative bound on
 	// the half-diagonal. (length(U) + length(V) >= |U +/- V| for any U, V.)
 	float near_dist = dist;
 	if (p_light.type == RT_LIGHT_TYPE_RECT) {
-		// For RECT, spot_direction is aliased to axisU (:269) -- it is NOT a cone axis.
+		// For RECT, spot_direction is aliased to axisU (:284) -- it is NOT a cone axis.
 		vec3 axis_u = p_light.spot_direction;
 		vec3 axis_v = vec3(p_light.rect_axis_v[0], p_light.rect_axis_v[1], p_light.rect_axis_v[2]);
 		near_dist = max(0.0, dist - (length(axis_u) + length(axis_v)));
@@ -87,7 +87,7 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 			return 0.0;
 		}
 
-		// CLAMPED TO 1.0, unlike the shading path's max(1e-4, ...) at :424.
+		// CLAMPED TO 1.0, unlike the shading path's max(1e-4, ...) at :439.
 		// Widening the cone above admits directions between the widened and the
 		// true cone on purpose, and for exactly those the raw ratio exceeds 1,
 		// making 1 - pow(ratio, k) NEGATIVE. A negative weight corrupts the CDF

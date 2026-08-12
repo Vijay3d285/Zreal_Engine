@@ -173,7 +173,7 @@ static bool light_can_contribute(const Vector3 &p_hit_pos, const MirrorLight &p_
 
 	if (p_light.max_range_squared != 0.0f) {
 		// Shading range-tests the SAMPLED point: the centre for omni/spot
-		// (raytracing_lights_inc.glsl:393), a point on the quad for rect (:300).
+		// (raytracing_lights_inc.glsl:408), a point on the quad for rect (:315).
 		float nearest = dist;
 		if (p_light.type == LIGHT_TYPE_RECT) {
 			nearest = MAX(0.0f, dist - (p_light.spot_direction.length() + p_light.rect_axis_v.length()));
@@ -183,7 +183,7 @@ static bool light_can_contribute(const Vector3 &p_hit_pos, const MirrorLight &p_
 		}
 	}
 	if (p_light.type == LIGHT_TYPE_SPOT) {
-		// Shading rejects on scos <= cos_spot_angle (:421) using the SAMPLED
+		// Shading rejects on scos <= cos_spot_angle (:436) using the SAMPLED
 		// direction, which for a sphere light of radius r ranges over an
 		// angular disc of half-angle asin(r/d) around the centre direction.
 		const Vector3 L = to_light / MAX(dist, 1e-4f);
@@ -291,7 +291,7 @@ TEST_CASE("[PathTracer][LightSelect] a negative light gets positive weight") {
 }
 
 TEST_CASE("[PathTracer][LightSelect] a rect straddling its range boundary keeps weight") {
-	// Shading range-tests the sampled point on the quad (raytracing_lights_inc.glsl:300);
+	// Shading range-tests the sampled point on the quad (raytracing_lights_inc.glsl:315);
 	// the weight knows only the centre. Without the half-diagonal expansion this
 	// rect weighs 0 while half of it is still lit.
 	MirrorLight l;
@@ -351,6 +351,50 @@ TEST_CASE("[PathTracer][LightSelect] the floor is under the product, not each fa
 	faint.emission = Vector3(1, 1, 1);
 	const float w = mirror_weight(Vector3(0, 0, 0), faint, false);
 	CHECK(w == doctest::Approx(mirror_luminance(faint.emission) * RT_LIGHT_WEIGHT_FLOOR));
+
+	// DISCRIMINATING case. The two OMNI configurations above cannot tell a
+	// product-level floor apart from a per-factor one: OMNI pins spot_factor at
+	// exactly 1.0, and max(A*1,F) == max(A,F)*max(1,F) for any A (both reduce to
+	// max(A,F) because max(1,F) == 1 when F < 1). A SPOT light is required so
+	// atten and spot_factor are BOTH free variables, and the two formulas only
+	// diverge when one factor sits strictly below the floor while the other sits
+	// meaningfully above it.
+	//
+	// Construction (worked by hand, not tuned against the code under test):
+	//   - cos_spot_angle = 0, radius = 0 -> cos_widened = cos_spot_angle = 0,
+	//     so spot_rim = (1 - scos) / (1 - 0) = 1 - scos, and with
+	//     inv_spot_attenuation = 1, spot_factor = 1 - spot_rim = scos exactly.
+	//   - dist = sqrt(2), attenuation = 2 (default), no range window
+	//     -> atten = 1 / dist^2 = 1 / 2 = 0.5 exactly.
+	//   - Pick scos = 0.0002 (comfortably above the scos <= 0 gate, ~2000x
+	//     float epsilon, and comfortably below the 1e-3 floor): spot_factor = 0.0002.
+	//   - atten * spot_factor = 0.5 * 0.0002 = 0.0001, which is BELOW the floor
+	//     (1e-3), so the product formula's floor engages:
+	//       product:    max(0.5 * 0.0002, 1e-3) = max(0.0001, 0.001) = 0.001
+	//     while the per-factor formula does not, because atten = 0.5 alone
+	//     clears the floor:
+	//       per-factor: max(0.5, 1e-3) * max(0.0002, 1e-3) = 0.5 * 0.001 = 0.0005
+	//   0.001 != 0.0005 -- the two formulas now disagree, which is the property
+	//   this case exists to pin. Emission is (1,1,1) so mag == 1 and the
+	//   expected weight equals the floor value directly.
+	MirrorLight spot;
+	spot.type = LIGHT_TYPE_SPOT;
+	spot.position = Vector3(0, 0, 0);
+	spot.spot_direction = Vector3(0, 0, -1);
+	spot.cos_spot_angle = 0.0f;
+	spot.radius = 0.0f;
+	spot.inv_spot_attenuation = 1.0f;
+	spot.attenuation = 2.0f;
+	spot.emission = Vector3(1, 1, 1);
+
+	const float dist = Math::sqrt(2.0f);
+	const float target_scos = 0.0002f;
+	const float pz = -target_scos * dist;
+	const float px = Math::sqrt(MAX(0.0f, dist * dist - pz * pz));
+	const Vector3 spot_p(px, 0.0f, pz);
+
+	const float spot_w = mirror_weight(spot_p, spot, false);
+	CHECK(spot_w == doctest::Approx(RT_LIGHT_WEIGHT_FLOOR));
 }
 
 TEST_CASE("[PathTracer][LightSelect] zero indirect energy weighs zero only on indirect bounces") {
