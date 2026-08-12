@@ -431,6 +431,12 @@ func setup_lighting(data, geom_data = {}):
 		dir_light.directional_shadow_max_distance = 120.0
 	dir_light.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
 	dir_light.directional_shadow_blend_splits = true
+	# LOAD-BEARING as of Phase B's environment-NEE: Godot's default sky_mode is
+	# SKY_MODE_LIGHT_AND_SKY, which draws this light's disc into the sky texture. That
+	# disc would then be both NEE-sampled analytically AND importance-sampled by
+	# env_sample(), double-counting the scene's brightest emitter -- previously buried
+	# in noise, now the one feature the environment CDF concentrates on. Do not change
+	# this to SKY_MODE_LIGHT_AND_SKY without emissive/analytic reconciliation (roadmap C1).
 	dir_light.sky_mode = DirectionalLight3D.SKY_MODE_LIGHT_ONLY
 
 	# CRITICAL: add_child BEFORE look_at
@@ -793,6 +799,30 @@ func setup_lighting(data, geom_data = {}):
 	#   PT_DENOISER_NONE = 0
 	#   PT_DENOISER_DLSS_RAY_RECONSTRUCTION = 1
 	env.set_pathtracing_enabled(true)
+	# SKY LIGHTING IS NOW IMPORTANCE-SAMPLED (roadmap C3 / Phase B). There is no
+	# knob for it and none is wanted: the integrator builds a CDF over the sky
+	# octmap whenever an Environment with a Sky exists, samples it for next-event
+	# estimation, and MIS-combines that against BSDF rays that reach the sky.
+	#
+	# The practical consequence for this script: DO NOT ADD A FILL LIGHT to
+	# compensate for sky noise. Measured on a sky-lit scene with real occluders,
+	# RMSE at matched sample counts fell 6.6x-9.5x (4.8x-6.9x once the extra
+	# shadow ray's frame-time cost is priced in), so the grain that a fill light
+	# used to paper over is largely gone. Adding one now just flattens the
+	# lighting and costs frames.
+	#
+	# Two caveats worth knowing before tuning anything here:
+	#   * INDOORS the win is smaller. The distribution is over the sky, not over
+	#     what is actually visible from a shading point, so behind walls most
+	#     environment samples are occluded and thrown away. Portal sampling is
+	#     the technique for that and is not implemented.
+	#   * There is an OPEN +2.4% brightening on dielectric specular surfaces --
+	#     which is most materials this script renders -- traced to the
+	#     COMBINE_BRDFS_WITH_FRESNEL integrand mismatch in brdf_inc.glsl. If a
+	#     day render reads slightly hot against an older reference, that is the
+	#     likely cause; see PATH_TRACER_QUALITY_ROADMAP.md item C3 before
+	#     "correcting" it with an exposure tweak here.
+	#
 	# Pathtracer config. DLSS Ray Reconstruction (DLSS-RR) is a NEURAL TEMPORAL denoiser:
 	# it cleans noise by ACCUMULATING INFORMATION ACROSS FRAMES (per RenderingServer docs: "a
 	# low sample count (1-2) is typically sufficient since the denoiser accumulates information
@@ -809,6 +839,19 @@ func setup_lighting(data, geom_data = {}):
 	# setter and, independently, a 3-bit spec-constant field in the GLSL), so the 12
 	# requested below was never honoured. Both clamps were widened to a 16 ceiling and
 	# this line now means what it says.
+	#
+	# NOTE on what max_bounces below actually caps: the integrator terminates a path
+	# as soon as EITHER its diffuse or its glossy lobe count reaches its own cap (set
+	# below), not when the combined total reaches max_bounces. Every surviving bounce
+	# increments exactly one of the two counters, so with per-lobe caps D and G the
+	# longest reachable path is D + G - 1 bounces, independent of max_bounces --
+	# with the 4/4 caps set below that ceiling is 7. So max_bounces=12 (day) and
+	# max_bounces=8 (night) are both headroom above a bound that per-lobe caps reach
+	# first, not targets this scene will ever hit. This is not a bug to "fix" by
+	# raising max_bounces: Blender Cycles ships the identical 4 diffuse / 4 glossy /
+	# 12 total defaults (intern/cycles/blender/addon/properties.py) and terminates
+	# paths the same way, so stock Cycles is effectively bounded near 7 too --
+	# matching that is the point, not a coincidence to route around.
 	# ── SAMPLES PER PIXEL: the dominant cost lever on this route ──────────────
 	#
 	# TOTAL per-pixel samples = SPP x DLSS_RR_REALTIME_STILL_FRAMES (render.gd,
@@ -860,8 +903,14 @@ func setup_lighting(data, geom_data = {}):
 	# Per-lobe bounce limits (Phase B3). Before this the integrator hardcoded a cap of
 	# TWO diffuse bounces regardless of max_bounces, which is why interior corners and
 	# ceilings read flat and lifeless: light could not make three diffuse hops to reach
-	# them. Blender's shipped defaults are 4 diffuse / 4 glossy; raising diffuse costs
-	# render time roughly linearly and buys softer, warmer indirect light.
+	# them. Blender's shipped defaults are 4 diffuse / 4 glossy, matched here. Raising
+	# diffuse buys softer, warmer indirect light, but its render-time cost is
+	# scene-dependent rather than a guaranteed linear scaling: Russian Roulette
+	# (roadmap B4, landed) terminates low-throughput paths probabilistically from
+	# bounce 3 onward, so how much a higher cap actually costs depends on how far
+	# throughput has already decayed by the time paths reach it. In a dark interior
+	# most paths are killed before the extra bounces are ever taken; on bright
+	# surfaces they survive and are paid for.
 	env.set_pathtracing_max_diffuse_bounce(4)
 	env.set_pathtracing_max_glossy_bounce(4)
 
@@ -901,6 +950,14 @@ func setup_lighting(data, geom_data = {}):
 	#   ZR_PT_CLAMP_INDIRECT firefly clamp, 0 = off     (default 0; Blender's is 10)
 	#   ZR_PT_NOISE_THRESH   adaptive sampling, 0 = off (default 0 for a pure reference)
 	#   ZR_PT_FINAL          "oidn" | "dlssrr" | "none" (default "oidn")
+	#
+	# KNOWN OPEN ITEM if CLAMP_INDIRECT is enabled: it only clamps the environment-NEE
+	# half of a sky hit (raytracing_closest_hit_common_inc.glsl clamp_contribution on the
+	# env_sample() contribution); the BSDF/miss half that reaches the sky is added raw
+	# (scene_raytracing_raygen.glsl sky_contribution). The two MIS strategies then
+	# estimate different integrands, so the sky darkens where the env-NEE weight is high
+	# while BSDF-sampled sun fireflies pass through unclamped. This is inert at the
+	# default (clamp is 0 = off); it is not intended behaviour, just not yet fixed.
 	var phase_a_offline := PHASE_A_OFFLINE_STILL and OS.get_environment("ZR_PHASE_A") == "1"
 
 	if phase_a_offline:
