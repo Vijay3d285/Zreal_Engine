@@ -35,6 +35,7 @@ TEST_FORCE_LINK(test_pt_emissive)
 #include "core/math/math_funcs.h"
 #include "core/math/transform_3d.h"
 #include "core/math/vector3.h"
+#include "core/templates/hashfuncs.h"
 
 #include <algorithm>
 #include <vector>
@@ -441,6 +442,143 @@ TEST_CASE("[PathTracer][Emissive] an all-zero distribution selects nothing") {
 
 	std::vector<float> empty;
 	CHECK_FALSE(mirror_select_instance(empty, 1.0f, 0.5f, slot, prob, remap));
+}
+
+// Mirror of the rebuild token composed at the end of gather_emissive_instances().
+// One entry per KEPT emitter, in slot order.
+struct MirrorTokenEntry {
+	uint32_t geometry_index = 0;
+	uint32_t prim_count = 0;
+	// Merged-MultiMesh rebake stamp, 0 for instances that did not come from that
+	// path. A merged MM bakes its per-instance transforms into the merged VERTEX
+	// buffer, so when its instances move NOTHING else in this struct changes --
+	// not the transform, not the emission, not the primitive count. This field is
+	// the only thing standing between that and a permanently stale area.
+	uint64_t merge_stamp = 0;
+	Transform3D xform;
+	Vector3 emission;
+};
+
+static uint64_t mirror_token(uint32_t p_instance_count, const std::vector<MirrorTokenEntry> &p_kept) {
+	uint32_t h = hash_murmur3_one_32(p_instance_count);
+	h = hash_murmur3_one_32((uint32_t)p_kept.size(), h);
+	uint32_t h2 = hash_murmur3_one_32(p_instance_count, 0x9E3779B9u);
+	h2 = hash_murmur3_one_32((uint32_t)p_kept.size(), h2);
+
+	for (const MirrorTokenEntry &e : p_kept) {
+		float xf[12];
+		// Same 12 floats the GPU receives, in the same order.
+		xf[0] = e.xform.basis.rows[0][0];
+		xf[1] = e.xform.basis.rows[0][1];
+		xf[2] = e.xform.basis.rows[0][2];
+		xf[3] = e.xform.origin.x;
+		xf[4] = e.xform.basis.rows[1][0];
+		xf[5] = e.xform.basis.rows[1][1];
+		xf[6] = e.xform.basis.rows[1][2];
+		xf[7] = e.xform.origin.y;
+		xf[8] = e.xform.basis.rows[2][0];
+		xf[9] = e.xform.basis.rows[2][1];
+		xf[10] = e.xform.basis.rows[2][2];
+		xf[11] = e.xform.origin.z;
+
+		h = hash_murmur3_one_32(e.geometry_index, h);
+		h = hash_murmur3_one_32(e.prim_count, h);
+		h = hash_murmur3_one_64(e.merge_stamp, h);
+		h2 = hash_murmur3_one_32(e.geometry_index, h2);
+		h2 = hash_murmur3_one_32(e.prim_count, h2);
+		h2 = hash_murmur3_one_64(e.merge_stamp, h2);
+		for (int k = 0; k < 12; k++) {
+			h = hash_murmur3_one_float(xf[k], h);
+			h2 = hash_murmur3_one_float(xf[k], h2);
+		}
+		h = hash_murmur3_one_float(e.emission.x, h);
+		h = hash_murmur3_one_float(e.emission.y, h);
+		h = hash_murmur3_one_float(e.emission.z, h);
+		h2 = hash_murmur3_one_float(e.emission.x, h2);
+		h2 = hash_murmur3_one_float(e.emission.y, h2);
+		h2 = hash_murmur3_one_float(e.emission.z, h2);
+	}
+	return (uint64_t(hash_fmix32(h2)) << 32) | uint64_t(hash_fmix32(h));
+}
+
+TEST_CASE("[PathTracer][Emissive] every rebuild-token input is live") {
+	// The token is compared for equality every frame and a match means "do not
+	// rebuild". So an input the token cannot see is an input that silently
+	// freezes the distribution -- which is exactly how the environment CDF once
+	// baked an all-zero sky and never revisited it. Each sub-case perturbs ONE
+	// input and requires the token to move.
+	MirrorTokenEntry base;
+	base.geometry_index = 3;
+	base.prim_count = 24;
+	base.merge_stamp = 0;
+	base.xform.basis = Basis(Vector3(0, 1, 0), 0.37f).scaled(Vector3(1.25f, 0.75f, 2.0f));
+	base.xform.origin = Vector3(1.5f, -0.25f, 4.0f);
+	base.emission = Vector3(0.8f, 0.4f, 0.1f);
+
+	const uint32_t instance_count = 40;
+	const std::vector<MirrorTokenEntry> kept = { base };
+	const uint64_t t0 = mirror_token(instance_count, kept);
+
+	// Identical input must reproduce the token, or the distribution rebuilds
+	// every frame and the dirty flag is pointless.
+	CHECK(mirror_token(instance_count, kept) == t0);
+
+	SUBCASE("a moved emitter") {
+		std::vector<MirrorTokenEntry> k = kept;
+		k[0].xform.origin.y += 0.001f;
+		CHECK(mirror_token(instance_count, k) != t0);
+	}
+	SUBCASE("a rotated emitter with an unchanged origin") {
+		// Rotation lives in the basis, not the origin -- a token that hashed only
+		// the translation would pass every other case here.
+		std::vector<MirrorTokenEntry> k = kept;
+		k[0].xform.basis = k[0].xform.basis * Basis(Vector3(1, 0, 0), 0.05f);
+		CHECK(mirror_token(instance_count, k) != t0);
+	}
+	SUBCASE("a re-coloured emitter") {
+		std::vector<MirrorTokenEntry> k = kept;
+		k[0].emission.z += 0.01f;
+		CHECK(mirror_token(instance_count, k) != t0);
+	}
+	SUBCASE("a NON-emissive instance appended at the end") {
+		// Every emitter's index, transform and emission is untouched, but the slot
+		// table must grow to cover the new gl_InstanceCustomIndex.
+		CHECK(mirror_token(instance_count + 1, kept) != t0);
+	}
+	SUBCASE("a merged MultiMesh whose instances moved") {
+		// THE case this field exists for: the merged vertex buffer is rebaked, so
+		// the world geometry moved, yet geometry_index, prim_count, xform and
+		// emission are all bit-identical. Only the rebake stamp differs.
+		std::vector<MirrorTokenEntry> k = kept;
+		k[0].merge_stamp = 1;
+		const uint64_t t1 = mirror_token(instance_count, k);
+		CHECK(t1 != t0);
+		// And it must keep discriminating as the stamp advances, not merely on the
+		// first 0 -> nonzero step.
+		k[0].merge_stamp = 2;
+		CHECK(mirror_token(instance_count, k) != t1);
+		// A change confined to the HIGH word must register too: the stamp is 64-bit
+		// and a 32-bit truncation would drop it.
+		k[0].merge_stamp = uint64_t(1) << 40;
+		CHECK(mirror_token(instance_count, k) != t0);
+	}
+	SUBCASE("an emitter that lost triangles") {
+		std::vector<MirrorTokenEntry> k = kept;
+		k[0].prim_count = 23;
+		CHECK(mirror_token(instance_count, k) != t0);
+	}
+	SUBCASE("the same emitter at a different instance index") {
+		std::vector<MirrorTokenEntry> k = kept;
+		k[0].geometry_index = 4;
+		CHECK(mirror_token(instance_count, k) != t0);
+	}
+	SUBCASE("a second emitter appearing") {
+		std::vector<MirrorTokenEntry> k = kept;
+		MirrorTokenEntry second = base;
+		second.geometry_index = 9;
+		k.push_back(second);
+		CHECK(mirror_token(instance_count, k) != t0);
+	}
 }
 
 TEST_CASE("[PathTracer][Emissive] compressed emitters use blas_transform x aabb^-1") {

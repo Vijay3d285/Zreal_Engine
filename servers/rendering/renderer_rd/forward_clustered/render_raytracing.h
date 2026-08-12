@@ -492,6 +492,14 @@ class RenderRaytracing {
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
+	/// TLAS instance index -> merged-MultiMesh rebake stamp, for instances that
+	/// came from the merged-MM path. Sparse on purpose: a merged MultiMesh
+	/// contributes one TLAS instance per surface, so this holds a handful of
+	/// entries at most, and every other instance carries no stamp. Consumed by
+	/// gather_emissive_instances(), which folds it into the emissive rebuild
+	/// token -- a merged MM bakes its transforms into vertices, so nothing else
+	/// the token sees changes when its instances move.
+	HashMap<uint32_t, uint64_t> merged_mm_instance_stamps;
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
 

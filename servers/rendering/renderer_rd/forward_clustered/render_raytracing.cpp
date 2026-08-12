@@ -484,6 +484,7 @@ void RenderRaytracing::prepare_frame() {
 	material_data.clear();
 	motion_indices.clear();
 	motion_transforms.clear();
+	merged_mm_instance_stamps.clear();
 
 	// Per-frame "touched this frame" lists are cleared here and refilled by
 	// `_access_*_slot` during the build phase. Saves a hashmap walk in
@@ -2630,6 +2631,20 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {
+			// A merged MultiMesh bakes its per-instance transforms into the merged
+			// VERTEX buffer, so moving the instances leaves `blas_transforms` and
+			// every RT_GeometryData field untouched -- the emissive rebuild token
+			// would read unchanged while the geometry underneath it moved, and the
+			// distribution would keep a stale world-space area forever. Record the
+			// same stamp `_build_merged_mm_blas` itself uses to decide whether to
+			// rebake, keyed by TLAS instance index, so gather_emissive_instances()
+			// can fold it in. The surface counter rides along because a re-uploaded
+			// mesh surface can change vertex positions without changing the
+			// triangle count the token already covers.
+			merged_mm_instance_stamps[geometry_data.size()] =
+					mesh_storage->multimesh_get_last_change(pending.mm_rid) ^
+					(uint64_t(pending.surface_counter) * 0x9E3779B97F4A7C15ULL);
+
 			blass.push_back(merged_sd.blas);
 			blas_transforms.push_back(pending.instance_transform);
 			geometry_data.push_back(merged_sd.geometry);
@@ -3174,6 +3189,15 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 	// The full instance count is folded in as well: appending a NON-emissive
 	// instance at the end leaves every emitter's index, transform and emission
 	// untouched, but the slot table still has to grow to cover the new index.
+	//
+	// And so is the merged-MultiMesh rebake stamp, per instance. A merged MM
+	// bakes its per-instance transforms into the merged VERTEX buffer, so moving
+	// its instances changes neither blas_transforms[i] nor any RT_GeometryData
+	// field -- the set/transform/emission triple this token was specified over is
+	// blind to it. `merged_mm_instance_stamps` carries the same value
+	// _build_merged_mm_blas() tests to decide whether to rebake, so the token now
+	// retriggers on exactly the frames the geometry actually moved. Instances
+	// that did not come from that path have no entry and contribute 0.
 	uint32_t h = hash_murmur3_one_32(instance_count);
 	h = hash_murmur3_one_32(candidates.size(), h);
 	uint32_t h2 = hash_murmur3_one_32(instance_count, 0x9E3779B9u);
@@ -3189,10 +3213,16 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 		float xf[12];
 		RendererRD::MaterialStorage::store_transform_transposed_3x4(c.input.xform, xf);
 
+		const HashMap<uint32_t, uint64_t>::ConstIterator stamp_it =
+				merged_mm_instance_stamps.find(c.instance_index);
+		const uint64_t merge_stamp = stamp_it ? stamp_it->value : 0;
+
 		h = hash_murmur3_one_32(c.input.geometry_index, h);
 		h = hash_murmur3_one_32(c.input.prim_count, h);
+		h = hash_murmur3_one_64(merge_stamp, h);
 		h2 = hash_murmur3_one_32(c.input.geometry_index, h2);
 		h2 = hash_murmur3_one_32(c.input.prim_count, h2);
+		h2 = hash_murmur3_one_64(merge_stamp, h2);
 		for (int k = 0; k < 12; k++) {
 			h = hash_murmur3_one_float(xf[k], h);
 			h2 = hash_murmur3_one_float(xf[k], h2);
