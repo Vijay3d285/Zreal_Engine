@@ -159,8 +159,30 @@ computing the token is cheap.
 `pdf_A = P(inst) × (1/prim_count) × (1/area_tri)`.
 
 No per-triangle buffer exists anywhere in this design: `area_tri` is recomputed
-where it is needed, from vertices the shader already has. That is what keeps both
-the build pass and the reverse lookup small.
+where it is needed, from the vertex buffer. That is what keeps the build pass and
+the reverse lookup free of any per-triangle storage.
+
+> **CORRECTION (2026-08-12, during planning).** An earlier revision of this
+> section claimed `area_tri` came "from vertices the shader already has". That is
+> **false**: the closest-hit shader derives `h.hit_pos` from
+> `gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT` and fetches only
+> normals and UVs from the vertex buffer — never positions. The reverse lookup
+> must therefore fetch and decode three vertex positions itself.
+>
+> This does **not** change the architecture decision. The rejected per-triangle
+> alternative would also require a buffer read at the same site, plus the memory
+> and the build-time scan; recomputing stays cheaper. It changes only the claimed
+> cost, and it means a shared `rt_fetch_vertex_position(geom, idx)` helper is
+> required — used by the area pass, the NEE sample point, and the reverse lookup
+> alike.
+>
+> Positions come in two layouts and the helper must handle both:
+> uncompressed is `position_stride` bytes with the first three floats as xyz;
+> compressed (`FLAG_COMPRESSED`, `position_stride == 8`) is four `uint16`s across
+> two words — `x | (y << 16)` in word 0, `z` in the low half of word 1 (the high
+> half is the tangent angle, per `fetch_tbn_compressed_vertex`) — normalised to
+> `[0,1]` and mapped through the AABB transform from
+> `get_aabb_compression_xforms`.
 
 **The cost, stated plainly:** uniform triangle selection is high-variance when one
 triangle holds most of a mesh's emissive area — a surface with one large triangle
@@ -246,8 +268,10 @@ twice. This is the identical defect C3 had to fix for the sky.
 **BSDF side** (at the emissive hit): weight by
 `power_heuristic(ps.mis_ray_pdf, pdf_ω)`, where `pdf_ω` is what emissive NEE
 *would* have used to sample this exact point from the previous shading point:
-`emissive_slot[gl_InstanceCustomIndex]` → `P(inst)`, `area_tri` from the hit's own
-vertices, `dist` from `gl_HitTEXT`, `cos_θ_light` from the geometric normal.
+`emissive_slot[gl_InstanceCustomIndex]` → `P(inst)`, `area_tri` from three vertex
+positions fetched and decoded via `rt_fetch_vertex_position` (see the correction
+in §4.2 — the hit shader does *not* already hold them), `dist` from `gl_HitTEXT`,
+`cos_θ_light` from the geometric normal.
 
 **NEE side**: weight by `power_heuristic(pdf_ω, combinedPdf(N, L, V, material))`,
 reusing B2's mixture pdf over both BSDF lobes.
