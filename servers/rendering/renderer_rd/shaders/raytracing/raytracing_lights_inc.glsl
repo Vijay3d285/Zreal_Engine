@@ -68,6 +68,37 @@ layout(set = 0, binding = RT_LIGHT_BUFFER_BINDING, std430) readonly buffer Light
 	RTLightData rt_lights[];
 };
 
+// Godot-style windowed distance attenuation, from a squared distance.
+// window = (1 - (d/range)^4)^2, combined with pow(d, -decay).
+// Shared verbatim by the shading path (via lights_get_attenuation) and by the
+// light-selection weight (lights_select_weight). These MUST stay one function:
+// if the weight's falloff drifts from the contribution's falloff, the estimator
+// divides by a pdf that does not match the density it sampled from.
+float lights_attenuation_from_dist_sq(float p_dist_sq, float p_inv_max_range, float p_decay) {
+	if (p_dist_sq <= 0.0) {
+		return 1.0; // Directional: no distance attenuation.
+	}
+
+	float distance = sqrt(p_dist_sq);
+	float atten = min(pow(max(distance, 0.0001), -p_decay), 1.0);
+
+	// Windowed falloff if range is finite (inv_max_range >= 0).
+	if (p_inv_max_range >= 0.0) {
+		float nd = distance * p_inv_max_range;
+		nd *= nd;
+		nd *= nd; // nd^4
+		nd = max(1.0 - nd, 0.0);
+		nd *= nd; // nd^2 window
+		return atten * nd;
+	}
+
+	return atten;
+}
+
+// Importance-weighted selection (roadmap C2). Included here, after RTLightData
+// and the rt_lights SSBO, because it reads both.
+#include "raytracing_light_select_inc.glsl"
+
 // ============================================================================
 // Unified Cone Sampling (for sphere, directional, spot lights)
 // ============================================================================
@@ -149,27 +180,11 @@ vec3 lights_sample_cone(LightSample ls, vec2 u, out float pdf) {
 // Attenuation
 // ============================================================================
 
-// Godot-style windowed distance attenuation.
-// window = (1 - (d/range)^4)^2, combined with pow(d, -decay).
+// Thin LightSample-typed wrapper over lights_attenuation_from_dist_sq (defined
+// above, right after the rt_lights SSBO). Kept here because LightSample isn't
+// declared until after that point.
 float lights_get_attenuation(LightSample ls, float inv_max_range, float decay) {
-	if (ls.distance_sq <= 0.0) {
-		return 1.0; // Directional: no distance attenuation.
-	}
-
-	float distance = sqrt(ls.distance_sq);
-	float atten = min(pow(max(distance, 0.0001), -decay), 1.0);
-
-	// Windowed falloff if range is finite (inv_max_range >= 0).
-	if (inv_max_range >= 0.0) {
-		float nd = distance * inv_max_range;
-		nd *= nd;
-		nd *= nd; // nd^4
-		nd = max(1.0 - nd, 0.0);
-		nd *= nd; // nd^2 window
-		return atten * nd;
-	}
-
-	return atten;
+	return lights_attenuation_from_dist_sq(ls.distance_sq, inv_max_range, decay);
 }
 
 // Per-light specular multiplier.
