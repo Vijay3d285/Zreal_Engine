@@ -152,8 +152,12 @@ bool lights_select(vec3 p_hit_pos, uint p_light_count, bool p_is_indirect_bounce
 		}
 	}
 
-	// Drift guard. The two passes sum the same values in the same order, but
-	// u * total can still land at or past the final running sum through rounding.
+	// Drift guard. The two passes sum the same values in the same order, but a
+	// GPU compiler is free to reassociate/fuse each pass's additions differently,
+	// so pass 2's running sum can end up strictly less than pass 1's total.
+	// NOT reachable by varying p_u alone for a fixed total -- p_u * total can
+	// never land at or past the real running sum through rounding when both
+	// passes agree on total; do not try to construct a p_u that triggers this.
 	// Answer with the last positive-weight light -- never an index past the array,
 	// and never a zero-weight light (which would be a pdf of 0 on a taken path).
 	if (last_w > 0.0) {

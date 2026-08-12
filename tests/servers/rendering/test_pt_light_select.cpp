@@ -409,21 +409,23 @@ TEST_CASE("[PathTracer][LightSelect] zero indirect energy weighs zero only on in
 	CHECK(mirror_weight(p, l, true) == 0.0f); // indirect: contributes nothing, matched
 }
 
-// Mirror of lights_select(). Takes weights directly so the walk can be tested
-// independently of how they were produced.
-static bool mirror_select(const std::vector<float> &p_weights, float p_u, uint32_t &r_index, float &r_pdf) {
+// Core of the walk with pass 1's total supplied by the caller instead of summed
+// here. Production computes `total` and the per-light weights in two separate
+// passes (lights_select() in raytracing_light_select_inc.glsl) precisely so a
+// GPU compiler is free to reassociate/fuse each pass differently -- the guard
+// below exists for the case where that makes pass 2's accumulated `running`
+// end up strictly less than pass 1's `total`. Exposing `p_total` as a parameter
+// is what lets a test *drive* that mismatch deliberately: mirror_select() below
+// always passes the real sum, so it can never land here (see the guard test).
+static bool mirror_select_with_total(const std::vector<float> &p_weights, float p_u, float p_total, uint32_t &r_index, float &r_pdf) {
 	r_index = 0;
 	r_pdf = 0.0f;
 
-	float total = 0.0f;
-	for (uint32_t i = 0; i < (uint32_t)p_weights.size(); i++) {
-		total += p_weights[i];
-	}
-	if (!(total > 0.0f)) {
+	if (!(p_total > 0.0f)) {
 		return false;
 	}
 
-	const float target = p_u * total;
+	const float target = p_u * p_total;
 	float running = 0.0f;
 	uint32_t last_pos = 0;
 	float last_w = 0.0f;
@@ -437,18 +439,30 @@ static bool mirror_select(const std::vector<float> &p_weights, float p_u, uint32
 		running += w;
 		if (running > target) {
 			r_index = i;
-			r_pdf = w / total;
+			r_pdf = w / p_total;
 			return true;
 		}
 	}
-	// Drift guard: u * total landed at or past the accumulated sum through
-	// floating-point rounding. The last positive-weight light is the answer.
+	// Drift guard: target landed at or past the accumulated sum. The last
+	// positive-weight light is the answer -- never an index past the array,
+	// and never a zero-weight light (which would be a pdf of 0 on a taken path).
 	if (last_w > 0.0f) {
 		r_index = last_pos;
-		r_pdf = last_w / total;
+		r_pdf = last_w / p_total;
 		return true;
 	}
 	return false;
+}
+
+// Mirror of lights_select(). Takes weights directly so the walk can be tested
+// independently of how they were produced. Always passes pass 2's own sum as
+// the total, matching production's non-drifted case.
+static bool mirror_select(const std::vector<float> &p_weights, float p_u, uint32_t &r_index, float &r_pdf) {
+	float total = 0.0f;
+	for (uint32_t i = 0; i < (uint32_t)p_weights.size(); i++) {
+		total += p_weights[i];
+	}
+	return mirror_select_with_total(p_weights, p_u, total, r_index, r_pdf);
 }
 
 TEST_CASE("[PathTracer][LightSelect] selection frequency matches the weights") {
@@ -544,6 +558,43 @@ TEST_CASE("[PathTracer][LightSelect] u at the top of the range stays in bounds")
 	REQUIRE(mirror_select(w, u_max, idx, pdf));
 	CHECK(idx == 1); // the last POSITIVE-weight light, not index 2 and not index 3
 	CHECK(pdf == doctest::Approx(2.0f / 3.0f));
+}
+
+TEST_CASE("[PathTracer][LightSelect] the drift guard fires when pass 1's total disagrees with pass 2's sum") {
+	// NOT reachable through u. For a fixed total, u * total can never land at or
+	// past the real running sum: checked exhaustively for u = 1 - 2^-24 (the
+	// largest float below 1.0) and for the production sampler's actual maximum
+	// output, (2^32-1)/(2^32+512), against totals 3, 4, 5, 6, 8 -- f32(u * total)
+	// always rounds strictly below total. There is no ties-to-even exception
+	// either: e.g. at total = 4, u * total lives in the [2,4) binade where float
+	// spacing is exactly 2^-22, so nothing rounds up into it.
+	//
+	// The guard exists for a different divergence: production computes pass 1's
+	// `total` and pass 2's per-light weights as two SEPARATE passes (see
+	// lights_select() in raytracing_light_select_inc.glsl), so a GPU compiler is
+	// free to reassociate or fuse the additions differently in each. That can
+	// leave pass 2's accumulated `running` strictly less than pass 1's `total`,
+	// with no relation to u at all. mirror_select_with_total() models that
+	// directly by taking pass 1's total as an explicit, independent parameter.
+	std::vector<float> w;
+	w.push_back(1.0f);
+	w.push_back(2.0f);
+	w.push_back(0.0f); // trailing zero: the guard must still skip it
+
+	// pass 2 will only ever accumulate 1.0 + 2.0 == 3.0 from these weights. Force
+	// pass 1's total far above that, standing in for a reassociated/fused pass 1
+	// sum that drifted high -- any total > 3.0 makes the loop's `running > target`
+	// branch unreachable and forces the post-loop guard, regardless of u.
+	const float forced_total = 10.0f;
+	const float u = 0.5f; // target = 5.0, comfortably past the real running sum of 3.0
+
+	uint32_t idx = 99;
+	float pdf = -1.0f;
+	REQUIRE(mirror_select_with_total(w, u, forced_total, idx, pdf));
+	CHECK(idx == 1); // last POSITIVE-weight light -- index 2's zero weight must be skipped
+	CHECK(idx < (uint32_t)w.size()); // never past the array
+	CHECK(pdf == doctest::Approx(2.0f / forced_total));
+	CHECK(pdf > 0.0f); // never a zero pdf on a path the walk actually returned as taken
 }
 
 TEST_CASE("[PathTracer][LightSelect] all-zero weights returns false, not index 0") {
