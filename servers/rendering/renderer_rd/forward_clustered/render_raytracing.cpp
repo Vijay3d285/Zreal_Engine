@@ -3065,6 +3065,34 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 			continue;
 		}
 
+		// Skinned / vertex-displaced emitters are deliberately EXCLUDED, and this
+		// is not a stub for "deformed geometry is unsupported" -- do not remove it
+		// without replacing the mechanism it stands in for.
+		//
+		// The distribution is rebuilt from a token over the instance set, their
+		// transforms and their emission; vertex data is not in it, and cannot
+		// cheaply be, because those positions live behind BDA pointers the render
+		// graph cannot track. So a mesh that deforms IN PLACE never retriggers the
+		// area pass and would keep its first frame's `total_area` forever. Task 5
+		// divides by that area to form the area-measure pdf, and a pdf computed
+		// from last frame's area against a sample point taken from this frame's
+		// geometry is simply the wrong density: BIASED, and undetectable
+		// downstream.
+		//
+		// Skipping is UNBIASED by comparison. The instance keeps emissive_slot ==
+		// -1, so NEE can never select it, its selection weight is zero, and the MIS
+		// partition hands the whole weight to the strategy that can still reach it:
+		// a BSDF ray that lands on the surface takes w_mis = 1.0 and contributes
+		// its full radiance. Energy is preserved exactly. The only cost is higher
+		// variance on that one emitter -- which is precisely the pre-C1 behaviour,
+		// so nothing regresses. This is the same zero-weight invariant the rest of
+		// the design rests on (a zero light pdf already hands the BSDF full
+		// weight); trading a real bias for extra variance on animated emitters is
+		// the right way round.
+		if ((geom.flags & RT_GEOM_FLAG_DEFORMED) != 0) {
+			continue;
+		}
+
 		const RT_MaterialData &mat = material_data[i];
 		const bool textured = (mat.flags & RT_MAT_FLAG_HAS_EMISSION_TEX) != 0;
 		const float lum = mat.emission_color[0] * 0.2126f + mat.emission_color[1] * 0.7152f + mat.emission_color[2] * 0.0722f;
@@ -3109,10 +3137,7 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 				mat.emission_color[1] * mat.emission_strength,
 				mat.emission_color[2] * mat.emission_strength);
 
-		// Ranking key, used ONLY to decide who survives when a scene has more than
-		// INSTANCES_MAX emitters. The real area is not known until the GPU pass
-		// runs, so approximate it with the instance's squared scale -- an area-like
-		// factor -- times the emitted luminance.
+		// Ranking key. See the sort below for what it is and is not good for.
 		const float scale_sq = MAX(obj_to_world.basis.get_scale().length_squared(), 0.0f);
 		c.key = MAX(lum, 0.0f) * mat.emission_strength * scale_sq;
 		candidates.push_back(c);
@@ -3122,6 +3147,17 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 		return 0;
 	}
 
+	// HEURISTIC, and only ever a heuristic. `key` is
+	// luminance * strength * ||basis scale||^2, standing in for radiant power --
+	// which cannot be computed here, because the true surface area is not known
+	// until the GPU pass runs (that is the whole reason the GPU pass exists).
+	//
+	// It decides exactly one thing: WHO SURVIVES when a scene carries more than
+	// INSTANCES_MAX emitters. Below that threshold the sort does not run at all
+	// and the key has no effect on the distribution, which is built from real
+	// GPU-measured areas either way. Its known weakness is that it sees only the
+	// bounding scale, so a dense mesh of many tiny triangles ranks equal to a
+	// single large quad of the same bounding scale despite very different area.
 	if (candidates.size() > RendererRD::EmissiveLights::INSTANCES_MAX) {
 		struct CandidateSorter {
 			_FORCE_INLINE_ bool operator()(const Candidate &a, const Candidate &b) const {

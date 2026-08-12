@@ -419,10 +419,19 @@ class RenderRaytracing {
 	RID _get_env_dist_fallback_buffer();
 
 	// Power-weighted sampling distribution over emissive mesh instances (C1).
-	// Owned here alongside `env_cdf` so the shader and pipeline are shared, even
-	// though the instance set itself is viewport-dependent: with more than one
-	// path-traced viewport the rebuild token simply alternates and the (cheap,
-	// <= 256-instance) build runs once per viewport per frame.
+	//
+	// Owned here alongside `env_cdf` so the shader and pipeline are shared. Note
+	// the asymmetry with `env_cdf` though: the sky is viewport-independent, but
+	// the emissive INSTANCE SET is not -- each viewport has its own visibility
+	// set, so each produces a different set and therefore a different rebuild
+	// token. With more than one path-traced viewport live, the token alternates
+	// every frame and the build re-runs once per viewport per frame. That stays
+	// CORRECT (the token is over the data, so whatever is built matches what was
+	// gathered); it is only wasted work. The build is a <= 256-workgroup area
+	// reduction plus a 256-entry serial scan, so the waste is small -- but if a
+	// scene with many path-traced viewports ever makes it measurable, the fix is
+	// to move this (and its per-frame scratch below) into RTViewportState, the
+	// way `geometry_buffer` / `light_buffer` already are.
 	RendererRD::EmissiveLights emissive_lights;
 	// Result of this frame's `rendering/pathtracer/emissive_mesh_lights` read.
 	// The feature ships default-OFF, so the false path is the one that runs in

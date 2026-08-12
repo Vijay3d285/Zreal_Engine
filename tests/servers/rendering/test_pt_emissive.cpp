@@ -218,6 +218,30 @@ static bool mirror_is_emissive(uint32_t p_flags, const Vector3 &p_emission_color
 	return mirror_luminance(p_emission_color) * p_strength > 1e-4f;
 }
 
+static const uint32_t GEOM_FLAG_COMPRESSED = 1u;
+static const uint32_t GEOM_FLAG_PROCEDURAL = 2u;
+static const uint32_t GEOM_FLAG_DEFORMED = 4u;
+
+// Mirror of the GEOMETRY-side exclusions in gather_emissive_instances(), which
+// run before the material qualification above. Three separate reasons, and the
+// bits are adjacent, so a mask typo silently swaps one exclusion for another.
+static bool mirror_geometry_eligible(uint32_t p_geom_flags, uint32_t p_prim_count) {
+	if ((p_geom_flags & GEOM_FLAG_PROCEDURAL) != 0u) {
+		return false; // No triangles: the vertex address points at AABB data.
+	}
+	if (p_prim_count == 0u) {
+		return false;
+	}
+	// Deformed geometry is excluded on purpose: its area would go stale (the
+	// rebuild token does not cover vertex data), and a stale area is a BIASED
+	// pdf. Absent from the distribution is unbiased -- slot stays -1, NEE never
+	// selects it, and MIS gives the BSDF ray full weight.
+	if ((p_geom_flags & GEOM_FLAG_DEFORMED) != 0u) {
+		return false;
+	}
+	return true;
+}
+
 // Mirror of the CDF walk in emissive_select_instance(). Returns the selected
 // slot and rescales the remainder within its bucket to [0,1) for the triangle
 // draw. r_remap MUST span the full unit interval across a bucket or the
@@ -303,6 +327,29 @@ TEST_CASE("[PathTracer][Emissive] qualification covers textured and coloured emi
 	// weight vector changes which side of the threshold each lands on.
 	CHECK(mirror_is_emissive(0u, Vector3(0, 1, 0), 2e-4f)); // 0.7152 * 2e-4 > 1e-4
 	CHECK_FALSE(mirror_is_emissive(0u, Vector3(0, 0, 1), 2e-4f)); // 0.0722 * 2e-4 < 1e-4
+}
+
+TEST_CASE("[PathTracer][Emissive] geometry exclusions are by flag, not by accident") {
+	// An ordinary static emitter with triangles is the only eligible shape.
+	CHECK(mirror_geometry_eligible(0u, 12u));
+	// COMPRESSED is NOT an exclusion -- compressed emitters are fully supported,
+	// they just need the aabb^-1 correction (see the transform case below). This
+	// is the assertion that stops someone widening the mask to "any flag set".
+	CHECK(mirror_geometry_eligible(GEOM_FLAG_COMPRESSED, 12u));
+
+	// Procedural: no triangles to integrate over.
+	CHECK_FALSE(mirror_geometry_eligible(GEOM_FLAG_PROCEDURAL, 12u));
+	// Deformed: excluded to avoid a stale total_area, which would be a biased pdf.
+	CHECK_FALSE(mirror_geometry_eligible(GEOM_FLAG_DEFORMED, 12u));
+	// A compressed mesh that also deforms is still excluded -- the deformed bit
+	// must be tested independently, not as an equality against the whole word.
+	CHECK_FALSE(mirror_geometry_eligible(GEOM_FLAG_COMPRESSED | GEOM_FLAG_DEFORMED, 12u));
+
+	// Zero primitives is its own exclusion, independent of any flag: it must bite
+	// on otherwise-eligible geometry too, or an empty surface reaches the area
+	// pass and dispatches a workgroup that reduces to zero.
+	CHECK_FALSE(mirror_geometry_eligible(0u, 0u));
+	CHECK_FALSE(mirror_geometry_eligible(GEOM_FLAG_COMPRESSED, 0u));
 }
 
 TEST_CASE("[PathTracer][Emissive] instance selection frequency matches power") {
