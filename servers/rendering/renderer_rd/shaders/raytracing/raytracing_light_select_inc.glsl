@@ -33,8 +33,8 @@
 
 /// Importance of `p_light` at `p_hit_pos`. Always >= 0.
 float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indirect_bounce) {
-	// Magnitude, not signed luminance: compute_light_energy() applies sign = -1
-	// for a negative light (render_raytracing.cpp:2755), so emission arrives
+	// Magnitude, not signed luminance: RenderRaytracing::gather_lights() applies
+	// sign = -1 for a negative light (`light_is_negative`), so emission arrives
 	// negative in every channel. A signed weight would corrupt the CDF. The sign
 	// is uniform across channels, so abs(luminance(e)) == luminance(abs(e)).
 	float mag = abs(luminance(p_light.emission));
@@ -43,8 +43,11 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 	}
 
 	// indirect_energy multiplies the contribution for every type on indirect
-	// bounces (raytracing_lights_inc.glsl:336, :462, :505), so zero here means
-	// zero contribution there -- matched, no bias.
+	// bounces -- all three shading sites in raytracing_lights_inc.glsl compute
+	// `indirect_mul`: one in lights_eval_rect_light, and one in each of the
+	// positional (omni+spot) and directional branches of
+	// lights_evaluate_direct_lighting. So zero here means zero contribution
+	// there -- matched, no bias.
 	float indirect_factor = p_is_indirect_bounce ? p_light.indirect_energy : 1.0;
 	if (indirect_factor <= 0.0) {
 		return 0.0;
@@ -60,12 +63,14 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 	float dist = sqrt(dist_sq);
 
 	// HAZARD 1 -- rect range. Shading range-tests the SAMPLED point on the quad
-	// (:315) while this knows only the centre, so a rect straddling the boundary
-	// would weigh 0 with part of it still lit. Expand by a conservative bound on
+	// (the max_range_squared early-out in lights_eval_rect_light, which tests
+	// `sample_point`, not the centre) while this knows only the centre, so a rect
+	// straddling the boundary would weigh 0 with part of it still lit. Expand by a conservative bound on
 	// the half-diagonal. (length(U) + length(V) >= |U +/- V| for any U, V.)
 	float near_dist = dist;
 	if (p_light.type == RT_LIGHT_TYPE_RECT) {
-		// For RECT, spot_direction is aliased to axisU (:284) -- it is NOT a cone axis.
+		// For RECT, spot_direction is aliased to axisU -- lights_eval_rect_light
+		// opens with `vec3 axisU = light.spot_direction;`. It is NOT a cone axis.
 		vec3 axis_u = p_light.spot_direction;
 		vec3 axis_v = vec3(p_light.rect_axis_v[0], p_light.rect_axis_v[1], p_light.rect_axis_v[2]);
 		near_dist = max(0.0, dist - (length(axis_u) + length(axis_v)));
@@ -78,8 +83,8 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 
 	float spot_factor = 1.0;
 	// Gated on type, NOT on the falloff fields being populated: RECT lights also
-	// carry a cos_spot_angle (they are spots with angle >= 179.9, see
-	// render_raytracing.cpp:2887) and reusing it here would cone-cull a quad.
+	// carry a cos_spot_angle (RenderRaytracing::gather_lights() emits them as
+	// spots with angle >= 179.9) and reusing it here would cone-cull a quad.
 	if (p_light.type == RT_LIGHT_TYPE_SPOT) {
 		vec3 L = to_light / max(dist, 1e-4);
 		float scos = dot(-L, p_light.spot_direction);
@@ -97,7 +102,9 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 			return 0.0;
 		}
 
-		// CLAMPED TO 1.0, unlike the shading path's max(1e-4, ...) at :439.
+		// CLAMPED TO 1.0, unlike the shading path's spot_rim, which is
+		// `max(1e-4, ...)` in the positional (omni+spot) branch of
+		// lights_evaluate_direct_lighting.
 		// Widening the cone above admits directions between the widened and the
 		// true cone on purpose, and for exactly those the raw ratio exceeds 1,
 		// making 1 - pow(ratio, k) NEGATIVE. A negative weight corrupts the CDF
@@ -123,7 +130,7 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 /// the correct answer there, NOT a uniform fallback. A fallback would resume
 /// sampling lights that provably contribute nothing.
 ///
-/// Two passes over the <=64-light array (RT_LIGHTS_MAX, render_raytracing.h:170).
+/// Two passes over the <=64-light array (RT_LIGHTS_MAX in render_raytracing.h).
 /// The second pass recomputes the weights rather than caching them: a 64-float
 /// local array in a raytracing stage will very likely spill to scratch memory,
 /// and the occupancy loss costs more than the arithmetic it saves.

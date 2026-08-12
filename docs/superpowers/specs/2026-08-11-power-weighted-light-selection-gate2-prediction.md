@@ -1,5 +1,11 @@
 # Gate 2 (`culled`) direction prediction
 
+> **REFUTED 2026-08-11.** The predicted shift did not occur; the pre-C2
+> estimator is exactly unbiased. §"Secondary use" below is **void as method** —
+> gate 2's mean is not a liveness probe, because both builds must read the same
+> there. See the C2 CORRECTION block in `PATH_TRACER_QUALITY_ROADMAP.md`.
+> The prediction body is left sealed and unrevised.
+
 Written and committed **before gate 2 was measured**. If the measurement
 contradicts it, the contradiction is recorded and investigated — this file is
 not revised to match the result.

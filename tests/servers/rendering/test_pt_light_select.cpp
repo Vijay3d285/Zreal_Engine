@@ -172,8 +172,12 @@ static bool light_can_contribute(const Vector3 &p_hit_pos, const MirrorLight &p_
 	const float dist = to_light.length();
 
 	if (p_light.max_range_squared != 0.0f) {
-		// Shading range-tests the SAMPLED point: the centre for omni/spot
-		// (raytracing_lights_inc.glsl:408), a point on the quad for rect (:315).
+		// Shading range-tests the SAMPLED point: the centre for omni/spot (the
+		// "outside max range" early-out in the POSITIONAL branch of
+		// lights_evaluate_direct_lighting -- the production branch, NOT the
+		// similar-looking range test inside the #if RT_LIGHT_SELECT_UNIFORM
+		// reservoir loop above it), and a point on the quad for rect (the
+		// max_range_squared test on `sample_point` in lights_eval_rect_light).
 		float nearest = dist;
 		if (p_light.type == LIGHT_TYPE_RECT) {
 			nearest = MAX(0.0f, dist - (p_light.spot_direction.length() + p_light.rect_axis_v.length()));
@@ -183,7 +187,8 @@ static bool light_can_contribute(const Vector3 &p_hit_pos, const MirrorLight &p_
 		}
 	}
 	if (p_light.type == LIGHT_TYPE_SPOT) {
-		// Shading rejects on scos <= cos_spot_angle (:436) using the SAMPLED
+		// Shading rejects on scos <= cos_spot_angle (the spot cone early-out in
+		// the positional branch of lights_evaluate_direct_lighting) using the SAMPLED
 		// direction, which for a sphere light of radius r ranges over an
 		// angular disc of half-angle asin(r/d) around the centre direction.
 		const Vector3 L = to_light / MAX(dist, 1e-4f);
@@ -273,8 +278,8 @@ TEST_CASE("[PathTracer][LightSelect] no weight is ever negative") {
 }
 
 TEST_CASE("[PathTracer][LightSelect] a negative light gets positive weight") {
-	// compute_light_energy() applies sign = -1 for light_is_negative
-	// (render_raytracing.cpp:2755), so emission arrives negative in every channel.
+	// RenderRaytracing::gather_lights() applies sign = -1 for light_is_negative,
+	// so emission arrives negative in every channel.
 	// A signed luminance weight would go negative and corrupt the CDF.
 	MirrorLight neg;
 	neg.type = LIGHT_TYPE_OMNI;
@@ -291,7 +296,8 @@ TEST_CASE("[PathTracer][LightSelect] a negative light gets positive weight") {
 }
 
 TEST_CASE("[PathTracer][LightSelect] a rect straddling its range boundary keeps weight") {
-	// Shading range-tests the sampled point on the quad (raytracing_lights_inc.glsl:315);
+	// Shading range-tests the sampled point on the quad (the max_range_squared
+	// test on `sample_point` in lights_eval_rect_light);
 	// the weight knows only the centre. Without the half-diagonal expansion this
 	// rect weighs 0 while half of it is still lit.
 	MirrorLight l;

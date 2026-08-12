@@ -17,7 +17,7 @@
 
 // A/B switch for roadmap C2, kept permanently as measurement scaffolding rather
 // than deleted after the phase. Precedent: COMBINE_BRDFS_WITH_FRESNEL
-// (brdf_inc.glsl:158) is the only reason B2's +2.4% converged-mean shift could
+// (defined in brdf_inc.glsl) is the only reason B2's +2.4% converged-mean shift could
 // be pinned to a specific line instead of guessed at.
 //   0 = power-weighted CDF (production)
 //   1 = the pre-C2 uniform k=16 mini-batch reservoir
