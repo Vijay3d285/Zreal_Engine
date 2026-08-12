@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://tests/pt_light_rmse.gd" id="1_ptlightrmse"]
+
+[node name="PTLightRMSE" type="Node"]
+script = ExtResource("1_ptlightrmse")
