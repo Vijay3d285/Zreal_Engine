@@ -56,12 +56,19 @@ const ALBEDO := 0.5 # LINEAR reflectance.
 const TOLERANCE := 0.01 # 1 percent, matching pt_energy_gate.gd's gate 1.
 const LIGHT_COUNT := 16
 
-## Captured at 256 frames / 256x256 from the RT_LIGHT_SELECT_UNIFORM 1 build
-## (the pre-C2 uniform reservoir), commit bfaa512a93 with only that macro
-## flipped. Gate 1 asserts against it; gate 2 only reports against it.
-## ZR_GATE_REF overrides both.
-const REF_IN_RANGE := 0.0 # filled in after the control run
-const REF_CULLED := 0.0 # filled in after the control run
+## Captured at 2048 frames / 256x256 from the RT_LIGHT_SELECT_UNIFORM 1 build
+## (the pre-C2 uniform reservoir) at commit 0b5a8eb969 with only that macro
+## flipped. Gate 1 ASSERTS against REF_IN_RANGE; gate 2 only REPORTS against
+## REF_CULLED. ZR_GATE_REF overrides both.
+##
+## Both are pre-C2 numbers on purpose: gate 1 then states "the C2 selector did
+## not move the energy the old estimator produced", which is the claim that
+## matters. Repeat runs of one build reproduce to ~1e-6 relative (6.068414 vs
+## 6.068419), so anything above ~0.05% is a real difference and not run noise;
+## the default 256-frame run sits ~0.03% off these 2048-frame values purely from
+## finite-sample residual, which is why the tolerance is 1% and not tighter.
+const REF_IN_RANGE := 6.066992
+const REF_CULLED := 2.874023
 
 var _res := 256
 var _plane: MeshInstance3D

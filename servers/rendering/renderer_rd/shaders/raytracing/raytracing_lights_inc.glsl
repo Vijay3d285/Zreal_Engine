@@ -372,12 +372,22 @@ vec3 lights_evaluate_direct_lighting(
 	}
 
 #if RT_LIGHT_SELECT_UNIFORM
-	// PRE-C2 CONTROL PATH. Uniform mini-batch reservoir. Two defects, both fixed
-	// by the production path below: with 41 lights and k=16 the brightest light
-	// is never considered at ~60% of shading points, and light_select_pdf is
-	// ESTIMATED rather than known -- valid_count_estimate is a random variable
-	// and E[1/X] != 1/E[X], so the density is biased whenever range culling
-	// rejects anything. Kept only to A/B the change.
+	// PRE-C2 CONTROL PATH. Uniform mini-batch reservoir. Its defect is VARIANCE,
+	// not bias: with 41 lights and k=16 the brightest light is never even
+	// considered at ~60% of shading points, and every draw that does find it is
+	// scaled up to compensate, so the estimator is heavy-tailed. Measured at
+	// 9.8x-16.5x the equal-time RMSE of the production path below (task-3 report).
+	//
+	// NOTE, corrected by measurement: light_select_pdf here is ESTIMATED rather
+	// than known, and the design spec expected that to BIAS the converged image
+	// whenever range culling rejected anything. It does not, and the gate showed
+	// no shift. The estimator MULTIPLIES the contribution by valid_count_estimate
+	// (contribution / pdf), never by its reciprocal, and given valid_found = m > 0
+	// the reservoir's pick is uniform over the VALID lights regardless of m; so
+	// E[f(L_sel) * N*m/k] = mean(f over valid) * E[N*m/k] = sum over valid f,
+	// exactly. Jensen never enters. The only real energy defect is the
+	// valid_found == 0 dropout below, of relative size (1 - V/N)^k -- 2^-16 in the
+	// gate scene, 0 when nothing is culled. Kept only to A/B the change.
 	const uint k = uint(min(RT_LIGHT_RESERVOIR_SIZE, int(light_count)));
 	uint valid_found = 0u;
 	uint selected_idx = 0u;

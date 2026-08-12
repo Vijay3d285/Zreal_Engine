@@ -518,9 +518,58 @@ Caveats:
 Build an emissive-triangle buffer alongside `gather_lights` in `render_raytracing.cpp` (area, emission, power). Sample by power, MIS-combine against the BSDF (B2 must be in first). Reuse the existing TLAS for shadow rays.
 *Accept:* a room lit only by a glowing panel converges clean; no hotspot speckle; matches a Cycles reference of the same scene.
 
-**C2. Power-weighted light selection** — *Gap #7*
-Replace uniform reservoir candidate selection with importance proportional to `energy / distance²` × angular falloff, following `light_tree_node_importance` (`tree.h:304`). A flat power-weighted CDF captures most of the benefit; the full tree is optional.
-*Accept:* one bright key among 40 dim fills converges at several× the current rate.
+**C2. Power-weighted light selection** — *Gap #7* — **DONE**
+The uniform k=16 mini-batch reservoir is replaced by a flat power-weighted CDF
+over the light array with an **exact** selection pdf
+(`shaders/raytracing/raytracing_light_select_inc.glsl`). The weight is
+`|luminance(emission)| × attenuation × spot_factor × indirect_energy`, sharing
+`lights_attenuation_from_dist_sq` verbatim with the shading path so the density
+sampled from and the density divided by cannot drift apart. Three cases where a
+naive weight would zero a light that still contributes are handled and marked in
+the file (rect half-diagonal expansion, spot cone widened by the sphere's
+angular radius, and a floor under the *product* of the continuous factors). The
+light tree is not built; the flat CDF is two O(light_count) passes per shading
+point. `RT_LIGHT_SELECT_UNIFORM` (`raytracing_lights_inc.glsl:24`) is kept
+permanently as A/B scaffolding — `1` restores the pre-C2 reservoir.
+
+*Accept criterion (one bright key among 40 dim fills converging at several× the
+current rate): **met, by 10.5-16.9× on samples and 9.8-16.5× equal-time**,* at a
+frame-time cost of **+50.8%** at 41 lights (0.7487 → 1.1287 ms/frame, 256×256,
+RTX A4000). Energy is neutral where it must be: the `in_range` gate, where the
+old estimator was exact, moves by **+0.004%** against a 1% tolerance. Full
+numbers, liveness evidence and method in
+`.superpowers/sdd/2026-08-11-power-weighted-light-selection/task-3-report.md`;
+gates are `pipeline_references/tests/pt_light_gate_scene.tscn` and
+`pt_light_rmse_scene.tscn`.
+
+> **CORRECTION — the pre-C2 estimator was NOT biased under range culling.**
+> The design spec predicted that estimating `light_select_pdf` from the
+> valid-count ratio biased the converged image whenever culling rejected
+> anything (`E[1/X] ≠ 1/E[X]`), and the `culled` gate was built to measure that
+> shift. It measured **−0.003%**, smaller than the same gate's own finite-sample
+> residual, refuting a predicted "few percent". The premise was wrong, not the
+> measurement: the estimator *multiplies* the contribution by
+> `valid_count_estimate` (it divides by its reciprocal), and given
+> `valid_found = m > 0` the reservoir's pick is uniform over the valid lights
+> independently of `m`, so `E[f·N·m/k] = mean(f) · V` exactly. Jensen never
+> enters. The pre-C2 path's only true energy defect is the `valid_found == 0`
+> dropout, of relative size `(1 − V/N)^k` — 2⁻¹⁶ in the gate scene, 0 when
+> nothing is culled. **The justification for C2 is variance, not bias**, and the
+> variance result above stands on its own. Code comments corrected; the spec is
+> left as the historical record.
+
+**OPEN (efficiency, not correctness): the surface-normal cosine is deliberately
+excluded from the weight** (design spec §3.5). Roughly half of all selection
+draws therefore still go to lights facing away from the shading point, and are
+discarded by the existing `NdotL <= 0` tests after a draw has been paid for.
+Including a `max(0, dot(N, L))`-style factor would recover frame time; it is not
+a correctness issue, because the pdf is exact for whatever weight is used.
+
+**OPEN (coverage): no rendered measurement covers spot, rect or directional
+lights.** Every light in every measured scene is an `OmniLight3D`. The spot cone
+factor, the rect half-diagonal expansion and the directional early-out are
+covered by `tests/servers/rendering/test_pt_light_select.cpp` and by nothing
+that renders.
 
 **C3. Environment importance sampling** — *Gap #11* — **DONE, with one open defect**
 Marginal + conditional CDFs are built over the sky octmap by a compute pass
@@ -666,7 +715,7 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
-Ordering summary: **A1 → A2/A3/A4 → C1 → C2 (Phase B complete; C3 done) → D → E → F.**
+Ordering summary: **A1 → A2/A3/A4 → C1 (Phase B complete; C2 and C3 done) → D → E → F.**
 
 **Phase B is complete** — B1, B2, B3, B4 and B5 have all landed. "Complete" here
 means every listed item is implemented and measured; it does **not** mean Phase B
@@ -678,8 +727,20 @@ mismatch, the **asymmetric firefly clamping** across the MIS partition, the
 executes the GLSL** — the shader-side tests mirror the shader in C++ rather than
 running it.
 
-Remaining in **Phase C: C1** (emissive-mesh light sampling) and **C2**
-(power-weighted light selection). **C1 is the gate on extending MIS weights
-beyond the environment** — until emissive meshes are NEE-sampleable and analytic
-lights are BSDF-reachable, weighting either one is energy deletion, not variance
-reduction.
+Remaining in **Phase C: C1** (emissive-mesh light sampling). **C2 is done** —
+power-weighted CDF selection with an exact pdf, measured at 9.8-16.5× equal-time
+on a power-concentrated scene for +50.8% frame time; see the C2 entry, including
+the correction to the spec's bias claim and two open items (the cosine is
+excluded from the weight; no rendered coverage of spot/rect/directional).
+
+**C1 is the gate on extending MIS weights beyond the environment — for emissive
+meshes.** Emissive meshes are real TLAS geometry, so once they are also
+NEE-sampleable they are reachable by *both* strategies, and that is exactly when
+a MIS weight becomes meaningful rather than energy deletion. **Analytic lights
+are a different case and are not waiting on C1:** omni, spot, directional and
+`RT_LIGHT_TYPE_RECT` are pure buffer data with no TLAS presence, so no BSDF ray
+can ever hit one, before or after C1. There is no second strategy to combine
+against, so analytic lights correctly carry **no MIS weight, permanently** —
+this is not a gap to close. (An earlier revision of this section said C1 was
+gating "until … analytic lights are BSDF-reachable"; that is wrong and would
+have sent someone looking for a fix that must not be written.)

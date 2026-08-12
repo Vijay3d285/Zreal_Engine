@@ -4,11 +4,20 @@
 // lights_attenuation_from_dist_sq, the rt_lights SSBO) and brdf_inc.glsl
 // (luminance). Include it AFTER those.
 //
-// Replaces the uniform k=16 mini-batch reservoir, which had two defects: with
+// Replaces the uniform k=16 mini-batch reservoir, whose defect is VARIANCE: with
 // 41 lights it never even considered the brightest one at ~60% of shading
-// points, and its pdf was ESTIMATED (valid_count_estimate is a random variable,
-// and E[1/X] != 1/E[X]), so the density was biased whenever range culling
-// rejected anything.
+// points, and compensated by scaling up the draws that did find it, producing a
+// heavy-tailed estimator. Measured at 9.8x-16.5x the equal-time RMSE of this
+// selector on that configuration (task-3 report).
+//
+// Its pdf was also ESTIMATED rather than known (valid_count_estimate is a random
+// variable). The design spec expected that to BIAS the converged image under
+// range culling via E[1/X] != 1/E[X]; the culled energy gate measured no shift,
+// and the reason is that the reciprocal is never taken -- the estimator
+// multiplies by valid_count_estimate, whose expectation is exactly the valid
+// count. See raytracing_lights_inc.glsl's control-path comment for the argument.
+// An exactly-known pdf is still worth having: it is what lets the selection
+// density be chosen freely (by power) instead of being pinned to uniform.
 //
 // THE INVARIANT THIS FILE MUST PRESERVE: a light with weight 0 is never
 // selected, so zero weight must imply zero contribution. Otherwise the

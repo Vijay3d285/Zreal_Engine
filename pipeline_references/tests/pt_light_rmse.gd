@@ -139,7 +139,11 @@ func _sweep(p_env: Environment) -> void:
 	var xref: Image = null
 	var x_path := OS.get_environment("ZR_LIGHT_XREF")
 	if x_path != "":
-		xref = _load_raw(x_path, _res, _res)
+		# The window manager can refuse the requested window size (a 128-wide
+		# request comes back as 148 here), so the reference must be matched
+		# against the size the viewport ACTUALLY has, not against ZR_LIGHT_RES.
+		var vsize := get_viewport().get_visible_rect().size
+		xref = _load_raw(x_path, int(vsize.x), int(vsize.y))
 		if xref == null:
 			print("  WARNING: could not load cross reference '%s'" % x_path)
 		else:
