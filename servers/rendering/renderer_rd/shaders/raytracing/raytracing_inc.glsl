@@ -250,17 +250,26 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 // Each bounce owns a block of RT_PRNG_BOUNCE_NUM consecutive dimensions; the
 // constants below index within the current block. Earlier dimensions are better
 // stratified, so the highest-variance decision (the BSDF direction) gets 0.
-// Cycles uses a block of 16; we have fewer decisions, so 8 with room to grow.
-#define RT_PRNG_BOUNCE_NUM 8u
+// Cycles uses a block of 16 (kernel/types.h PathTraceDimension); we were at 8
+// with every slot taken, and C1's emissive NEE needs three more dimensions.
+// WIDENING THIS RE-STRATIFIES EVERY BOUNCE: rng_next_bounce advances `offset` by
+// RT_PRNG_BOUNCE_NUM, so each bounce after the first now draws from a different
+// Sobol dimension than it did at 8. The estimator stays unbiased -- every
+// dimension of the sequence is equidistributed -- but the image changes at any
+// finite sample count, and the converged mean must not. That is gated
+// separately (pt_emissive_gate.gd, gate 3) before any lighting change lands.
+#define RT_PRNG_BOUNCE_NUM 16u
 #define RT_PRNG_FILTER 0u // 2D, init block only: sub-pixel reconstruction filter.
 #define RT_PRNG_SURFACE_BSDF 0u // 2D: BSDF direction sample.
 #define RT_PRNG_LIGHT 2u // 2D: position on the selected light.
 #define RT_PRNG_LOBE 4u // 1D: diffuse-vs-specular lobe choice.
-#define RT_PRNG_TERMINATE 5u // 1D: reserved for B4 Russian Roulette.
-#define RT_PRNG_LIGHT_SELECT 6u // 1D: which analytic light to sample.
-#define RT_PRNG_ENV 7u // 2D: direction sample on the environment. LAST FREE SLOT
-                       // in the 8-dimension per-bounce block; anything added
-                       // after this must widen RT_PRNG_BOUNCE_NUM (Cycles uses 16).
+#define RT_PRNG_TERMINATE 5u // 1D: Russian Roulette survival (B4).
+#define RT_PRNG_LIGHT_SELECT 6u // 1D: which analytic light to sample (C2).
+#define RT_PRNG_ENV 7u // 2D: direction sample on the environment (C3).
+#define RT_PRNG_EMISSIVE_SELECT 8u // 1D: emissive instance + triangle (C1).
+#define RT_PRNG_EMISSIVE_POINT 9u // 2D: barycentric point on that triangle (C1).
+// Slots 10-15 are free. Earlier dimensions are better stratified, so the
+// highest-variance decision (the BSDF direction) keeps 0.
 
 /// Sampler state for one path. `pixel` is the per-pixel Owen scramble seed,
 /// `sample_index` selects the point in the sequence, and `offset` is the base
