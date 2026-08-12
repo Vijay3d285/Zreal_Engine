@@ -409,4 +409,156 @@ TEST_CASE("[PathTracer][LightSelect] zero indirect energy weighs zero only on in
 	CHECK(mirror_weight(p, l, true) == 0.0f); // indirect: contributes nothing, matched
 }
 
+// Mirror of lights_select(). Takes weights directly so the walk can be tested
+// independently of how they were produced.
+static bool mirror_select(const std::vector<float> &p_weights, float p_u, uint32_t &r_index, float &r_pdf) {
+	r_index = 0;
+	r_pdf = 0.0f;
+
+	float total = 0.0f;
+	for (uint32_t i = 0; i < (uint32_t)p_weights.size(); i++) {
+		total += p_weights[i];
+	}
+	if (!(total > 0.0f)) {
+		return false;
+	}
+
+	const float target = p_u * total;
+	float running = 0.0f;
+	uint32_t last_pos = 0;
+	float last_w = 0.0f;
+	for (uint32_t i = 0; i < (uint32_t)p_weights.size(); i++) {
+		const float w = p_weights[i];
+		if (w <= 0.0f) {
+			continue;
+		}
+		last_pos = i;
+		last_w = w;
+		running += w;
+		if (running > target) {
+			r_index = i;
+			r_pdf = w / total;
+			return true;
+		}
+	}
+	// Drift guard: u * total landed at or past the accumulated sum through
+	// floating-point rounding. The last positive-weight light is the answer.
+	if (last_w > 0.0f) {
+		r_index = last_pos;
+		r_pdf = last_w / total;
+		return true;
+	}
+	return false;
+}
+
+TEST_CASE("[PathTracer][LightSelect] selection frequency matches the weights") {
+	std::vector<float> w;
+	w.push_back(1.0f);
+	w.push_back(7.0f);
+	w.push_back(0.0f); // a zero-weight light must never be selected
+	w.push_back(2.0f);
+	const float total = 10.0f;
+
+	const int N = 100000;
+	int counts[4] = { 0, 0, 0, 0 };
+	for (int i = 0; i < N; i++) {
+		const float u = (float(i) + 0.5f) / float(N); // stratified, mirrors Sobol's job
+		uint32_t idx = 0;
+		float pdf = 0.0f;
+		REQUIRE(mirror_select(w, u, idx, pdf));
+		REQUIRE(idx < 4);
+		counts[idx]++;
+		CHECK(pdf == doctest::Approx(w[idx] / total));
+	}
+	CHECK(counts[2] == 0);
+	CHECK(float(counts[0]) / float(N) == doctest::Approx(0.1f).epsilon(0.005));
+	CHECK(float(counts[1]) / float(N) == doctest::Approx(0.7f).epsilon(0.005));
+	CHECK(float(counts[3]) / float(N) == doctest::Approx(0.2f).epsilon(0.005));
+}
+
+TEST_CASE("[PathTracer][LightSelect] the pdf sums to one over all outcomes") {
+	std::vector<float> w;
+	w.push_back(3.0f);
+	w.push_back(0.0f);
+	w.push_back(11.0f);
+	w.push_back(0.5f);
+
+	// Every reachable outcome's pdf, summed, must be exactly 1.
+	float sum = 0.0f;
+	for (uint32_t i = 0; i < (uint32_t)w.size(); i++) {
+		if (w[i] <= 0.0f) {
+			continue;
+		}
+		sum += w[i] / 14.5f;
+	}
+	CHECK(sum == doctest::Approx(1.0f));
+
+	// And the walk must agree with that pdf at every index it can return.
+	for (int i = 0; i < 1000; i++) {
+		uint32_t idx = 0;
+		float pdf = 0.0f;
+		REQUIRE(mirror_select(w, float(i) / 1000.0f, idx, pdf));
+		CHECK(pdf == doctest::Approx(w[idx] / 14.5f));
+	}
+}
+
+TEST_CASE("[PathTracer][LightSelect] the walk lands on the right side of each boundary") {
+	std::vector<float> w;
+	w.push_back(2.0f); // [0.0, 0.2)
+	w.push_back(3.0f); // [0.2, 0.5)
+	w.push_back(5.0f); // [0.5, 1.0)
+	const float total = 10.0f;
+
+	struct Probe {
+		float u;
+		uint32_t expect;
+	};
+	const Probe probes[] = {
+		{ 0.0f, 0 },
+		{ 0.19999f, 0 },
+		{ 0.20001f, 1 },
+		{ 0.49999f, 1 },
+		{ 0.50001f, 2 },
+		{ 0.99999f, 2 },
+	};
+	for (const Probe &p : probes) {
+		uint32_t idx = 0;
+		float pdf = 0.0f;
+		REQUIRE(mirror_select(w, p.u, idx, pdf));
+		CHECK(idx == p.expect);
+		CHECK(pdf == doctest::Approx(w[p.expect] / total));
+	}
+}
+
+TEST_CASE("[PathTracer][LightSelect] u at the top of the range stays in bounds") {
+	std::vector<float> w;
+	w.push_back(1.0f);
+	w.push_back(2.0f);
+	w.push_back(0.0f); // trailing zero: the clamp must NOT land here
+
+	uint32_t idx = 99;
+	float pdf = 0.0f;
+	// Largest float strictly below 1.0 (bit pattern 0x3F7FFFFF). Math::nextafter
+	// does not exist in this codebase -- there is no nextafter in core/math/math_funcs.h.
+	const float u_max = 0.99999994f;
+	REQUIRE(mirror_select(w, u_max, idx, pdf));
+	CHECK(idx == 1); // the last POSITIVE-weight light, not index 2 and not index 3
+	CHECK(pdf == doctest::Approx(2.0f / 3.0f));
+}
+
+TEST_CASE("[PathTracer][LightSelect] all-zero weights returns false, not index 0") {
+	std::vector<float> w;
+	w.push_back(0.0f);
+	w.push_back(0.0f);
+
+	uint32_t idx = 99;
+	float pdf = -1.0f;
+	CHECK_FALSE(mirror_select(w, 0.5f, idx, pdf));
+	CHECK(pdf == 0.0f); // never a pdf of 0 paired with a "valid" index
+
+	// Empty is the same case.
+	std::vector<float> empty;
+	CHECK_FALSE(mirror_select(empty, 0.5f, idx, pdf));
+}
+
 } // namespace TestPTLightSelect

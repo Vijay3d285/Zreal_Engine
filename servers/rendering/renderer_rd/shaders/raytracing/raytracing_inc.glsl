@@ -217,14 +217,15 @@ const uint FLAG_DEFORMED = 4u;
 //    that because different paths branch differently. Never convert these back
 //    into "advance and return" helpers.
 //
-// 2. PCG (pcg_hash / rand) survives for the light reservoir loop, which draws a
-//    variable number of values per shading point (raytracing_lights_inc.glsl).
-//    Giving that loop 2 * RT_LIGHT_RESERVOIR_SIZE Sobol dimensions would spend
-//    our best-stratified dimensions on the decision Cycles itself does not Sobol
-//    sample -- its light tree descends on one rescaled number (kernel/light/tree.h).
-//    Replacing the reservoir with a power-weighted selector is roadmap item C2.
-//    Until then the stream is at least SEEDED from the Sobol state so it stays
-//    decorrelated from the rest of the path.
+// 2. PCG (pcg_hash / rand) survives for the RT_LIGHT_SELECT_UNIFORM control path
+//    (raytracing_lights_inc.glsl): the pre-C2 mini-batch reservoir it gates draws
+//    a variable number of values per shading point. Giving that loop
+//    2 * RT_LIGHT_RESERVOIR_SIZE Sobol dimensions would spend our best-stratified
+//    dimensions on the decision Cycles itself does not Sobol sample -- its light
+//    tree descends on one rescaled number (kernel/light/tree.h). Roadmap item C2
+//    replaced the reservoir with a power-weighted selector for production; this
+//    stream now serves only that A/B control path. It is at least SEEDED from
+//    the Sobol state so it stays decorrelated from the rest of the path.
 
 /// PCG random number generator - improved XSH-RR variant with better avalanche.
 uint pcg_hash(uint seed) {
@@ -256,7 +257,7 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 #define RT_PRNG_LIGHT 2u // 2D: position on the selected light.
 #define RT_PRNG_LOBE 4u // 1D: diffuse-vs-specular lobe choice.
 #define RT_PRNG_TERMINATE 5u // 1D: reserved for B4 Russian Roulette.
-#define RT_PRNG_RESERVOIR 6u // 1D: seeds the reservoir's PCG side stream.
+#define RT_PRNG_LIGHT_SELECT 6u // 1D: which analytic light to sample.
 #define RT_PRNG_ENV 7u // 2D: direction sample on the environment. LAST FREE SLOT
                        // in the 8-dimension per-bounce block; anything added
                        // after this must widen RT_PRNG_BOUNCE_NUM (Cycles uses 16).
@@ -310,7 +311,8 @@ vec2 rng_2d(RNGState p_rng, uint p_dim) {
 }
 
 /// Seed for a PCG side stream that is decorrelated from every Sobol dimension.
-/// Used only where the draw count is data-dependent (the light reservoir).
+/// Used only by the RT_LIGHT_SELECT_UNIFORM control path (the pre-C2 light
+/// reservoir), which is the one remaining caller with a data-dependent draw count.
 uint rng_side_stream(RNGState p_rng, uint p_dim) {
 	return pcg_hash(p_rng.pixel ^ pcg_hash(p_rng.sample_index * 2654435761u + p_rng.offset + p_dim));
 }

@@ -15,9 +15,21 @@
 #define RT_LIGHT_TYPE_RECT 2 // Area / rectangle light
 #define RT_LIGHT_TYPE_SPOT 3 // Spot light with cone falloff
 
+// A/B switch for roadmap C2, kept permanently as measurement scaffolding rather
+// than deleted after the phase. Precedent: COMBINE_BRDFS_WITH_FRESNEL
+// (brdf_inc.glsl:158) is the only reason B2's +2.4% converged-mean shift could
+// be pinned to a specific line instead of guessed at.
+//   0 = power-weighted CDF (production)
+//   1 = the pre-C2 uniform k=16 mini-batch reservoir
+#ifndef RT_LIGHT_SELECT_UNIFORM
+#define RT_LIGHT_SELECT_UNIFORM 0
+#endif
+
+#if RT_LIGHT_SELECT_UNIFORM
 // Reservoir sampling batch size for stochastic light selection.
 #ifndef RT_LIGHT_RESERVOIR_SIZE
 #define RT_LIGHT_RESERVOIR_SIZE 16
+#endif
 #endif
 
 // ============================================================================
@@ -344,7 +356,9 @@ vec3 lights_eval_rect_light(
 // ============================================================================
 
 // Evaluate direct lighting using NEE with stochastic light selection.
-// Uses mini-batch reservoir sampling for importance-weighted light selection.
+// Production path: power-weighted CDF draw with an exact pdf (roadmap C2).
+// RT_LIGHT_SELECT_UNIFORM=1 switches to the pre-C2 uniform mini-batch reservoir,
+// kept as A/B measurement scaffolding.
 vec3 lights_evaluate_direct_lighting(
 		vec3 hit_pos,
 		vec3 N,
@@ -357,21 +371,22 @@ vec3 lights_evaluate_direct_lighting(
 		return vec3(0.0);
 	}
 
-	// Mini-batch reservoir sampling: sample k lights, pick the best valid one.
+#if RT_LIGHT_SELECT_UNIFORM
+	// PRE-C2 CONTROL PATH. Uniform mini-batch reservoir. Two defects, both fixed
+	// by the production path below: with 41 lights and k=16 the brightest light
+	// is never considered at ~60% of shading points, and light_select_pdf is
+	// ESTIMATED rather than known -- valid_count_estimate is a random variable
+	// and E[1/X] != 1/E[X], so the density is biased whenever range culling
+	// rejects anything. Kept only to A/B the change.
 	const uint k = uint(min(RT_LIGHT_RESERVOIR_SIZE, int(light_count)));
 	uint valid_found = 0u;
 	uint selected_idx = 0u;
 
-	// Data-dependent draw count -- see the sampler note in raytracing_inc.glsl.
-	// PCG side stream, decorrelated from every Sobol dimension. Roadmap C2 replaces
-	// this loop with power-weighted selection, at which point it becomes a fixed
-	// number of draws and can move onto Sobol dimensions.
-	uint reservoir_stream = rng_side_stream(p_rng, RT_PRNG_RESERVOIR);
+	uint reservoir_stream = rng_side_stream(p_rng, RT_PRNG_LIGHT_SELECT);
 	for (uint i = 0u; i < k; i++) {
 		uint idx = min(uint(rand(reservoir_stream) * float(light_count)), light_count - 1u);
 		RTLightData test_light = rt_lights[idx];
 
-		// Range check for positional lights.
 		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT || test_light.type == RT_LIGHT_TYPE_RECT);
 		bool is_valid = !is_positional;
 		if (!is_valid) {
@@ -392,9 +407,18 @@ vec3 lights_evaluate_direct_lighting(
 		return vec3(0.0);
 	}
 
-	// Estimate valid count from sample ratio, PDF = 1/validCount.
 	float valid_count_estimate = float(light_count) * (float(valid_found) / float(k));
 	float light_select_pdf = 1.0 / max(valid_count_estimate, 1.0);
+#else
+	// Power-weighted CDF (roadmap C2). One Sobol draw, exact pdf.
+	uint selected_idx;
+	float light_select_pdf;
+	if (!lights_select(hit_pos, light_count, is_indirect_bounce,
+				rng_1d(p_rng, RT_PRNG_LIGHT_SELECT), selected_idx, light_select_pdf)) {
+		// Every light weighs zero, so every light contributes zero.
+		return vec3(0.0);
+	}
+#endif
 
 	RTLightData light = rt_lights[selected_idx];
 	vec2 u = rng_2d(p_rng, RT_PRNG_LIGHT);

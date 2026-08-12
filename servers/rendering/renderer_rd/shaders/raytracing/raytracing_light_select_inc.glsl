@@ -107,3 +107,59 @@ float lights_select_weight(vec3 p_hit_pos, RTLightData p_light, bool p_is_indire
 
 	return mag * spatial * indirect_factor;
 }
+
+/// Draw one light proportional to lights_select_weight(). Returns false when
+/// every light weighs zero, which means every light contributes zero -- black is
+/// the correct answer there, NOT a uniform fallback. A fallback would resume
+/// sampling lights that provably contribute nothing.
+///
+/// Two passes over the <=64-light array (RT_LIGHTS_MAX, render_raytracing.h:170).
+/// The second pass recomputes the weights rather than caching them: a 64-float
+/// local array in a raytracing stage will very likely spill to scratch memory,
+/// and the occupancy loss costs more than the arithmetic it saves.
+bool lights_select(vec3 p_hit_pos, uint p_light_count, bool p_is_indirect_bounce, float p_u,
+		out uint r_index, out float r_pdf) {
+	r_index = 0u;
+	r_pdf = 0.0;
+
+	// Pass 1: normalizer.
+	float total = 0.0;
+	for (uint i = 0u; i < p_light_count; i++) {
+		total += lights_select_weight(p_hit_pos, rt_lights[i], p_is_indirect_bounce);
+	}
+	// Written as !(total > 0.0) so a NaN normalizer takes this branch too.
+	if (!(total > 0.0)) {
+		return false;
+	}
+
+	// Pass 2: walk to u * total.
+	float target = p_u * total;
+	float running = 0.0;
+	uint last_pos = 0u;
+	float last_w = 0.0;
+	for (uint i = 0u; i < p_light_count; i++) {
+		float w = lights_select_weight(p_hit_pos, rt_lights[i], p_is_indirect_bounce);
+		if (w <= 0.0) {
+			continue;
+		}
+		last_pos = i;
+		last_w = w;
+		running += w;
+		if (running > target) {
+			r_index = i;
+			r_pdf = w / total;
+			return true;
+		}
+	}
+
+	// Drift guard. The two passes sum the same values in the same order, but
+	// u * total can still land at or past the final running sum through rounding.
+	// Answer with the last positive-weight light -- never an index past the array,
+	// and never a zero-weight light (which would be a pdf of 0 on a taken path).
+	if (last_w > 0.0) {
+		r_index = last_pos;
+		r_pdf = last_w / total;
+		return true;
+	}
+	return false; // Unreachable while total > 0; kept so every path returns.
+}
