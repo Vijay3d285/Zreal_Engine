@@ -36,7 +36,6 @@ TEST_FORCE_LINK(test_pt_emissive)
 #include "core/math/transform_3d.h"
 #include "core/math/vector3.h"
 
-#include <algorithm>
 #include <vector>
 
 namespace TestPTEmissive {
@@ -68,6 +67,25 @@ static Vector3 mirror_decode_compressed_position(uint32_t p_word0, uint32_t p_wo
 			p_aabb_pos.z + n.z * p_aabb_size.z);
 }
 
+// Mirror of the UNCOMPRESSED branch of rt_fetch_vertex_position(). p_position_stride
+// is in BYTES (matches GeometryData::position_stride); the shader converts it to a
+// float-element stride via `>> 2` before indexing. The engine's REAL value here is
+// 12 (sizeof(float)*3): the standard non-2D uncompressed case, confirmed at
+// render_raytracing.cpp:838 (per-surface RT_GeometryData fill) and :2154 (merged
+// multimesh buffer, commented "float3, uncompressed"). It also emits 8
+// (sizeof(float)*2) for ARRAY_FLAG_USE_2D_VERTICES surfaces (render_raytracing.cpp:656,
+// 834) -- not exercised here. Any OTHER stride used below (e.g. one wider than a
+// tightly-packed float3, as if extra attributes were interleaved after the
+// position) is synthetic: it exists only to exercise the `>> 2` conversion and the
+// per-vertex indexing arithmetic independently of the real value, not as a claim
+// about what the engine emits.
+static Vector3 mirror_decode_uncompressed_position(const std::vector<float> &p_buffer,
+		uint32_t p_index, uint32_t p_position_stride_bytes) {
+	const uint32_t stride_floats = p_position_stride_bytes >> 2;
+	const uint32_t base = p_index * stride_floats;
+	return Vector3(p_buffer[base + 0], p_buffer[base + 1], p_buffer[base + 2]);
+}
+
 // Mirror of the world-space triangle area used by the area-reduction pass.
 static float mirror_triangle_area_world(const Transform3D &p_xform,
 		const Vector3 &p0, const Vector3 &p1, const Vector3 &p2) {
@@ -92,6 +110,56 @@ TEST_CASE("[PathTracer][Emissive] compressed position decode spans the AABB") {
 	// Without the & 0xFFFF mask, z would read ~65535/65535 instead of 0.
 	const Vector3 z_zero = mirror_decode_compressed_position(0u, 0xFFFF0000u, aabb_pos, aabb_size);
 	CHECK(z_zero.z == doctest::Approx(aabb_pos.z));
+}
+
+TEST_CASE("[PathTracer][Emissive] compressed decode keeps x, y and z distinct") {
+	// Every earlier case sets x == y (both 0, or both saturated), so a decode
+	// with x and y swapped would pass all of them. Distinct non-extremal values
+	// in all three components are what actually pin the word layout.
+	const Vector3 aabb_pos(-2.0f, 5.0f, 0.25f);
+	const Vector3 aabb_size(4.0f, 1.0f, 8.0f);
+
+	const uint32_t xu = 16384u; // ~0.25
+	const uint32_t yu = 49151u; // ~0.75
+	const uint32_t zu = 32768u; // ~0.50
+	const uint32_t tangent = 0x1234u; // high half of word 1: must not reach z
+	const uint32_t w0 = xu | (yu << 16);
+	const uint32_t w1 = zu | (tangent << 16);
+
+	const Vector3 p = mirror_decode_compressed_position(w0, w1, aabb_pos, aabb_size);
+	CHECK(p.x == doctest::Approx(aabb_pos.x + (float(xu) / 65535.0f) * aabb_size.x));
+	CHECK(p.y == doctest::Approx(aabb_pos.y + (float(yu) / 65535.0f) * aabb_size.y));
+	CHECK(p.z == doctest::Approx(aabb_pos.z + (float(zu) / 65535.0f) * aabb_size.z));
+}
+
+TEST_CASE("[PathTracer][Emissive] uncompressed position decode respects stride and index") {
+	// Real engine stride: 12 bytes (float3) -- see the mirror's comment above
+	// for the render_raytracing.cpp citations. A second, larger, SYNTHETIC
+	// stride (20 bytes / 5 floats, as if extra interleaved data followed the
+	// position) checks the `>> 2` conversion and indexing arithmetic
+	// independently of the real value; it is not a claim about what the engine
+	// emits. Both sub-cases use a vertex index > 0 -- a stride bug is invisible
+	// at index 0 regardless of the stride, and a `>> 2` bug is invisible if
+	// every stride tested is the same.
+	{
+		// stride 12 (3 floats/vertex), vertex index 2.
+		std::vector<float> buf = {
+			0.0f, 0.0f, 0.0f, // vertex 0 (unused)
+			0.0f, 0.0f, 0.0f, // vertex 1 (unused)
+			1.5f, -2.5f, 3.25f, // vertex 2 -- the one under test
+		};
+		const Vector3 p = mirror_decode_uncompressed_position(buf, 2u, 12u);
+		CHECK(p.is_equal_approx(Vector3(1.5f, -2.5f, 3.25f)));
+	}
+	{
+		// stride 20 (5 floats/vertex: 3 position + 2 padding), vertex index 1.
+		std::vector<float> buf = {
+			10.0f, 20.0f, 30.0f, 99.0f, 99.0f, // vertex 0 (unused, w/ padding)
+			4.0f, 5.0f, 6.0f, 99.0f, 99.0f, // vertex 1 -- the one under test
+		};
+		const Vector3 p = mirror_decode_uncompressed_position(buf, 1u, 20u);
+		CHECK(p.is_equal_approx(Vector3(4.0f, 5.0f, 6.0f)));
+	}
 }
 
 TEST_CASE("[PathTracer][Emissive] world area is correct under NON-UNIFORM scale") {

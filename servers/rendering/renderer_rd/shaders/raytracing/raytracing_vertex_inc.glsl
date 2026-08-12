@@ -28,6 +28,9 @@ vec3 rt_fetch_vertex_position(GeometryData p_geom, uint p_index) {
 				float(w0 >> 16),
 				float(w1 & 0xFFFFu)) / 65535.0;
 
+		// inv_aabb_xform is unused here (only the forward transform is needed to
+		// decode a position) -- it's an out-param on every call site because
+		// get_aabb_compression_xforms() always produces both.
 		mat4 aabb_xform, inv_aabb_xform;
 		get_aabb_compression_xforms(p_geom, aabb_xform, inv_aabb_xform);
 		return (aabb_xform * vec4(n, 1.0)).xyz;
