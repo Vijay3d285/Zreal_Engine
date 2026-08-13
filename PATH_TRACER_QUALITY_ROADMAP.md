@@ -259,15 +259,16 @@ Power heuristic on both sides: environment NEE is weighted by
 `power_heuristic(env_pdf, combinedPdf)` at the shading point, and the miss stage
 weights BSDF sky hits by `power_heuristic(mis_ray_pdf, env_pdf)`.
 
-**MIS weights must stay OFF for analytic lights and emissive meshes until C1
-lands.** MIS is only valid where two strategies can both reach the same
-direction. Analytic lights are unreachable by BSDF rays (they are delta or
-implicit geometry the ray never hits), and emissive meshes are unreachable by
-NEE (nothing samples them yet). Weighting either one down would multiply a real
-contribution by `w < 1` with no second strategy to supply the complement, i.e.
-delete energy. The analytic-light NEE path is therefore byte-for-byte untouched
-and carries no MIS weight; its reservoir selection pdf is a stochastic estimate
-rather than the exact density MIS requires, which is a second reason.
+**MIS weights must stay OFF for analytic lights, permanently; emissive meshes
+carry one as of C1.** MIS is only valid where two strategies can both reach the
+same direction. Analytic lights are unreachable by BSDF rays (they are delta or
+implicit geometry the ray never hits), so weighting them down would multiply a
+real contribution by `w < 1` with no second strategy to supply the complement,
+i.e. delete energy. The analytic-light NEE path is therefore byte-for-byte
+untouched and carries no MIS weight — **this is not a gap to close**, see the
+closing note in §6. Emissive meshes were in the same position only because
+nothing sampled them; **C1 made them NEE-sampleable and added the weight on both
+sides**, and both halves are measured in the C1 entry below.
 
 *Measured (sky-lit courtyard, sky-only lighting, `pipeline_references/tests/pt_sky_rmse_scene.tscn`):*
 RMSE against a high-sample reference, environment NEE off vs on, at matched
@@ -433,7 +434,9 @@ not tuned after any number was seen. All figures above are for
 distribution heavier-tailed by construction (most contributions vanish, rare
 survivors are boosted by `1/p`), which increases the tail weight the adaptive
 estimator would have to observe with adaptive sampling on — that interaction is
-not measured here and is deferred to Phase C.
+not measured here and was deferred to Phase C. **Phase C is now complete and did
+not measure it either**; the RR × adaptive-sampling interaction is unowned and
+still unmeasured.
 
 **B5. Owen-scrambled Sobol / blue-noise sampler** — *Gap #6* — **DONE**
 Sobol-Burley with per-pixel Owen scrambling, dimension-indexed draws
@@ -512,11 +515,91 @@ Caveats:
 - Single-scene measurement (a diffuse three-wall room, one omni light, no
   occlusion complexity); it has not been repeated on a higher-variance scene.
 
-### Phase C — Light & environment fidelity *(~2 weeks)*
+### Phase C — Light & environment fidelity *(~2 weeks)* — **COMPLETE (C1, C2, C3 all landed)**
 
-**C1. Emissive-mesh light sampling** — *Gap #5*
-Build an emissive-triangle buffer alongside `gather_lights` in `render_raytracing.cpp` (area, emission, power). Sample by power, MIS-combine against the BSDF (B2 must be in first). Reuse the existing TLAS for shadow rays.
-*Accept:* a room lit only by a glowing panel converges clean; no hotspot speckle; matches a Cycles reference of the same scene.
+**C1. Emissive-mesh light sampling** — *Gap #5* — **DONE**
+Emissive TLAS geometry is now directly sampleable by next-event estimation and
+MIS-combined against the BSDF rays that already reached it. An
+`EmissiveLights` slot manager (`storage_rd/emissive_lights.{h,cpp}`) gathers
+emissive instances alongside `gather_lights` and a compute pass
+(`shaders/raytracing/emissive_area_build.glsl`) integrates each instance's
+world-space triangle area on the GPU, producing a power CDF
+(`power = luminance(emission) * total_area`) plus a per-TLAS-instance slot table.
+`emissive_sample()` / `emissive_pdf_solid_angle_for_hit()`
+(`shaders/raytracing/raytracing_emissive_inc.glsl`) are the forward and reverse
+densities; the two MIS halves are `power_heuristic()` over the *same* two
+solid-angle densities with the arguments swapped, so they sum to exactly one.
+Emitted radiance is composed in exactly one place (`emissive_radiance()`) and
+called from both sites, so the two strategies cannot drift into estimating
+different integrands — the structural defect behind B2's still-open +2.4% shift.
+The whole feature is behind `rendering/pathtracer/emissive_mesh_lights`, which
+**ships default off**.
+
+*Accept criterion (a room lit only by a glowing panel converges clean, no hotspot
+speckle): **met, by 3.4-4.1× on samples and 3.2-4.1× equal-time for a 2.0 m
+panel, and 51-70× on samples / 35-68× equal-time for a 0.25 m panel of the same
+total power**,* at a frame-time cost of **+9.0% to +15.2%** across three
+interleaved runs (192×192, RTX A4000; the spread is thermal, see the report).
+Energy is neutral where it must be: converged means agree to **−0.021%** against a
+0.43% band derived from the run's own standard error, and the absolute
+brightness matches a closed-form irradiance integral to **−0.019%** (small distant
+emitter) and **−0.009%** (large near emitter). The Cycles half of the original
+accept criterion is **not** met — there is still no Cycles reference EXR in this
+project, for C1 or for anything else.
+
+**The BSDF half is measured, not assumed.** On a small distant emitter
+`pdf_light/pdf_bsdf ≈ 34`, so `w_bsdf ≈ 0.001` and the image is NEE-only whether
+or not the BSDF half works — a correct partition and one whose BSDF half is
+silently zeroed produce the same mean *and* the same spread there. Gate 4 exists
+for that reason: a 2.0 m panel at 0.6 m puts **`w_bsdf` at 0.5609**, so 56% of the
+measured brightness flows through the BSDF half, and it lands **−0.009%** off an
+exact quadrature of the same integral. Full numbers, `w_bsdf` per configuration,
+liveness evidence and method in
+`.superpowers/sdd/2026-08-12-emissive-mesh-lights/task-6-report.md`; gates are
+`pipeline_references/tests/pt_emissive_gate_scene.tscn` and
+`pt_emissive_rmse_scene.tscn`.
+
+**Sampler-widening neutrality (C1 Task 1 widened `RT_PRNG_BOUNCE_NUM` 8 → 16,
+which re-stratifies every bounce in every scene) is measured separately** against
+`pt_light_gate_scene.tscn`'s recorded pre-C1 reference with the feature off:
+**+0.004%** at 2048 frames against a 1% tolerance — the same figure C2 recorded,
+i.e. no movement at all.
+
+*Open items carried out of C1:*
+- **The fixture double-representation in `pipeline_references/image_glb_creation.gd`
+  is documented and NOT fixed** (design spec §2.1). Night renders make each light
+  fixture's bulb surface emissive *and* create an `OmniLight3D`/`SpotLight3D` at
+  the same fixture unconditionally. Today that is harmless because the emissive
+  mesh contributes only through rare BSDF hits; **enabling
+  `rendering/pathtracer/emissive_mesh_lights` without a pipeline change would turn
+  each of those surfaces into a second fully-sampled light and materially brighten
+  night renders.** Structurally identical to the `SKY_MODE_LIGHT_AND_SKY` sun-disc
+  double count that forced `SKY_MODE_LIGHT_ONLY`. The engine cannot detect it: an
+  emissive mesh and an analytic light are independent objects with no relationship
+  the renderer can see.
+- **No per-triangle area weighting.** Triangle selection within an instance is
+  uniform (`1/prim_count`), so a mesh whose emitting triangles differ wildly in
+  area spends most draws on slivers. Unbiased — the pdf divides by the selected
+  triangle's own area — but higher variance, and untested against a deliberately
+  uneven tessellation.
+- **No rendered coverage of textured emissives.** `emissive_radiance()` has a
+  `RT_MAT_FLAG_HAS_EMISSION_TEX` branch; every rendered measurement uses a flat
+  emission colour, so that branch is exercised only by CPU mirrors.
+- **Deformed and custom-hit-group emitters are excluded from the distribution by
+  design.** Their slot stays `-1`, so `emissive_slot_for_instance()` returns −1,
+  the MIS weight stays 1.0 and the BSDF path carries them in full. Unbiased, but
+  higher variance than a sampled emitter — they behave exactly as they did
+  pre-C1.
+- **The setting ships default off**, so the feature is exercised only when
+  deliberately enabled. Nothing about existing renders changes on the day it
+  lands; the cost is that it is inert until someone opts in.
+- **The merged-MultiMesh ordering edge is maintained by a deliberately unread
+  uniform binding and a 4-byte `buffer_copy` chain.** Both look like dead code and
+  neither is: deleting either reintroduces a race where the area pass runs against
+  a stale merged buffer.
+- **`SKY_MODE_LIGHT_AND_SKY` is still unsupported alongside environment NEE.** C1
+  did *not* reconcile emissive and analytic lights — see the corrected pointer in
+  the C3 open-items list below.
 
 **C2. Power-weighted light selection** — *Gap #7* — **DONE**
 The uniform k=16 mini-batch reservoir is replaced by a flat power-weighted CDF
@@ -654,9 +737,13 @@ is shared with analytic-light NEE, so it changes analytic-light shading engine-w
   converged mean (BSDF rays already hit that disc), but previously buried in
   noise; the environment CDF now concentrates samples on it, so it converges
   quickly to the doubled value. `SKY_MODE_LIGHT_AND_SKY` is therefore
-  unsupported alongside environment NEE until emissive/analytic reconciliation
-  lands (C1); `pipeline_references/image_glb_creation.gd` works around this by
-  setting `SKY_MODE_LIGHT_ONLY` on its sun.
+  unsupported alongside environment NEE; `pipeline_references/image_glb_creation.gd`
+  works around this by setting `SKY_MODE_LIGHT_ONLY` on its sun. **CORRECTION: an
+  earlier revision said this would be resolved when C1 landed. C1 has landed and
+  it is not.** C1 made emissive *meshes* NEE-sampleable; the sun disc drawn into
+  the sky texture is not a mesh and is not in the emissive distribution, so the
+  double count between analytic NEE and environment NEE is untouched. The
+  workaround stands and the reconciliation is still unowned.
 
 ### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)*
 
@@ -718,7 +805,7 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
-Ordering summary: **A1 → A2/A3/A4 → C1 (Phase B complete; C2 and C3 done) → D → E → F.**
+Ordering summary: **A1 → A2/A3/A4 → D → E → F (Phases B and C are complete).**
 
 **Phase B is complete** — B1, B2, B3, B4 and B5 have all landed. "Complete" here
 means every listed item is implemented and measured; it does **not** mean Phase B
@@ -730,20 +817,36 @@ mismatch, the **asymmetric firefly clamping** across the MIS partition, the
 executes the GLSL** — the shader-side tests mirror the shader in C++ rather than
 running it.
 
-Remaining in **Phase C: C1** (emissive-mesh light sampling). **C2 is done** —
-power-weighted CDF selection with an exact pdf, measured at 9.8-16.5× equal-time
-on a power-concentrated scene for +50.8% frame time; see the C2 entry, including
-the correction to the spec's bias claim and two open items (the cosine is
-excluded from the weight; no rendered coverage of spot/rect/directional).
+**Phase C is complete** — C1, C2 and C3 have all landed. As with Phase B,
+"complete" means every listed item is implemented and measured; it does **not**
+mean the phase is free of known defects. C3's **+2.4% converged-mean shift on
+dielectric specular surfaces** and its `SKY_MODE_LIGHT_AND_SKY` double count are
+both still open, and C1's open items — chief among them the **fixture
+double-representation in `image_glb_creation.gd`**, which would materially
+brighten night renders if the setting were enabled without a pipeline change —
+are recorded in the C1 entry. **C1 ships default off.**
 
-**C1 is the gate on extending MIS weights beyond the environment — for emissive
-meshes.** Emissive meshes are real TLAS geometry, so once they are also
-NEE-sampleable they are reachable by *both* strategies, and that is exactly when
-a MIS weight becomes meaningful rather than energy deletion. **Analytic lights
-are a different case and are not waiting on C1:** omni, spot, directional and
-`RT_LIGHT_TYPE_RECT` are pure buffer data with no TLAS presence, so no BSDF ray
-can ever hit one, before or after C1. There is no second strategy to combine
-against, so analytic lights correctly carry **no MIS weight, permanently** —
-this is not a gap to close. (An earlier revision of this section said C1 was
-gating "until … analytic lights are BSDF-reachable"; that is wrong and would
-have sent someone looking for a fix that must not be written.)
+- **C1**: emissive-mesh NEE with MIS, 3.2-4.1× equal-time on a 2.0 m panel and
+  35-68× on a 0.25 m panel of the same power, for +9-15% frame time; converged
+  means neutral to −0.021% and absolute brightness within 0.02% of a closed-form
+  irradiance integral, including a configuration where the BSDF half carries 56%
+  of the energy.
+- **C2**: power-weighted CDF selection with an exact pdf, 9.8-16.5× equal-time on
+  a power-concentrated scene for +50.8% frame time; see the C2 entry, including
+  the correction to the spec's bias claim and two open items (the cosine is
+  excluded from the weight; no rendered coverage of spot/rect/directional).
+- **C3**: environment importance sampling, 4.8-6.9× equal-time, with the +2.4%
+  dielectric-specular shift open.
+
+**MIS weights now cover both strategies that can reach the same direction: the
+environment (B2) and emissive meshes (C1). Analytic lights are a different case
+and are finished, not pending:** omni, spot, directional and `RT_LIGHT_TYPE_RECT`
+are pure buffer data with no TLAS presence, so no BSDF ray can ever hit one.
+There is no second strategy to combine against, so analytic lights correctly
+carry **no MIS weight, permanently** — this is not a gap to close. (An earlier
+revision of this section said C1 was gating "until … analytic lights are
+BSDF-reachable"; that is wrong and would have sent someone looking for a fix that
+must not be written.)
+
+**The next item is Phase D** (material data pipeline), which is a hard
+prerequisite for Phase E.

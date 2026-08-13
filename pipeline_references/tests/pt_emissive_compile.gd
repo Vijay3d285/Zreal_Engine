@@ -61,38 +61,62 @@ func _ready() -> void:
 	var env := _build_scene()
 	await get_tree().create_timer(2.0).timeout
 
-	# -1.0 is the readback-failed sentinel; a real mean is never negative.
-	var off: float = await _pass(env, false)
-	var on: float = await _pass(env, true)
+	# Empty is the readback-failed sentinel.
+	var off: Dictionary = await _pass(env, false)
+	var on: Dictionary = await _pass(env, true)
 
 	print("\n=== RESULT ===")
-	if off < 0.0 or on < 0.0:
+	if off.is_empty() or on.is_empty():
 		_failures.append("accumulator readback returned null")
 	else:
-		var d: float = on - off
-		var rel: float = d / maxf(off, 1e-9)
-		print("  emissive NEE OFF : %.6f" % off)
-		print("  emissive NEE ON  : %.6f" % on)
+		var d: float = on["mean"] - off["mean"]
+		var rel: float = d / maxf(off["mean"], 1e-9)
+		print("  emissive NEE OFF : %.6f   (std-dev %.6f, noise sigma %.6f)"
+				% [off["mean"], off["sd"], off["noise"]])
+		print("  emissive NEE ON  : %.6f   (std-dev %.6f, noise sigma %.6f)"
+				% [on["mean"], on["sd"], on["noise"]])
 		print("  delta            : %+.6f  (%+.3f%%)" % [d, rel * 100.0])
 		print("  A near-ZERO delta is correct: MIS redistributes the emitter, it does not add light.")
+
+		# THE BAND IS DERIVED FROM THIS RUN'S OWN NOISE, not hardcoded. The
+		# previous 3% was calibrated by hand against one scene at one frame count
+		# and said nothing about any other; at ZR_EMI_FRAMES=2048 it is ~24 sigma
+		# and effectively vacuous, while on a dimmer emitter it could be tighter
+		# than the measurement can resolve. The standard error comes from the
+		# HIGH-PASS noise sigma (adjacent-pixel first differences), which cancels
+		# the smooth spatial signal and leaves the pixel-independent Monte Carlo
+		# noise; the plain std-dev would set the band by how contrasty the scene
+		# is instead.
+		#
 		# Two-sided, because the two failures are different bugs and both are
 		# silent. Above the band: the MIS weight is not reaching the emissive hit
-		# and the surface is counted twice again (the +99.7% this task removed).
+		# and the surface is counted twice again (the +99.7% Task 5 removed).
 		# Below it: energy is being deleted rather than redistributed -- e.g. the
 		# reverse pdf disagreeing with the forward one, which drives the BSDF half
 		# to ~0 without NEE picking the difference up.
-		#
-		# TOLERANCE is 3%: the two passes accumulate independent noise realizations
-		# and sample the emitter by different strategies, so their means differ by
-		# well under a percent here but never by exactly nothing.
-		const ENERGY_TOL := 0.03
-		if absf(rel) > ENERGY_TOL:
-			_failures.append("MIS does not conserve energy: ON is %+.3f%% off OFF (tolerance %.1f%%). %s"
-					% [rel * 100.0, ENERGY_TOL * 100.0,
+		var se_rel: float = sqrt(off["se"] * off["se"] + on["se"] * on["se"]) / maxf(off["mean"], 1e-9)
+		var tol: float = clampf(6.0 * se_rel, 0.002, 0.03)
+		print("  combined standard error : %.4f%% relative" % (se_rel * 100.0))
+		print("  derived band (6 se, clamped to [0.2%%, 3%%]) : %.3f%%" % (tol * 100.0))
+		# A NaN satisfies `> tol` AND `< tol`, so it passes every bound silently.
+		# It has to be rejected before either comparison, not after.
+		if is_nan(rel) or is_inf(rel):
+			_failures.append("relative delta is not a finite number (%f) -- one of the two means is NaN, or the OFF mean is zero" % rel)
+		elif absf(rel) > tol:
+			_failures.append("MIS does not conserve energy: ON is %+.3f%% off OFF (derived band %.3f%%). %s"
+					% [rel * 100.0, tol * 100.0,
 					"Above the band means the emissive hit is unweighted (double count)."
 							if rel > 0.0 else "Below it means the weight is deleting energy."])
-		if absf(rel) < 1e-9:
-			_failures.append("the setting made NO difference whatsoever -- suspiciously exact. The NEE block is probably not running at all (stale .glsl.gen.h, or the spec-constant flag never reached the shader)")
+
+		# LIVENESS. The mean cannot carry this -- the assertion above is that the
+		# means AGREE, and they agree just as well when the NEE block never fires.
+		# The per-pixel spread is what differs between a working build and an inert
+		# one. The old `absf(rel) < 1e-9` check was four orders of magnitude below
+		# the live delta (0.26%) and would have passed an entirely dead feature
+		# whose two passes happened to differ by any noise at all.
+		if not (on["sd"] < off["sd"]):
+			_failures.append("liveness: per-pixel spread did not fall (OFF %.6f, ON %.6f). The NEE block is probably not running at all (stale .glsl.gen.h, or the spec-constant flag never reached the shader)"
+					% [off["sd"], on["sd"]])
 
 	if _failures.is_empty():
 		print("PASS - shaders compiled and the emissive NEE path is live.")
@@ -103,7 +127,7 @@ func _ready() -> void:
 		get_tree().quit(1)
 
 
-func _pass(p_env: Environment, p_enabled: bool) -> float:
+func _pass(p_env: Environment, p_enabled: bool) -> Dictionary:
 	ProjectSettings.set_setting(SETTING, p_enabled)
 	print("\n=== %s emissive_mesh_lights ===" % ("ENABLE" if p_enabled else "DISABLE"))
 	# The setting drives a specialization constant, so flipping it forces a fresh
@@ -115,16 +139,20 @@ func _pass(p_env: Environment, p_enabled: bool) -> float:
 
 	var img: Image = await _render_accum(p_env, get_viewport().get_viewport_rid(), _frames)
 	if img == null:
-		return -1.0
+		return {}
 	var stats := _measure_crop(img, 0.2, 0.8)
-	var sd := _stddev_crop(img, stats["mean"], 0.2, 0.8)
+	stats["sd"] = _stddev_crop(img, stats["mean"], 0.2, 0.8)
+	stats["noise"] = _noise_sigma_crop(img, 0.2, 0.8)
+	stats["se"] = stats["noise"] / sqrt(float(maxi(stats["n"], 1)))
 	print("  MEAN      : %.6f   (R %.6f  G %.6f  B %.6f over %d px)"
 			% [stats["mean"], stats["r"], stats["g"], stats["b"], stats["n"]])
-	print("  std-dev   : %.6f" % sd)
-	if sd <= 1e-7:
+	print("  std-dev   : %.6f" % stats["sd"])
+	print("  noise sig : %.6f   (adjacent-pixel high pass; std-dev with the" % stats["noise"])
+	print("              scene's own spatial variation removed)")
+	if stats["sd"] <= 1e-7:
 		_failures.append("zero per-pixel spread with the setting %s - nothing stochastic is running"
 				% ("ON" if p_enabled else "OFF"))
-	return stats["mean"]
+	return stats
 
 
 func _measure_crop(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
@@ -146,6 +174,27 @@ func _measure_crop(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
 	g *= inv
 	b *= inv
 	return { "r": r, "g": g, "b": b, "mean": (r + g + b) / 3.0, "n": n }
+
+
+## Per-pixel MONTE CARLO noise, isolated from the image's real spatial variation.
+## Adjacent pixels share the signal but carry independent noise, so the standard
+## deviation of first differences is sqrt(2) times the noise alone. This is what
+## the derived energy band above is computed from; `_stddev_crop` mixes signal
+## into the estimate and would set the band by how contrasty the scene is.
+func _noise_sigma_crop(p_img: Image, p_lo: float, p_hi: float) -> float:
+	var w := p_img.get_width()
+	var h := p_img.get_height()
+	var acc := 0.0
+	var n := 0
+	var x_end := int(w * p_hi) - 1
+	for y in range(int(h * p_lo), int(h * p_hi)):
+		for x in range(int(w * p_lo), x_end):
+			var a := p_img.get_pixel(x, y)
+			var b := p_img.get_pixel(x + 1, y)
+			var d := ((a.r + a.g + a.b) - (b.r + b.g + b.b)) / 3.0
+			acc += d * d
+			n += 1
+	return sqrt(acc / float(maxi(n, 1)) * 0.5)
 
 
 func _stddev_crop(p_img: Image, p_mean: float, p_lo: float, p_hi: float) -> float:
