@@ -3100,7 +3100,9 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 	// gl_InstanceCustomIndex.
 	DEV_ASSERT(material_data.size() == instance_count);
 	DEV_ASSERT(blas_transforms.size() == instance_count);
-	if (material_data.size() != instance_count || blas_transforms.size() != instance_count) {
+	DEV_ASSERT(sbt_offsets.size() == instance_count);
+	if (material_data.size() != instance_count || blas_transforms.size() != instance_count ||
+			sbt_offsets.size() != instance_count) {
 		return 0;
 	}
 
@@ -3145,6 +3147,36 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 		// weight); trading a real bias for extra variance on animated emitters is
 		// the right way round.
 		if ((geom.flags & RT_GEOM_FLAG_DEFORMED) != 0) {
+			continue;
+		}
+
+		// Custom hit groups are EXCLUDED, for the same reason deformed geometry is:
+		// what would go into the distribution is not what the surface actually
+		// emits.
+		//
+		// A custom-HG surface computes its emission in USER SHADER CODE
+		// (scene_raytracing_raygen.glsl's RT_CUSTOM_HIT_GROUP branch writes
+		// m.emissive from the fragment's `emission` output). There is no
+		// MaterialData -> radiance composition to share with it -- only the
+		// exposure factor is common, which is why emissive_radiance() cannot be
+		// used there. But the qualification below, the uploaded `emission`, and
+		// emissive_sample()'s own radiance lookup all read materials[], the
+		// StandardMaterial3D fields. So including such an instance would light the
+		// scene with radiance the surface does not emit (wrong image TODAY), and
+		// after Task 5 would additionally give the two MIS strategies different
+		// integrands while sharing a weight required to sum to 1.
+		//
+		// sbt_offsets is filled in lockstep with geometry_data at every push site
+		// and 0 means the default StandardMaterial3D hit group (render_raytracing.h).
+		// Procedural instances also carry a nonzero offset, so this subsumes the
+		// RT_GEOM_FLAG_PROCEDURAL skip above -- that one stays because it states an
+		// independent reason (no triangles to integrate over) that would still hold
+		// if hit-group assignment ever changed.
+		//
+		// Skipping is UNBIASED, exactly as for deformed geometry: slot stays -1, NEE
+		// can never select it, and a BSDF ray that lands on it takes the full
+		// contribution.
+		if (sbt_offsets[i] != 0) {
 			continue;
 		}
 

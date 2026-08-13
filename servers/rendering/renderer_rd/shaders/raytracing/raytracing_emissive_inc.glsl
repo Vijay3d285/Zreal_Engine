@@ -74,6 +74,13 @@ layout(set = 0, binding = 37, std430) readonly buffer EmissiveSlotRO {
 
 #define EMISSIVE_INSTANCES_MAX 256u
 
+// Smallest cos between the shadow ray and the emitter's normal that still counts
+// as front-facing. Declared once and used by BOTH emissive_sample() (which
+// rejects the draw) and emissive_pdf_solid_angle() (which zeroes the density), so
+// the forward and reverse directions cannot disagree about which samples exist.
+// Value matches lights_eval_rect_light's cos_theta reject.
+#define EMISSIVE_MIN_COS_LIGHT 1e-5
+
 // ============================================================================
 // EMITTED RADIANCE -- THE ONE COMPOSITION SITE (C1 Task 4)
 // ============================================================================
@@ -250,15 +257,22 @@ float emissive_prob_for_slot(uint p_slot) {
 ///     pdf_A     = P(inst) * (1 / prim_count) * (1 / area_tri)
 ///     pdf_omega = pdf_A * dist^2 / cos_light
 ///
-/// Front-face-only by construction -- a non-positive cos_light means the sampled
-/// point faces away and the estimator is zero there, matching
-/// lights_eval_rect_light's cos_theta reject and the back-face culling the BSDF
-/// ray itself is traced under.
+/// Front-face-only by construction -- a cos_light at or below
+/// EMISSIVE_MIN_COS_LIGHT means the sampled point faces away (or is edge-on) and
+/// the estimator is zero there, matching lights_eval_rect_light's cos_theta reject
+/// and the back-face culling the BSDF ray itself is traced under.
+///
+/// THE THRESHOLD IS THE SAME CONSTANT emissive_sample() REJECTS ON, and that is
+/// not tidiness. If this guard were the looser `<= 0.0` while the sampler rejected
+/// at 1e-5, then for cos_light in (0, 1e-5] the REVERSE lookup would report a huge
+/// NEE density for a direction NEE can never produce -- and Task 5's power
+/// heuristic would drive that BSDF hit's weight to ~0 and delete the energy. The
+/// measure is vanishing, the failure is silent, and agreeing costs nothing.
 ///
 /// CPU mirror: mirror_pdf_solid_angle() in tests/servers/rendering/test_pt_emissive.cpp.
 float emissive_pdf_solid_angle(float p_prob_inst, uint p_prim_count,
 		float p_area_tri, float p_dist, float p_cos_light) {
-	if (p_prim_count == 0u || p_area_tri <= 0.0 || p_cos_light <= 0.0) {
+	if (p_prim_count == 0u || p_area_tri <= 0.0 || p_cos_light <= EMISSIVE_MIN_COS_LIGHT) {
 		return 0.0;
 	}
 	float pdf_a = p_prob_inst * (1.0 / float(p_prim_count)) * (1.0 / p_area_tri);
@@ -269,12 +283,30 @@ float emissive_pdf_solid_angle(float p_prob_inst, uint p_prim_count,
 /// lookup Task 5 needs when a BSDF ray lands on an emitter and has to know what
 /// weight NEE would have given that direction.
 ///
-/// p_slot comes from emissive_slot[gl_InstanceCustomIndexEXT] and p_geometry_index
-/// from gl_InstanceCustomIndexEXT itself. The area is recomputed for the single
-/// triangle that was hit -- NOT read from the instance's total_area, which is the
-/// sum over all of them.
-float emissive_pdf_solid_angle_for_hit(uint p_slot, uint p_geometry_index,
-		uint p_primitive_id, float p_dist, float p_cos_light) {
+/// p_slot comes from emissive_slot[gl_InstanceCustomIndexEXT]; p_primitive_id from
+/// gl_PrimitiveID; p_L is the UNIT direction from the shading point toward the hit,
+/// i.e. gl_WorldRayDirectionEXT, the same orientation NEE's own L carries; p_dist
+/// is the distance between them.
+///
+/// IT TAKES A DIRECTION, NOT A COS, AND IT LOOKS UP ITS OWN GEOMETRY. Both are
+/// deliberate narrowings of what a caller can get wrong:
+///
+///   - cos_light is computed HERE, from emissive_orient_normal(), which is the
+///     same function and the same triangle emissive_sample() uses. Handing it in
+///     would let Task 5 derive it from the hit's h.geometry_normal instead --
+///     oriented by compute_hit_data() through gl_HitKindEXT and the vertex normal
+///     matrix, a genuinely different code path -- and on any emitter whose winding
+///     opposes its vertex normal the reverse density would then disagree with the
+///     forward one. No compile error, no failing test, a biased MIS partition.
+///
+///   - the geometry index comes from emissive_instances[p_slot], not from a
+///     parameter. A caller that passed a slot and a geometry index belonging to
+///     different instances would silently integrate over the wrong mesh; the pair
+///     cannot be mismatched if only one of them is passed.
+///
+/// The area is recomputed for the single triangle that was hit -- NOT read from
+/// the instance's total_area, which is the sum over all of them.
+float emissive_pdf_solid_angle_for_hit(uint p_slot, uint p_primitive_id, vec3 p_L, float p_dist) {
 	// The contract gate, first, before any other block in this file is touched:
 	// when the feature is off all three bindings are the same 16-byte zero-filled
 	// fallback and emissive_instances[] is out of bounds.
@@ -291,13 +323,21 @@ float emissive_pdf_solid_angle_for_hit(uint p_slot, uint p_geometry_index,
 		return 0.0;
 	}
 
-	GeometryData geom = geometries[p_geometry_index];
+	GeometryData geom = geometries[e.geometry_index];
+	mat4 xform = emissive_unpack_xform(e);
 	vec3 p0, p1, p2;
 	uint i0, i1, i2;
-	emissive_fetch_triangle_world(geom, emissive_unpack_xform(e), p_primitive_id, p0, p1, p2, i0, i1, i2);
-	float area_tri = 0.5 * length(cross(p1 - p0, p2 - p0));
+	emissive_fetch_triangle_world(geom, xform, p_primitive_id, p0, p1, p2, i0, i1, i2);
 
-	return emissive_pdf_solid_angle(prob_inst, e.prim_count, area_tri, p_dist, p_cos_light);
+	vec3 ng_raw = cross(p1 - p0, p2 - p0);
+	float area_tri = 0.5 * length(ng_raw);
+	if (!(area_tri > 0.0)) {
+		return 0.0;
+	}
+	vec3 Ng = emissive_orient_normal(ng_raw / (2.0 * area_tri), geom, xform, i0, i1, i2);
+	float cos_light = dot(-p_L, Ng);
+
+	return emissive_pdf_solid_angle(prob_inst, e.prim_count, area_tri, p_dist, cos_light);
 }
 
 // ============================================================================
@@ -379,7 +419,7 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 	// traversal; these are two dot products. Same ordering as the fix already
 	// applied to the positional analytic-light branch.
 	float cos_light = dot(-L, Ng);
-	if (cos_light <= 1e-5) {
+	if (cos_light <= EMISSIVE_MIN_COS_LIGHT) {
 		return false; // Back of the emitter, or edge-on.
 	}
 	if (dot(p_N, L) <= 0.0) {

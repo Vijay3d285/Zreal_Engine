@@ -473,13 +473,14 @@ void main() {
 	// than restating it -- that factor is the part every composition site has in
 	// common, and the part a second copy would drift on.
 	//
-	// CAVEAT FOR TASK 5, recorded where it will be read: for a custom-HG instance
-	// this value can differ from what emissive_radiance() would return for the same
-	// surface, because gather_emissive_instances() builds the distribution from
-	// materials[] (the StandardMaterial3D fields), not from the user shader. The
-	// two MIS strategies would then estimate different integrands on such an
-	// emitter. No custom-HG emitter is exercised by the C1 gates; excluding them
-	// from the distribution is the obvious repair if one ever is.
+	// This value CAN differ from what emissive_radiance() would return for the same
+	// surface, because the user shader is free to emit anything. That is why
+	// gather_emissive_instances() excludes custom-hit-group instances from the
+	// emissive distribution outright (render_raytracing.cpp, beside the procedural
+	// and deformed skips) -- NEE composes radiance from materials[], so an emitter
+	// whose real radiance comes from user code would otherwise light the scene with
+	// a value it does not emit, and after Task 5 would give the two MIS strategies
+	// different integrands while sharing a weight required to sum to 1.
 	m.emissive = emissive_apply_exposure(emission);
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
 

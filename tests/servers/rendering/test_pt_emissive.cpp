@@ -690,9 +690,16 @@ TEST_CASE("[PathTracer][Emissive] compressed emitters use blas_transform x aabb^
 
 // Mirror of emissive_pdf_solid_angle(). pdf_A = P(inst) * (1/prim_count) * (1/area_tri),
 // then converted to the solid-angle measure the BSDF pdf lives in.
+//
+// The cos threshold is the SAME constant emissive_sample() rejects on
+// (EMISSIVE_MIN_COS_LIGHT). A looser guard here would let the reverse lookup
+// report a huge NEE density for directions NEE can never draw, and Task 5's power
+// heuristic would then delete that BSDF hit's energy.
+static const float MIN_COS_LIGHT = 1e-5f;
+
 static float mirror_pdf_solid_angle(float p_prob_inst, uint32_t p_prim_count,
 		float p_area_tri, float p_dist, float p_cos_light) {
-	if (p_prim_count == 0 || p_area_tri <= 0.0f || p_cos_light <= 0.0f) {
+	if (p_prim_count == 0 || p_area_tri <= 0.0f || p_cos_light <= MIN_COS_LIGHT) {
 		return 0.0f;
 	}
 	const float pdf_a = p_prob_inst * (1.0f / float(p_prim_count)) * (1.0f / p_area_tri);
@@ -734,6 +741,25 @@ TEST_CASE("[PathTracer][Emissive] a back-facing sample contributes nothing") {
 	// Front-face-only, matching lights_eval_rect_light's cos_theta <= 1e-5 reject.
 	CHECK(mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, 0.0f) == 0.0f);
 	CHECK(mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, -0.5f) == 0.0f);
+}
+
+TEST_CASE("[PathTracer][Emissive] the pdf and the sampler agree on the cos threshold") {
+	// The sampler rejects at cos <= MIN_COS_LIGHT, so the density must be zero over
+	// exactly the same set. If this guard were the looser `<= 0`, then for cos in
+	// (0, 1e-5] the REVERSE lookup would report a density of order 1/cos -- up to
+	// 1e5 times the BSDF pdf -- for a direction NEE never produces, and Task 5's
+	// power heuristic would give that BSDF hit weight ~0 and delete its energy.
+	//
+	// Straddle the threshold: at it, and just past it.
+	CHECK(mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, MIN_COS_LIGHT) == 0.0f);
+	CHECK(mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, MIN_COS_LIGHT * 0.5f) == 0.0f);
+
+	const float just_over = mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, MIN_COS_LIGHT * 2.0f);
+	CHECK(just_over > 0.0f);
+	// And it really is the 1/cos blow-up that would have been reported below the
+	// threshold -- the guard is suppressing a large number, not a negligible one.
+	CHECK(just_over == doctest::Approx(4.0f / (MIN_COS_LIGHT * 2.0f)));
+	CHECK(just_over > 1e5f);
 }
 
 TEST_CASE("[PathTracer][Emissive] a degenerate or empty instance yields no pdf") {
@@ -926,6 +952,147 @@ TEST_CASE("[PathTracer][Emissive] orientation needs the INVERSE TRANSPOSE, not t
 	uniform.basis = Basis::from_scale(Vector3(3, 3, 3));
 	CHECK(mirror_orient_normal(uniform, p0, p1, p2, n_obj, false)
 					.is_equal_approx(mirror_orient_normal(uniform, p0, p1, p2, n_obj, true)));
+}
+
+// Mirror of the sqrt-warped barycentric draw in emissive_sample():
+//     su = sqrt(u.x);  b = (1 - su, su * (1 - u.y), su * u.y)
+//
+// p_warp selects the CONTROL: false drops the sqrt, which is the mistake this
+// exists to catch. It still produces valid barycentrics, so nothing crashes and
+// nothing looks wrong -- the points just bunch toward p0 while the pdf keeps
+// reporting the constant 1/area. That is a pure energy error with no other symptom.
+static Vector3 mirror_barycentric_warp(float p_ux, float p_uy, bool p_warp = true) {
+	const float su = p_warp ? Math::sqrt(p_ux) : p_ux;
+	return Vector3(1.0f - su, su * (1.0f - p_uy), su * p_uy);
+}
+
+// Mirror of the triangle draw, which reuses the CDF bucket remainder rather than
+// spending a second random dimension.
+static uint32_t mirror_triangle_index(float p_remap, uint32_t p_prim_count) {
+	return MIN((uint32_t)(p_remap * (float)p_prim_count), p_prim_count - 1u);
+}
+
+TEST_CASE("[PathTracer][Emissive] the barycentric warp yields valid barycentrics") {
+	// Non-negative and summing to 1 at every corner of the unit square and across
+	// its interior. A negative component would place the sample OUTSIDE the
+	// triangle, where the emitter does not exist.
+	for (int i = 0; i <= 20; i++) {
+		for (int j = 0; j <= 20; j++) {
+			const float ux = float(i) / 20.0f;
+			const float uy = float(j) / 20.0f;
+			const Vector3 b = mirror_barycentric_warp(ux, uy);
+			CHECK(b.x >= 0.0f);
+			CHECK(b.y >= 0.0f);
+			CHECK(b.z >= 0.0f);
+			CHECK(b.x + b.y + b.z == doctest::Approx(1.0f));
+		}
+	}
+	// The three vertices are reachable, so no part of the emitter is excluded.
+	CHECK(mirror_barycentric_warp(0.0f, 0.0f).is_equal_approx(Vector3(1, 0, 0)));
+	CHECK(mirror_barycentric_warp(1.0f, 0.0f).is_equal_approx(Vector3(0, 1, 0)));
+	CHECK(mirror_barycentric_warp(1.0f, 1.0f).is_equal_approx(Vector3(0, 0, 1)));
+}
+
+TEST_CASE("[PathTracer][Emissive] warped samples are UNIFORM over the triangle") {
+	// The pdf is the constant 1/area_tri, which is only the right density if the
+	// points are uniform by AREA. Drop the sqrt and they concentrate toward p0
+	// while the pdf is unchanged -- brightening one corner of every emitter and
+	// darkening the rest, with no failing test anywhere else in this suite.
+	//
+	// The test triangle is SCALENE and away from the origin, so no symmetry of the
+	// triangle itself can mask a directional bias.
+	const Vector3 a(1.0f, -2.0f, 0.5f);
+	const Vector3 b(4.5f, 0.25f, -1.0f);
+	const Vector3 c(0.0f, 3.0f, 2.25f);
+
+	// Medial subdivision: the midpoint triangle splits any triangle into four
+	// pieces of EXACTLY one quarter of the area each -- three corner pieces and a
+	// central one. So a uniform draw must land in each with probability 1/4.
+	// Which piece a point falls in is decided from its recovered barycentrics:
+	// corner i iff that coordinate is >= 0.5, central otherwise.
+	const int N = 200;
+	int warped[4] = { 0, 0, 0, 0 };
+	int control[4] = { 0, 0, 0, 0 };
+	for (int i = 0; i < N; i++) {
+		for (int j = 0; j < N; j++) {
+			// Stratified sweep of the unit square, sampling cell centres.
+			const float ux = (float(i) + 0.5f) / float(N);
+			const float uy = (float(j) + 0.5f) / float(N);
+
+			for (int pass = 0; pass < 2; pass++) {
+				const Vector3 bc = mirror_barycentric_warp(ux, uy, pass == 0);
+				// Build the actual world point, then RECOVER its barycentrics from
+				// sub-triangle areas rather than reusing `bc`. That way the case
+				// exercises the whole object-space composition and not just the
+				// formula it came from.
+				const Vector3 p = bc.x * a + bc.y * b + bc.z * c;
+				const float total = (b - a).cross(c - a).length();
+				const float wa = (b - p).cross(c - p).length() / total;
+				const float wb = (p - a).cross(c - a).length() / total;
+				const float wc = (b - a).cross(p - a).length() / total;
+				REQUIRE(wa + wb + wc == doctest::Approx(1.0f).epsilon(0.001));
+
+				int bucket = 3; // central
+				if (wa >= 0.5f) {
+					bucket = 0;
+				} else if (wb >= 0.5f) {
+					bucket = 1;
+				} else if (wc >= 0.5f) {
+					bucket = 2;
+				}
+				if (pass == 0) {
+					warped[bucket]++;
+				} else {
+					control[bucket]++;
+				}
+			}
+		}
+	}
+
+	const float n = float(N * N);
+	for (int k = 0; k < 4; k++) {
+		CHECK(float(warped[k]) / n == doctest::Approx(0.25f).epsilon(0.02));
+	}
+
+	// THE CONTROL, so this case cannot pass vacuously: without the sqrt the corner
+	// at p0 collects far more than its quarter. If this ever stops failing, the
+	// uniformity assertion above has stopped meaning anything.
+	CHECK(float(control[0]) / n > 0.4f);
+}
+
+TEST_CASE("[PathTracer][Emissive] the triangle draw covers every triangle and never overruns") {
+	// The remainder handed in is emissive_select_instance's, which clamps to
+	// 0.99999994 -- the largest float below 1. That value times prim_count must
+	// still land on the LAST triangle and not one past it.
+	const float CDF_REMAP_MAX = 0.99999994f;
+
+	CHECK(mirror_triangle_index(0.0f, 1) == 0);
+	CHECK(mirror_triangle_index(CDF_REMAP_MAX, 1) == 0);
+	CHECK(mirror_triangle_index(0.0f, 12) == 0);
+	CHECK(mirror_triangle_index(CDF_REMAP_MAX, 12) == 11);
+	CHECK(mirror_triangle_index(CDF_REMAP_MAX, 256) == 255);
+	// A count large enough that (1 - 2^-24) * count rounds up in float, which is
+	// where an unguarded uint() cast would step off the end of the mesh.
+	CHECK(mirror_triangle_index(CDF_REMAP_MAX, 100000u) < 100000u);
+	// The clamp is load-bearing, not defensive: at a remap of exactly 1 the cast
+	// alone yields prim_count.
+	CHECK(mirror_triangle_index(1.0f, 12) == 11);
+
+	// Every triangle is reachable and the draw is uniform over them, which is the
+	// (1 / prim_count) factor the pdf claims. A sweep, since the remainder is a
+	// rescaled CDF bucket and must span the whole unit interval.
+	const uint32_t prim_count = 12;
+	const int N = 120000;
+	std::vector<int> hits(prim_count, 0);
+	for (int i = 0; i < N; i++) {
+		const float remap = MIN((float(i) + 0.5f) / float(N), CDF_REMAP_MAX);
+		const uint32_t t = mirror_triangle_index(remap, prim_count);
+		REQUIRE(t < prim_count);
+		hits[t]++;
+	}
+	for (uint32_t t = 0; t < prim_count; t++) {
+		CHECK(float(hits[t]) / float(N) == doctest::Approx(1.0f / float(prim_count)).epsilon(0.01));
+	}
 }
 
 } // namespace TestPTEmissive
