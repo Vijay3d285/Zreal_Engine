@@ -684,4 +684,248 @@ TEST_CASE("[PathTracer][Emissive] compressed emitters use blas_transform x aabb^
 					.is_equal_approx(instance));
 }
 
+// ---------------------------------------------------------------------------
+// C1 Task 4: the NEE pdf.
+// ---------------------------------------------------------------------------
+
+// Mirror of emissive_pdf_solid_angle(). pdf_A = P(inst) * (1/prim_count) * (1/area_tri),
+// then converted to the solid-angle measure the BSDF pdf lives in.
+static float mirror_pdf_solid_angle(float p_prob_inst, uint32_t p_prim_count,
+		float p_area_tri, float p_dist, float p_cos_light) {
+	if (p_prim_count == 0 || p_area_tri <= 0.0f || p_cos_light <= 0.0f) {
+		return 0.0f;
+	}
+	const float pdf_a = p_prob_inst * (1.0f / float(p_prim_count)) * (1.0f / p_area_tri);
+	return pdf_a * (p_dist * p_dist) / p_cos_light;
+}
+
+TEST_CASE("[PathTracer][Emissive] the area pdf composes and normalises") {
+	// Two instances, 4 and 1 triangles, all of unit area. Summing
+	// P(inst) * P(tri|inst) * area over every triangle must give exactly 1.
+	const float probs[2] = { 0.3f, 0.7f };
+	const uint32_t prims[2] = { 4, 1 };
+	float total = 0.0f;
+	for (int i = 0; i < 2; i++) {
+		for (uint32_t t = 0; t < prims[i]; t++) {
+			const float pdf_a = probs[i] * (1.0f / float(prims[i])) * (1.0f / 1.0f);
+			total += pdf_a * 1.0f; // integrate the density over the triangle's area
+		}
+	}
+	CHECK(total == doctest::Approx(1.0f));
+}
+
+TEST_CASE("[PathTracer][Emissive] grazing angles INFLATE the solid-angle pdf") {
+	// pdf_omega = pdf_A * d^2 / cos. A sign or reciprocal slip here is invisible
+	// head-on (cos == 1) and only shows at grazing angles, so test there.
+	const float head_on = mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, 1.0f);
+	const float grazing = mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, 0.05f);
+	CHECK(head_on == doctest::Approx(4.0f));
+	CHECK(grazing > head_on);
+	CHECK(grazing == doctest::Approx(4.0f / 0.05f));
+}
+
+TEST_CASE("[PathTracer][Emissive] distance enters the pdf quadratically") {
+	const float near_pdf = mirror_pdf_solid_angle(1.0f, 1, 1.0f, 1.0f, 1.0f);
+	const float far_pdf = mirror_pdf_solid_angle(1.0f, 1, 1.0f, 3.0f, 1.0f);
+	CHECK(far_pdf == doctest::Approx(near_pdf * 9.0f));
+}
+
+TEST_CASE("[PathTracer][Emissive] a back-facing sample contributes nothing") {
+	// Front-face-only, matching lights_eval_rect_light's cos_theta <= 1e-5 reject.
+	CHECK(mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, 0.0f) == 0.0f);
+	CHECK(mirror_pdf_solid_angle(1.0f, 1, 1.0f, 2.0f, -0.5f) == 0.0f);
+}
+
+TEST_CASE("[PathTracer][Emissive] a degenerate or empty instance yields no pdf") {
+	CHECK(mirror_pdf_solid_angle(1.0f, 0, 1.0f, 2.0f, 1.0f) == 0.0f);
+	CHECK(mirror_pdf_solid_angle(1.0f, 4, 0.0f, 2.0f, 1.0f) == 0.0f);
+}
+
+TEST_CASE("[PathTracer][Emissive] all four pdf factors are simultaneously live") {
+	// THE GAP THE FIVE CASES ABOVE LEAVE. Every one of them pins `area_tri` at
+	// exactly 1 or 0 and `prob_inst` at exactly 1, so an implementation that
+	// dropped either factor entirely would pass all five. The pdf is a product of
+	// four terms; each has to be non-extremal and mutually distinct at least
+	// once, against a closed form rather than an inequality.
+	//
+	//   pdf_A     = 0.35 * (1/7) * (1/2.5) = 0.02
+	//   pdf_omega = 0.02 * 1.5^2 / 0.4     = 0.1125
+	const float prob = 0.35f;
+	const uint32_t prims = 7;
+	const float area = 2.5f;
+	const float dist = 1.5f;
+	const float cosl = 0.4f;
+	const float pdf = mirror_pdf_solid_angle(prob, prims, area, dist, cosl);
+	CHECK(pdf == doctest::Approx(0.1125f));
+
+	// And each factor moves the answer by its own predicted ratio, independently
+	// of the others -- so no factor can be silently folded into a neighbour.
+	CHECK(mirror_pdf_solid_angle(prob * 2.0f, prims, area, dist, cosl)
+					== doctest::Approx(pdf * 2.0f));
+	CHECK(mirror_pdf_solid_angle(prob, prims * 2u, area, dist, cosl)
+					== doctest::Approx(pdf * 0.5f));
+	CHECK(mirror_pdf_solid_angle(prob, prims, area * 2.0f, dist, cosl)
+					== doctest::Approx(pdf * 0.5f));
+	CHECK(mirror_pdf_solid_angle(prob, prims, area, dist * 2.0f, cosl)
+					== doctest::Approx(pdf * 4.0f));
+	CHECK(mirror_pdf_solid_angle(prob, prims, area, dist, cosl * 2.0f)
+					== doctest::Approx(pdf * 0.5f));
+
+	// KNOWN BLIND SPOT, recorded rather than papered over: prim_count and
+	// area_tri both enter as reciprocals of a single product, so exchanging the
+	// two is arithmetically invisible in the RETURNED VALUE and no choice of
+	// inputs can separate them here. What does separate them is their GUARDS -- a
+	// zero prim_count and a zero area are rejected by different clauses (the case
+	// above) -- and the shader's types: one is a uint triangle count used to index
+	// the mesh, the other a float world-space area.
+}
+
+// Mirror of emissive_pdf_solid_angle_for_hit()'s FIRST step: recovering P(inst)
+// for an ALREADY-KNOWN slot by differencing the CDF, rather than by walking it
+// the way selection does. Task 5's MIS weight for a BSDF ray that lands on an
+// emitter depends on this agreeing exactly with what selection would have
+// reported for the same slot; if it does not, the two strategies weight one
+// direction with two different densities and the partition stops summing to 1.
+static float mirror_prob_from_cdf_bucket(const std::vector<float> &p_prefix, float p_total, uint32_t p_slot) {
+	if (!(p_total > 0.0f) || p_slot >= (uint32_t)p_prefix.size()) {
+		return 0.0f;
+	}
+	const float lo = (p_slot == 0) ? 0.0f : p_prefix[p_slot - 1];
+	const float w = p_prefix[p_slot] - lo;
+	return (w > 0.0f) ? (w / p_total) : 0.0f;
+}
+
+TEST_CASE("[PathTracer][Emissive] the reverse P(inst) lookup matches the forward walk") {
+	// Powers {1, 7, 0, 2}: an interior bucket, the FIRST bucket (whose lower edge
+	// is the implicit 0 rather than prefix[-1] -- an off-by-one there is invisible
+	// on every other slot), a zero-width bucket, and the last.
+	std::vector<float> cdf = { 1.0f, 8.0f, 8.0f, 10.0f };
+	const float total = 10.0f;
+
+	CHECK(mirror_prob_from_cdf_bucket(cdf, total, 0) == doctest::Approx(0.1f));
+	CHECK(mirror_prob_from_cdf_bucket(cdf, total, 1) == doctest::Approx(0.7f));
+	CHECK(mirror_prob_from_cdf_bucket(cdf, total, 2) == 0.0f);
+	CHECK(mirror_prob_from_cdf_bucket(cdf, total, 3) == doctest::Approx(0.2f));
+
+	// The probabilities of the reachable buckets sum to 1: a reverse lookup that
+	// forgot to divide by total, or differenced the wrong neighbour, would not.
+	float sum = 0.0f;
+	for (uint32_t s = 0; s < 4; s++) {
+		sum += mirror_prob_from_cdf_bucket(cdf, total, s);
+	}
+	CHECK(sum == doctest::Approx(1.0f));
+
+	// Agreement with the forward walk, slot for slot, over a full sweep of u.
+	for (int i = 0; i < 4000; i++) {
+		const float u = (float(i) + 0.5f) / 4000.0f;
+		uint32_t slot = 0;
+		float prob = 0.0f, remap = 0.0f;
+		REQUIRE(mirror_select_instance(cdf, total, u, slot, prob, remap));
+		CHECK(mirror_prob_from_cdf_bucket(cdf, total, slot) == doctest::Approx(prob));
+	}
+
+	// The disabled-feature gate, from the other direction: an all-zero
+	// distribution yields no probability for any slot, and an out-of-range slot
+	// yields none either.
+	CHECK(mirror_prob_from_cdf_bucket(cdf, 0.0f, 1) == 0.0f);
+	CHECK(mirror_prob_from_cdf_bucket(cdf, total, 4) == 0.0f);
+}
+
+// Mirror of emissive_orient_normal(). Returns the GEOMETRIC normal -- the world
+// cross product, never the vertex normal -- turned to face the side the surface
+// emits from, which is the side a back-face-culled BSDF ray can hit.
+//
+// p_use_naive_matrix selects the WRONG normal transform (the basis itself rather
+// than its inverse transpose) so a test can show the two disagree.
+static Vector3 mirror_orient_normal(const Transform3D &p_xform, const Vector3 &p0,
+		const Vector3 &p1, const Vector3 &p2, const Vector3 &p_n_obj,
+		bool p_use_naive_matrix = false) {
+	const Vector3 w0 = p_xform.xform(p0);
+	const Vector3 w1 = p_xform.xform(p1);
+	const Vector3 w2 = p_xform.xform(p2);
+	const Vector3 ng = (w1 - w0).cross(w2 - w0).normalized();
+	const Vector3 n_world = p_use_naive_matrix
+			? p_xform.basis.xform(p_n_obj)
+			: p_xform.basis.inverse().transposed().xform(p_n_obj);
+	return (ng.dot(n_world) < 0.0f) ? -ng : ng;
+}
+
+TEST_CASE("[PathTracer][Emissive] the emitting side comes from the vertex normal, not the winding") {
+	// THE BUG THIS CASE EXISTS FOR, found by instrumenting a real frame in C1 Task
+	// 4: taking cross(p1-p0, p2-p0) as the emitter's outward normal. Godot winds
+	// its meshes opposite to the CCW convention that cross product assumes, so on a
+	// box emitter above a floor it pointed INWARD -- 62.6% of NEE samples landed on
+	// the far side of the emitter and were killed by their own shadow ray, 36.5%
+	// were rejected as back-facing, and 0.9% survived. The image did not change,
+	// which is why only a measurement caught it.
+	const Vector3 n_obj(0, 1, 0);
+	// Wound so the raw cross product AGREES with the vertex normal.
+	const Vector3 a0(0, 0, 0), a1(1, 0, 0), a2(0, 0, -1);
+	// The same triangle with two vertices exchanged: raw cross product now OPPOSES
+	// the vertex normal. Both must yield the SAME emitting side.
+	const Vector3 b0(0, 0, 0), b1(0, 0, -1), b2(1, 0, 0);
+
+	const Transform3D id;
+	CHECK(mirror_orient_normal(id, a0, a1, a2, n_obj).is_equal_approx(Vector3(0, 1, 0)));
+	CHECK(mirror_orient_normal(id, b0, b1, b2, n_obj).is_equal_approx(Vector3(0, 1, 0)));
+
+	// And the raw cross product really does disagree between the two windings, so
+	// the case would fail against an implementation that skipped the orientation.
+	const Vector3 raw_a = (a1 - a0).cross(a2 - a0).normalized();
+	const Vector3 raw_b = (b1 - b0).cross(b2 - b0).normalized();
+	CHECK(raw_a.is_equal_approx(-raw_b));
+
+	// A MIRRORING transform (negative determinant) flips the world-space winding
+	// while leaving the outward side where it was. No winding convention can see
+	// this; only the vertex normal can.
+	Transform3D mirrored;
+	mirrored.basis = Basis::from_scale(Vector3(-1, 1, 1));
+	const Vector3 mirrored_raw = (mirrored.xform(a1) - mirrored.xform(a0))
+										 .cross(mirrored.xform(a2) - mirrored.xform(a0))
+										 .normalized();
+	CHECK(mirrored_raw.is_equal_approx(Vector3(0, -1, 0))); // the winding flipped
+	CHECK(mirror_orient_normal(mirrored, a0, a1, a2, n_obj).is_equal_approx(Vector3(0, 1, 0)));
+}
+
+TEST_CASE("[PathTracer][Emissive] orientation needs the INVERSE TRANSPOSE, not the basis") {
+	// Under non-uniform scale the naive `basis * n` test reduces to sign(g . n) in
+	// OBJECT space, which is scale-blind; the correct inverse-transpose test
+	// weights each component by 1/s^2. Here they disagree in SIGN, so an
+	// implementation using the basis directly would orient this emitter backwards.
+	//
+	// Object-space triangle chosen so its geometric normal is (-0.5, 1, 0):
+	// g . n = 0.5 > 0 (naive: aligned) while g.x/1 + g.y/100 = -0.49 < 0 under
+	// scale (1, 10, 1) (correct: opposed).
+	const Vector3 n_obj = Vector3(1, 1, 0).normalized();
+	const Vector3 p0(0, 0, 0);
+	const Vector3 p1(0, 0, 1); // edge along +z
+	const Vector3 p2(1, 0.5f, 0); // in the plane perpendicular to (-0.5, 1, 0)
+
+	// Confirm the object-space geometric normal really is the (-0.5, 1, 0) direction.
+	const Vector3 g_obj = (p1 - p0).cross(p2 - p0);
+	CHECK(g_obj.normalized().is_equal_approx(Vector3(-0.5f, 1.0f, 0.0f).normalized()));
+	CHECK(g_obj.dot(n_obj) > 0.0f); // naive test says "aligned"
+
+	Transform3D scaled;
+	scaled.basis = Basis::from_scale(Vector3(1, 10, 1));
+
+	const Vector3 correct = mirror_orient_normal(scaled, p0, p1, p2, n_obj, false);
+	const Vector3 naive = mirror_orient_normal(scaled, p0, p1, p2, n_obj, true);
+	CHECK(correct.is_equal_approx(-naive));
+
+	// Pin WHICH one is right rather than only that they differ: the emitting side
+	// is the one the properly transformed vertex normal points to.
+	const Vector3 n_world = scaled.basis.inverse().transposed().xform(n_obj);
+	CHECK(correct.dot(n_world) > 0.0f);
+	CHECK(naive.dot(n_world) < 0.0f);
+
+	// Under UNIFORM scale the two matrices differ only by a positive factor, so
+	// the naive form happens to agree -- which is exactly why a suite that only
+	// tested uniform scale would not notice.
+	Transform3D uniform;
+	uniform.basis = Basis::from_scale(Vector3(3, 3, 3));
+	CHECK(mirror_orient_normal(uniform, p0, p1, p2, n_obj, false)
+					.is_equal_approx(mirror_orient_normal(uniform, p0, p1, p2, n_obj, true)));
+}
+
 } // namespace TestPTEmissive

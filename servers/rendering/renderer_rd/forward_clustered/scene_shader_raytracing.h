@@ -83,6 +83,8 @@ public:
 		RT_FLAG_DLSS_RR_ENABLED = (1 << 1),
 		RT_FLAG_FOG_ENABLED = (1 << 2),
 		RT_FLAG_SER_ENABLED = (1 << 3),
+		// Bits 4-8 belong to RT_MIN_BOUNCE (below), so the next feature flag is 9.
+		RT_FLAG_EMISSIVE_LIGHTS_ENABLED = (1 << 9),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
@@ -104,7 +106,7 @@ public:
 	// alias the Russian Roulette min_bounce field, corrupt the readback, and leave
 	// the rendered image merely plausible instead of visibly wrong. Keep this in
 	// sync whenever RT_FLAG_* gains a member.
-	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
+	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
 			"RT_FLAG_* bit overlaps the Russian Roulette min_bounce field (bits 4-8)");
 
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).

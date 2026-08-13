@@ -29,6 +29,13 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_MIN_BOUNCE_MASK 0x1Fu
 #define RT_GET_MIN_BOUNCE() (((RT_FLAGS >> RT_MIN_BOUNCE_SHIFT) & RT_MIN_BOUNCE_MASK) == 0u ? 3u : ((((RT_FLAGS >> RT_MIN_BOUNCE_SHIFT) & RT_MIN_BOUNCE_MASK)) - 1u))
 
+// Emissive-mesh next-event estimation (roadmap C1). Bit 9 -- the first free bit
+// ABOVE the min_bounce field, which owns 4-8. MUST match
+// RT_FLAG_EMISSIVE_LIGHTS_ENABLED in scene_shader_raytracing.h; the C++ side
+// carries a static_assert proving no feature flag has encroached on min_bounce.
+#define RT_FLAG_EMISSIVE_LIGHTS_ENABLED 512u // 1 << 9
+#define RT_GET_EMISSIVE_ENABLED() ((RT_FLAGS & RT_FLAG_EMISSIVE_LIGHTS_ENABLED) != 0u)
+
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
 

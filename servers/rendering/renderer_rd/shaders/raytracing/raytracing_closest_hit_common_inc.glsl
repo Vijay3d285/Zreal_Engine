@@ -107,6 +107,19 @@ vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_dep
 	return normalize(mix(h.geometry_normal, mapped, normal_map_depth));
 }
 
+// Emissive-mesh light sampling (roadmap C1). Included HERE and not at the top of
+// the stage: emissive_radiance() calls sample_material_texture(), defined a few
+// lines above, and emissive_sample() calls lights_trace_shadow_ray() and the BRDF
+// library, both already in scope by the time this file is included. Anything
+// earlier and the include does not compile; anything later and shade_and_bounce
+// below cannot see it.
+//
+// It also brings the composition of emitted radiance itself into scope for
+// scene_raytracing_raygen.glsl's closest_hit main(), which fills m.emissive
+// through it -- so the NEE estimator and the BSDF-hit estimator are the same
+// expression by construction rather than by inspection.
+#include "raytracing_emissive_inc.glsl"
+
 // ============================================================================
 // DEPTH WRITE (primary ray only)
 // ============================================================================
@@ -689,6 +702,33 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 				vec3 contrib = ps.throughput * bsdf_val * sky_rad * (w / env_pdf_val);
 				ps.radiance += clamp_contribution(contrib, clamp_limit);
 			}
+		}
+	}
+
+	// =================================================================
+	// Emissive-mesh NEE (roadmap C1).
+	//
+	// A THIRD strategy, independent of both blocks above: glowing geometry is
+	// invisible to the analytic-light reservoir (it is not in rt_lights[]) and to
+	// environment sampling (it is not the sky), so before this the only way to
+	// find it was for a BSDF ray to stumble onto it -- which is why a small bright
+	// emitter used to be almost pure noise.
+	//
+	// Gated on a SPECIALIZATION CONSTANT, so a build with the feature off compiles
+	// this away entirely rather than paying a runtime branch. There was no enable
+	// to copy: environment NEE is unconditional, guarded only by env_sample()
+	// returning false.
+	//
+	// The estimator carries its own MIS weight; the matching weight on the BSDF
+	// side -- scaling down the emissive radiance a bounce ray collects when it
+	// lands on an emitter -- is Task 5. Until then emissive surfaces are counted
+	// by both strategies and the image is brighter by design.
+	// =================================================================
+	if (RT_GET_EMISSIVE_ENABLED()) {
+		vec3 emissive_direct;
+		vec3 emissive_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
+		if (emissive_sample(emissive_origin, N, V, brdf_mat, rng, emissive_direct)) {
+			ps.radiance += clamp_contribution(ps.throughput * emissive_direct, clamp_limit);
 		}
 	}
 

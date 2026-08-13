@@ -670,6 +670,22 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		flags |= RT_FLAG_SER_ENABLED;
 	}
 
+	// Emissive-mesh next-event estimation (roadmap C1). Read here, once per frame,
+	// from the same project setting RenderRaytracing::build_tlas() reads into
+	// `emissive_active` to decide whether to build the distribution at all.
+	//
+	// The two reads are independent, and that is deliberate rather than sloppy:
+	// this one only decides whether the SHADER CODE exists (it drives a
+	// specialization constant, so the NEE block is compiled out when false), while
+	// that one decides whether the BUFFERS hold a real distribution. Either
+	// disagreement is safe. Shader on / buffers fallback is the state every frame
+	// is in before the first build lands, and the `total_power > 0` gate at the top
+	// of emissive_sample() makes it a no-op. Shader off / buffers built merely
+	// wastes the build for a frame.
+	if (GLOBAL_GET("rendering/pathtracer/emissive_mesh_lights")) {
+		flags |= RT_FLAG_EMISSIVE_LIGHTS_ENABLED;
+	}
+
 	{
 		// (int)Variant on a nil/non-numeric value converts to 0 -- the MOST
 		// aggressive setting (roulette from the first bounce), not a safe

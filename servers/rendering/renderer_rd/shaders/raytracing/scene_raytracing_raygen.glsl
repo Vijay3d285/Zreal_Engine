@@ -467,7 +467,20 @@ void main() {
 	m.roughness = roughness;
 	m.metalness = metallic;
 	m.specular = specular;
-	m.emissive = emission * scene_data_block.data.emissive_exposure_normalization;
+	// A custom hit group's `emission` is whatever its user shader code wrote, so
+	// there is no MaterialData to compose it from and the full emissive_radiance()
+	// form does not apply. It still goes through the SHARED exposure factor rather
+	// than restating it -- that factor is the part every composition site has in
+	// common, and the part a second copy would drift on.
+	//
+	// CAVEAT FOR TASK 5, recorded where it will be read: for a custom-HG instance
+	// this value can differ from what emissive_radiance() would return for the same
+	// surface, because gather_emissive_instances() builds the distribution from
+	// materials[] (the StandardMaterial3D fields), not from the user shader. The
+	// two MIS strategies would then estimate different integrands on such an
+	// emitter. No custom-HG emitter is exercised by the C1 gates; excluding them
+	// from the distribution is the obvious repair if one ever is.
+	m.emissive = emissive_apply_exposure(emission);
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
 
 	// Apply normal map if it was written.
@@ -514,16 +527,23 @@ void main() {
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
-	vec3 emissive = vec3(0.0);
-	if ((mat.flags & 2u) != 0u) {
-		// Emission texture present: sample texture * color * strength.
-		emissive = sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb * mat.emission_color * mat.emission_strength;
-		emissive *= scene_data_block.data.emissive_exposure_normalization;
-	} else if (mat.emission_strength > 0.0) {
-		// Color-only emission (no texture): evaluate color * strength directly.
-		emissive = mat.emission_color * mat.emission_strength;
-		emissive *= scene_data_block.data.emissive_exposure_normalization;
-	}
+	// THE single composition of emitted radiance, shared verbatim with emissive
+	// NEE (raytracing_emissive_inc.glsl). This site and the NEE site are the two
+	// MIS strategies Task 5 will weight against each other, and a weight pair that
+	// sums to 1 is only meaningful if both halves estimate the SAME integrand --
+	// so they call one function rather than two expressions that look alike.
+	//
+	// The inlined form this replaced had an extra `emission_strength > 0.0` guard
+	// on the NO-TEXTURE branch only. For every strength the engine can produce it
+	// is redundant -- color * 0 * exposure is already vec3(0), and
+	// emission_energy_multiplier's range starts at 0 (material.cpp:3605) -- so the
+	// value does not move. It differed only for a NEGATIVE strength set past the
+	// Inspector by script, and there the old code was already self-inconsistent:
+	// the textured branch multiplied a negative through while this one clamped it.
+	// Uniformly multiplying it out is the coherent behaviour, and such an emitter
+	// is excluded from the NEE distribution anyway (gather_emissive_instances
+	// qualifies on lum * strength > 1e-4).
+	vec3 emissive = emissive_radiance(mat, uv);
 
 	// Build MaterialResult.
 	MaterialResult m;
