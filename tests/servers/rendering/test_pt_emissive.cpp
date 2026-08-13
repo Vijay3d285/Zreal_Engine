@@ -1095,4 +1095,164 @@ TEST_CASE("[PathTracer][Emissive] the triangle draw covers every triangle and ne
 	}
 }
 
+// ============================================================================
+// THE MIS PARTITION (C1 Task 5)
+// ============================================================================
+
+// Mirror of power_heuristic (raytracing_inc.glsl).
+static float mirror_power_heuristic(float p_a, float p_b) {
+	const float a2 = p_a * p_a;
+	const float b2 = p_b * p_b;
+	const float d = a2 + b2;
+	return (d > 0.0f) ? (a2 / d) : 0.0f;
+}
+
+// Mirror of the emissive-hit weight decision in shade_and_bounce()
+// (raytracing_closest_hit_common_inc.glsl). `p_slot` is
+// emissive_slot_for_instance(gl_InstanceCustomIndexEXT), which is -1 both for a
+// non-emitter and whenever the distribution is empty; `p_mis_ray_pdf` is
+// ps.mis_ray_pdf, negative on the RT_MIS_PDF_NONE sentinel.
+//
+// The three conditions are ANDed in the shader in this order for a reason the
+// arithmetic here cannot show: with the feature off all three emissive bindings
+// are the same 16-byte zero-filled fallback, so the slot lookup must not happen
+// until RT_GET_EMISSIVE_ENABLED() has short-circuited.
+static float mirror_bsdf_emissive_weight(bool p_emissive_enabled, int p_slot,
+		float p_mis_ray_pdf, float p_light_pdf) {
+	if (p_emissive_enabled && p_mis_ray_pdf > 0.0f && p_slot >= 0) {
+		return mirror_power_heuristic(p_mis_ray_pdf, p_light_pdf);
+	}
+	return 1.0f;
+}
+
+TEST_CASE("[PathTracer][Emissive] the MIS partition sums to exactly one") {
+	// Both halves must be formed from the SAME two pdfs in the SAME measure, or
+	// the emissive surface is counted twice (sum > 1) or dimmed (sum < 1).
+	const float pairs[6][2] = {
+		{ 1.0f, 1.0f }, { 0.001f, 5.0f }, { 5.0f, 0.001f },
+		{ 1e-6f, 1e6f }, { 3.7f, 0.42f }, { 100.0f, 100.0f }
+	};
+	for (const auto &p : pairs) {
+		const float w_nee = mirror_power_heuristic(p[0], p[1]);
+		const float w_bsdf = mirror_power_heuristic(p[1], p[0]);
+		CHECK(w_nee + w_bsdf == doctest::Approx(1.0f));
+	}
+}
+
+TEST_CASE("[PathTracer][Emissive] an unreachable strategy takes the whole weight") {
+	// A near-delta specular bounce carries RT_MIS_PDF_NONE and must not be
+	// weighted down against a strategy that could not have produced it. Modelled
+	// here as the sentinel path: weight 1, unconditionally.
+	const float light_pdf = 12.5f;
+	const float bsdf_pdf_sentinel = -1.0f; // RT_MIS_PDF_NONE
+	const float w = (bsdf_pdf_sentinel < 0.0f) ? 1.0f : mirror_power_heuristic(bsdf_pdf_sentinel, light_pdf);
+	CHECK(w == doctest::Approx(1.0f));
+}
+
+TEST_CASE("[PathTracer][Emissive] a zero light pdf hands the BSDF full weight") {
+	// Where emissive NEE cannot reach (back face, degenerate triangle), its pdf
+	// is 0 and the BSDF half must collect the whole contribution -- otherwise the
+	// energy is deleted rather than redistributed.
+	CHECK(mirror_power_heuristic(4.2f, 0.0f) == doctest::Approx(1.0f));
+	CHECK(mirror_power_heuristic(0.0f, 4.2f) == doctest::Approx(0.0f));
+}
+
+TEST_CASE("[PathTracer][Emissive] the weight is the POWER heuristic, not the balance heuristic") {
+	// THE GAP THE THREE CASES ABOVE LEAVE, and it is not academic. The balance
+	// heuristic a/(a+b) ALSO sums to one, ALSO gives 1 at b == 0 and 0 at a == 0,
+	// so it satisfies every assertion above -- yet it is a measurably different
+	// (higher-variance) partition, and it is NOT what emissive_sample() already
+	// uses on the NEE side. If the two halves picked different heuristics the sum
+	// would stop being one and the surface would be miscounted, which is exactly
+	// the failure no sum-to-one test written against a single heuristic can see.
+	//
+	// beta = 2 is pinned against a closed form at a point where the two differ:
+	//   power   : 2^2 / (2^2 + 1^2) = 4/5 = 0.8
+	//   balance : 2   / (2   + 1)   = 2/3 = 0.6667
+	CHECK(mirror_power_heuristic(2.0f, 1.0f) == doctest::Approx(0.8f));
+	CHECK(mirror_power_heuristic(2.0f, 1.0f) != doctest::Approx(2.0f / 3.0f));
+
+	// And the exponent itself: doubling BOTH pdfs must leave the weight alone
+	// (scale invariance, true of any beta), while the RATIO must enter squared.
+	// At a ratio of 3 the weights are 9/10 vs 1/10 -- balance would say 3/4, 1/4.
+	CHECK(mirror_power_heuristic(6.0f, 3.0f) == doctest::Approx(0.8f));
+	CHECK(mirror_power_heuristic(3.0f, 1.0f) == doctest::Approx(0.9f));
+	CHECK(mirror_power_heuristic(1.0f, 3.0f) == doctest::Approx(0.1f));
+}
+
+TEST_CASE("[PathTracer][Emissive] the BSDF hit is weighted only where NEE could also reach it") {
+	// Mirror of shade_and_bounce()'s gate. Three independent conditions have to be
+	// true before the emissive hit is scaled down at all; each one going false on
+	// its own must restore the full contribution, because in each case emissive NEE
+	// could NOT have produced this direction and there is no second strategy to
+	// share with. Weighting any of them down deletes energy outright.
+	//
+	// The pdfs below are the measurement scene's own order of magnitude: a 0.6-unit
+	// emitter at ~5 units gives pdf_omega ~ 11 sr^-1 against a Lambertian
+	// combinedPdf of ~0.32.
+	const float light_pdf = 11.0f;
+	const float bsdf_pdf = 0.32f;
+
+	// All three live: the surface really is reachable both ways, so the weight is
+	// the heuristic's -- and it is nearly all NEE's.
+	const float w_live = mirror_bsdf_emissive_weight(true, 3, bsdf_pdf, light_pdf);
+	CHECK(w_live == doctest::Approx(mirror_power_heuristic(bsdf_pdf, light_pdf)));
+	CHECK(w_live < 0.01f); // ~0.00084 -- the double count is what this removes.
+	CHECK(w_live > 0.0f); // ...but it is NOT zero: the BSDF half is not deleted.
+
+	// Feature off: NEE never ran, so the hit keeps everything. (Also the case in
+	// which emissive_slot[] must not be read at all -- see the shader gate.)
+	CHECK(mirror_bsdf_emissive_weight(false, 3, bsdf_pdf, light_pdf) == doctest::Approx(1.0f));
+
+	// Not an emitter in the distribution: slot -1. This covers the DEFORMED and
+	// custom-hit-group exclusions, which are unbiased only because of this line.
+	CHECK(mirror_bsdf_emissive_weight(true, -1, bsdf_pdf, light_pdf) == doctest::Approx(1.0f));
+
+	// Sentinel BSDF pdf (RT_MIS_PDF_NONE, and the 0.0 that cannot occur because
+	// shade_and_bounce stores the sentinel instead): camera ray or near-delta
+	// specular bounce, unreachable by NEE.
+	CHECK(mirror_bsdf_emissive_weight(true, 3, -1.0f, light_pdf) == doctest::Approx(1.0f));
+	CHECK(mirror_bsdf_emissive_weight(true, 3, 0.0f, light_pdf) == doctest::Approx(1.0f));
+
+	// A slot of 0 is a VALID emitter, not a falsy "no slot". An implementation
+	// that tested `slot` for truth rather than for `>= 0` would hand slot 0 the
+	// full weight and double-count the first emitter in the distribution.
+	CHECK(mirror_bsdf_emissive_weight(true, 0, bsdf_pdf, light_pdf) < 0.01f);
+
+	// Zero light pdf inside the live branch -- the emitter is in the distribution
+	// but NEE cannot draw THIS direction (back face, degenerate triangle). Full
+	// weight, from the heuristic itself rather than from the gate.
+	CHECK(mirror_bsdf_emissive_weight(true, 3, bsdf_pdf, 0.0f) == doctest::Approx(1.0f));
+
+	// THE CONTROL, so the case cannot pass vacuously: a gate that always took the
+	// weighted branch would drive the "feature off" and "not an emitter" rows to
+	// w_live, and that is not 1. If this ever stops holding, every == 1.0 check
+	// above has stopped distinguishing anything.
+	CHECK(w_live != doctest::Approx(1.0f));
+}
+
+TEST_CASE("[PathTracer][Emissive] the two halves partition the measurement scene's emitter") {
+	// The end-to-end statement of the acceptance criterion, in the units the probe
+	// measures. `pipeline_references/tests/pt_emissive_compile_scene.tscn` reads
+	// 0.0609 with the feature off (BSDF hits only) and 0.1216 with it on and no
+	// weight -- a 99.7% double count. With the partition applied the two strategies
+	// must sum back to ONE copy of the same radiance, at every ratio the scene's
+	// geometry can produce, not just the one measured.
+	const float bsdf_pdf = 0.32f; // Lambertian, cos-weighted.
+	const float radiance = 0.0609f; // One copy, in the probe's units.
+
+	// A sweep over emitter solid angles from "fills the hemisphere" to "pinhole".
+	const float light_pdfs[7] = { 0.05f, 0.32f, 1.0f, 11.0f, 250.0f, 1e4f, 1e6f };
+	for (float light_pdf : light_pdfs) {
+		const float w_bsdf = mirror_bsdf_emissive_weight(true, 3, bsdf_pdf, light_pdf);
+		const float w_nee = mirror_power_heuristic(light_pdf, bsdf_pdf);
+		CHECK((w_bsdf + w_nee) * radiance == doctest::Approx(radiance));
+	}
+
+	// Unweighted, the same sum is 2x -- which is the number the probe actually
+	// reports today, and the one this task exists to remove.
+	CHECK((1.0f + mirror_power_heuristic(11.0f, bsdf_pdf)) * radiance
+					== doctest::Approx(0.1216f).epsilon(0.01));
+}
+
 } // namespace TestPTEmissive

@@ -251,6 +251,29 @@ float emissive_prob_for_slot(uint p_slot) {
 	return (w > 0.0) ? (w / total) : 0.0;
 }
 
+/// The emitter slot for a TLAS instance, or -1 when it is not in the
+/// distribution -- and -1 whenever there is no distribution at all.
+///
+/// THE CONTRACT GATE IS INSIDE, which is the whole reason this exists rather than
+/// callers indexing `emissive_slot[]` themselves. When
+/// `rendering/pathtracer/emissive_mesh_lights` is off -- and also when it is ON
+/// but EmissiveLights has no valid buffers yet, which the spec constant cannot
+/// tell you about (render_raytracing.cpp binds the fallback on
+/// `emissive_active && emissive_lights.is_valid()`) -- all three bindings are the
+/// same 16-byte zero-filled buffer, so `emissive_slot[]` is effectively
+/// zero-length and indexing it by gl_InstanceCustomIndex is out of bounds.
+/// That read does not fault reliably; it returns whatever is there.
+///
+/// -1 is the right answer on that path and not merely a safe one: with no
+/// distribution NEE cannot have sampled anything, so the BSDF hit is the only
+/// strategy and must take the full weight.
+int emissive_slot_for_instance(uint p_instance_custom_index) {
+	if (!(emissive_cdf.total_power > 0.0)) {
+		return -1;
+	}
+	return emissive_slot[p_instance_custom_index];
+}
+
 /// Area-measure density of the sampling scheme, converted to the SOLID-ANGLE
 /// measure the BSDF pdf lives in so the two can be combined by MIS:
 ///
@@ -353,10 +376,13 @@ float emissive_pdf_solid_angle_for_hit(uint p_slot, uint p_primitive_id, vec3 p_
 /// Returns the contribution BEFORE throughput and firefly clamping; the caller
 /// applies both, matching the neighbouring analytic and environment NEE blocks.
 ///
-/// Carries the MIS weight for the NEE half only. The other half -- weighting the
-/// emissive radiance a BSDF ray collects when it lands on an emitter -- is Task
-/// 5's, via emissive_pdf_solid_angle_for_hit() above. Until that lands, emissive
-/// surfaces are counted twice and the image is legitimately brighter.
+/// Carries the MIS weight for the NEE half. The other half -- weighting the
+/// emissive radiance a BSDF ray collects when it lands on an emitter -- lives at
+/// the emissive accumulation in shade_and_bounce()
+/// (raytracing_closest_hit_common_inc.glsl) and goes through
+/// emissive_pdf_solid_angle_for_hit() above. The two are power_heuristic() over
+/// the SAME two densities with the arguments swapped, so they sum to exactly one.
+/// Change the density either half uses and you must change both.
 bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_mat,
 		RNGState p_rng, out vec3 r_contribution) {
 	r_contribution = vec3(0.0);

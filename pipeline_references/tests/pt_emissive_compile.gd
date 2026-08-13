@@ -19,9 +19,15 @@ extends "res://tests/pt_validation.gd"
 ## ON, and print both means. Any compile failure surfaces as an ERROR line on
 ## stderr from ShaderRD / RenderingDevice.
 ##
-## THE BRIGHTNESS DELTA IS EXPECTED TO BE POSITIVE. NEE lands before MIS, so
-## until Task 5 weights the emissive HIT the emitter is counted by both
-## strategies. The number printed here is the evidence Task 5 removed something.
+## THE BRIGHTNESS DELTA IS NOW EXPECTED TO BE ~ZERO, and that is the point.
+## Emissive NEE finds the emitter far more reliably than a BSDF ray stumbling
+## onto it, but MIS (Task 5) splits the two strategies with weights that sum to
+## one, so turning the feature on must change the VARIANCE of this image and not
+## its MEAN. It is a redistribution, not extra light.
+##
+## Before Task 5 this read +99.7% -- NEE's contribution added on top of an
+## unweighted emissive hit. That number is what the MIS partition removed, and
+## the tolerance below is what stops it coming back.
 ##
 ## Env vars:
 ##   ZR_EMI_FRAMES  accumulated frames per pass  (default 64)
@@ -68,9 +74,25 @@ func _ready() -> void:
 		print("  emissive NEE OFF : %.6f" % off)
 		print("  emissive NEE ON  : %.6f" % on)
 		print("  delta            : %+.6f  (%+.3f%%)" % [d, rel * 100.0])
-		print("  A POSITIVE delta is the EXPECTED double count. Task 5 removes it.")
-		if absf(rel) < 1e-6:
-			_failures.append("the setting made no difference at all -- the NEE block is not running (stale .glsl.gen.h, or the spec-constant flag never reached the shader)")
+		print("  A near-ZERO delta is correct: MIS redistributes the emitter, it does not add light.")
+		# Two-sided, because the two failures are different bugs and both are
+		# silent. Above the band: the MIS weight is not reaching the emissive hit
+		# and the surface is counted twice again (the +99.7% this task removed).
+		# Below it: energy is being deleted rather than redistributed -- e.g. the
+		# reverse pdf disagreeing with the forward one, which drives the BSDF half
+		# to ~0 without NEE picking the difference up.
+		#
+		# TOLERANCE is 3%: the two passes accumulate independent noise realizations
+		# and sample the emitter by different strategies, so their means differ by
+		# well under a percent here but never by exactly nothing.
+		const ENERGY_TOL := 0.03
+		if absf(rel) > ENERGY_TOL:
+			_failures.append("MIS does not conserve energy: ON is %+.3f%% off OFF (tolerance %.1f%%). %s"
+					% [rel * 100.0, ENERGY_TOL * 100.0,
+					"Above the band means the emissive hit is unweighted (double count)."
+							if rel > 0.0 else "Below it means the weight is deleting energy."])
+		if absf(rel) < 1e-9:
+			_failures.append("the setting made NO difference whatsoever -- suspiciously exact. The NEE block is probably not running at all (stale .glsl.gen.h, or the spec-constant flag never reached the shader)")
 
 	if _failures.is_empty():
 		print("PASS - shaders compiled and the emissive NEE path is live.")

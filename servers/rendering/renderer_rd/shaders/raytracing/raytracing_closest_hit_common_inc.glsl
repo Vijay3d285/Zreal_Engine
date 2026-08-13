@@ -515,11 +515,66 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Environment fog for this ray segment (before surface contribution).
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
 
-	// Emissive contribution.
+	// Emissive contribution, MIS-weighted against emissive NEE (roadmap C1).
 	float clamp_limit = (total_bounces == 0u)
 			? get_rt_param(RT_PARAM_CLAMP_DIRECT)
 			: get_rt_param(RT_PARAM_CLAMP_INDIRECT);
-	ps.radiance += clamp_contribution(ps.throughput * m.emissive, clamp_limit);
+
+	// An emissive surface is reachable by BOTH strategies -- emissive NEE samples
+	// it from the previous vertex, and the BSDF ray traced from that same vertex
+	// can land on it -- so its radiance has to be SPLIT by a pair of weights
+	// summing to 1. Without this every glowing surface is counted twice; the
+	// measured double count on pt_emissive_compile_scene.tscn was +99.7%, and it is
+	// the identical defect B2 fixed for the sky.
+	//
+	// THE OTHER HALF IS emissive_sample()'s `power_heuristic(pdf_omega,
+	// combinedPdf(...))`. The two are built from the same two densities in the same
+	// (solid-angle) measure, swapped, which is what makes them sum to exactly one:
+	//   NEE  : ph(light_pdf, bsdf_pdf)
+	//   here : ph(bsdf_pdf,  light_pdf)
+	//
+	// EVERY PATH OUT OF THE GATE WITH WEIGHT 1.0 IS DELIBERATE, and each is a case
+	// where NEE could not have produced this direction, so there is no second
+	// strategy to share with and weighting down would DELETE energy rather than
+	// redistribute it:
+	//
+	//   - feature off. NEE never ran.
+	//   - ps.mis_ray_pdf <= 0.0, i.e. RT_MIS_PDF_NONE. A camera ray (raygen seeds
+	//     the sentinel), a near-delta specular bounce, or a below-hemisphere
+	//     recovery -- see the mis_ray_pdf assignment at the bottom of this function
+	//     for why each is unreachable by any NEE strategy.
+	//   - slot < 0. Not in the distribution: a non-emitter, or an emitter excluded
+	//     for being DEFORMED or a CUSTOM HIT GROUP (gather_emissive_instances).
+	//     Those exclusions are unbiased ONLY because of this line.
+	//   - light_pdf == 0.0 inside the branch. The instance is an emitter but NEE
+	//     cannot draw THIS direction: back face, degenerate triangle, or a
+	//     primitive past prim_count. power_heuristic(bsdf_pdf, 0) is 1.0, so the
+	//     surface is still lit correctly -- no extra branch needed, and none wanted.
+	//
+	// gl_WorldRayDirectionEXT is the direction FROM the shading point TOWARD this
+	// hit -- the same orientation NEE's own L carries (note V = -gl_WorldRayDirectionEXT
+	// above). emissive_pdf_solid_angle_for_hit() takes that direction rather than a
+	// cosine on purpose: it derives cos_light through emissive_orient_normal(), the
+	// same function emissive_sample() uses, so the forward and reverse densities
+	// cannot disagree about which face emits.
+	//
+	// The slot lookup is INSIDE the gate and carries the `total_power > 0.0`
+	// contract itself (emissive_slot_for_instance): with the feature off,
+	// emissive_slot[] is backed by a 16-byte fallback and reading it is out of
+	// bounds. GLSL's && short-circuits, so RT_GET_EMISSIVE_ENABLED() -- a
+	// specialization constant, folded at compile time -- removes the lookup
+	// entirely from a build with the feature off.
+	float emissive_mis_weight = 1.0;
+	if (RT_GET_EMISSIVE_ENABLED() && ps.mis_ray_pdf > 0.0) {
+		int emissive_slot_index = emissive_slot_for_instance(gl_InstanceCustomIndexEXT);
+		if (emissive_slot_index >= 0) {
+			float emissive_light_pdf = emissive_pdf_solid_angle_for_hit(
+					uint(emissive_slot_index), uint(gl_PrimitiveID),
+					gl_WorldRayDirectionEXT, gl_HitTEXT);
+			emissive_mis_weight = power_heuristic(ps.mis_ray_pdf, emissive_light_pdf);
+		}
+	}
+	ps.radiance += clamp_contribution(ps.throughput * m.emissive * emissive_mis_weight, clamp_limit);
 
 	// Per-lobe limits, matching Cycles: a path stops when the lobe it has been
 	// taking exceeds its own cap, not when every budget is exhausted
@@ -719,10 +774,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// to copy: environment NEE is unconditional, guarded only by env_sample()
 	// returning false.
 	//
-	// The estimator carries its own MIS weight; the matching weight on the BSDF
-	// side -- scaling down the emissive radiance a bounce ray collects when it
-	// lands on an emitter -- is Task 5. Until then emissive surfaces are counted
-	// by both strategies and the image is brighter by design.
+	// The estimator carries its own MIS weight, `power_heuristic(pdf_omega,
+	// combinedPdf(...))`. Its matching half -- scaling down the emissive radiance a
+	// bounce ray collects when it lands on an emitter -- is applied at the emissive
+	// accumulation near the top of this function. The two are the same power
+	// heuristic over the same two densities with the arguments swapped, so they
+	// partition each emissive surface rather than counting it twice.
 	// =================================================================
 	if (RT_GET_EMISSIVE_ENABLED()) {
 		vec3 emissive_direct;
