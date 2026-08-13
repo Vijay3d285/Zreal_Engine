@@ -82,6 +82,43 @@ const ALBEDO := 0.5
 const QUAD_N := 64
 const RECV_N := 7
 
+## MINIMUM EFFECT SIZE FOR THE LIVENESS PROBE. `on < off` alone is a COIN FLIP on
+## an inert build, and that is the exact failure this gate exists to catch.
+##
+## Two renders of the same configuration are not bit-identical here (the OFF side
+## moves in the 5th decimal place run to run), so on a build where the setting
+## never reaches the shader the two spreads differ by a small random amount and
+## the sign of that difference is a fair coin. Both spread probes are computed
+## from the SAME image pair, so they are correlated and the joint pass probability
+## is near 50%, not 25%. Nothing else in the suite covers it: with the feature
+## wholly inert, gate 4's ON equals its OFF equals the prediction and gate 4
+## passes, gate 2 passes, and the RMSE sweep -- which would show it enormously --
+## asserts nothing and exits 0.
+##
+## So the probe demands a MINIMUM RATIO, not merely a sign. The sampling error of
+## a ratio of two standard deviations estimated from n pixels is about 1/sqrt(n)
+## = 0.87% at n = 13225, so 1.05 sits ~5.7 sigma above 1.0 (an inert build fails
+## it deterministically) while the measured ratios of 1.236 and 1.249 clear it by
+## ~20 sigma. Raise this only with a measurement in hand.
+const LIVENESS_MIN_RATIO := 1.05
+
+## Multiplier on the derived standard error for the energy band, and therefore
+## THE DETECTION FLOOR: this gate cannot see an energy regression smaller than
+## SIGMA_MULTIPLIER x the run's own standard error. On gate 1 at 2048 frames that
+## floor is ~0.43%. It is printed at run time so nobody has to work it out.
+##
+## 6 rather than 3, deliberately. The OFF estimator in every scene here is
+## HEAVY-TAILED -- a small emitter found by a BSDF ray once in thousands -- so its
+## Gaussian standard error is a LOWER BOUND on its true uncertainty, and a nominal
+## 3 sigma band computed from an understated sigma is not really 3 sigma. Halving
+## this to 3.0 would halve the detection floor to ~0.22% at the cost of a gate
+## that fails a correct build often enough to be ignored. The consequence is
+## recorded rather than hidden: the -0.284% residual on
+## pt_emissive_compile_scene.tscn (task-6-report.md section 6) is BELOW what this
+## band can resolve, which is why it is carried as an unexplained observation and
+## not as a finding.
+const SIGMA_MULTIPLIER := 6.0
+
 var _res := 192
 var _frames := 2048
 var _failures: Array[String] = []
@@ -176,10 +213,13 @@ func _gate_invariance() -> void:
 	# spectacularly converged pair cannot produce an unmeetable gate, and capped
 	# at 3% so a spectacularly noisy one cannot produce a vacuous one.
 	var se_rel: float = sqrt(off["se"] * off["se"] + on["se"] * on["se"]) / maxf(off["mean"], 1e-9)
-	var tol: float = clampf(6.0 * se_rel, 0.002, 0.03)
+	var tol: float = clampf(SIGMA_MULTIPLIER * se_rel, 0.002, 0.03)
 	var rel: float = (on["mean"] - off["mean"]) / maxf(off["mean"], 1e-9)
 	print("  combined standard error : %.4f%% relative" % (se_rel * 100.0))
-	print("  derived tolerance (6 se, clamped to [0.2%%, 3%%]) : %.3f%%" % (tol * 100.0))
+	print("  derived tolerance (%.0f se, clamped to [0.2%%, 3%%]) : %.3f%%"
+			% [SIGMA_MULTIPLIER, tol * 100.0])
+	print("  DETECTION FLOOR: this gate cannot see an energy regression below")
+	print("                   %.3f%%. See SIGMA_MULTIPLIER for why it is 6 and not 3." % (tol * 100.0))
 	if is_nan(rel) or is_inf(rel):
 		# A NaN passes `> tol` AND `< tol` silently. It has to be caught first.
 		_failures.append("gate 1: relative shift is not a finite number (%f). One of the two means is NaN or the OFF mean is zero." % rel)
@@ -189,14 +229,41 @@ func _gate_invariance() -> void:
 				"Above the band: the emissive hit is not MIS-weighted and the panel is counted twice."
 						if rel > 0.0 else "Below the band: the weight is deleting energy rather than redistributing it."])
 
-	# --- assertion B: the spread falls ---------------------------------------
+	# --- assertion B: the spread falls, BY A MINIMUM AMOUNT -------------------
 	# This is the half that distinguishes a working build from an inert one.
+	#
+	# THE HIGH-PASS NOISE SIGMA IS THE LOAD-BEARING PROBE, and it is the one that
+	# carries the LIVENESS_MIN_RATIO minimum effect size (see that constant for why
+	# a bare `on < off` is a coin flip on an inert build).
+	#
+	# THE RAW STD-DEV CHECK BELOW IT IS WEAK AND IS KNOWN TO BE WEAK, and it is
+	# deliberately NOT given a minimum ratio, because it could not meet one. At
+	# 2048 frames the raw std-dev of this scene is dominated by the room's real
+	# spatial structure rather than by noise, so almost all of it cancels between
+	# the two renders. Three measured margins, in order:
+	#
+	#     0.562422 vs 0.561645  ->  +0.138%
+	#     0.562255 vs 0.561645  ->  +0.109%
+	#     0.561870 vs 0.561642  ->  +0.041%
+	#
+	# All the right sign, none of them large, and the third is inside the
+	# run-to-run wobble of the OFF side. THIS ASSERTION CAN FAIL A CORRECT BUILD.
+	# It is kept because the acceptance criterion names it and because the sign has
+	# been reproducible, NOT because it discriminates -- a build where the setting
+	# never reached the shader would pass it about half the time. The noise sigma
+	# above is what makes such a build fail deterministically. If this one ever
+	# fails while the noise sigma still clears LIVENESS_MIN_RATIO, that is this
+	# statistic being weak and not the feature being broken: read the sigma, and do
+	# not loosen either threshold to make it green.
+	var noise_ratio: float = off["noise"] / maxf(on["noise"], 1e-12)
+	print("  liveness: noise sigma ratio %.3fx, minimum required %.2fx"
+			% [noise_ratio, LIVENESS_MIN_RATIO])
+	if not (noise_ratio > LIVENESS_MIN_RATIO):
+		_failures.append("gate 1 liveness: high-pass noise sigma fell by only %.3fx (OFF %.6f, ON %.6f); %.2fx is required. Equal means alone are also produced by an NEE block that never fires, and a spread that barely moves says the setting never reached the shader (stale .glsl.gen.h) or the NEE block is inert. A bare sign test would have passed this on a coin flip."
+				% [noise_ratio, off["noise"], on["noise"], LIVENESS_MIN_RATIO])
 	if not (on["sd"] < off["sd"]):
-		_failures.append("gate 1 liveness: per-pixel spread did NOT fall (OFF %.6f, ON %.6f). Equal means alone are also produced by an NEE block that never fires; a spread that does not move says the setting never reached the shader (stale .glsl.gen.h) or the NEE block is inert."
+		_failures.append("gate 1 liveness (WEAK PROBE, see the comment above): raw per-pixel std-dev did not fall (OFF %.6f, ON %.6f). Check the noise sigma before treating this as a defect -- at 2048 frames the raw std-dev of this scene is signal-dominated and its margin is ~0.1%%."
 				% [off["sd"], on["sd"]])
-	if not (on["noise"] < off["noise"]):
-		_failures.append("gate 1 liveness: high-pass noise sigma did NOT fall (OFF %.6f, ON %.6f)."
-				% [off["noise"], on["noise"]])
 
 
 # ---------------------------------------------------------------------------

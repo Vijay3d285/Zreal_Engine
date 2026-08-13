@@ -36,6 +36,27 @@ extends "res://tests/pt_validation.gd"
 const SETTING := "rendering/pathtracer/emissive_mesh_lights"
 const ALBEDO := 0.5
 
+## MINIMUM EFFECT SIZE FOR THE LIVENESS PROBE. `on < off` alone is a COIN FLIP on
+## a build where the setting never reaches the shader: two renders of the same
+## configuration are not bit-identical, so the two spreads differ by a small
+## random amount and the sign is a fair coin. See the same constant in
+## pt_emissive_gate.gd for the full argument. Both spreads here clear this by an
+## enormous margin (measured 12.3x on the raw std-dev and 62x on the noise sigma
+## at 2048 frames), so the threshold costs nothing and closes the hole.
+const LIVENESS_MIN_RATIO := 1.05
+
+## Multiplier on the derived standard error for the energy band, and therefore
+## THE DETECTION FLOOR: this probe cannot see an energy shift smaller than
+## SIGMA_MULTIPLIER x the run's own standard error, which is ~0.69% at
+## ZR_EMI_FRAMES=2048. 6 rather than 3 because the OFF estimator here is
+## heavy-tailed -- a 0.6 m emitter at 5 m found by roughly one BSDF ray in
+## thousands -- so its Gaussian standard error is a LOWER BOUND on its true
+## uncertainty and a nominal 3 sigma band computed from an understated sigma is
+## not really 3 sigma. The consequence is recorded rather than hidden: this
+## scene's persistent -0.284% residual is BELOW what this band resolves, which is
+## exactly why task-6-report.md carries it as an unexplained observation.
+const SIGMA_MULTIPLIER := 6.0
+
 var _res := 192
 var _frames := 64
 var _failures: Array[String] = []
@@ -95,9 +116,11 @@ func _ready() -> void:
 		# reverse pdf disagreeing with the forward one, which drives the BSDF half
 		# to ~0 without NEE picking the difference up.
 		var se_rel: float = sqrt(off["se"] * off["se"] + on["se"] * on["se"]) / maxf(off["mean"], 1e-9)
-		var tol: float = clampf(6.0 * se_rel, 0.002, 0.03)
+		var tol: float = clampf(SIGMA_MULTIPLIER * se_rel, 0.002, 0.03)
 		print("  combined standard error : %.4f%% relative" % (se_rel * 100.0))
-		print("  derived band (6 se, clamped to [0.2%%, 3%%]) : %.3f%%" % (tol * 100.0))
+		print("  derived band (%.0f se, clamped to [0.2%%, 3%%]) : %.3f%%"
+				% [SIGMA_MULTIPLIER, tol * 100.0])
+		print("  DETECTION FLOOR: this probe cannot see an energy shift below %.3f%%." % (tol * 100.0))
 		# A NaN satisfies `> tol` AND `< tol`, so it passes every bound silently.
 		# It has to be rejected before either comparison, not after.
 		if is_nan(rel) or is_inf(rel):
@@ -114,9 +137,20 @@ func _ready() -> void:
 		# one. The old `absf(rel) < 1e-9` check was four orders of magnitude below
 		# the live delta (0.26%) and would have passed an entirely dead feature
 		# whose two passes happened to differ by any noise at all.
-		if not (on["sd"] < off["sd"]):
-			_failures.append("liveness: per-pixel spread did not fall (OFF %.6f, ON %.6f). The NEE block is probably not running at all (stale .glsl.gen.h, or the spec-constant flag never reached the shader)"
-					% [off["sd"], on["sd"]])
+		#
+		# A MINIMUM RATIO, not a sign test: see LIVENESS_MIN_RATIO. Both spreads
+		# clear it by 12.3x and 62x here, so this costs nothing and it is the only
+		# thing standing between "the setting never reached the shader" and a PASS.
+		var sd_ratio: float = off["sd"] / maxf(on["sd"], 1e-12)
+		var noise_ratio: float = off["noise"] / maxf(on["noise"], 1e-12)
+		print("  liveness: std-dev ratio %.3fx, noise sigma ratio %.3fx, minimum required %.2fx"
+				% [sd_ratio, noise_ratio, LIVENESS_MIN_RATIO])
+		if not (sd_ratio > LIVENESS_MIN_RATIO):
+			_failures.append("liveness: per-pixel spread fell by only %.3fx (OFF %.6f, ON %.6f); %.2fx is required. The NEE block is probably not running at all (stale .glsl.gen.h, or the spec-constant flag never reached the shader). A bare sign test would have passed this on a coin flip."
+					% [sd_ratio, off["sd"], on["sd"], LIVENESS_MIN_RATIO])
+		if not (noise_ratio > LIVENESS_MIN_RATIO):
+			_failures.append("liveness: high-pass noise sigma fell by only %.3fx (OFF %.6f, ON %.6f); %.2fx is required."
+					% [noise_ratio, off["noise"], on["noise"], LIVENESS_MIN_RATIO])
 
 	if _failures.is_empty():
 		print("PASS - shaders compiled and the emissive NEE path is live.")

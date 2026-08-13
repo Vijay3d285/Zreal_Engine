@@ -541,11 +541,15 @@ panel, and 51-70× on samples / 35-68× equal-time for a 0.25 m panel of the sam
 total power**,* at a frame-time cost of **+9.0% to +15.2%** across three
 interleaved runs (192×192, RTX A4000; the spread is thermal, see the report).
 Energy is neutral where it must be: converged means agree to **−0.021%** against a
-0.43% band derived from the run's own standard error, and the absolute
-brightness matches a closed-form irradiance integral to **−0.019%** (small distant
-emitter) and **−0.009%** (large near emitter). The Cycles half of the original
-accept criterion is **not** met — there is still no Cycles reference EXR in this
-project, for C1 or for anything else.
+0.43% band derived from the run's own standard error, and the absolute brightness
+matches **an exact numerical quadrature of the same irradiance integral** to
+**−0.019%** (small distant emitter) and **−0.009%** (large near emitter). *Those
+figures are against the quadrature, not against the small-patch closed form* —
+against the closed form the same measurement reads −0.883%, and the −0.865%
+difference is the approximation itself, not the renderer. Both are asserted at 2%
+and both pass; conflating them would overstate the precision by 46×. The Cycles
+half of the original accept criterion is **not** met — there is still no Cycles
+reference EXR in this project, for C1 or for anything else.
 
 **The BSDF half is measured, not assumed.** On a small distant emitter
 `pdf_light/pdf_bsdf ≈ 34`, so `w_bsdf ≈ 0.001` and the image is NEE-only whether
@@ -566,6 +570,20 @@ which re-stratifies every bounce in every scene) is measured separately** agains
 i.e. no movement at all.
 
 *Open items carried out of C1:*
+- **OPEN (unexplained): a persistent −0.284% ON-vs-OFF residual on
+  `pt_emissive_compile_scene.tscn`.** Three consecutive measurements on that scene
+  have come back negative (−0.257% at 256 frames in Task 5, −0.284% at 2048 in
+  Task 6), roughly 2.5σ and **below the 0.69% detection floor of that probe's own
+  derived band**, so it passes. It is *not* reproduced on any of the three gate
+  scenes (−0.021%, and −0.019% / −0.009% against an exact quadrature, which are
+  absolute checks rather than A/B comparisons and so are the stronger constraint).
+  The most likely reading is that the heavy-tailed OFF estimator lands low and its
+  Gaussian standard error understates its own uncertainty — gate 2 shows the same
+  sign pattern where the truth is known independently. **This is a hypothesis, not
+  a diagnosis.** The one structural difference between that scene and the gates is
+  that its emitter is a `BoxMesh` (12 triangles of very unequal area, most
+  back-facing or self-occluded) where the gates use a `QuadMesh` with two equal
+  triangles. Full argument in `task-6-report.md` §6.
 - **The fixture double-representation in `pipeline_references/image_glb_creation.gd`
   is documented and NOT fixed** (design spec §2.1). Night renders make each light
   fixture's bulb surface emissive *and* create an `OmniLight3D`/`SpotLight3D` at
@@ -680,6 +698,9 @@ on samples and 4.8-6.9× equal-time.*** Full numbers and method in
 > figure taken there means nothing. Use `pt_sky_rmse_scene.tscn`.
 
 **OPEN: +2.4% converged-mean shift on dielectric specular surfaces.**
+*(B2's defect, measured here — see the attribution note in §6. The mechanism is
+B2's `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch; C3 is where the numbers
+were taken, not where the bug is.)*
 A fully converged render (65536 frames) is 2.38% brighter with environment NEE
 than without it. Pinned to `COMBINE_BRDFS_WITH_FRESNEL` (`brdf_inc.glsl:158`,
 value 1): the sampler attenuates the diffuse lobe by `1 - F(V·H_random)` with
@@ -819,24 +840,35 @@ running it.
 
 **Phase C is complete** — C1, C2 and C3 have all landed. As with Phase B,
 "complete" means every listed item is implemented and measured; it does **not**
-mean the phase is free of known defects. C3's **+2.4% converged-mean shift on
-dielectric specular surfaces** and its `SKY_MODE_LIGHT_AND_SKY` double count are
+mean the phase is free of known defects. The **+2.4% converged-mean shift on
+dielectric specular surfaces** and the `SKY_MODE_LIGHT_AND_SKY` double count are
 both still open, and C1's open items — chief among them the **fixture
 double-representation in `image_glb_creation.gd`**, which would materially
 brighten night renders if the setting were enabled without a pipeline change —
 are recorded in the C1 entry. **C1 ships default off.**
 
+**One attribution, stated once so the rest of this document can point at it.** The
++2.4% dielectric-specular shift is **B2's defect, recorded under C3**: the
+mechanism is the `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch that B2's
+environment MIS introduced (`brdf_inc.glsl:158`), and it was *measured* during C3,
+which is why the numbers live in the C3 entry. It is not a C3 defect and it is not
+two separate items. Earlier revisions of this section called it "C3's", which
+would send someone to the wrong code.
+
 - **C1**: emissive-mesh NEE with MIS, 3.2-4.1× equal-time on a 2.0 m panel and
   35-68× on a 0.25 m panel of the same power, for +9-15% frame time; converged
-  means neutral to −0.021% and absolute brightness within 0.02% of a closed-form
-  irradiance integral, including a configuration where the BSDF half carries 56%
-  of the energy.
+  means neutral to −0.021% and absolute brightness within 0.02% of **an exact
+  numerical quadrature** of the same irradiance integral (−0.883% against the
+  small-patch closed form; the difference is the approximation, see the C1 entry),
+  including a configuration where the BSDF half carries 56% of the energy. One
+  unexplained open item: a persistent −0.284% residual on the Tasks 4/5 scene,
+  below that probe's own detection floor and not reproduced on the gate scenes.
 - **C2**: power-weighted CDF selection with an exact pdf, 9.8-16.5× equal-time on
   a power-concentrated scene for +50.8% frame time; see the C2 entry, including
   the correction to the spec's bias claim and two open items (the cosine is
   excluded from the weight; no rendered coverage of spot/rect/directional).
-- **C3**: environment importance sampling, 4.8-6.9× equal-time, with the +2.4%
-  dielectric-specular shift open.
+- **C3**: environment importance sampling, 4.8-6.9× equal-time, with B2's +2.4%
+  dielectric-specular shift open and measured here.
 
 **MIS weights now cover both strategies that can reach the same direction: the
 environment (B2) and emissive meshes (C1). Analytic lights are a different case
