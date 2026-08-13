@@ -129,6 +129,13 @@ private:
 	RID slot_buffer;
 	uint32_t slot_buffer_capacity = 0; // Bytes; grow-only.
 
+	// Bound at binding 3 and never read by the shader. Its only job is to be the
+	// far end of a tracked dependency chain -- see ORDERING_SCRATCH_BYTES and the
+	// long comment in update(). 16 bytes because that is the smallest allocation
+	// the RD backend will make; only the first 4 are ever written.
+	RID ordering_scratch_buffer;
+	static constexpr uint32_t ORDERING_SCRATCH_BYTES = 16;
+
 	RID shader;
 	RID pipeline;
 	bool dirty = true;
@@ -156,8 +163,17 @@ public:
 
 	// p_geometry_buffer is the existing RT geometry SSBO; the compute pass reads
 	// vertex data through the BDA pointers inside it.
+	//
+	// p_ordering_src_buffers is the set of per-frame-baked vertex buffers the
+	// build will read through those BDA pointers -- in practice the active merged
+	// MultiMesh vertex buffers. They are NOT read by this class; four bytes are
+	// copied out of each one purely to create a render-graph edge that orders this
+	// build after whatever rebaked them. See the comment in update(); passing an
+	// empty list is correct when there is nothing per-frame-baked to order
+	// against, and silently dropping a buffer that IS reintroduces the race.
 	void update(const LocalVector<InstanceInput> &p_instances, RID p_geometry_buffer,
-			const LocalVector<int32_t> &p_slot_table, uint64_t p_token);
+			const LocalVector<int32_t> &p_slot_table, uint64_t p_token,
+			const LocalVector<RID> &p_ordering_src_buffers);
 
 	RID get_instance_buffer() const { return instance_buffer; }
 	RID get_cdf_buffer() const { return cdf_buffer; }

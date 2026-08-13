@@ -440,6 +440,12 @@ class RenderRaytracing {
 	bool emissive_active = false;
 	LocalVector<RendererRD::EmissiveLights::InstanceInput> emissive_inputs;
 	LocalVector<int32_t> emissive_slots;
+	/// Per-frame-baked vertex buffers the emissive build reads via BDA, handed to
+	/// EmissiveLights::update() so it can manufacture a render-graph edge against
+	/// whatever rebaked them. These are the merged MultiMesh vertex buffers; the
+	/// graph cannot see a BDA read, so without this the area pass has no declared
+	/// ordering against multimesh_merge.glsl. Not read by us.
+	LocalVector<RID> emissive_ordering_srcs;
 
 	// Stand-in bound at set 0 bindings 35-37 when emissive-mesh lights are off (or
 	// the distribution has not been built yet). Same reasoning as

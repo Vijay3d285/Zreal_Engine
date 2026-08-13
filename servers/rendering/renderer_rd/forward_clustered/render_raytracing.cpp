@@ -2781,8 +2781,28 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	if (emissive_active) {
 		uint64_t emissive_token = 0;
 		gather_emissive_instances(emissive_inputs, emissive_slots, emissive_token);
+
+		// Collect the vertex buffers that were BAKED THIS FRAME and that the area
+		// pass will read through the BDA pointers in RT_GeometryData. The graph
+		// cannot see a BDA read, so EmissiveLights manufactures an ordering edge
+		// from these (see the chain comment in EmissiveLights::update); handing it
+		// an incomplete list silently reintroduces the race it exists to prevent.
+		//
+		// Only the merged MultiMesh path qualifies: static mesh vertex buffers are
+		// uploaded once through the transfer worker and never rewritten, and
+		// deformed surfaces are excluded from the distribution entirely by
+		// gather_emissive_instances(), so neither can be mid-write here.
+		emissive_ordering_srcs.clear();
+		for (uint32_t i = 0; i < merged_mm_active_this_frame.size(); i++) {
+			RTMergedMMEntry *e = merged_mm_pool.get_or_null(merged_mm_active_this_frame[i]);
+			if (e && e->merged_vtx_buffer.is_valid()) {
+				emissive_ordering_srcs.push_back(e->merged_vtx_buffer);
+			}
+		}
+
 		emissive_lights.mark_dirty_if_token_changed(emissive_token);
-		emissive_lights.update(emissive_inputs, state->geometry_buffer, emissive_slots, emissive_token);
+		emissive_lights.update(emissive_inputs, state->geometry_buffer, emissive_slots,
+				emissive_token, emissive_ordering_srcs);
 	}
 
 	return state;

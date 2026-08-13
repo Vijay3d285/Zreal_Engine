@@ -63,6 +63,42 @@ layout(set = 0, binding = 2, std430) readonly buffer Geometries {
 	GeometryData geometries[];
 };
 
+// ORDERING SCRATCH -- DECLARED ON PURPOSE, NEVER READ. DO NOT DELETE.
+//
+// This block exists solely to give the render graph a dependency it cannot
+// otherwise see. MODE_AREA's real vertex reads go through the buffer-device
+// addresses inside GeometryData (rt_fetch_vertex_position), and a BDA read is
+// invisible to the graph's resource tracking -- it tracks what a uniform set
+// DECLARES, not what a shader dereferences. So without this, nothing orders this
+// pass against multimesh_merge.glsl, which rebakes a merged MultiMesh's vertex
+// buffer in the same frame.
+//
+// The C++ side (EmissiveLights::update) copies four meaningless bytes out of
+// every active merged vertex buffer into the buffer bound here, immediately
+// before this dispatch, forming a chain of TRACKED accesses:
+//
+//     merge dispatch (STORAGE_BUFFER_READ_WRITE, so SHADER_WRITE)
+//         -> buffer copy (COPY_FROM on the merged buffer, COPY_TO on this one)
+//             -> this dispatch (STORAGE_BUFFER_READ on this one, SHADER_READ)
+//
+// Each link is a real read-after-write the graph resolves into a level ordering
+// plus a barrier (rendering_device_graph.cpp:580-582 pushes a GLOBAL memory
+// barrier alongside the per-buffer one, and a global VkMemoryBarrier is not
+// scoped to a buffer, which is what makes the BDA read safe).
+//
+// The bytes copied in are garbage and are never looked at. Reading from this
+// block would not make it more correct, only slower. But DELETING it -- or the
+// copy, or the binding -- silently removes the ordering, and the symptom is a
+// wrong total_area computed from half-written vertices and then frozen into the
+// distribution for an entire accumulated still render.
+layout(set = 0, binding = 3, std430) restrict readonly buffer OrderingScratch {
+	// Runtime-sized deliberately: it makes the reflected block length 0, which is
+	// what lets uniform_set_create accept a buffer of any size here
+	// (rendering_device.cpp:4781, "If 0, then it's sized on link time").
+	uint _never_read[];
+}
+ordering_scratch;
+
 layout(push_constant, std430) uniform Params {
 	uint mode;
 	uint count;

@@ -54,6 +54,9 @@ void EmissiveLights::free_resources() {
 		if (slot_buffer.is_valid()) {
 			rd->free_rid(slot_buffer);
 		}
+		if (ordering_scratch_buffer.is_valid()) {
+			rd->free_rid(ordering_scratch_buffer);
+		}
 		// `shader` is owned by the version, not by us; version_free releases both.
 		// It drives RenderingDevice internally, so it belongs inside this guard
 		// alongside the free_rid calls above.
@@ -65,6 +68,7 @@ void EmissiveLights::free_resources() {
 	instance_buffer = RID();
 	cdf_buffer = RID();
 	slot_buffer = RID();
+	ordering_scratch_buffer = RID();
 	slot_buffer_capacity = 0;
 	version = RID();
 	shader = RID();
@@ -106,7 +110,8 @@ bool EmissiveLights::_ensure_shader() {
 }
 
 void EmissiveLights::update(const LocalVector<InstanceInput> &p_instances, RID p_geometry_buffer,
-		const LocalVector<int32_t> &p_slot_table, uint64_t p_token) {
+		const LocalVector<int32_t> &p_slot_table, uint64_t p_token,
+		const LocalVector<RID> &p_ordering_src_buffers) {
 	RD *rd = RD::get_singleton();
 	ERR_FAIL_NULL(rd);
 
@@ -124,6 +129,12 @@ void EmissiveLights::update(const LocalVector<InstanceInput> &p_instances, RID p
 		ERR_FAIL_COND_MSG(!cdf_buffer.is_valid(), "EmissiveLights: Failed to create the CDF buffer.");
 		rd->set_resource_name(cdf_buffer, "RT Emissive CDF Buffer");
 		rd->buffer_clear(cdf_buffer, 0, CDF_BUFFER_BYTES);
+	}
+	if (!ordering_scratch_buffer.is_valid()) {
+		ordering_scratch_buffer = rd->storage_buffer_create(ORDERING_SCRATCH_BYTES);
+		ERR_FAIL_COND_MSG(!ordering_scratch_buffer.is_valid(), "EmissiveLights: Failed to create the ordering scratch buffer.");
+		rd->set_resource_name(ordering_scratch_buffer, "RT Emissive Ordering Scratch");
+		rd->buffer_clear(ordering_scratch_buffer, 0, ORDERING_SCRATCH_BYTES);
 	}
 	// The slot table is indexed by gl_InstanceCustomIndex, so it is sized by the
 	// FULL instance count. A minimum of one entry keeps the binding valid for an
@@ -195,6 +206,60 @@ void EmissiveLights::update(const LocalVector<InstanceInput> &p_instances, RID p
 		rd->buffer_update(slot_buffer, 0, p_slot_table.size() * sizeof(int32_t), p_slot_table.ptr());
 	}
 
+	// ---------------------------------------------------------------------
+	// ORDERING CHAIN -- NOT AN OPTIMISATION, AND NOT REMOVABLE.
+	// ---------------------------------------------------------------------
+	// The dispatch below reads vertex positions through the buffer-device
+	// addresses stored in GeometryData. The render graph tracks what a uniform set
+	// DECLARES, not what a shader dereferences through a raw pointer, so those
+	// reads are invisible to it: nothing would order this build against
+	// multimesh_merge.glsl, which rebakes a merged MultiMesh's vertex buffer
+	// earlier in the very same frame. Recording order does not help --
+	// RENDER_GRAPH_REORDER is on (rendering_device.cpp:145, :8233) and commands
+	// sort by (level, priority, index) with `index` only an intra-level tiebreak
+	// that inserts no barrier (rendering_device_graph.h:317-331).
+	//
+	// So we manufacture the edge out of four meaningless bytes. For each
+	// per-frame-baked buffer the build will touch via BDA, copy 4 bytes into our
+	// scratch buffer. buffer_copy registers BOTH endpoints with the graph --
+	// `trackers = { dst, src }`, `usages = { COPY_TO, COPY_FROM }`
+	// (rendering_device_graph.cpp, add_buffer_copy) -- and the scratch buffer is
+	// then bound to the dispatch as a readonly storage buffer. That gives:
+	//
+	//   merge dispatch   STORAGE_BUFFER_READ_WRITE -> SHADER_READ|SHADER_WRITE
+	//     -> buffer copy COPY_FROM (merged) / COPY_TO (scratch)
+	//       -> dispatch  STORAGE_BUFFER_READ on scratch -> SHADER_READ
+	//
+	// Two real read-after-writes, so the graph gives us both the level ordering
+	// and the barriers. The second transition is COPY_WRITE -> SHADER_READ
+	// (_usage_to_access_bits), and those bits also land in a GLOBAL memory barrier
+	// (rendering_device_graph.cpp:580-582, "Memory barriers are pushed regardless
+	// of buffer barriers being used or not", grouped per level at :1382-1383). A
+	// global VkMemoryBarrier is not scoped to a buffer, which is precisely what
+	// makes the merge's write visible to our BDA read.
+	//
+	// The copied bytes are garbage and are never read, by design. Deleting this
+	// loop, the binding, or the block in emissive_area_build.glsl silently removes
+	// the ordering; the symptom is a total_area computed from half-written
+	// vertices and then frozen into the distribution for an entire accumulated
+	// still render, which is exactly the class of bug that does not reproduce on
+	// demand. Runs only on rebuild frames -- everything above returns early when
+	// the token is unchanged.
+	//
+	// buffer_copy is forbidden while a compute list is open, and the scratch
+	// buffer only gains its graph tracker when it is first used as a copy
+	// destination, so these copies must come before BOTH uniform_set_create and
+	// compute_list_begin. Do not move them.
+	for (uint32_t i = 0; i < p_ordering_src_buffers.size(); i++) {
+		const RID src = p_ordering_src_buffers[i];
+		if (src.is_valid()) {
+			// Always to offset 0: successive copies write-after-write the same four
+			// bytes, which serialises them behind each other. That is harmless at
+			// this size and keeps the scratch buffer a fixed 16 bytes.
+			rd->buffer_copy(src, ordering_scratch_buffer, 0, 0, sizeof(uint32_t));
+		}
+	}
+
 	Vector<RD::Uniform> uniforms;
 	{
 		RD::Uniform u;
@@ -215,6 +280,18 @@ void EmissiveLights::update(const LocalVector<InstanceInput> &p_instances, RID p
 		u.binding = 2;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		u.append_id(p_geometry_buffer);
+		uniforms.push_back(u);
+	}
+	{
+		// Binding 3 is the ordering scratch. The shader declares it and never reads
+		// it; this binding is the last link of the chain built just above, and it
+		// is what turns the copies into a dependency the graph can see. It is not
+		// dead code -- see the comment on the copy loop and the matching one in
+		// emissive_area_build.glsl before removing it.
+		RD::Uniform u;
+		u.binding = 3;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(ordering_scratch_buffer);
 		uniforms.push_back(u);
 	}
 
