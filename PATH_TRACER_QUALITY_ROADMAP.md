@@ -584,6 +584,12 @@ i.e. no movement at all.
   that its emitter is a `BoxMesh` (12 triangles of very unequal area, most
   back-facing or self-occluded) where the gates use a `QuadMesh` with two equal
   triangles. Full argument in `task-6-report.md` §6.
+  **Ruled out as candidate causes: the alpha-tested and front-culled emitter
+  exclusions added in the C1 final fix wave.** Both defects made NEE emit light a
+  BSDF ray could not reach, so both read **positive** on an ON-vs-OFF comparison —
+  the wrong sign to explain a negative residual — and neither applies to this
+  scene anyway (its `BoxMesh` emitter is opaque and back-culled). Do not re-derive
+  this.
 - **The fixture double-representation in `pipeline_references/image_glb_creation.gd`
   is documented and NOT fixed** (design spec §2.1). Night renders make each light
   fixture's bulb surface emissive *and* create an `OmniLight3D`/`SpotLight3D` at

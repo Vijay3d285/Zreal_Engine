@@ -709,12 +709,18 @@ static float mirror_pdf_solid_angle(float p_prob_inst, uint32_t p_prim_count,
 TEST_CASE("[PathTracer][Emissive] the area pdf composes and normalises") {
 	// Two instances, 4 and 1 triangles, all of unit area. Summing
 	// P(inst) * P(tri|inst) * area over every triangle must give exactly 1.
+	//
+	// The area density is recovered THROUGH mirror_pdf_solid_angle() rather than
+	// re-derived inline: at cos_light == 1 and dist == 1 the solid-angle conversion
+	// factor (d^2 / cos) is exactly 1, so the function returns pdf_A itself. Written
+	// with the formula spelled out here instead, this test would only have checked
+	// its own arithmetic and would have passed against any implementation at all.
 	const float probs[2] = { 0.3f, 0.7f };
 	const uint32_t prims[2] = { 4, 1 };
 	float total = 0.0f;
 	for (int i = 0; i < 2; i++) {
 		for (uint32_t t = 0; t < prims[i]; t++) {
-			const float pdf_a = probs[i] * (1.0f / float(prims[i])) * (1.0f / 1.0f);
+			const float pdf_a = mirror_pdf_solid_angle(probs[i], prims[i], 1.0f, 1.0f, 1.0f);
 			total += pdf_a * 1.0f; // integrate the density over the triangle's area
 		}
 	}
@@ -1169,6 +1175,12 @@ TEST_CASE("[PathTracer][Emissive] the weight is the POWER heuristic, not the bal
 	// beta = 2 is pinned against a closed form at a point where the two differ:
 	//   power   : 2^2 / (2^2 + 1^2) = 4/5 = 0.8
 	//   balance : 2   / (2   + 1)   = 2/3 = 0.6667
+	//
+	// AND THIS IS THE ONLY PLACE beta CAN BE PINNED -- no rendered gate can do it,
+	// and gate 4 must not be mistaken for one. Both heuristics partition to exactly
+	// 1, so both give the SAME converged mean; only the variance differs, and only
+	// gate 4's predicted w_bsdf would move. beta is a variance choice here, not a
+	// correctness one, which is precisely why it needs a unit assertion.
 	CHECK(mirror_power_heuristic(2.0f, 1.0f) == doctest::Approx(0.8f));
 	CHECK(mirror_power_heuristic(2.0f, 1.0f) != doctest::Approx(2.0f / 3.0f));
 

@@ -158,8 +158,27 @@ func _ready() -> void:
 		await _gate_nearfield()
 
 	print("\n=== RESULT ===")
+
+	# A PARTIAL RUN MUST NOT BE ABLE TO PRINT A PASS. LIVENESS_MIN_RATIO -- the one
+	# assertion in this suite that an inert build (NEE never firing) fails
+	# deterministically -- lives in gate 1 alone. Every other assertion here is an
+	# equality between two unbiased estimators of the same integral, which an
+	# emissive NEE block that never runs satisfies perfectly. So
+	# `ZR_EMIS_GATE_MODE=analytic` or `=nearfield` on a wholly dead build would
+	# otherwise print "PASS" and exit 0.
+	#
+	# This project has already shipped one gate that could not fail (C3), and the
+	# two commits before this one exist to close that class of hole. Do not reopen
+	# it: a green light is only ever available from mode=all.
+	if mode != "all":
+		print("\n*** PARTIAL RUN (mode=%s). This is NOT a pass of the C1 gate suite:" % mode)
+		print("    the liveness probe lives in gate 1 and did not run. ***")
+
 	if _failures.is_empty():
-		print("PASS - emissive-mesh light gates green.")
+		if mode == "all":
+			print("PASS - emissive-mesh light gates green.")
+		else:
+			print("No failures in the gates that ran (mode=%s) - INCONCLUSIVE, not a pass." % mode)
 		get_tree().quit(0)
 	else:
 		for f in _failures:
