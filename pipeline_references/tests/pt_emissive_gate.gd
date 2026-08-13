@@ -178,6 +178,13 @@ func _ready() -> void:
 ## with exactly that hole and only a variance probe caught it. So the per-pixel
 ## spread is asserted too, and it is the half of this gate that proves the two
 ## renders were not the same render twice.
+##
+## The spread assertion is on the HIGH-PASS NOISE SIGMA, with a minimum effect
+## size (LIVENESS_MIN_RATIO). The RAW per-pixel std-dev is printed as a diagnostic
+## and deliberately not asserted: at these frame counts it is dominated by the
+## room's spatial structure rather than by sampling noise, so it would both fail
+## correct builds and pass inert ones. The reasoning and the three measured
+## margins are at the assertion itself.
 func _gate_invariance() -> void:
 	var half := 1.0 # 2.0 m quad
 	var height := 3.5
@@ -236,34 +243,42 @@ func _gate_invariance() -> void:
 	# carries the LIVENESS_MIN_RATIO minimum effect size (see that constant for why
 	# a bare `on < off` is a coin flip on an inert build).
 	#
-	# THE RAW STD-DEV CHECK BELOW IT IS WEAK AND IS KNOWN TO BE WEAK, and it is
-	# deliberately NOT given a minimum ratio, because it could not meet one. At
-	# 2048 frames the raw std-dev of this scene is dominated by the room's real
-	# spatial structure rather than by noise, so almost all of it cancels between
-	# the two renders. Three measured margins, in order:
+	# THE RAW STD-DEV IS PRINTED AS A DIAGNOSTIC AND IS DELIBERATELY NOT ASSERTED.
+	# This is a controller ruling, and the evidence for it is below so no future
+	# reader has to rediscover it. Three measured margins on correct builds, in
+	# order:
 	#
 	#     0.562422 vs 0.561645  ->  +0.138%
 	#     0.562255 vs 0.561645  ->  +0.109%
 	#     0.561870 vs 0.561642  ->  +0.041%
 	#
-	# All the right sign, none of them large, and the third is inside the
-	# run-to-run wobble of the OFF side. THIS ASSERTION CAN FAIL A CORRECT BUILD.
-	# It is kept because the acceptance criterion names it and because the sign has
-	# been reproducible, NOT because it discriminates -- a build where the setting
-	# never reached the shader would pass it about half the time. The noise sigma
-	# above is what makes such a build fail deterministically. If this one ever
-	# fails while the noise sigma still clears LIVENESS_MIN_RATIO, that is this
-	# statistic being weak and not the feature being broken: read the sigma, and do
-	# not loosen either threshold to make it green.
+	# All the right sign, all tiny, and the third is inside the OFF side's own
+	# run-to-run wobble. At 2048 frames the raw std-dev of this scene is dominated
+	# by the ROOM'S SPATIAL STRUCTURE rather than by sampling noise, so almost all
+	# of it cancels between the two renders and what is left is not really the
+	# quantity anyone wanted measured. An assertion on it would have both failure
+	# modes at once: it can FAIL A CORRECT BUILD, and it would PASS AN INERT ONE
+	# about half the time. That profile does not survive contact with a future
+	# engineer -- the first flake gets it deleted or widened, and the real probe
+	# sitting beside it tends to follow. That is close to how C3's hole came about.
+	#
+	# The acceptance criterion's intent ("per-pixel spread is strictly lower with
+	# the feature on") is kept, and asserted, on the HIGH-PASS NOISE SIGMA: the same
+	# quantity estimated with the scene's spatial structure removed, and now with a
+	# minimum effect size. That is the sounder estimator, not a weaker one.
 	var noise_ratio: float = off["noise"] / maxf(on["noise"], 1e-12)
-	print("  liveness: noise sigma ratio %.3fx, minimum required %.2fx"
-			% [noise_ratio, LIVENESS_MIN_RATIO])
+	var sd_ratio: float = off["sd"] / maxf(on["sd"], 1e-12)
+	print("  LIVENESS (asserted): noise sigma %.6f -> %.6f, ratio %.3fx, minimum required %.2fx"
+			% [off["noise"], on["noise"], noise_ratio, LIVENESS_MIN_RATIO])
+	print("  diagnostic (NOT asserted): raw std-dev %.6f -> %.6f, ratio %.3fx"
+			% [off["sd"], on["sd"], sd_ratio])
+	print("      signal-dominated at high frame counts -- at %d frames most of this" % _frames)
+	print("      statistic is the room, not the sampling noise, so it neither fails")
+	print("      an inert build nor reliably passes a correct one. See the comment")
+	print("      at this assertion for the three measured margins behind that.")
 	if not (noise_ratio > LIVENESS_MIN_RATIO):
 		_failures.append("gate 1 liveness: high-pass noise sigma fell by only %.3fx (OFF %.6f, ON %.6f); %.2fx is required. Equal means alone are also produced by an NEE block that never fires, and a spread that barely moves says the setting never reached the shader (stale .glsl.gen.h) or the NEE block is inert. A bare sign test would have passed this on a coin flip."
 				% [noise_ratio, off["noise"], on["noise"], LIVENESS_MIN_RATIO])
-	if not (on["sd"] < off["sd"]):
-		_failures.append("gate 1 liveness (WEAK PROBE, see the comment above): raw per-pixel std-dev did not fall (OFF %.6f, ON %.6f). Check the noise sigma before treating this as a defect -- at 2048 frames the raw std-dev of this scene is signal-dominated and its margin is ~0.1%%."
-				% [off["sd"], on["sd"]])
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +475,17 @@ func _pass(p_env: Environment, p_on: bool, p_lo: float, p_hi: float) -> Dictiona
 	s["noise"] = _noise_sigma_crop(img, p_lo, p_hi)
 	s["se"] = s["noise"] / sqrt(float(maxi(s["n"], 1)))
 	s["ms"] = float(dt) / float(_frames)
-	if s["sd"] <= 1e-9:
+	# DEGENERACY GUARD, not the liveness comparison. It catches a constant image --
+	# a cleared accumulator, a failed readback that returned zeros, a render that
+	# never ran -- rather than comparing the two configurations.
+	#
+	# It is phrased on the HIGH-PASS NOISE SIGMA and not on the raw std-dev, so
+	# that NO pass/fail verdict anywhere in this file depends on the raw figure
+	# (see the block at gate 1's liveness assertion for why it was demoted). This
+	# loses nothing: a constant image has zero spread by either measure, and the
+	# smallest noise sigma ever observed on a live render here is 2.4e-5, five
+	# orders of magnitude above this threshold.
+	if s["noise"] <= 1e-9:
 		_failures.append("zero per-pixel spread with the setting %s - nothing stochastic is running"
 				% ("ON" if p_on else "OFF"))
 	return s
