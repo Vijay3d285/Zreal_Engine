@@ -2220,6 +2220,15 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 }
 
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
+	// This frame's read of the emissive-mesh feature flag, taken BEFORE any early
+	// return. update_uniform_set() picks the emissive bindings from it (see the
+	// binding 35-37 block), and the emissive build below only runs on the fully
+	// successful path -- so if this were assigned down there, an early return would
+	// leave LAST frame's value driving this frame's binding choice. It is only ever
+	// benign (emissive_lights.is_valid() and the total_power gate both cover it),
+	// but the reasoning step should not have to exist.
+	emissive_active = GLOBAL_GET("rendering/pathtracer/emissive_mesh_lights");
+
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
 	}
@@ -2777,7 +2786,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	//
 	// The feature ships default-OFF. When off nothing is gathered, nothing is
 	// built, and update_uniform_set() binds the zero-filled fallback instead.
-	emissive_active = GLOBAL_GET("rendering/pathtracer/emissive_mesh_lights");
+	// `emissive_active` was read at the top of this function, not here, so an
+	// early return cannot leave a stale value behind it.
 	if (emissive_active) {
 		uint64_t emissive_token = 0;
 		gather_emissive_instances(emissive_inputs, emissive_slots, emissive_token);
@@ -3098,11 +3108,18 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 	// expanded fallback). So index i means the same instance in all three, and
 	// i is also the `geometries[]` index the shader sees as
 	// gl_InstanceCustomIndex.
+	//
+	// `instance_flags` is in the same lockstep and is asserted with them: it is
+	// pushed once per geometry_data push at all four sites (procedural, the
+	// per-surface loop, and both MultiMesh branches), with no early `continue`
+	// between the two pushes at any of them, and it is the array TLAS assembly
+	// itself indexes by i.
 	DEV_ASSERT(material_data.size() == instance_count);
 	DEV_ASSERT(blas_transforms.size() == instance_count);
 	DEV_ASSERT(sbt_offsets.size() == instance_count);
+	DEV_ASSERT(instance_flags.size() == instance_count);
 	if (material_data.size() != instance_count || blas_transforms.size() != instance_count ||
-			sbt_offsets.size() != instance_count) {
+			sbt_offsets.size() != instance_count || instance_flags.size() != instance_count) {
 		return 0;
 	}
 
@@ -3177,6 +3194,70 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 		// can never select it, and a BSDF ray that lands on it takes the full
 		// contribution.
 		if (sbt_offsets[i] != 0) {
+			continue;
+		}
+
+		// ------------------------------------------------------------------
+		// REACHABILITY, not material. The three skips below share one argument:
+		// MIS partitions a surface between two strategies that must agree on
+		// WHICH POINTS EXIST. Everything above qualifies an instance on what its
+		// material emits; these qualify it on whether a BSDF ray can actually get
+		// there. Where it cannot -- or cannot reach all of it -- NEE would still
+		// sample uniformly and emit full radiance, inventing light the renderer
+		// otherwise says is not there. That is not a double count (the partition
+		// stays self-consistent, so no test that sums the two weights can see it);
+		// it is one strategy integrating a different surface from the other.
+		//
+		// Each is UNBIASED to skip, by the same invariant as deformed geometry and
+		// custom hit groups above: slot stays -1, NEE can never select it, and a
+		// BSDF ray that lands on it takes w_mis == 1.0 and the whole contribution.
+		// The cost is variance on that emitter -- exactly the pre-C1 behaviour.
+		// ------------------------------------------------------------------
+
+		// ALPHA-TESTED EMITTERS. The any_hit stage discards a hit whose
+		// `albedo.a * albedo_color.a` falls below 0.5, and an instance carries
+		// FORCE_OPAQUE only when its material uses no alpha at all (the
+		// uses_alpha_clip / uses_blend_alpha / uses_alpha test in build_tlas).
+		// So on an alpha-scissored emitter a BSDF ray through a cut-out passes
+		// straight through and collects nothing, while emissive_sample() draws
+		// uniformly over the FULL geometric triangle, forms area_tri over the full
+		// triangle, and composes radiance through emissive_radiance(), which never
+		// consults alpha. It would emit full L_e out of the holes.
+		//
+		// This is not an exotic case: it is C1's archetypal content -- a neon sign,
+		// an LED strip card, a monitor bezel authored as a textured quad -- where
+		// the cut-out can be most of the surface.
+		if ((instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) == 0) {
+			continue;
+		}
+
+		// FRONT-CULLED EMITTERS. build_tlas sets FLIP_FACING for CULL_MODE_BACK,
+		// CULL_DISABLE|FLIP_FACING for CULL_MODE_DISABLED, and NEITHER bit for
+		// CULL_MODE_FRONT. Every camera and bounce ray is traced under
+		// RT_RAY_FLAGS == gl_RayFlagsCullBackFacingTrianglesEXT, so with neither
+		// bit set the reachable side is the INWARD one -- while
+		// emissive_orient_normal() orients against the vertex normal and therefore
+		// emits from the outward side. NEE would light the scene from a face no
+		// BSDF ray can ever hit.
+		//
+		// Double-sided (CULL_DISABLE) is CORRECT and deliberately kept: its front
+		// face gets the MIS split, and on its back face cos_light < 0 drives the
+		// reverse pdf to 0, which hands that hit weight 1. Only CULL_MODE_FRONT --
+		// the neither-bit case -- is broken, so test for the absence of both bits
+		// rather than for the presence of FLIP_FACING.
+		const uint32_t cull_bits = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT |
+				RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+		if ((instance_flags[i] & cull_bits) == 0) {
+			continue; // CULL_MODE_FRONT.
+		}
+
+		// EMITTERS WITH NO NORMAL ATTRIBUTE. fetch_tbn() returns its (0,1,0)
+		// default when normal_byte_offset == OFFSET_NONE, so emissive_orient_normal()
+		// orients the geometric normal against a CONSTANT and the emitting side is
+		// whatever that constant happens to select -- per triangle, and arbitrary.
+		// The raster path renders such a mesh dark; NEE would light the scene from
+		// a face chosen by an accident of the default.
+		if (geom.normal_byte_offset == RT_OFFSET_NONE || geom.vertex_buffer_address == 0) {
 			continue;
 		}
 
@@ -3802,7 +3883,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	// records, the power CDF, and the per-instance slot table.
 	//
 	// `emissive_active` is this frame's read of
-	// `rendering/pathtracer/emissive_mesh_lights`, taken in build_tlas(). It is
+	// `rendering/pathtracer/emissive_mesh_lights`, taken at the TOP of build_tlas()
+	// so that an early return there cannot leave last frame's value here. It is
 	// false by default, so the fallback path below is the one every existing scene
 	// takes: it must bind something valid, and it must read as an EMPTY
 	// distribution rather than as undefined bytes. That is why it is an owned,
