@@ -18,6 +18,16 @@
 // bound when the feature is disabled; `emissive_instances[]` and
 // `emissive_slot[]` are then backed by only 16 bytes and indexing them is out of
 // bounds.
+//
+// NOTE ON `restrict`: none of the three blocks below carry it, deliberately.
+// When the feature is off, render_raytracing.cpp binds the SAME 16-byte
+// zero-filled fallback buffer to all three bindings, so they genuinely alias.
+// `restrict` is a promise to the compiler that a block's memory is reached
+// through no other name, and that promise would be false on the off path -- which
+// is the path every scene takes by default. All three are readonly, so the
+// aliasing is harmless in fact, but a false `restrict` is undefined behaviour
+// rather than a missed optimisation, and there is nothing to optimise here: these
+// are read-only loads.
 
 // Verbatim twin of C++ EmissiveLights::EmissiveInstanceGPU (std430, 80 bytes).
 // `total_area` and `power` are written by the GPU build, not by the CPU.
@@ -31,11 +41,11 @@ struct EmissiveInstance {
 	float _pad;
 };
 
-layout(set = 0, binding = 35, std430) restrict readonly buffer EmissiveInstancesRO {
+layout(set = 0, binding = 35, std430) readonly buffer EmissiveInstancesRO {
 	EmissiveInstance emissive_instances[];
 };
 
-layout(set = 0, binding = 36, std430) restrict readonly buffer EmissiveCDFRO {
+layout(set = 0, binding = 36, std430) readonly buffer EmissiveCDFRO {
 	float total_power;
 	float _cdf_pad0;
 	float _cdf_pad1;
@@ -50,7 +60,7 @@ emissive_cdf;
 // Indexed by gl_InstanceCustomIndex, so this is sized to the FULL TLAS instance
 // count -- not to the emitter count and not to EMISSIVE_INSTANCES_MAX. Holds the
 // instance's slot in emissive_instances[], or -1 when it is not an emitter.
-layout(set = 0, binding = 37, std430) restrict readonly buffer EmissiveSlotRO {
+layout(set = 0, binding = 37, std430) readonly buffer EmissiveSlotRO {
 	int emissive_slot[];
 };
 

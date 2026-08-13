@@ -92,9 +92,29 @@ layout(set = 0, binding = 2, std430) readonly buffer Geometries {
 // wrong total_area computed from half-written vertices and then frozen into the
 // distribution for an entire accumulated still render.
 layout(set = 0, binding = 3, std430) restrict readonly buffer OrderingScratch {
-	// Runtime-sized deliberately: it makes the reflected block length 0, which is
-	// what lets uniform_set_create accept a buffer of any size here
-	// (rendering_device.cpp:4781, "If 0, then it's sized on link time").
+	// The bound buffer is 16 bytes and this block describes far more than that,
+	// which is fine -- but NOT for the reason it looks like.
+	//
+	// uniform_set_create does have a size gate (rendering_device.cpp:4781,
+	// `set_uniform.length > 0 && buffer->size != set_uniform.length`). It is dead
+	// for storage buffers, and it is dead for ALL of them, not just runtime-sized
+	// ones: SPIRV-Reflect zeroes the block size for every descriptor whose type is
+	// STORAGE_BUFFER, unconditionally --
+	//
+	//     bool is_parent_rta = (p_descriptor->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+	//     ...
+	//     if (is_parent_rta) { p_descriptor->block.size = 0; ... }
+	//
+	// (spirv_reflect.c:2991-3000; note `is_parent_rta` is named for runtime arrays
+	// but is assigned from the descriptor type). rendering_shader_container.cpp:445
+	// copies that zero into `uniform.length`, so the gate's `length > 0` is never
+	// true for a storage buffer. The same is why the 16-byte
+	// `env_dist_fallback_buffer` can stand in for a multi-kilobyte block.
+	//
+	// So making this member runtime-sized is a style choice, not a requirement --
+	// a fixed-size member would bind exactly as happily. Do not "fix" it into a
+	// fixed size on the belief that the size must match: you would get a working
+	// shader and a wrong mental model of why it works.
 	uint _never_read[];
 }
 ordering_scratch;

@@ -243,6 +243,24 @@ static bool mirror_geometry_eligible(uint32_t p_geom_flags, uint32_t p_prim_coun
 	return true;
 }
 
+// Mirror of the two-sided power computation for one emissive instance.
+//
+// This spans a C++/GLSL boundary and neither side alone is meaningful:
+// gather_emissive_instances() folds emission_strength INTO the uploaded colour
+// (`emission = emission_color * emission_strength`), and only then does
+// emissive_area_build.glsl's MODE_AREA take the luminance of that product and
+// multiply by the reduced world area (`power = max(lum, 0) * area`). The strength
+// therefore reaches `power` solely through the C++ fold -- dropping it leaves a
+// shader that still compiles, a distribution that is still internally consistent,
+// and every emitter's power wrong by a factor of `strength`.
+static float mirror_instance_power(const Vector3 &p_emission_color, float p_strength, float p_area) {
+	const Vector3 folded(
+			p_emission_color.x * p_strength,
+			p_emission_color.y * p_strength,
+			p_emission_color.z * p_strength);
+	return MAX(mirror_luminance(folded), 0.0f) * p_area;
+}
+
 // Mirror of the CDF walk in emissive_select_instance(). Returns the selected
 // slot and rescales the remainder within its bucket to [0,1) for the triangle
 // draw. r_remap MUST span the full unit interval across a bucket or the
@@ -351,6 +369,51 @@ TEST_CASE("[PathTracer][Emissive] geometry exclusions are by flag, not by accide
 	// pass and dispatches a workgroup that reduces to zero.
 	CHECK_FALSE(mirror_geometry_eligible(0u, 0u));
 	CHECK_FALSE(mirror_geometry_eligible(GEOM_FLAG_COMPRESSED, 0u));
+}
+
+TEST_CASE("[PathTracer][Emissive] power folds in strength, area and the luma weights") {
+	// Every input is deliberately non-unit and the colour is non-uniform across
+	// channels, so no factor can hide inside another: strength 1 would hide the
+	// fold, area 1 would hide the area, and a grey colour would let any luma
+	// weighting pass.
+	const Vector3 color(0.2f, 0.6f, 0.9f);
+	const float strength = 3.5f;
+	const float area = 2.75f;
+
+	const float expected_lum = 0.2f * 0.2126f + 0.6f * 0.7152f + 0.9f * 0.0722f;
+	CHECK(mirror_instance_power(color, strength, area)
+					== doctest::Approx(expected_lum * strength * area));
+
+	// THE REGRESSION THIS CASE EXISTS FOR: if the C++ fold is dropped and the
+	// shader takes the luminance of the raw colour, power loses exactly a factor
+	// of `strength`. Pin that the two differ, and by how much.
+	const float unfolded = MAX(mirror_luminance(color), 0.0f) * area;
+	CHECK(unfolded != doctest::Approx(mirror_instance_power(color, strength, area)));
+	CHECK(mirror_instance_power(color, strength, area) == doctest::Approx(unfolded * strength));
+
+	// Power is linear in each factor independently.
+	CHECK(mirror_instance_power(color, strength * 2.0f, area)
+					== doctest::Approx(2.0f * mirror_instance_power(color, strength, area)));
+	CHECK(mirror_instance_power(color, strength, area * 3.0f)
+					== doctest::Approx(3.0f * mirror_instance_power(color, strength, area)));
+
+	// The channel weights must be the real ones, not interchangeable: the same
+	// energy moved from blue to green is over nine times the power.
+	const float green = mirror_instance_power(Vector3(0, 1, 0), strength, area);
+	const float blue = mirror_instance_power(Vector3(0, 0, 1), strength, area);
+	CHECK(green == doctest::Approx(0.7152f * strength * area));
+	CHECK(blue == doctest::Approx(0.0722f * strength * area));
+	CHECK(green > blue * 9.0f);
+
+	// A zero-area instance contributes nothing however bright, and a black
+	// emitter contributes nothing however large -- both are the CDF's zero-width
+	// bucket case, which selection must never return.
+	CHECK(mirror_instance_power(color, strength, 0.0f) == doctest::Approx(0.0f));
+	CHECK(mirror_instance_power(Vector3(0, 0, 0), strength, area) == doctest::Approx(0.0f));
+
+	// Negative emission is clamped rather than subtracting power from the total,
+	// which would corrupt the prefix sum into a non-monotonic CDF.
+	CHECK(mirror_instance_power(Vector3(-1.0f, -1.0f, -1.0f), strength, area) == doctest::Approx(0.0f));
 }
 
 TEST_CASE("[PathTracer][Emissive] instance selection frequency matches power") {

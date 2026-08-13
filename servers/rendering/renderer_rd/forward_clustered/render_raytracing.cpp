@@ -2792,11 +2792,31 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		// uploaded once through the transfer worker and never rewritten, and
 		// deformed surfaces are excluded from the distribution entirely by
 		// gather_emissive_instances(), so neither can be mid-write here.
+		//
+		// BOTH buffers the area pass dereferences must be listed. It reads
+		// positions through geom.vertex_buffer_address (rt_fetch_vertex_position)
+		// AND indices through geom.index_buffer_address (get_triangle_indices_ex),
+		// and for a merged MultiMesh those are merged_vtx_buffer and
+		// replicated_idx_buffer respectively -- both written by multimesh_merge.glsl
+		// (the merged geom fill sets index_buffer_address from
+		// replicated_idx_buffer). Listing only the vertex buffer happens to work
+		// today because the whole Phase-2 merge collapses into a single graph
+		// command, so ordering after one of its writes orders after all of them --
+		// but that is a coincidence of the current structure, and splitting the
+		// merge into two dispatches would silently break it. The attribute buffer
+		// is deliberately absent: the area pass reads no attributes.
 		emissive_ordering_srcs.clear();
 		for (uint32_t i = 0; i < merged_mm_active_this_frame.size(); i++) {
 			RTMergedMMEntry *e = merged_mm_pool.get_or_null(merged_mm_active_this_frame[i]);
-			if (e && e->merged_vtx_buffer.is_valid()) {
+			if (!e) {
+				continue;
+			}
+			if (e->merged_vtx_buffer.is_valid()) {
 				emissive_ordering_srcs.push_back(e->merged_vtx_buffer);
+			}
+			// Invalid for a non-indexed merged surface, which reads no index buffer.
+			if (e->replicated_idx_buffer.is_valid()) {
+				emissive_ordering_srcs.push_back(e->replicated_idx_buffer);
 			}
 		}
 
