@@ -474,6 +474,16 @@ private:
 		StringName clearcoat;
 		StringName clearcoat_roughness;
 		StringName anisotropy;
+		StringName transmission;
+		StringName ior;
+		StringName thickness;
+		StringName attenuation_distance;
+		StringName attenuation_color;
+		StringName specular_factor;
+		StringName specular_tint;
+		StringName sheen_color;
+		StringName sheen_roughness;
+		StringName anisotropy_rotation;
 		StringName heightmap_scale;
 		StringName subsurface_scattering_strength;
 		StringName transmittance_color;
@@ -548,6 +558,22 @@ private:
 	float clearcoat = 0.0f;
 	float clearcoat_roughness = 0.0f;
 	float anisotropy = 0.0f;
+
+	// Path-tracer-only material parameters (glTF material extensions).
+	// The forward+ generated shader declares no uniform for any of these; they
+	// reach the RT path through the material parameter map. See
+	// docs/superpowers/specs/2026-08-18-material-data-pipeline-design.md 3.1.
+	float transmission = 0.0f;
+	float ior = 1.5f;
+	float thickness = 0.0f;
+	float attenuation_distance = 0.0f; // 0 means infinite (no absorption).
+	Color attenuation_color = Color(1, 1, 1);
+	float specular_factor = 1.0f;
+	Color specular_tint = Color(1, 1, 1);
+	Color sheen_color = Color(0, 0, 0);
+	float sheen_roughness = 0.0f;
+	float anisotropy_rotation = 0.0f; // Radians.
+
 	float heightmap_scale = 0.0f;
 	float subsurface_scattering_strength = 0.0f;
 	Color transmittance_color;
@@ -683,6 +709,36 @@ public:
 
 	void set_anisotropy(float p_anisotropy);
 	float get_anisotropy() const;
+
+	void set_transmission(float p_transmission);
+	float get_transmission() const;
+
+	void set_ior(float p_ior);
+	float get_ior() const;
+
+	void set_thickness(float p_thickness);
+	float get_thickness() const;
+
+	void set_attenuation_distance(float p_attenuation_distance);
+	float get_attenuation_distance() const;
+
+	void set_attenuation_color(const Color &p_attenuation_color);
+	Color get_attenuation_color() const;
+
+	void set_specular_factor(float p_specular_factor);
+	float get_specular_factor() const;
+
+	void set_specular_tint(const Color &p_specular_tint);
+	Color get_specular_tint() const;
+
+	void set_sheen_color(const Color &p_sheen_color);
+	Color get_sheen_color() const;
+
+	void set_sheen_roughness(float p_sheen_roughness);
+	float get_sheen_roughness() const;
+
+	void set_anisotropy_rotation(float p_anisotropy_rotation);
+	float get_anisotropy_rotation() const;
 
 	void set_heightmap_scale(float p_heightmap_scale);
 	float get_heightmap_scale() const;

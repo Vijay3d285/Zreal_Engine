@@ -572,6 +572,22 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->clearcoat = "clearcoat";
 	shader_names->clearcoat_roughness = "clearcoat_roughness";
 	shader_names->anisotropy = "anisotropy_ratio";
+
+	// Parameter names equal property names for all ten. Verified collision-free
+	// against the generated forward+ shader: grepping `uniform <type> <name>` in
+	// this file returns zero matches for every one. A collision would route the
+	// value into the forward+ UBO and change rendering.
+	shader_names->transmission = "transmission";
+	shader_names->ior = "ior";
+	shader_names->thickness = "thickness";
+	shader_names->attenuation_distance = "attenuation_distance";
+	shader_names->attenuation_color = "attenuation_color";
+	shader_names->specular_factor = "specular_factor";
+	shader_names->specular_tint = "specular_tint";
+	shader_names->sheen_color = "sheen_color";
+	shader_names->sheen_roughness = "sheen_roughness";
+	shader_names->anisotropy_rotation = "anisotropy_rotation";
+
 	shader_names->heightmap_scale = "heightmap_scale";
 	shader_names->subsurface_scattering_strength = "subsurface_scattering_strength";
 	shader_names->backlight = "backlight";
@@ -2251,6 +2267,96 @@ float BaseMaterial3D::get_anisotropy() const {
 	return anisotropy;
 }
 
+void BaseMaterial3D::set_transmission(float p_transmission) {
+	transmission = p_transmission;
+	_material_set_param(shader_names->transmission, p_transmission);
+}
+
+float BaseMaterial3D::get_transmission() const {
+	return transmission;
+}
+
+void BaseMaterial3D::set_ior(float p_ior) {
+	ior = p_ior;
+	_material_set_param(shader_names->ior, p_ior);
+}
+
+float BaseMaterial3D::get_ior() const {
+	return ior;
+}
+
+void BaseMaterial3D::set_thickness(float p_thickness) {
+	thickness = p_thickness;
+	_material_set_param(shader_names->thickness, p_thickness);
+}
+
+float BaseMaterial3D::get_thickness() const {
+	return thickness;
+}
+
+void BaseMaterial3D::set_attenuation_distance(float p_attenuation_distance) {
+	attenuation_distance = p_attenuation_distance;
+	_material_set_param(shader_names->attenuation_distance, p_attenuation_distance);
+}
+
+float BaseMaterial3D::get_attenuation_distance() const {
+	return attenuation_distance;
+}
+
+void BaseMaterial3D::set_attenuation_color(const Color &p_attenuation_color) {
+	attenuation_color = p_attenuation_color;
+	_material_set_param(shader_names->attenuation_color, p_attenuation_color);
+}
+
+Color BaseMaterial3D::get_attenuation_color() const {
+	return attenuation_color;
+}
+
+void BaseMaterial3D::set_specular_factor(float p_specular_factor) {
+	specular_factor = p_specular_factor;
+	_material_set_param(shader_names->specular_factor, p_specular_factor);
+}
+
+float BaseMaterial3D::get_specular_factor() const {
+	return specular_factor;
+}
+
+void BaseMaterial3D::set_specular_tint(const Color &p_specular_tint) {
+	specular_tint = p_specular_tint;
+	_material_set_param(shader_names->specular_tint, p_specular_tint);
+}
+
+Color BaseMaterial3D::get_specular_tint() const {
+	return specular_tint;
+}
+
+void BaseMaterial3D::set_sheen_color(const Color &p_sheen_color) {
+	sheen_color = p_sheen_color;
+	_material_set_param(shader_names->sheen_color, p_sheen_color);
+}
+
+Color BaseMaterial3D::get_sheen_color() const {
+	return sheen_color;
+}
+
+void BaseMaterial3D::set_sheen_roughness(float p_sheen_roughness) {
+	sheen_roughness = p_sheen_roughness;
+	_material_set_param(shader_names->sheen_roughness, p_sheen_roughness);
+}
+
+float BaseMaterial3D::get_sheen_roughness() const {
+	return sheen_roughness;
+}
+
+void BaseMaterial3D::set_anisotropy_rotation(float p_anisotropy_rotation) {
+	anisotropy_rotation = p_anisotropy_rotation;
+	_material_set_param(shader_names->anisotropy_rotation, p_anisotropy_rotation);
+}
+
+float BaseMaterial3D::get_anisotropy_rotation() const {
+	return anisotropy_rotation;
+}
+
 void BaseMaterial3D::set_heightmap_scale(float p_heightmap_scale) {
 	heightmap_scale = p_heightmap_scale;
 	_material_set_param(shader_names->heightmap_scale, p_heightmap_scale);
@@ -3375,6 +3481,36 @@ void BaseMaterial3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_anisotropy", "anisotropy"), &BaseMaterial3D::set_anisotropy);
 	ClassDB::bind_method(D_METHOD("get_anisotropy"), &BaseMaterial3D::get_anisotropy);
 
+	ClassDB::bind_method(D_METHOD("set_anisotropy_rotation", "anisotropy_rotation"), &BaseMaterial3D::set_anisotropy_rotation);
+	ClassDB::bind_method(D_METHOD("get_anisotropy_rotation"), &BaseMaterial3D::get_anisotropy_rotation);
+
+	ClassDB::bind_method(D_METHOD("set_transmission", "transmission"), &BaseMaterial3D::set_transmission);
+	ClassDB::bind_method(D_METHOD("get_transmission"), &BaseMaterial3D::get_transmission);
+
+	ClassDB::bind_method(D_METHOD("set_ior", "ior"), &BaseMaterial3D::set_ior);
+	ClassDB::bind_method(D_METHOD("get_ior"), &BaseMaterial3D::get_ior);
+
+	ClassDB::bind_method(D_METHOD("set_thickness", "thickness"), &BaseMaterial3D::set_thickness);
+	ClassDB::bind_method(D_METHOD("get_thickness"), &BaseMaterial3D::get_thickness);
+
+	ClassDB::bind_method(D_METHOD("set_attenuation_distance", "attenuation_distance"), &BaseMaterial3D::set_attenuation_distance);
+	ClassDB::bind_method(D_METHOD("get_attenuation_distance"), &BaseMaterial3D::get_attenuation_distance);
+
+	ClassDB::bind_method(D_METHOD("set_attenuation_color", "attenuation_color"), &BaseMaterial3D::set_attenuation_color);
+	ClassDB::bind_method(D_METHOD("get_attenuation_color"), &BaseMaterial3D::get_attenuation_color);
+
+	ClassDB::bind_method(D_METHOD("set_specular_factor", "specular_factor"), &BaseMaterial3D::set_specular_factor);
+	ClassDB::bind_method(D_METHOD("get_specular_factor"), &BaseMaterial3D::get_specular_factor);
+
+	ClassDB::bind_method(D_METHOD("set_specular_tint", "specular_tint"), &BaseMaterial3D::set_specular_tint);
+	ClassDB::bind_method(D_METHOD("get_specular_tint"), &BaseMaterial3D::get_specular_tint);
+
+	ClassDB::bind_method(D_METHOD("set_sheen_color", "sheen_color"), &BaseMaterial3D::set_sheen_color);
+	ClassDB::bind_method(D_METHOD("get_sheen_color"), &BaseMaterial3D::get_sheen_color);
+
+	ClassDB::bind_method(D_METHOD("set_sheen_roughness", "sheen_roughness"), &BaseMaterial3D::set_sheen_roughness);
+	ClassDB::bind_method(D_METHOD("get_sheen_roughness"), &BaseMaterial3D::get_sheen_roughness);
+
 	ClassDB::bind_method(D_METHOD("set_heightmap_scale", "heightmap_scale"), &BaseMaterial3D::set_heightmap_scale);
 	ClassDB::bind_method(D_METHOD("get_heightmap_scale"), &BaseMaterial3D::get_heightmap_scale);
 
@@ -3633,6 +3769,7 @@ void BaseMaterial3D::_bind_methods() {
 	ADD_GROUP("Anisotropy", "anisotropy_");
 	ADD_PROPERTYI(PropertyInfo(Variant::BOOL, "anisotropy_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_feature", "get_feature", FEATURE_ANISOTROPY);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "anisotropy", PROPERTY_HINT_RANGE, "-1,1,0.01"), "set_anisotropy", "get_anisotropy");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "anisotropy_rotation", PROPERTY_HINT_RANGE, "0,6.2831853,0.001,radians_as_degrees"), "set_anisotropy_rotation", "get_anisotropy_rotation");
 	ADD_PROPERTYI(PropertyInfo(Variant::OBJECT, "anisotropy_flowmap", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_texture", "get_texture", TEXTURE_FLOWMAP);
 
 	ADD_GROUP("Ambient Occlusion", "ao_");
@@ -3684,6 +3821,20 @@ void BaseMaterial3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "detail_uv_layer", PROPERTY_HINT_ENUM, "UV1,UV2"), "set_detail_uv", "get_detail_uv");
 	ADD_PROPERTYI(PropertyInfo(Variant::OBJECT, "detail_albedo", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_texture", "get_texture", TEXTURE_DETAIL_ALBEDO);
 	ADD_PROPERTYI(PropertyInfo(Variant::OBJECT, "detail_normal", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_texture", "get_texture", TEXTURE_DETAIL_NORMAL);
+
+	// Path-tracer-only parameters. The forward+ renderer ignores every one of
+	// these; they exist so glTF material extensions survive import and reach the
+	// RT material struct.
+	ADD_GROUP("Path Tracing", "");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "transmission", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_transmission", "get_transmission");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "ior", PROPERTY_HINT_RANGE, "0,3,0.001,or_greater"), "set_ior", "get_ior");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "thickness", PROPERTY_HINT_RANGE, "0,10,0.001,or_greater"), "set_thickness", "get_thickness");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "attenuation_distance", PROPERTY_HINT_RANGE, "0,100,0.001,or_greater"), "set_attenuation_distance", "get_attenuation_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "attenuation_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_attenuation_color", "get_attenuation_color");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "specular_factor", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_specular_factor", "get_specular_factor");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "specular_tint", PROPERTY_HINT_COLOR_NO_ALPHA), "set_specular_tint", "get_specular_tint");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "sheen_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_sheen_color", "get_sheen_color");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sheen_roughness", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_sheen_roughness", "get_sheen_roughness");
 
 	ADD_GROUP("UV1", "uv1_");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "uv1_scale", PROPERTY_HINT_LINK), "set_uv1_scale", "get_uv1_scale");

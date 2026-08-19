@@ -96,6 +96,9 @@
 			Texture that offsets the tangent map for anisotropy calculations and optionally controls the anisotropy effect (if an alpha channel is present). The flowmap texture is expected to be a derivative map, with the red channel representing distortion on the X axis and green channel representing distortion on the Y axis. Values below 0.5 will result in negative distortion, whereas values above 0.5 will result in positive distortion.
 			If present, the texture's alpha channel will be used to multiply the strength of the [member anisotropy] effect. Fully opaque pixels will keep the anisotropy effect's original strength while fully transparent pixels will disable the anisotropy effect entirely. The flowmap texture's blue channel is ignored.
 		</member>
+		<member name="anisotropy_rotation" type="float" setter="set_anisotropy_rotation" getter="get_anisotropy_rotation" default="0.0">
+			Rotation of the anisotropy tangent direction, in radians, imported from the glTF [code]KHR_materials_anisotropy[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property.
+		</member>
 		<member name="ao_enabled" type="bool" setter="set_feature" getter="get_feature" default="false">
 			If [code]true[/code], ambient occlusion is enabled. Ambient occlusion darkens areas based on the [member ao_texture].
 		</member>
@@ -110,6 +113,12 @@
 		</member>
 		<member name="ao_texture_channel" type="int" setter="set_ao_texture_channel" getter="get_ao_texture_channel" enum="BaseMaterial3D.TextureChannel" default="0">
 			Specifies the channel of the [member ao_texture] in which the ambient occlusion information is stored. This is useful when you store the information for multiple effects in a single texture. For example if you stored metallic in the red channel, roughness in the blue, and ambient occlusion in the green you could reduce the number of textures you use.
+		</member>
+		<member name="attenuation_color" type="Color" setter="set_attenuation_color" getter="get_attenuation_color" default="Color(1, 1, 1, 1)">
+			The color that light takes on as it passes through a volume, imported from the glTF [code]KHR_materials_volume[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property.
+		</member>
+		<member name="attenuation_distance" type="float" setter="set_attenuation_distance" getter="get_attenuation_distance" default="0.0">
+			The average distance light travels through a volume before its color is affected by [member attenuation_color], imported from the glTF [code]KHR_materials_volume[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property. A value of [code]0.0[/code] means the volume has infinite attenuation distance (no absorption).
 		</member>
 		<member name="backlight" type="Color" setter="set_backlight" getter="get_backlight" default="Color(0, 0, 0, 1)">
 			The color used by the backlight effect. Represents the light passing through an object.
@@ -278,6 +287,9 @@
 			For best results, the texture should be normalized (with [member heightmap_scale] reduced to compensate). In [url=https://gimp.org]GIMP[/url], this can be done using [b]Colors &gt; Auto &gt; Equalize[/b]. If the texture only uses a small part of its available range, the parallax effect may look strange, especially when the camera moves.
 			[b]Note:[/b] To reduce memory usage and improve loading times, you may be able to use a lower-resolution heightmap texture as most heightmaps are only comprised of low-frequency data.
 		</member>
+		<member name="ior" type="float" setter="set_ior" getter="get_ior" default="1.5">
+			Index of refraction, imported from the glTF [code]KHR_materials_ior[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property. A value of [code]0.0[/code] is valid and means no refraction.
+		</member>
 		<member name="metallic" type="float" setter="set_metallic" getter="get_metallic" default="0.0">
 			A high value makes the material appear more like a metal. Non-metals use their albedo as the diffuse color and add diffuse to the specular reflection. With non-metals, the reflection appears on top of the albedo color. Metals use their albedo as a multiplier to the specular reflection and set the diffuse color to black resulting in a tinted reflection. Materials work better when fully metal or fully non-metal, values between [code]0[/code] and [code]1[/code] should only be used for blending between metal and non-metal sections. To alter the amount of reflection use [member roughness].
 		</member>
@@ -374,9 +386,21 @@
 		<member name="shadow_to_opacity" type="bool" setter="set_flag" getter="get_flag" default="false">
 			If [code]true[/code], enables the "shadow to opacity" render mode where lighting modifies the alpha so shadowed areas are opaque and non-shadowed areas are transparent. Useful for overlaying shadows onto a camera feed in AR.
 		</member>
+		<member name="sheen_color" type="Color" setter="set_sheen_color" getter="get_sheen_color" default="Color(0, 0, 0, 1)">
+			The tint of the sheen (retroreflective fabric-like) lobe, imported from the glTF [code]KHR_materials_sheen[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property. A value of [code]Color(0, 0, 0)[/code] disables the sheen lobe.
+		</member>
+		<member name="sheen_roughness" type="float" setter="set_sheen_roughness" getter="get_sheen_roughness" default="0.0">
+			The roughness of the sheen lobe, imported from the glTF [code]KHR_materials_sheen[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property.
+		</member>
+		<member name="specular_factor" type="float" setter="set_specular_factor" getter="get_specular_factor" default="1.0">
+			The strength of the specular (dielectric F0) reflection, imported from the glTF [code]KHR_materials_specular[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property. Not to be confused with [member metallic_specular], which is Godot's native specular property.
+		</member>
 		<member name="specular_mode" type="int" setter="set_specular_mode" getter="get_specular_mode" enum="BaseMaterial3D.SpecularMode" default="0">
 			The method for rendering the specular blob.
 			[b]Note:[/b] [member specular_mode] only applies to the specular blob. It does not affect specular reflections from the sky, screen-space reflections, [VoxelGI], SDFGI or [ReflectionProbe]s. To disable reflections from these sources as well, set [member metallic_specular] to [code]0.0[/code] instead.
+		</member>
+		<member name="specular_tint" type="Color" setter="set_specular_tint" getter="get_specular_tint" default="Color(1, 1, 1, 1)">
+			The tint applied to the specular (dielectric F0) reflection, imported from the glTF [code]KHR_materials_specular[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property.
 		</member>
 		<member name="stencil_color" type="Color" setter="set_stencil_effect_color" getter="get_stencil_effect_color" default="Color(0, 0, 0, 1)" experimental="May be affected by future rendering pipeline changes.">
 			The primary color of the stencil effect.
@@ -430,6 +454,12 @@
 		</member>
 		<member name="texture_repeat" type="bool" setter="set_flag" getter="get_flag" default="true">
 			If [code]true[/code], the texture repeats when exceeding the texture's size. See [constant FLAG_USE_TEXTURE_REPEAT].
+		</member>
+		<member name="thickness" type="float" setter="set_thickness" getter="get_thickness" default="0.0">
+			The thickness of the volume behind this surface, imported from the glTF [code]KHR_materials_volume[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property.
+		</member>
+		<member name="transmission" type="float" setter="set_transmission" getter="get_transmission" default="0.0">
+			The fraction of light that passes through the surface via specular transmission, imported from the glTF [code]KHR_materials_transmission[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property.
 		</member>
 		<member name="transparency" type="int" setter="set_transparency" getter="get_transparency" enum="BaseMaterial3D.Transparency" default="0">
 			The material's transparency mode. Some transparency modes will disable shadow casting. Any transparency mode other than [constant TRANSPARENCY_DISABLED] has a greater performance impact compared to opaque rendering. See also [member blend_mode].
