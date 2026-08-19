@@ -336,6 +336,69 @@ float luminance(float3 rgb) {
 	return dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
 }
 
+// -------------------------------------------------------------------------
+//    Dielectric Fresnel and refraction (roadmap E1)
+//
+//    Ported from Blender Cycles, intern/cycles/kernel/closure/bsdf_util.h:47-108.
+//    A C++ MIRROR of these four functions lives in
+//    tests/servers/rendering/test_pt_transmission.cpp and is what the doctest
+//    suite asserts against -- the suite does NOT execute this shader. Keep the
+//    two textually identical modulo type names; a drift makes the tests pass
+//    while this code is wrong.
+//
+//    Why not reuse the Schlick evalFresnel above: Schlick is parameterised on
+//    F0 and has no eta, so it cannot express total internal reflection at all.
+//    TIR here falls out of the SAME test that produces cos_theta_t, so the two
+//    cannot drift out of sync.
+// -------------------------------------------------------------------------
+
+float F0_from_ior(float ior) {
+	float t = (ior - 1.0f) / (ior + 1.0f);
+	return t * t;
+}
+
+float ior_from_F0(float f0) {
+	float sqrt_f0 = sqrt(clamp(f0, 0.0f, 0.99f));
+	return (1.0f + sqrt_f0) / (1.0f - sqrt_f0);
+}
+
+// Returns reflectance for unpolarized light. Writes the cosine of the
+// transmitted angle (NEGATIVE, relative to the surface normal).
+//
+// Returns exactly 1.0 on total internal reflection, leaving r_cos_theta_t
+// untouched -- no transmitted direction exists in that case. The `<= 0.0`
+// test is deliberate and load-bearing: AT the critical angle the discriminant
+// is exactly zero, and a `< 0.0` test would leak a degenerate zero-length
+// transmitted direction through.
+//
+// CALLER CONTRACT: do not compute 1.0 / eta before this returns. ior == 0.0 is
+// legal glTF (KHR_materials_ior permits it as a signal value) and Phase D
+// imports it without complaint; the TIR branch handles it correctly, but an
+// eagerly-evaluated reciprocal would already be an infinity.
+float fresnel_dielectric(float cos_theta_i, float eta, OUT_PARAMETER(float) r_cos_theta_t) {
+	float eta_cos_theta_t_sq = eta * eta - (1.0f - cos_theta_i * cos_theta_i);
+	if (eta_cos_theta_t_sq <= 0.0f) {
+		return 1.0f; // Total internal reflection.
+	}
+	float ci = abs(cos_theta_i);
+	float cos_theta_t = -sqrt(eta_cos_theta_t_sq) / eta;
+	r_cos_theta_t = cos_theta_t;
+
+	// Amplitudes of the reflected s- and p-polarised waves.
+	float r_s = (ci + eta * cos_theta_t) / (ci - eta * cos_theta_t);
+	float r_p = (cos_theta_t + eta * ci) / (eta * ci - cos_theta_t);
+
+	// Squared amplitude gives the fraction of reflected energy.
+	return (r_s * r_s + r_p * r_p) * 0.5f;
+}
+
+// `incident` points AWAY from the surface (toward the viewer), matching V.
+// `cos_theta_t` is the negative cosine returned by fresnel_dielectric.
+// `inv_eta` is 1.0 / eta.
+float3 refract_angle(float3 incident, float3 normal, float cos_theta_t, float inv_eta) {
+	return (inv_eta * dot(normal, incident) + cos_theta_t) * normal - inv_eta * incident;
+}
+
 float3 baseColorToSpecularF0(float3 baseColor, float metalness, float dielectricF0) {
 	return lerp(float3(dielectricF0, dielectricF0, dielectricF0), baseColor, metalness);
 }
