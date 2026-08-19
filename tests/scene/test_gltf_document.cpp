@@ -326,6 +326,45 @@ TEST_CASE("[SceneTree][GLTFDocument] Unsupported extension textures are dropped,
 	}
 }
 
+TEST_CASE("[SceneTree][GLTFDocument] Import glTF material extension edge cases") {
+	register_gltf_extension();
+
+	Ref<GLTFDocument> gltf_document;
+	gltf_document.instantiate();
+	Ref<GLTFState> gltf_state;
+	gltf_state.instantiate();
+
+	const Error err = gltf_document->append_from_file(
+			TestUtils::get_data_path("models/material_extensions_edge_cases.gltf"), gltf_state);
+	REQUIRE(err == OK);
+
+	const Vector<Ref<Material>> &materials = gltf_state->get_materials();
+	REQUIRE(materials.size() == 1);
+
+	Ref<StandardMaterial3D> mat = materials[0];
+	REQUIRE(mat.is_valid());
+
+	// ior == 0.0 is legal glTF ("no refraction, F0 = 0") and must survive
+	// import unclamped. The class default is 1.5, so this only passes if
+	// the value was actually read rather than left untouched.
+	CHECK(mat->get_ior() == doctest::Approx(0.0f));
+
+	// glTF's infinite attenuation distance is represented as 0 on the Godot
+	// side; a non-positive authored value means the same thing and must be
+	// clamped to 0, not imported as a negative distance.
+	CHECK(mat->get_attenuation_distance() == doctest::Approx(0.0f));
+
+	// A wrong-typed scalar ("not-a-number" for a float field) costs only
+	// its own parameter: the property is left at its class default (1.0),
+	// not corrupted by an implicit Variant->double coercion to 0.
+	CHECK(mat->get_specular_factor() == doctest::Approx(1.0f));
+
+	// A color with one malformed component is rejected wholesale rather
+	// than partially imported with the bad component silently coerced to
+	// 0; the property stays at its class default of white.
+	CHECK(mat->get_specular_tint().is_equal_approx(Color(1, 1, 1)));
+}
+
 } // namespace TestGLTFDocument
 
 #endif // MODULE_GLTF_ENABLED

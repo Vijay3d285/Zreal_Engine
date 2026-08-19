@@ -3022,7 +3022,12 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 					return false;
 				}
 				for (int c = 0; c < 3; c++) {
-					const double d = arr[c];
+					const Variant component = arr[c];
+					if (component.get_type() != Variant::FLOAT && component.get_type() != Variant::INT) {
+						WARN_PRINT(vformat("glTF material '%s': ignoring non-numeric component in '%s'.", material->get_name(), p_key));
+						return false;
+					}
+					const double d = component;
 					if (!std::isfinite(d)) {
 						WARN_PRINT(vformat("glTF material '%s': ignoring non-finite component in '%s'.", material->get_name(), p_key));
 						return false;

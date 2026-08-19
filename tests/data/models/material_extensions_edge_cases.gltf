@@ -1,0 +1,24 @@
+{
+  "asset": { "version": "2.0", "generator": "hand-authored for Godot Phase D tests" },
+  "extensionsUsed": [
+    "KHR_materials_ior",
+    "KHR_materials_volume",
+    "KHR_materials_specular"
+  ],
+  "scene": 0,
+  "scenes": [ { "nodes": [] } ],
+  "materials": [
+    {
+      "name": "EdgeCases",
+      "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+      "extensions": {
+        "KHR_materials_ior": { "ior": 0.0 },
+        "KHR_materials_volume": { "attenuationDistance": -3.5 },
+        "KHR_materials_specular": {
+          "specularFactor": "not-a-number",
+          "specularColorFactor": [0.5, "oops", 0.2]
+        }
+      }
+    }
+  ]
+}
