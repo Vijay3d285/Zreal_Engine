@@ -374,7 +374,7 @@ void debug_visualize(
 	} else if (vis_mode == 10) {
 		ps.radiance = DLSSRR_computeDiffuseAlbedo(albedo, metalness);
 	} else if (vis_mode == 11) {
-		ps.radiance = DLSSRR_computeSpecularAlbedo(albedo, metalness, specular_to_f0(specular), roughness, NdotV);
+		ps.radiance = DLSSRR_computeSpecularAlbedo(albedo, metalness, vec3(specular_to_f0(specular)), roughness, NdotV);
 	} else if (vis_mode == 12) {
 		ps.radiance = (final_normal * 0.5 + 0.5) * (1.0 - roughness * 0.5);
 	} else if (vis_mode == 13) {
@@ -412,10 +412,10 @@ void debug_visualize(
 		ps.radiance = normalize(world_to_view * final_normal) * 0.5 + 0.5;
 	} else if (vis_mode == 17) {
 		vec3 diffuse_albedo = DLSSRR_computeDiffuseAlbedo(albedo, metalness);
-		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(albedo, metalness, specular_to_f0(specular), roughness, NdotV);
+		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(albedo, metalness, vec3(specular_to_f0(specular)), roughness, NdotV);
 		ps.radiance = mix(diffuse_albedo, specular_albedo, metalness);
 	} else if (vis_mode == 18) {
-		ps.radiance = baseColorToSpecularF0(albedo, metalness, specular_to_f0(specular));
+		ps.radiance = baseColorToSpecularF0(albedo, metalness, vec3(specular_to_f0(specular)));
 	} else if (vis_mode == 19) {
 		bool is_front_face = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT);
 		ps.radiance = is_front_face ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
@@ -451,7 +451,7 @@ void debug_visualize(
 		dbg_mat.baseColor = albedo;
 		dbg_mat.metalness = metalness;
 		dbg_mat.roughness = roughness;
-		dbg_mat.dielectricF0 = specular_to_f0(specular);
+		dbg_mat.dielectricF0 = vec3(specular_to_f0(specular));
 		dbg_mat.emissive = vec3(0.0);
 		dbg_mat.transmissivness = 0.0;
 		dbg_mat.opacity = 1.0;
@@ -612,7 +612,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.baseColor = m.albedo;
 	brdf_mat.metalness = m.metalness;
 	brdf_mat.roughness = m.roughness;
-	brdf_mat.dielectricF0 = specular_to_f0(m.specular);
+	brdf_mat.dielectricF0 = vec3(specular_to_f0(m.specular));
 	brdf_mat.emissive = m.emissive;
 	brdf_mat.transmissivness = 0.0;
 	brdf_mat.opacity = 1.0;

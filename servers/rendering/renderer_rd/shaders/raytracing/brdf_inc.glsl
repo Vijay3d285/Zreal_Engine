@@ -273,7 +273,11 @@ struct MaterialProperties {
 
 	float3 emissive;
 	float roughness;
-	float dielectricF0; // Base reflectance for dielectrics (e.g. 0.04 for default 4% reflectance).
+	// Base reflectance for dielectrics (e.g. 0.04 for the default 4%). PER-CHANNEL
+	// since roadmap E1: glTF's KHR_materials_specular specularColorFactor tints the
+	// dielectric F0 only, never the metallic F0 (which is baseColor). Was a scalar
+	// float before E1; widening is a no-op at the default white tint.
+	float3 dielectricF0;
 	float transmissivness;
 	float opacity;
 };
@@ -402,8 +406,8 @@ float3 refract_angle(float3 incident, float3 normal, float cos_theta_t, float in
 	return (inv_eta * dot(normal, incident) + cos_theta_t) * normal - inv_eta * incident;
 }
 
-float3 baseColorToSpecularF0(float3 baseColor, float metalness, float dielectricF0) {
-	return lerp(float3(dielectricF0, dielectricF0, dielectricF0), baseColor, metalness);
+float3 baseColorToSpecularF0(float3 baseColor, float metalness, float3 dielectricF0) {
+	return lerp(dielectricF0, baseColor, metalness);
 }
 
 float3 baseColorToDiffuseReflectance(float3 baseColor, float metalness) {
@@ -1326,7 +1330,7 @@ float3 DLSSRR_computeDiffuseAlbedo(float3 baseColor, float metalness) {
 	return baseColor * (1.0f - metalness);
 }
 
-float3 DLSSRR_computeSpecularAlbedo(float3 baseColor, float metalness, float dielectricF0, float roughness, float NdotV) {
+float3 DLSSRR_computeSpecularAlbedo(float3 baseColor, float metalness, float3 dielectricF0, float roughness, float NdotV) {
 	float3 F0 = baseColorToSpecularF0(baseColor, metalness, dielectricF0);
 	return DLSSRR_envBRDFApprox(F0, roughness, NdotV);
 }
