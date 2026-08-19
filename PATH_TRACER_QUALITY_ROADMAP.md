@@ -772,7 +772,7 @@ is shared with analytic-light NEE, so it changes analytic-light shading engine-w
   double count between analytic NEE and environment NEE is untouched. The
   workaround stands and the reconciliation is still unowned.
 
-### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)* — **COMPLETE**
+### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)* — **COMPLETE (D1, D2, D3 all landed)**
 
 **Nothing in Phase E is testable until this lands.** See §3.6.
 
@@ -913,9 +913,13 @@ ZR_GATE_FRAMES=2048 ZR_GATE_RES=256`) against the Phase D HEAD build:
 | std-dev | 0.117619 | 0.117620 |
 | delta vs. 2048-frame reference | +0.000240 (+0.004%) | +0.000240 (+0.004%) |
 
-Identical to the sixth significant figure, well inside this gate's own
-run-to-run noise floor (~1e-6 relative, per the gate's own header comment).
-**No shift. The invariant holds.**
+MEAN is identical to the sixth significant figure. The std-dev delta
+(0.117619 vs. 0.117620) is ~8.5e-6 relative — the gate header's cited ~1e-6
+figure describes MEAN reproducibility across repeat runs of the same build,
+not std-dev, so it is not the right bound to cite here. The std-dev delta is
+still two orders of magnitude below the gate's 1% tolerance and shows no
+directional bias consistent with a real behavioral change. **No shift. The
+invariant holds.**
 
 **Measured Blender acceptance (§7.1).** This is the only check in Phase D
 that validates our reading of Blender's *exporter* rather than our own
@@ -985,6 +989,30 @@ alongside the thirteen user-facing parameters).
 - Nothing in the integrator reads any of the new struct fields yet. No
   rendered output changed as a result of Phase D, and no claim of physical
   correctness is made for the new parameters — that is Phase E's job.
+- **The GPU material-data gate has two accepted residual risks, not fixed
+  because fixing them costs more than the risk they leave open** (both
+  written up in `pipeline_references/tests/pt_material_data_gate.gd`'s
+  header):
+  - **Fixture collision.** `V_CLEARCOAT` (0.55) and the blue channel of
+    `V_SPECULAR_TINT` (0.55) are equal. `clearcoat` lives at `RT_MaterialData`
+    offset 160 and `specular_tint.b` at offset 136; a struct-aliasing bug that
+    mapped one onto the other would read 0.55 in both checks and both would
+    pass. Accepted rather than re-cutting fixtures across four already-landed
+    tasks, because the two offsets are 24 bytes apart with several fields
+    between them, so any layout bug big enough to alias them would also shift
+    the rest of the struct's tail and fail most of the gate's other 17 checks
+    — but it means this one specific aliasing is, in principle, undetectable
+    by this fixture set.
+  - **The custom-hit-group path is compile-verified only, never executed.**
+    `debug_visualize()`'s two call sites in `scene_raytracing_raygen.glsl`
+    are mutually exclusive `#ifdef` branches; the gate's
+    `StandardMaterial3D` scene can only take the non-custom-hit-group branch.
+    The `materials[h.geometry_idx]` fetch in the `RT_CUSTOM_HIT_GROUP` branch
+    has therefore never run with real data in any test in this repo — only
+    built successfully. The gate's "data reaches the shader intact" claim
+    covers the `StandardMaterial3D` path only; a custom-hit-group gate scene
+    is out of scope for Phase D and remains open for whoever next touches
+    that path.
 
 **The next item is Phase E** (BSDF completeness), which is unblocked now that
 Phase D's material data demonstrably survives import, export, and the GPU
