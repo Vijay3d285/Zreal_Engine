@@ -102,11 +102,33 @@ Reusing them avoids two knobs for one quantity. This is not in tension with §3.
 that ruling exists because `specular` and `ior` disagree about the *curve*, and
 these three do not.
 
-**Consequence:** `_validate_property` hides these when their feature flag is off,
-so the importer must call `set_feature(FEATURE_CLEARCOAT, true)` /
+**Reusing an existing property obliges you to verify its default, its range, and
+its constructor behaviour from source — not to assume them.** A property that was
+chosen for a different purpose carries defaults chosen for that purpose, and they
+need not match the ones the new purpose implies. This design originally asserted
+that all three reused properties defaulted to 0.0; two of them do not (§4.1), and
+that single unverified assumption produced both a round-trip data loss and a
+wrong value uploaded for every material in every scene. The other eleven claims
+in this document were checked against source (§10); these three were not,
+precisely because this section framed them as "already existing" and therefore
+not new surface. They were new surface.
+
+**Consequence:** the importer must call `set_feature(FEATURE_CLEARCOAT, true)` /
 `set_feature(FEATURE_ANISOTROPY, true)` when the corresponding factor is
-non-default — otherwise the data is imported but not inspectable, failing the
-acceptance criterion. Enabling a feature *does* change forward+ codegen, which is
+non-default, for two reasons:
+
+1. *Inspectability.* `clearcoat_enabled` and `anisotropy_enabled` carry
+   `PROPERTY_HINT_GROUP_ENABLE`, so the Inspector greys out the whole group while
+   the feature is off and the imported values are invisible — failing the
+   acceptance criterion. (This is **not** done by `_validate_property`; an earlier
+   revision of this section said so and was wrong. `BaseMaterial3D::_validate_property`
+   has no feature-based hiding at all — it only hides clearcoat and anisotropy
+   when `shading_mode` is not per-pixel.)
+2. *Correctness of the uploaded value.* Per §4.1 these three parameters are
+   published as 0 while their feature is off, so without the `set_feature` call
+   the factors would sit on the object but reach the GPU as zero.
+
+Enabling a feature *does* change forward+ codegen, which is
 why the no-pixel-change invariant is scoped to content carrying none of the seven
 extensions (§7.2). RT output is unchanged unconditionally, because the path tracer
 reads none of these values in Phase D.
@@ -146,9 +168,27 @@ Thirteen values. Three reuse existing properties per §3.3; ten are new.
 | `sheen_color` | Color | black | `KHR_materials_sheen.sheenColorFactor` |
 | `sheen_roughness` | float | 0.0 | `KHR_materials_sheen.sheenRoughnessFactor` |
 | `anisotropy_rotation` | float (radians) | 0.0 | `KHR_materials_anisotropy.anisotropyRotation` |
-| `clearcoat` *(existing)* | float | 0.0 | `KHR_materials_clearcoat.clearcoatFactor` |
-| `clearcoat_roughness` *(existing)* | float | 0.0 | `KHR_materials_clearcoat.clearcoatRoughnessFactor` |
+| `clearcoat` *(existing)* | float | **1.0** | `KHR_materials_clearcoat.clearcoatFactor` |
+| `clearcoat_roughness` *(existing)* | float | **0.5** | `KHR_materials_clearcoat.clearcoatRoughnessFactor` |
 | `anisotropy` *(existing)* | float | 0.0 | `KHR_materials_anisotropy.anisotropyStrength` |
+
+**The three reused defaults are Godot's, not glTF's.** `BaseMaterial3D`'s
+constructor sets `clearcoat = 1.0` and `clearcoat_roughness = 0.5`
+(`material.cpp`, `doc/classes/BaseMaterial3D.xml`), while glTF defaults both to
+`0.0`. `anisotropy` is 0.0 on both sides. Two consequences, both implemented:
+
+- **Export cannot omit either clearcoat key.** "Omit when equal to the glTF
+  default" is lossless only where the class default and the glTF default agree,
+  which for these two they do not: an authored `clearcoat_roughness` of exactly
+  0.0 would be dropped and return as 0.5. Both keys are written unconditionally
+  whenever `FEATURE_CLEARCOAT` is on (§4.4).
+- **The parameter map is feature-gated.** `clearcoat`, `clearcoat_roughness` and
+  `anisotropy` publish 0 into the material parameter map while their feature is
+  off, and the member value when it is on. Otherwise every material in every
+  scene uploads `clearcoat = 1.0`, `clearcoat_roughness = 0.5` to the path
+  tracer. Forward+ is unaffected: with the feature off its generated shader
+  declares no such uniform, and the UBO fill iterates uniforms, not parameters.
+  See the §8 handoff note.
 
 Defaults were confirmed against Blender's importer rather than read from Khronos
 prose: `transmissionFactor` 0 (`pbrMetallicRoughness.py:283`), `attenuationColor`
@@ -239,7 +279,20 @@ into `extensions`, call `p_state->add_used_extension(name)` with `required` left
 false (`gltf_state.cpp:158`).
 
 Each extension is written **only when its factors differ from the glTF default**,
-so ordinary materials produce no extension bloat.
+so ordinary materials produce no extension bloat — with one deliberate exception:
+`clearcoatFactor` and `clearcoatRoughnessFactor` are written unconditionally
+whenever `FEATURE_CLEARCOAT` is on, because their Godot class defaults (1.0, 0.5)
+disagree with the glTF defaults (0.0, 0.0) and omission would therefore be lossy
+(§4.1).
+
+**Every value is clamped to its glTF-legal range on export.** Godot's property
+hints do not clamp, so `transmission`, `specular_factor`, `sheen_roughness`,
+`clearcoat`, `clearcoat_roughness` and `thickness` are all settable outside the
+range glTF permits, and `anisotropy` is *by design* signed [-1, 1] where glTF's
+`anisotropyStrength` is [0, 1]. Emitting those verbatim produces JSON that any
+validator rejects. A negative `anisotropy` clamps to 0 and emits a
+`WARN_PRINT_ONCE`; the 90-degree rotation its sign encodes is not exported,
+because composing sign and rotation is a Phase E decision (§8).
 
 Export exists for two reasons. It enables the hermetic round-trip test (§6.1)
 without a binary fixture in the repo. And it keeps
@@ -319,6 +372,12 @@ optional block should cost you that parameter, not the model.
 
 Skip the offending key, emit a warning naming the material and the key, and
 continue parsing the rest of the material.
+
+This includes an extension whose *value* is not a JSON object at all
+(`"KHR_materials_ior": 5`). Converting that Variant to a `Dictionary` yields an
+empty one, so every subsequent `has()` declines and the extension would vanish
+with no diagnostic — the one malformed input in these blocks that would otherwise
+be silent. The type is checked and warned on explicitly.
 
 ### 5.2 Non-finite scalars are rejected
 
@@ -470,9 +529,40 @@ the current baseline.
 - **F0 is double-specified on purpose.** Both `specular` (Godot's curve) and
   `ior` / `specular_factor` / `specular_tint` (glTF's) reach the shader. Phase E
   must decide which wins and document the deprecation of the other (§3.2).
+- **`clearcoat`, `clearcoat_roughness` and `anisotropy` are feature-gated in the
+  parameter map.** They publish 0 while `FEATURE_CLEARCOAT` / `FEATURE_ANISOTROPY`
+  is off and the member value when it is on (§4.1). A Phase E clearcoat lobe can
+  therefore read `mat.clearcoat` directly and get 0 for materials that do not want
+  a coat — no separate enable bit is needed in `RT_MaterialData`. Do **not**
+  "restore" the class defaults on the assumption they are the right zero point:
+  they are 1.0 and 0.5, and un-gating them coats every surface in every scene at
+  full strength.
 - **`anisotropy` is signed [-1, 1]**; the negative half encodes a 90-degree
   rotation in Godot's convention, while `anisotropy_rotation` carries glTF's true
-  angle in radians. Phase E must define how the two compose.
+  angle in radians. Phase E must define how the two compose. **Until it does,
+  glTF export clamps a negative `anisotropy` to 0 and warns**, because
+  `anisotropyStrength` is [0, 1] and a negative value is invalid glTF. That is a
+  deliberate placeholder, not a settled ruling: once Phase E defines the
+  composition, export should encode the sign into `anisotropyRotation` (a
+  90-degree offset) instead of discarding it, and this clamp should be revisited.
+- **A `ShaderMaterial` declaring `uniform float ior` or `uniform float thickness`
+  will have that value land in `RT_MaterialData`.** The path tracer reads the
+  material parameter map by name and cannot tell a `BaseMaterial3D` property from
+  a same-named custom shader uniform. This hazard already existed for `specular`,
+  `metallic` and `roughness`, but Phase D grew the exposed name surface from three
+  to thirteen and several of the new names (`ior`, `thickness`, `transmission`,
+  `sheen_color`) are generic enough to collide by accident. If Phase E starts
+  *shading* with these values, a `ShaderMaterial` that happens to use one of these
+  names will change appearance. Consider namespacing the reads (a `pt_` prefix on
+  the parameter names) before that becomes visible.
+- **Godot 3.x `.tres` compatibility.** 3.x `SpatialMaterial` had a `transmission`
+  property of type `Color` (subsurface transmission, unrelated to glTF's
+  transmission). Before Phase D that name fell through the 3.x-to-4.x remap table
+  and produced a "remapped parameter not found" message; now it matches the new
+  `float transmission` and fails Variant conversion instead. Marginal — it affects
+  only direct loads of unconverted 3.x resources — but the diagnostic changed
+  shape, so a report of a `transmission` conversion error on an old file is
+  expected rather than a new defect.
 - **`attenuation_density` is already reciprocal.** Do not invert it again.
 - **Per-parameter extension textures are absent by design** (§2). If Phase E needs
   them, that is a new phase, not a patch.
@@ -527,3 +617,14 @@ Every claim below was checked in source during design, not recalled.
 | glTF defaults, as Blender's importer applies them | `blender/imp/pbrMetallicRoughness.py:283`, `:340`, `:343`, `:366`, `:172` |
 | Highest existing debug vis mode is 22 | `raytracing_closest_hit_common_inc.glsl` |
 | `ADD_GROUP` with an empty prefix is an established pattern | `material.cpp:3558`, `:3570`, `:3706`, `:3723` |
+| `clearcoat` defaults to **1.0** and `clearcoat_roughness` to **0.5**, pushed by the constructor for every material regardless of `FEATURE_CLEARCOAT` | `material.cpp` constructor (`set_clearcoat(1); set_clearcoat_roughness(0.5);`), `doc/classes/BaseMaterial3D.xml` |
+| `BaseMaterial3D::_validate_property` has **no** feature-based hiding; clearcoat/anisotropy visibility comes from `PROPERTY_HINT_GROUP_ENABLE` on the `*_enabled` properties | `material.cpp` `_validate_property` (only `shading_mode`-based), `ADD_PROPERTYI(... "clearcoat_enabled", PROPERTY_HINT_GROUP_ENABLE ...)` |
+| A parameter with no matching shader uniform is never read into the UBO, so feature-gating a parameter's map value cannot change forward+ output | `material.cpp` (`if (features[FEATURE_CLEARCOAT])` guards the `uniform float clearcoat` emission), `material_storage.cpp` `update_uniform_buffer` iterates `p_uniforms` |
+
+**Correction, recorded deliberately.** The first two rows above were added after
+the fact. They are the defaults of the three *reused* properties (§3.3) — the only
+values in the original design taken on assumption rather than read from source,
+because §3.3 framed them as pre-existing surface. Both defects that followed
+(round-trip loss of a 0.0 clearcoat roughness; a wrong clearcoat value uploaded
+for every material in the scene) trace to that one gap. The rule this yields is
+in §3.3.
