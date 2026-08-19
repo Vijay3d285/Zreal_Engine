@@ -118,7 +118,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 96 bytes)
+// MATERIAL DATA (matches C++ layout, 176 bytes)
 // ============================================================================
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -141,4 +141,20 @@ struct MaterialData {
 	float normal_map_depth; // Normal map strength (default 1.0)
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none)
+
+	// --- Phase D: glTF material extension data. Nothing reads these yet. ---
+	float transmission;
+	float ior;
+	float thickness;
+	float attenuation_density; // Reciprocal of attenuation_distance; 0 = none.
+	vec3 attenuation_color;
+	float specular_factor;
+	vec3 specular_tint;
+	float sheen_roughness;
+	vec3 sheen_color;
+	float anisotropy_rotation; // Radians.
+	float clearcoat;
+	float clearcoat_roughness;
+	float anisotropy;
+	float _pad0;
 };

@@ -1383,6 +1383,14 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		s_default_mat.data.uv1_scale[1] = 1.0f;
 		s_default_mat.data.uv1_offset[0] = 0.0f;
 		s_default_mat.data.uv1_offset[1] = 0.0f;
+		s_default_mat.data.ior = 1.5f;
+		s_default_mat.data.specular_factor = 1.0f;
+		s_default_mat.data.attenuation_color[0] = 1.0f;
+		s_default_mat.data.attenuation_color[1] = 1.0f;
+		s_default_mat.data.attenuation_color[2] = 1.0f;
+		s_default_mat.data.specular_tint[0] = 1.0f;
+		s_default_mat.data.specular_tint[1] = 1.0f;
+		s_default_mat.data.specular_tint[2] = 1.0f;
 		s_default_mat_initialized = true;
 	}
 
@@ -1449,6 +1457,26 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_offset[1] = 0.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
+	mat.transmission = 0.0f;
+	mat.ior = 1.5f;
+	mat.thickness = 0.0f;
+	mat.attenuation_density = 0.0f;
+	mat.attenuation_color[0] = 1.0f;
+	mat.attenuation_color[1] = 1.0f;
+	mat.attenuation_color[2] = 1.0f;
+	mat.specular_factor = 1.0f;
+	mat.specular_tint[0] = 1.0f;
+	mat.specular_tint[1] = 1.0f;
+	mat.specular_tint[2] = 1.0f;
+	mat.sheen_roughness = 0.0f;
+	mat.sheen_color[0] = 0.0f;
+	mat.sheen_color[1] = 0.0f;
+	mat.sheen_color[2] = 0.0f;
+	mat.anisotropy_rotation = 0.0f;
+	mat.clearcoat = 0.0f;
+	mat.clearcoat_roughness = 0.0f;
+	mat.anisotropy = 0.0f;
+	mat._pad0 = 0.0f;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1675,6 +1703,88 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	Variant specular_var = material_storage->material_get_param(p_material_rid, "specular");
 	if (specular_var.get_type() == Variant::FLOAT) {
 		mat.specular = specular_var;
+	}
+
+	// Phase D: glTF material extension parameters. Nothing in the shader reads
+	// these yet; they are carried so Phase E has data to consume.
+	Variant transmission_var = material_storage->material_get_param(p_material_rid, "transmission");
+	if (transmission_var.get_type() == Variant::FLOAT) {
+		mat.transmission = transmission_var;
+	}
+
+	Variant ior_var = material_storage->material_get_param(p_material_rid, "ior");
+	if (ior_var.get_type() == Variant::FLOAT) {
+		mat.ior = ior_var;
+	}
+
+	Variant thickness_var = material_storage->material_get_param(p_material_rid, "thickness");
+	if (thickness_var.get_type() == Variant::FLOAT) {
+		mat.thickness = thickness_var;
+	}
+
+	// The property is a distance; the GPU carries its reciprocal so density 0
+	// means "no absorption" with no shader branch and no division at use.
+	Variant attenuation_distance_var = material_storage->material_get_param(p_material_rid, "attenuation_distance");
+	if (attenuation_distance_var.get_type() == Variant::FLOAT) {
+		const float d = attenuation_distance_var;
+		mat.attenuation_density = (d > 0.0f) ? (1.0f / d) : 0.0f;
+	}
+
+	Variant attenuation_color_var = material_storage->material_get_param(p_material_rid, "attenuation_color");
+	if (attenuation_color_var.get_type() == Variant::COLOR) {
+		Color c = ((Color)attenuation_color_var).srgb_to_linear();
+		mat.attenuation_color[0] = c.r;
+		mat.attenuation_color[1] = c.g;
+		mat.attenuation_color[2] = c.b;
+	}
+
+	Variant specular_factor_var = material_storage->material_get_param(p_material_rid, "specular_factor");
+	if (specular_factor_var.get_type() == Variant::FLOAT) {
+		mat.specular_factor = specular_factor_var;
+	}
+
+	Variant specular_tint_var = material_storage->material_get_param(p_material_rid, "specular_tint");
+	if (specular_tint_var.get_type() == Variant::COLOR) {
+		Color c = ((Color)specular_tint_var).srgb_to_linear();
+		mat.specular_tint[0] = c.r;
+		mat.specular_tint[1] = c.g;
+		mat.specular_tint[2] = c.b;
+	}
+
+	Variant sheen_color_var = material_storage->material_get_param(p_material_rid, "sheen_color");
+	if (sheen_color_var.get_type() == Variant::COLOR) {
+		Color c = ((Color)sheen_color_var).srgb_to_linear();
+		mat.sheen_color[0] = c.r;
+		mat.sheen_color[1] = c.g;
+		mat.sheen_color[2] = c.b;
+	}
+
+	Variant sheen_roughness_var = material_storage->material_get_param(p_material_rid, "sheen_roughness");
+	if (sheen_roughness_var.get_type() == Variant::FLOAT) {
+		mat.sheen_roughness = sheen_roughness_var;
+	}
+
+	Variant anisotropy_rotation_var = material_storage->material_get_param(p_material_rid, "anisotropy_rotation");
+	if (anisotropy_rotation_var.get_type() == Variant::FLOAT) {
+		mat.anisotropy_rotation = anisotropy_rotation_var;
+	}
+
+	Variant clearcoat_var = material_storage->material_get_param(p_material_rid, "clearcoat");
+	if (clearcoat_var.get_type() == Variant::FLOAT) {
+		mat.clearcoat = clearcoat_var;
+	}
+
+	Variant clearcoat_roughness_var = material_storage->material_get_param(p_material_rid, "clearcoat_roughness");
+	if (clearcoat_roughness_var.get_type() == Variant::FLOAT) {
+		mat.clearcoat_roughness = clearcoat_roughness_var;
+	}
+
+	// BaseMaterial3D's anisotropy parameter is named "anisotropy_ratio", not
+	// "anisotropy" (scene/resources/material.cpp:574). Reading "anisotropy"
+	// here would silently return nothing.
+	Variant anisotropy_var = material_storage->material_get_param(p_material_rid, "anisotropy_ratio");
+	if (anisotropy_var.get_type() == Variant::FLOAT) {
+		mat.anisotropy = anisotropy_var;
 	}
 
 	Variant emission_var = material_storage->material_get_param(p_material_rid, "emission");

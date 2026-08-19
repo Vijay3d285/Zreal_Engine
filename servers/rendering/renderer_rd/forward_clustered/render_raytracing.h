@@ -102,7 +102,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 96 bytes).
+// Must match GLSL MaterialData (std430, 176 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -120,8 +120,29 @@ struct alignas(16) RT_MaterialData {
 	float normal_map_depth; // Strength [0..N], default 1.0 (not Z-depth).
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none).
+	// --- Phase D: glTF material extension data. Nothing reads these yet. ---
+	float transmission;
+	float ior;
+	float thickness;
+	float attenuation_density; // Reciprocal of attenuation_distance; 0 = none.
+	float attenuation_color[3];
+	float specular_factor;
+	float specular_tint[3];
+	float sheen_roughness;
+	float sheen_color[3];
+	float anisotropy_rotation; // Radians.
+	float clearcoat;
+	float clearcoat_roughness;
+	float anisotropy;
+	float _pad0;
 };
-static_assert(sizeof(RT_MaterialData) == 96, "RT_MaterialData must be 96 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes for std430");
+// A vec3 aligns to 16 bytes in std430, so reordering members around one shifts
+// the GPU's view of every subsequent field WITHOUT changing sizeof. The size
+// assert alone passes on a broken layout; these three are what catch it.
+static_assert(offsetof(RT_MaterialData, attenuation_color) == 112, "attenuation_color must be 16-byte aligned for std430 vec3");
+static_assert(offsetof(RT_MaterialData, specular_tint) == 128, "specular_tint must be 16-byte aligned for std430 vec3");
+static_assert(offsetof(RT_MaterialData, sheen_color) == 144, "sheen_color must be 16-byte aligned for std430 vec3");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
