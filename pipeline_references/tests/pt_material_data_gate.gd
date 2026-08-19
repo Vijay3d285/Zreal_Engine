@@ -164,6 +164,24 @@ func _ready() -> void:
 			"feature-off clearcoat/clearcoat_roughness/anisotropy",
 			Vector3(0.0, 0.0, 0.0), true)
 
+	# UNTOUCHED-DEFAULT CASE.
+	#
+	# Nothing is set on this material at all -- it is what StandardMaterial3D.new()
+	# gives you, and what the overwhelming majority of materials in any real scene
+	# are with respect to these three fields. The constructor still calls
+	# set_clearcoat(1) and set_clearcoat_roughness(0.5) on it; the only thing
+	# stopping 1.0 and 0.5 from reaching the shader is that those setters consult
+	# features[], which is all-false at construction time.
+	#
+	# This is the check that answers "what does a freshly constructed material
+	# publish?" directly, rather than inferring it from the case above.
+	var mat_default := StandardMaterial3D.new()
+	mesh_instance.material_override = mat_default
+
+	await _check_mode(env, MODE_CLEARCOAT_ANISOTROPY,
+			"untouched-default clearcoat/clearcoat_roughness/anisotropy",
+			Vector3(0.0, 0.0, 0.0), true)
+
 	print("")
 	if _failures == 0:
 		print("PASS: all %d material fields arrived in the shader intact." % _checks)
