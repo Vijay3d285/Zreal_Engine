@@ -986,6 +986,16 @@ alongside the thirteen user-facing parameters).
 - `ior == 0.0` is legal glTF (`KHR_materials_ior` permits it as a signal
   value) and imports without complaint. **Phase E must not assume `ior >=
   1`** anywhere in the refraction math it writes.
+- **BACKLOG (deferred by the user, 2026-08-19) - glTF export does not clamp
+  the three colour factors.** Task 3's fix wave clamped the scalar exports
+  (`transmissionFactor`, `clearcoatFactor`, `anisotropyStrength`, ...) into
+  their glTF-legal ranges but left `sheenColorFactor`, `specularColorFactor`
+  and `attenuationColor` unclamped. Godot's `Color` is unbounded while glTF
+  requires `[0,1]` per component, so an authored value outside that range
+  writes spec-invalid JSON. Identical defect class to the scalars - closed
+  for them, still open for these; an omission in the fix brief rather than a
+  decision. Not a Phase E blocker: nothing in the integrator reads the
+  export path.
 - Nothing in the integrator reads any of the new struct fields yet. No
   rendered output changed as a result of Phase D, and no claim of physical
   correctness is made for the new parameters — that is Phase E's job.
