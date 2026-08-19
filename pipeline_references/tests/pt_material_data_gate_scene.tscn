@@ -1,0 +1,22 @@
+[gd_scene load_steps=4 format=3]
+
+[ext_resource type="Script" path="res://tests/pt_material_data_gate.gd" id="1_matgate"]
+
+[sub_resource type="BoxMesh" id="BoxMesh_matgate"]
+size = Vector3(4, 4, 0.1)
+
+[sub_resource type="Environment" id="Environment_matgate"]
+background_mode = 1
+background_color = Color(0, 0, 0, 1)
+
+[node name="PTMaterialDataGate" type="Node3D"]
+script = ExtResource("1_matgate")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 3)
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="."]
+mesh = SubResource("BoxMesh_matgate")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_matgate")

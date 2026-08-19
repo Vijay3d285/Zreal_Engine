@@ -500,7 +500,8 @@ void main() {
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			vec3 orm = vec3(1.0, m.roughness, m.metalness);
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, normal_map,
-					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive, V, NdotV);
+					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive, V, NdotV,
+					materials[h.geometry_idx]);
 			return;
 		}
 	}
@@ -563,7 +564,8 @@ void main() {
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			debug_visualize(VIS_MODE, h.geometry_normal, final_normal, tangent_space_normal,
-					h.tangent, h.bitangent, uv, albedo, orm, metalness, roughness, mat.specular, emissive, V, NdotV);
+					h.tangent, h.bitangent, uv, albedo, orm, metalness, roughness, mat.specular, emissive, V, NdotV,
+					mat);
 			return;
 		}
 	}

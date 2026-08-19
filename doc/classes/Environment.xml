@@ -585,6 +585,27 @@
 		<constant name="RT_DEBUG_BRDF_REJECTION" value="22" enum="PathtracingDebugMode">
 			Displays rays that were rejected by the BRDF sampling process, useful for debugging importance sampling issues.
 		</constant>
+		<constant name="RT_DEBUG_MAT_TRANSMISSION_IOR_THICKNESS" value="23" enum="PathtracingDebugMode">
+			Displays each surface's transmission factor, index of refraction, and thickness as the red, green, and blue channels respectively. A Phase D material-arrival probe: it writes the raw material values straight to radiance with no shading applied.
+		</constant>
+		<constant name="RT_DEBUG_MAT_DENSITY_SPECULAR_SHEENROUGH" value="24" enum="PathtracingDebugMode">
+			Displays each surface's volume attenuation density (the reciprocal of attenuation distance), specular factor, and sheen roughness as the red, green, and blue channels respectively. A Phase D material-arrival probe: it writes the raw material values straight to radiance with no shading applied.
+		</constant>
+		<constant name="RT_DEBUG_MAT_CLEARCOAT_ANISOTROPY" value="25" enum="PathtracingDebugMode">
+			Displays each surface's clearcoat factor, clearcoat roughness, and anisotropy as the red, green, and blue channels respectively. A Phase D material-arrival probe: it writes the raw material values straight to radiance with no shading applied.
+		</constant>
+		<constant name="RT_DEBUG_MAT_ANISOTROPY_ROTATION" value="26" enum="PathtracingDebugMode">
+			Displays each surface's anisotropy rotation (in radians) in the red channel. A Phase D material-arrival probe: it writes the raw material value straight to radiance with no shading applied.
+		</constant>
+		<constant name="RT_DEBUG_MAT_ATTENUATION_COLOR" value="27" enum="PathtracingDebugMode">
+			Displays each surface's volume attenuation color directly as radiance. A Phase D material-arrival probe: it writes the raw material value straight to radiance with no shading applied.
+		</constant>
+		<constant name="RT_DEBUG_MAT_SPECULAR_TINT" value="28" enum="PathtracingDebugMode">
+			Displays each surface's specular tint color directly as radiance. A Phase D material-arrival probe: it writes the raw material value straight to radiance with no shading applied.
+		</constant>
+		<constant name="RT_DEBUG_MAT_SHEEN_COLOR" value="29" enum="PathtracingDebugMode">
+			Displays each surface's sheen color directly as radiance. A Phase D material-arrival probe: it writes the raw material value straight to radiance with no shading applied.
+		</constant>
 		<constant name="FOG_MODE_EXPONENTIAL" value="0" enum="FogMode">
 			Use a physically-based fog model defined primarily by fog density.
 		</constant>

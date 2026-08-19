@@ -340,7 +340,8 @@ void debug_visualize(
 		float specular,
 		vec3 emissive,
 		vec3 V,
-		float NdotV) {
+		float NdotV,
+		MaterialData dbg_material) {
 	PathState ps = path_unpack(payload);
 
 	if (vis_mode == 1) {
@@ -485,6 +486,23 @@ void debug_visualize(
 		} else {
 			ps.radiance = vec3(1.0, 0.0, 0.0);
 		}
+	} else if (vis_mode == 23) {
+		// Phase D material-arrival probes. Raw, unscaled values: the
+		// accumulation target is float, so nothing needs remapping and values
+		// above 1.0 survive readback intact.
+		ps.radiance = vec3(dbg_material.transmission, dbg_material.ior, dbg_material.thickness);
+	} else if (vis_mode == 24) {
+		ps.radiance = vec3(dbg_material.attenuation_density, dbg_material.specular_factor, dbg_material.sheen_roughness);
+	} else if (vis_mode == 25) {
+		ps.radiance = vec3(dbg_material.clearcoat, dbg_material.clearcoat_roughness, dbg_material.anisotropy);
+	} else if (vis_mode == 26) {
+		ps.radiance = vec3(dbg_material.anisotropy_rotation, 0.0, 0.0);
+	} else if (vis_mode == 27) {
+		ps.radiance = dbg_material.attenuation_color;
+	} else if (vis_mode == 28) {
+		ps.radiance = dbg_material.specular_tint;
+	} else if (vis_mode == 29) {
+		ps.radiance = dbg_material.sheen_color;
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
