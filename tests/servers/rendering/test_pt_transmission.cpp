@@ -55,6 +55,10 @@ static float ior_from_f0(float p_f0) {
 	return (1.0f + sqrt_f0) / (1.0f - sqrt_f0);
 }
 
+static float luminance(const Vector3 &p_rgb) {
+	return p_rgb.dot(Vector3(0.2126f, 0.7152f, 0.0722f));
+}
+
 // Returns reflectance; writes the cosine of the transmitted angle (negative,
 // relative to the surface normal). Returns exactly 1.0 on total internal
 // reflection, in which case r_cos_theta_t is left untouched and no transmitted
@@ -168,10 +172,7 @@ TEST_CASE("[PathTracer][Transmission] Refraction at normal incidence does not be
 static void resolve_f0(float p_ior, float p_specular, float p_specular_factor,
 		const Vector3 &p_specular_tint, Vector3 *r_f0, float *r_eta) {
 	const float f0_scalar = f0_from_ior(p_ior);
-	Vector3 f0 = Vector3(f0_scalar, f0_scalar, f0_scalar) * p_specular_factor;
-	f0.x *= p_specular_tint.x;
-	f0.y *= p_specular_tint.y;
-	f0.z *= p_specular_tint.z;
+	Vector3 f0 = Vector3(f0_scalar, f0_scalar, f0_scalar) * p_specular_tint * p_specular_factor;
 
 	// Godot's specular_to_f0 is 0.16*s^2, normalised against the 0.04 reference
 	// so this factor is EXACTLY 1.0 at the 0.5 default. That exactness is what
@@ -181,8 +182,7 @@ static void resolve_f0(float p_ior, float p_specular, float p_specular_factor,
 	*r_f0 = f0;
 	// Cycles re-derives eta from the modified F0 so reflectance and refraction
 	// cannot disagree (svm/closure.h:429-431). Only when the knob is off-default.
-	const float lum = 0.2126f * f0.x + 0.7152f * f0.y + 0.0722f * f0.z;
-	*r_eta = (p_specular != 0.5f) ? ior_from_f0(lum) : p_ior;
+	*r_eta = (p_specular != 0.5f) ? ior_from_f0(luminance(f0)) : p_ior;
 }
 
 TEST_CASE("[PathTracer][Transmission] F0 arbitration is a no-op at every default") {
