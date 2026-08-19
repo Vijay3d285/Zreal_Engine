@@ -1,0 +1,55 @@
+{
+  "asset": { "version": "2.0", "generator": "hand-authored for Godot Phase D tests" },
+  "extensionsUsed": [
+    "KHR_materials_transmission",
+    "KHR_materials_ior",
+    "KHR_materials_volume",
+    "KHR_materials_specular",
+    "KHR_materials_clearcoat",
+    "KHR_materials_sheen",
+    "KHR_materials_anisotropy"
+  ],
+  "scene": 0,
+  "scenes": [ { "nodes": [] } ],
+  "materials": [
+    {
+      "name": "AllExtensions",
+      "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+      "extensions": {
+        "KHR_materials_transmission": { "transmissionFactor": 0.35 },
+        "KHR_materials_ior": { "ior": 1.72 },
+        "KHR_materials_volume": {
+          "thicknessFactor": 2.4,
+          "attenuationDistance": 5.0,
+          "attenuationColor": [0.9, 0.4, 0.15]
+        },
+        "KHR_materials_specular": {
+          "specularFactor": 0.62,
+          "specularColorFactor": [0.8, 0.7, 0.55]
+        },
+        "KHR_materials_clearcoat": {
+          "clearcoatFactor": 0.55,
+          "clearcoatRoughnessFactor": 0.28
+        },
+        "KHR_materials_sheen": {
+          "sheenColorFactor": [0.25, 0.5, 0.75],
+          "sheenRoughnessFactor": 0.45
+        },
+        "KHR_materials_anisotropy": {
+          "anisotropyStrength": 0.83,
+          "anisotropyRotation": 1.1
+        }
+      }
+    },
+    {
+      "name": "TextureDropped",
+      "pbrMetallicRoughness": { "baseColorFactor": [1.0, 1.0, 1.0, 1.0] },
+      "extensions": {
+        "KHR_materials_transmission": {
+          "transmissionFactor": 0.35,
+          "transmissionTexture": { "index": 0 }
+        }
+      }
+    }
+  ]
+}

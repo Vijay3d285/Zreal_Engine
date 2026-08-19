@@ -42,6 +42,7 @@ TEST_FORCE_LINK(test_gltf_document)
 
 #include "modules/gltf/extensions/gltf_document_extension_convert_importer_mesh.h"
 #include "modules/gltf/gltf_document.h"
+#include "scene/resources/material.h"
 
 namespace TestGLTFDocument {
 
@@ -249,6 +250,80 @@ TEST_CASE("[SceneTree][GLTFDocument] Load suzanne.glb") {
 
 	// Clean up the node.
 	memdelete(node);
+}
+
+TEST_CASE("[SceneTree][GLTFDocument] Import glTF material extensions") {
+	register_gltf_extension();
+
+	Ref<GLTFDocument> gltf_document;
+	gltf_document.instantiate();
+	Ref<GLTFState> gltf_state;
+	gltf_state.instantiate();
+
+	const Error err = gltf_document->append_from_file(
+			TestUtils::get_data_path("models/material_extensions.gltf"), gltf_state);
+	REQUIRE(err == OK);
+
+	const Vector<Ref<Material>> &materials = gltf_state->get_materials();
+	REQUIRE(materials.size() == 2);
+
+	Ref<StandardMaterial3D> mat = materials[0];
+	REQUIRE(mat.is_valid());
+
+	// Scalars are compared exactly: no colour-space conversion touches them.
+	CHECK(mat->get_transmission() == doctest::Approx(0.35f));
+	CHECK(mat->get_ior() == doctest::Approx(1.72f));
+	CHECK(mat->get_thickness() == doctest::Approx(2.4f));
+	CHECK(mat->get_attenuation_distance() == doctest::Approx(5.0f));
+	CHECK(mat->get_specular_factor() == doctest::Approx(0.62f));
+	CHECK(mat->get_sheen_roughness() == doctest::Approx(0.45f));
+	CHECK(mat->get_anisotropy_rotation() == doctest::Approx(1.1f));
+	CHECK(mat->get_clearcoat() == doctest::Approx(0.55f));
+	CHECK(mat->get_clearcoat_roughness() == doctest::Approx(0.28f));
+	CHECK(mat->get_anisotropy() == doctest::Approx(0.83f));
+
+	// Colours are linear in glTF and sRGB in Godot properties, so compare
+	// against the converted value, with tolerance for the conversion.
+	const Color expect_atten = Color(0.9f, 0.4f, 0.15f).linear_to_srgb();
+	const Color expect_spec = Color(0.8f, 0.7f, 0.55f).linear_to_srgb();
+	const Color expect_sheen = Color(0.25f, 0.5f, 0.75f).linear_to_srgb();
+	CHECK(mat->get_attenuation_color().is_equal_approx(expect_atten));
+	CHECK(mat->get_specular_tint().is_equal_approx(expect_spec));
+	CHECK(mat->get_sheen_color().is_equal_approx(expect_sheen));
+
+	// Reused properties are hidden in the Inspector unless their feature is on,
+	// so importing the value without enabling the feature would fail the
+	// spec's "inspectable" acceptance criterion.
+	CHECK(mat->get_feature(BaseMaterial3D::FEATURE_CLEARCOAT));
+	CHECK(mat->get_feature(BaseMaterial3D::FEATURE_ANISOTROPY));
+}
+
+TEST_CASE("[SceneTree][GLTFDocument] Unsupported extension textures are dropped, factors kept") {
+	register_gltf_extension();
+
+	Ref<GLTFDocument> gltf_document;
+	gltf_document.instantiate();
+	Ref<GLTFState> gltf_state;
+	gltf_state.instantiate();
+
+	const Error err = gltf_document->append_from_file(
+			TestUtils::get_data_path("models/material_extensions.gltf"), gltf_state);
+	REQUIRE(err == OK);
+
+	const Vector<Ref<Material>> &materials = gltf_state->get_materials();
+	REQUIRE(materials.size() == 2);
+
+	Ref<StandardMaterial3D> mat = materials[1];
+	REQUIRE(mat.is_valid());
+
+	// The factor survives...
+	CHECK(mat->get_transmission() == doctest::Approx(0.35f));
+	// ...and the texture is dropped rather than silently mis-assigned to some
+	// other channel. A warning naming the material is emitted; this asserts the
+	// behaviour, not the log line.
+	for (int i = 0; i < BaseMaterial3D::TEXTURE_MAX; i++) {
+		CHECK(mat->get_texture((BaseMaterial3D::TextureParam)i).is_null());
+	}
 }
 
 } // namespace TestGLTFDocument

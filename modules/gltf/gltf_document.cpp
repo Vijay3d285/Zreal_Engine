@@ -74,6 +74,7 @@
 #include "modules/gridmap/grid_map.h"
 #endif
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -2972,6 +2973,185 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			Dictionary emissive_strength = material_extensions["KHR_materials_emissive_strength"];
 			if (emissive_strength.has("emissiveStrength")) {
 				material->set_emission_energy_multiplier(emissive_strength["emissiveStrength"]);
+			}
+		}
+
+		// glTF material extensions carried for the path tracer. Factors only;
+		// per-parameter extension textures are dropped with a warning below.
+		// A malformed extension costs its parameter, never the model: these
+		// blocks skip and warn where core glTF fields ERR_FAIL.
+		{
+			Vector<String> dropped_textures;
+
+			// Reads a finite float from a glTF extension dictionary. Returns
+			// false (leaving r_value untouched) if the key is absent, the wrong
+			// type, or non-finite. A NaN reaching the shader poisons pixels far
+			// from its origin, so it is rejected here.
+			auto read_ext_float = [&](const Dictionary &p_ext, const char *p_key, float &r_value) -> bool {
+				if (!p_ext.has(p_key)) {
+					return false;
+				}
+				const Variant v = p_ext[p_key];
+				if (v.get_type() != Variant::FLOAT && v.get_type() != Variant::INT) {
+					WARN_PRINT(vformat("glTF material '%s': ignoring non-numeric '%s'.", material->get_name(), p_key));
+					return false;
+				}
+				const double d = v;
+				if (!std::isfinite(d)) {
+					WARN_PRINT(vformat("glTF material '%s': ignoring non-finite '%s'.", material->get_name(), p_key));
+					return false;
+				}
+				r_value = (float)d;
+				return true;
+			};
+
+			// Reads a linear RGB triple and converts it to Godot's sRGB-encoded
+			// Color convention, matching baseColorFactor above.
+			auto read_ext_color = [&](const Dictionary &p_ext, const char *p_key, Color &r_value) -> bool {
+				if (!p_ext.has(p_key)) {
+					return false;
+				}
+				const Variant v = p_ext[p_key];
+				if (v.get_type() != Variant::ARRAY) {
+					WARN_PRINT(vformat("glTF material '%s': ignoring malformed '%s'.", material->get_name(), p_key));
+					return false;
+				}
+				const Array arr = v;
+				if (arr.size() != 3) {
+					WARN_PRINT(vformat("glTF material '%s': ignoring '%s' with %d components (expected 3).", material->get_name(), p_key, arr.size()));
+					return false;
+				}
+				for (int c = 0; c < 3; c++) {
+					const double d = arr[c];
+					if (!std::isfinite(d)) {
+						WARN_PRINT(vformat("glTF material '%s': ignoring non-finite component in '%s'.", material->get_name(), p_key));
+						return false;
+					}
+				}
+				r_value = Color(arr[0], arr[1], arr[2]).linear_to_srgb();
+				return true;
+			};
+
+			auto note_dropped_texture = [&](const Dictionary &p_ext, const char *p_key) {
+				if (p_ext.has(p_key)) {
+					dropped_textures.push_back(p_key);
+				}
+			};
+
+			if (material_extensions.has("KHR_materials_transmission")) {
+				const Dictionary &ext = material_extensions["KHR_materials_transmission"];
+				float v = 0.0f;
+				if (read_ext_float(ext, "transmissionFactor", v)) {
+					material->set_transmission(v);
+				}
+				note_dropped_texture(ext, "transmissionTexture");
+			}
+
+			if (material_extensions.has("KHR_materials_ior")) {
+				const Dictionary &ext = material_extensions["KHR_materials_ior"];
+				float v = 1.5f;
+				if (read_ext_float(ext, "ior", v)) {
+					// No clamping, matching Blender's importer. ior == 0.0 is
+					// legal glTF and means "no refraction, F0 = 0".
+					material->set_ior(v);
+				}
+			}
+
+			if (material_extensions.has("KHR_materials_volume")) {
+				const Dictionary &ext = material_extensions["KHR_materials_volume"];
+				float v = 0.0f;
+				if (read_ext_float(ext, "thicknessFactor", v)) {
+					material->set_thickness(v);
+				}
+				// glTF default is infinity, which we represent as 0. A
+				// non-positive authored value means the same thing.
+				float dist = 0.0f;
+				if (read_ext_float(ext, "attenuationDistance", dist)) {
+					material->set_attenuation_distance(dist > 0.0f ? dist : 0.0f);
+				}
+				Color c;
+				if (read_ext_color(ext, "attenuationColor", c)) {
+					material->set_attenuation_color(c);
+				}
+				note_dropped_texture(ext, "thicknessTexture");
+			}
+
+			if (material_extensions.has("KHR_materials_specular")) {
+				const Dictionary &ext = material_extensions["KHR_materials_specular"];
+				float v = 1.0f;
+				if (read_ext_float(ext, "specularFactor", v)) {
+					material->set_specular_factor(v);
+				}
+				Color c;
+				if (read_ext_color(ext, "specularColorFactor", c)) {
+					material->set_specular_tint(c);
+				}
+				note_dropped_texture(ext, "specularTexture");
+				note_dropped_texture(ext, "specularColorTexture");
+			}
+
+			if (material_extensions.has("KHR_materials_clearcoat")) {
+				const Dictionary &ext = material_extensions["KHR_materials_clearcoat"];
+				bool any = false;
+				float v = 0.0f;
+				if (read_ext_float(ext, "clearcoatFactor", v)) {
+					material->set_clearcoat(v);
+					any = true;
+				}
+				float r = 0.0f;
+				if (read_ext_float(ext, "clearcoatRoughnessFactor", r)) {
+					material->set_clearcoat_roughness(r);
+					any = true;
+				}
+				if (any) {
+					// _validate_property hides clearcoat while the feature is
+					// off, so without this the data imports but is not
+					// inspectable.
+					material->set_feature(BaseMaterial3D::FEATURE_CLEARCOAT, true);
+				}
+				note_dropped_texture(ext, "clearcoatTexture");
+				note_dropped_texture(ext, "clearcoatRoughnessTexture");
+				note_dropped_texture(ext, "clearcoatNormalTexture");
+			}
+
+			if (material_extensions.has("KHR_materials_sheen")) {
+				const Dictionary &ext = material_extensions["KHR_materials_sheen"];
+				Color c;
+				if (read_ext_color(ext, "sheenColorFactor", c)) {
+					material->set_sheen_color(c);
+				}
+				float r = 0.0f;
+				if (read_ext_float(ext, "sheenRoughnessFactor", r)) {
+					material->set_sheen_roughness(r);
+				}
+				note_dropped_texture(ext, "sheenColorTexture");
+				note_dropped_texture(ext, "sheenRoughnessTexture");
+			}
+
+			if (material_extensions.has("KHR_materials_anisotropy")) {
+				const Dictionary &ext = material_extensions["KHR_materials_anisotropy"];
+				bool any = false;
+				float s = 0.0f;
+				if (read_ext_float(ext, "anisotropyStrength", s)) {
+					material->set_anisotropy(s);
+					any = true;
+				}
+				float rot = 0.0f;
+				if (read_ext_float(ext, "anisotropyRotation", rot)) {
+					material->set_anisotropy_rotation(rot);
+					any = true;
+				}
+				if (any) {
+					material->set_feature(BaseMaterial3D::FEATURE_ANISOTROPY, true);
+				}
+				note_dropped_texture(ext, "anisotropyTexture");
+			}
+
+			if (!dropped_textures.is_empty()) {
+				WARN_PRINT(vformat(
+						"glTF material '%s': ignoring unsupported extension texture(s): %s. "
+						"Factors were imported; per-parameter extension textures are not yet supported.",
+						material->get_name(), String(", ").join(dropped_textures)));
 			}
 		}
 
@@ -6970,9 +7150,16 @@ HashSet<String> GLTFDocument::get_supported_gltf_extensions_hashset() {
 	supported_extensions.insert("GODOT_single_root");
 	supported_extensions.insert("KHR_animation_pointer");
 	supported_extensions.insert("KHR_lights_punctual");
+	supported_extensions.insert("KHR_materials_anisotropy");
+	supported_extensions.insert("KHR_materials_clearcoat");
 	supported_extensions.insert("KHR_materials_emissive_strength");
+	supported_extensions.insert("KHR_materials_ior");
 	supported_extensions.insert("KHR_materials_pbrSpecularGlossiness");
+	supported_extensions.insert("KHR_materials_sheen");
+	supported_extensions.insert("KHR_materials_specular");
+	supported_extensions.insert("KHR_materials_transmission");
 	supported_extensions.insert("KHR_materials_unlit");
+	supported_extensions.insert("KHR_materials_volume");
 	supported_extensions.insert("KHR_node_visibility");
 	supported_extensions.insert("KHR_texture_transform");
 	for (Ref<GLTFDocumentExtension> ext : all_document_extensions) {
