@@ -428,7 +428,7 @@ git commit -m "refactor(pt): widen dielectricF0 to float3 for tinted specular"
 
 **Interfaces:**
 - Consumes: `F0_from_ior`, `ior_from_F0` (Task 1); `float3 dielectricF0` (Task 2).
-- Produces: `MaterialResult` gains `float transmission`, `float ior`, `float thickness`, `float3 attenuation`. `brdf_mat.dielectricF0` carries the resolved tinted F0; a local `float resolved_eta` carries the resolved eta.
+- Produces: `MaterialResult` gains `float transmission`, `float ior`, `float thickness`, `float3 attenuation`, `float3 specular_tint`, `float specular_factor`. `void resolveDielectricF0(float ior, float specular, float specular_factor, float3 specular_tint, OUT_PARAMETER(float3) F0, OUT_PARAMETER(float) eta)` in `brdf_inc.glsl` — Task 7 calls it too. `brdf_mat.dielectricF0` carries the resolved tinted F0; a local `float resolved_eta` carries the resolved eta.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -624,9 +624,47 @@ At the HG0 site (after `m.normal = final_normal;` around `:557`), append:
 	m.specular_factor = mat.specular_factor;
 ```
 
-- [ ] **Step 5: Resolve F0 and eta in `shade_and_bounce`**
+- [ ] **Step 5: Define the F0 arbitration helper and call it**
 
-In `raytracing_closest_hit_common_inc.glsl`, replace line `:615`:
+**Two call sites need this arithmetic** — `shade_and_bounce` here, and
+`debug_visualize` in Task 7 — and they must agree EXACTLY or the GPU gate
+validates a formula the renderer does not use. Define it once.
+
+In `brdf_inc.glsl`, immediately after the Fresnel block Task 1 added (which
+sits between `luminance` at `:335-337` and `baseColorToSpecularF0`), add:
+
+```glsl
+// F0 / IOR arbitration (roadmap E1, spec section 3.2). Phase D left F0
+// double-specified between Godot's `specular` and the glTF ior /
+// specular_factor / specular_tint triple; this resolves it.
+//
+// Structure is Cycles' (kernel/svm/closure.h:426-431): IOR is the source of
+// truth, the artist-facing specular knob is a multiplier that no-ops at its
+// 0.5 default, and eta is re-derived from the modified F0 when it is not 0.5
+// so reflectance and refraction cannot disagree.
+//
+// The RESPONSE CURVE is Godot's, not Blender's: 4*specular^2 is
+// specular_to_f0 (0.16*s^2) normalised against the 0.04 reference, so it is
+// EXACTLY 1.0 at 0.5 and preserves Godot's shape away from it. Blender uses
+// 2*level; the two agree only at 0.5 (0.08 vs 0.16 at specular = 1.0).
+//
+// At every default -- ior 1.5, specular 0.5, specular_factor 1.0, white tint
+// -- this yields exactly float3(0.04) and eta 1.5, identical to the
+// specular_to_f0(0.5) it replaces. That is arithmetic, not a measurement, and
+// it is why untouched materials cannot shift.
+//
+// SINGLE SOURCE OF TRUTH. shade_and_bounce and debug_visualize's vis modes 30
+// and 31 both call this. Do not inline a second copy -- a gate that validates
+// a divergent copy of the formula proves nothing about the renderer.
+void resolveDielectricF0(float ior, float specular, float specular_factor, float3 specular_tint, OUT_PARAMETER(float3) F0, OUT_PARAMETER(float) eta) {
+	float f0_scalar = F0_from_ior(ior);
+	F0 = float3(f0_scalar, f0_scalar, f0_scalar) * specular_tint * specular_factor;
+	F0 *= 4.0f * specular * specular;
+	eta = (specular != 0.5f) ? ior_from_F0(luminance(F0)) : ior;
+}
+```
+
+Then in `raytracing_closest_hit_common_inc.glsl`, replace line `:615`:
 
 ```glsl
 	brdf_mat.dielectricF0 = vec3(specular_to_f0(m.specular));
@@ -653,12 +691,11 @@ with:
 	// -- this yields exactly vec3(0.04) and eta 1.5, identical to the
 	// specular_to_f0(0.5) this line replaced. That is arithmetic, not a
 	// measurement, and it is why untouched materials cannot shift.
-	float f0_scalar = F0_from_ior(m.ior);
-	brdf_mat.dielectricF0 = vec3(f0_scalar) * m.specular_tint * m.specular_factor;
-	brdf_mat.dielectricF0 *= 4.0 * m.specular * m.specular;
-	float resolved_eta = (m.specular != 0.5)
-			? ior_from_F0(luminance(brdf_mat.dielectricF0))
-			: m.ior;
+	// See resolveDielectricF0 in brdf_inc.glsl for why IOR wins and why the
+	// specular knob is a multiplier that no-ops at 0.5.
+	float resolved_eta;
+	resolveDielectricF0(m.ior, m.specular, m.specular_factor, m.specular_tint,
+			brdf_mat.dielectricF0, resolved_eta);
 ```
 
 Declare `resolved_eta` at this scope, not inside a branch: Task 5 reads it into
@@ -1037,7 +1074,7 @@ git commit -m "feat(pt): transmission spec constant, bounce budget and payload b
 
 **Interfaces:**
 - Consumes: `fresnel_dielectric`, `refract_angle`, `F0_from_ior` (Task 1); `float3 dielectricF0` (Task 2); `MaterialResult.transmission` and `resolved_eta` (Task 3); `RT_PRNG_TRANSMIT` (Task 4).
-- Produces: `bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit)`; `combinedPdf` gains a `pdf_reflect` factor gated on `transmission > 0`.
+- Produces: `float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmission, OUT_PARAMETER(float3) reflectance, OUT_PARAMETER(float) transmittance, OUT_PARAMETER(float) cos_theta_t)` returning `pdf_reflect`; `bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit)`; `combinedPdf` gains a `pdf_reflect` factor gated on `transmission > 0`.
 
 **The two things most likely to go wrong here.**
 
@@ -1129,9 +1166,59 @@ bin\godot.windows.editor.x86_64.console.exe --test "*Transmission*"
 
 For a genuine RED, temporarily remove the `(denom > 0.0f) ?` guard from `mirror_pdf_reflect` and confirm the degenerate case **fails** on `!Math::is_nan(p)`. Restore and confirm green. Record both.
 
-- [ ] **Step 3: Add the closure**
+- [ ] **Step 3: Add the split helper and the closure**
 
-In `brdf_inc.glsl`, immediately after `sampleSpecularMicrofacet` (which ends around `:915`), insert:
+**The split is computed in two places** — inside the closure when sampling, and
+inside `combinedPdf` when evaluating the density for MIS. Those two MUST return
+the same number for the same inputs. If they drift, the MIS weights partition a
+different integrand than the estimator evaluates, which is exactly the defect
+class B2 shipped and C3 measured at +2.4%. So it is one function, called twice,
+not two copies.
+
+In `brdf_inc.glsl`, immediately after `sampleSpecularMicrofacet` (which ends
+around `:915`), first insert the helper:
+
+```glsl
+// Fresnel-weighted reflect-vs-transmit split for a dielectric microfacet.
+// Ported from Cycles bsdf_microfacet.h:844-851 and :299-305.
+//
+// SINGLE SOURCE OF TRUTH for the split. sampleDielectricMicrofacet uses it to
+// CHOOSE a lobe; combinedPdf uses it to report that choice's DENSITY. Two
+// copies that disagree would make every MIS weight on a transmissive surface
+// describe a different integrand than the estimator evaluates. Do not inline
+// a second copy.
+//
+// Returns pdf_reflect. Writes the remapped per-channel reflectance, the scalar
+// transmittance, and the cosine of the transmitted angle (only meaningful when
+// the return value is below 1.0 -- under TIR no transmitted direction exists
+// and cos_theta_t is left untouched).
+float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmission, OUT_PARAMETER(float3) reflectance, OUT_PARAMETER(float) transmittance, OUT_PARAMETER(float) cos_theta_t) {
+	float F_real = fresnel_dielectric(HdotV, eta, cos_theta_t);
+
+	// Remap the real Fresnel curve onto the tinted [F0, 1] range -- Cycles'
+	// generalized-Schlick "exponent < 0" branch (bsdf_microfacet.h:299-305).
+	// This is how a tinted F0 (from specular_tint) coexists with a real Fresnel
+	// term that TIR depends on: plain Schlick cannot express TIR, and plain
+	// real Fresnel cannot carry the tint.
+	float F0_real = F0_from_ior(eta);
+	float s = saturate((F_real - F0_real) / max(1.0f - F0_real, 0.00001f));
+	reflectance = lerp(F0, float3(1.0f, 1.0f, 1.0f), s);
+	transmittance = (1.0f - F_real) * transmission;
+
+	float avg_reflectance = dot(reflectance, float3(1.0f, 1.0f, 1.0f)) / 3.0f;
+	float denom = avg_reflectance + transmittance;
+
+	// The guard is LOAD-BEARING, not defensive. At eta == 1.0 with
+	// transmission == 0, F_real is 0, reflectance is F0 == 0, transmittance is
+	// 0, and the unguarded ratio is 0/0. sanitize_payload_value would silently
+	// zero the resulting NaN and poison the pixel with no failing test. Falling
+	// back to 1.0 routes the degenerate case down the reflective branch with a
+	// zero weight, terminating the path cleanly.
+	return (denom > 0.0f) ? (avg_reflectance / denom) : 1.0f;
+}
+```
+
+Then, after it, the closure itself:
 
 ```glsl
 // Dielectric microfacet closure: reflection AND transmission as one closure
@@ -1161,31 +1248,13 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 
 	float HdotV = dot(Hlocal, Vlocal);
 
-	// Real Fresnel. cos_theta_t is only written when a transmitted direction
-	// exists; TIR returns 1.0 and leaves it alone.
+	// cos_theta_t is only written when a transmitted direction exists; under
+	// TIR the helper returns 1.0 and leaves it alone.
 	float cos_theta_t = 0.0f;
-	float F_real = fresnel_dielectric(HdotV, eta, cos_theta_t);
-
-	// Remap the real Fresnel curve onto the tinted [F0, 1] range -- Cycles'
-	// generalized-Schlick "exponent < 0" branch (bsdf_microfacet.h:299-305).
-	// This is how a tinted F0 (from specular_tint) coexists with a real Fresnel
-	// term that TIR depends on: plain Schlick cannot express TIR, and plain real
-	// Fresnel cannot carry the tint.
-	float F0_real = F0_from_ior(eta);
-	float s = saturate((F_real - F0_real) / max(1.0f - F0_real, 0.00001f));
-	float3 reflectance = lerp(F0, float3(1.0f, 1.0f, 1.0f), s);
-	float transmittance = (1.0f - F_real) * transmission;
-
-	float avg_reflectance = dot(reflectance, float3(1.0f, 1.0f, 1.0f)) / 3.0f;
-	float denom = avg_reflectance + transmittance;
-
-	// The guard is LOAD-BEARING, not defensive. At eta == 1.0 with
-	// transmission == 0, F_real is 0, reflectance is F0 == 0, transmittance is 0,
-	// and the unguarded ratio is 0/0. sanitize_payload_value would silently zero
-	// the resulting NaN and poison the pixel with no failing test. Falling back
-	// to 1.0 routes the degenerate case down the reflective branch with a zero
-	// weight, terminating the path cleanly.
-	float pdf_reflect = (denom > 0.0f) ? (avg_reflectance / denom) : 1.0f;
+	float3 reflectance;
+	float transmittance;
+	float pdf_reflect = dielectricFresnelSplit(HdotV, eta, F0, transmission,
+			reflectance, transmittance, cos_theta_t);
 
 	isTransmit = (u.z >= pdf_reflect);
 
@@ -1244,17 +1313,18 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	// Gated on transmissivness > 0 so an opaque material's density is unchanged
 	// INSTRUCTION-FOR-INSTRUCTION, matching the sampling dispatch. The two must
 	// agree about which formulation generated the sample.
+	// Same function sampleDielectricMicrofacet calls to CHOOSE the lobe. It must
+	// be the same function, not a copy: the density reported here and the density
+	// actually sampled there are the two halves of every MIS weight on a
+	// transmissive surface.
 	float transmitScale = 1.0f;
 	if (material.transmissivness > 0.0f) {
+		float3 reflectance_unused;
+		float transmittance_unused;
 		float cos_theta_t_unused = 0.0f;
-		float F_real = fresnel_dielectric(max(0.00001f, LdotH), material.ior, cos_theta_t_unused);
-		float F0_real = F0_from_ior(material.ior);
-		float s = saturate((F_real - F0_real) / max(1.0f - F0_real, 0.00001f));
-		float3 reflectance = lerp(data.specularF0, float3(1.0f, 1.0f, 1.0f), s);
-		float transmittance = (1.0f - F_real) * material.transmissivness;
-		float avg_r = dot(reflectance, float3(1.0f, 1.0f, 1.0f)) / 3.0f;
-		float denom = avg_r + transmittance;
-		transmitScale = (denom > 0.0f) ? (avg_r / denom) : 1.0f;
+		transmitScale = dielectricFresnelSplit(max(0.00001f, LdotH), material.ior,
+				data.specularF0, material.transmissivness,
+				reflectance_unused, transmittance_unused, cos_theta_t_unused);
 	}
 
 	return pSpec * specularContribution * transmitScale + (1.0f - pSpec) * pdfDiffuse;
@@ -1545,6 +1615,7 @@ git commit -m "feat(pt): integrate transmission into the path, remove the transm
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-6.
+- Consumes: `resolveDielectricF0` (Task 3) — called, never re-inlined.
 - Produces: vis modes 30 (`RT_DEBUG_MAT_RESOLVED_F0`) and 31 (`RT_DEBUG_MAT_RESOLVED_ETA`).
 
 **Why the gate exists.** The doctest suite mirrors the GLSL in C++ and never executes the shader, and the headless renderer discards material parameters entirely (`servers/rendering/dummy/storage/material_storage.h:123-124` are both no-ops). Only a real GPU render can prove the arbitration and the physics landed. Phase D's `pt_material_data_gate.gd` is the pattern to follow — read it before writing this.
@@ -1565,21 +1636,21 @@ In `environment.cpp`, append `,Resolved F0,Resolved Eta` to the `pathtracing_deb
 In `debug_visualize`, after the Phase D branches (modes 23-29), add:
 
 ```glsl
-	} else if (vis_mode == 30) {
-		// Resolved dielectric F0 after the E1 arbitration, RAW and unscaled.
-		// This is the value most able to fail silently: a wrong F0 still looks
-		// like plausible glass, so it is asserted numerically rather than judged.
-		float f0s = F0_from_ior(dbg_material.ior);
-		vec3 f0 = vec3(f0s) * dbg_material.specular_tint * dbg_material.specular_factor;
-		ps.radiance = f0 * (4.0 * specular * specular);
-	} else if (vis_mode == 31) {
-		// Resolved eta. Re-derived from F0 only when specular is off its 0.5
-		// default, matching shade_and_bounce.
-		float f0s = F0_from_ior(dbg_material.ior);
-		vec3 f0 = vec3(f0s) * dbg_material.specular_tint * dbg_material.specular_factor;
-		f0 *= (4.0 * specular * specular);
-		float eta = (specular != 0.5) ? ior_from_F0(luminance(f0)) : dbg_material.ior;
-		ps.radiance = vec3(eta);
+	} else if (vis_mode == 30 || vis_mode == 31) {
+		// Resolved dielectric F0 (30) and resolved eta (31) after the E1
+		// arbitration, RAW and unscaled.
+		//
+		// This calls the SAME resolveDielectricF0 that shade_and_bounce calls
+		// (Task 3). That is the entire point of the gate: a second inlined copy
+		// of the formula here would let the gate pass while the renderer used
+		// something else -- validating the test's own arithmetic rather than the
+		// shipped code. F0 is the value most able to fail silently, because a
+		// wrong one still looks like plausible glass.
+		vec3 dbg_f0;
+		float dbg_eta;
+		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
+				dbg_material.specular_tint, dbg_f0, dbg_eta);
+		ps.radiance = (vis_mode == 30) ? dbg_f0 : vec3(dbg_eta);
 	}
 ```
 
@@ -1704,6 +1775,15 @@ compiled, which is exactly how Phase D's plan shipped three mechanical defects.
 2. Task 5's `mirror_pdf_reflect` hardcoded `f0_from_ior(1.5f)` while accepting an
    arbitrary `F_real`, so it would silently mis-assert at any other IOR. Fixed by
    taking `p_eta` as a parameter.
+
+**One defect found in the pre-flight scan and fixed by amendment.** The plan
+originally inlined the Fresnel remap / `pdf_reflect` computation at three sites
+and the F0 arbitration at two. Both are now single functions in `brdf_inc.glsl`
+— `dielectricFresnelSplit` (Task 5) and `resolveDielectricF0` (Task 3) — called
+from every site. This is not a style preference: the sampling density and the
+`combinedPdf` density are the two halves of every MIS weight on a transmissive
+surface, and a gate that validates its own copy of the arbitration proves
+nothing about the renderer.
 
 **One residual risk, not fixable from here.** The GLSL in Tasks 5 and 6 has been
 read against its call sites but never compiled. `rotatePoint`, `invertRotation`,
