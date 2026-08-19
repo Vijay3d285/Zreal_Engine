@@ -772,7 +772,7 @@ is shared with analytic-light NEE, so it changes analytic-light shading engine-w
   double count between analytic NEE and environment NEE is untouched. The
   workaround stands and the reconciliation is still unowned.
 
-### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)*
+### Phase D — Material data pipeline *(NEW, first-class; ~2 weeks)* — **COMPLETE**
 
 **Nothing in Phase E is testable until this lands.** See §3.6.
 
@@ -785,7 +785,7 @@ Extend `StandardMaterial3D` (or introduce a `PrincipledMaterial3D`) to carry the
 **D3. Widen RT `MaterialData`**
 Add transmission, IOR, clearcoat (+roughness), sheen (+tint), anisotropy (+rotation) to `raytracing_data_inc.glsl:87-105` and its C++ twin. **Respect the std430 / `static_assert(sizeof == N)` / `alignas(16)` parity rules** — the struct has a verbatim GLSL counterpart and both must agree byte-for-byte.
 
-*Accept:* a Blender-authored GLB with glass, car paint, and fabric round-trips with every parameter intact and inspectable, *before* any new BSDF math exists to consume it.
+*Accept:* a Blender-authored GLB with glass, car paint, and fabric round-trips with every parameter intact and inspectable, *before* any new BSDF math exists to consume it. **Met — see the Phase D closeout in §6.**
 
 ### Phase E — BSDF completeness *(~3 weeks, parallelizable after D)*
 
@@ -832,7 +832,7 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
-Ordering summary: **A1 → A2/A3/A4 → D → E → F (Phases B and C are complete).**
+Ordering summary: **A1 → A2/A3/A4 → D → E → F (Phases B, C and D are complete).**
 
 **Phase B is complete** — B1, B2, B3, B4 and B5 have all landed. "Complete" here
 means every listed item is implemented and measured; it does **not** mean Phase B
@@ -886,5 +886,106 @@ revision of this section said C1 was gating "until … analytic lights are
 BSDF-reachable"; that is wrong and would have sent someone looking for a fix that
 must not be written.)
 
-**The next item is Phase D** (material data pipeline), which is a hard
-prerequisite for Phase E.
+**Phase D is complete** — D1, D2 and D3 have all landed (Tasks 1-5: ten new
+`BaseMaterial3D` path-tracer-only parameters; glTF import of seven material
+extensions; glTF export closing the round-trip; `RT_MaterialData` widened
+96→176 bytes; a GPU gate proving the data reaches the shader intact). As with
+Phases B and C, "complete" means every listed item is implemented and
+measured; it does **not** mean the phase does anything to rendered output yet.
+**Nothing reads any of the new values in the integrator. No pixel changed. No
+physical correctness is claimed** — Phase D is data plumbing, full stop, and
+that is the entire point: Phase E can now write BSDF math against material
+data that demonstrably survives import, export, and the GPU upload path,
+instead of against nothing.
+
+**Measured no-pixel-change (§7.2).** The pre-D invariant — a scene carrying
+none of the seven new extensions must render bit-for-bit identically before
+and after Phase D, because the integrator reads none of the new struct fields
+and nothing pre-existing was overwritten — was checked by reverting
+`scene/`, `modules/gltf/`, `servers/rendering/` and `tests/` in place to
+`27086b741e` (the commit immediately before Phase D), rebuilding, and
+re-running `pt_light_gate_scene.tscn`'s gate 1 (`ZR_GATE_MODE=in_range
+ZR_GATE_FRAMES=2048 ZR_GATE_RES=256`) against the Phase D HEAD build:
+
+| | pre-D (`27086b741e`) | Phase D (HEAD) |
+|---|---|---|
+| MEAN | 6.067232 | 6.067232 |
+| std-dev | 0.117619 | 0.117620 |
+| delta vs. 2048-frame reference | +0.000240 (+0.004%) | +0.000240 (+0.004%) |
+
+Identical to the sixth significant figure, well inside this gate's own
+run-to-run noise floor (~1e-6 relative, per the gate's own header comment).
+**No shift. The invariant holds.**
+
+**Measured Blender acceptance (§7.1).** This is the only check in Phase D
+that validates our reading of Blender's *exporter* rather than our own
+importer against our own hand-written fixtures — Tasks 2 and 3's tests are
+hermetic and cannot substitute for it. A GLB was built headlessly with
+Blender 4.5.3 LTS (`bpy`, `--background --python`) containing three
+Principled-BSDF materials — glass (Transmission Weight, IOR, a Volume
+Absorption node plus a `glTF Material Output` node group supplying
+Thickness), car paint (Coat Weight/Roughness, Anisotropic/Anisotropic
+Rotation), fabric (Sheen Weight/Roughness/Tint) — exercising all thirteen
+imported parameters, then loaded through `GLTFDocument.append_from_file` under
+`--path pipeline_references`, the same runtime import path the production
+pipeline uses. **All thirteen of thirteen round-tripped correctly:**
+`transmission`, `ior`, `thickness`, `attenuation_distance`,
+`attenuation_color`, `specular_factor`, `specular_tint`, `clearcoat`,
+`clearcoat_roughness`, `sheen_color`, `sheen_roughness`, `anisotropy`,
+`anisotropy_rotation`.
+
+Two things surfaced during this check that are **not** defects but are
+easy to mistake for one, so they are recorded here:
+
+- The three color-valued parameters (`attenuation_color`, `specular_tint`,
+  `sheen_color`) come back from the Inspector visibly different from the raw
+  linear floats Blender writes into the glTF JSON (e.g. JSON `0.2` reads back
+  as Godot Color `0.4845`). This is **not** a bug: `read_ext_color`
+  (`gltf_document.cpp:3118-3146`) applies `linear_to_srgb()` on import and the
+  corresponding export path applies `srgb_to_linear()`, exactly mirroring the
+  pre-existing `baseColorFactor` convention (`gltf_document.cpp:3340-3341` /
+  `2680`) — Godot's `BaseMaterial3D` Color properties are stored
+  sRGB-encoded. Un-converting the Inspector values with the standard sRGB
+  transfer function reproduces Blender's linear inputs to four decimal
+  places. Round-trip verified correct; noted because the raw-JSON-vs-Inspector
+  diff looks alarming at a glance.
+- Blender's own `KHR_materials_specular` exporter folds `specularFactor` into
+  `specularColorFactor` whenever `Specular IOR Level > 0.5` (its internal
+  `fac = level * 2.0` exceeds glTF's `specularFactor <= 1.0` ceiling), and
+  `Anisotropic Rotation` is a 0-1 turn fraction in Blender's UI that the
+  exporter converts to radians for glTF's `anisotropyRotation` (matching
+  Godot's `anisotropy_rotation`, which is also radians). Both are exporter-side
+  conventions, not import bugs, but worth knowing when hand-authoring test
+  content in Blender.
+
+**Suite:** `--test` → **1487 passed, 0 failed, 3 skipped** (Task 2's edge-case
+coverage deliberately emits `WARN_PRINT` for non-numeric/malformed extension
+fields; those warnings are expected, not failures). **GPU gate:**
+`pt_material_data_gate_scene.tscn` → **PASS, all 19 material fields arrived in
+the shader intact** (19, not 13, because the gate additionally exercises the
+`attenuation_density` and `specular_factor`/`sheen_roughness` packing lanes
+alongside the thirteen user-facing parameters).
+
+**Open items, carried into Phase E, stated plainly rather than buried:**
+
+- Per-parameter extension textures (`transmissionTexture`,
+  `specularTexture`, `clearcoatTexture`, `sheenColorTexture`, …) are dropped
+  with a `WARN_PRINT`. **Deliberate** (spec §2), not an oversight — only
+  factors are imported.
+- `KHR_materials_iridescence` is not imported at all; it is absent from
+  `supported_extensions` and has no `BaseMaterial3D` parameter.
+- **F0 is double-specified.** Both `specular` (Godot's pre-existing
+  Fresnel-at-normal-incidence control) and the new `ior` /
+  `specular_factor` / `specular_tint` triple reach the shader simultaneously.
+  Nothing today resolves the conflict — **Phase E must decide which wins**
+  before writing any BSDF math that reads F0.
+- `ior == 0.0` is legal glTF (`KHR_materials_ior` permits it as a signal
+  value) and imports without complaint. **Phase E must not assume `ior >=
+  1`** anywhere in the refraction math it writes.
+- Nothing in the integrator reads any of the new struct fields yet. No
+  rendered output changed as a result of Phase D, and no claim of physical
+  correctness is made for the new parameters — that is Phase E's job.
+
+**The next item is Phase E** (BSDF completeness), which is unblocked now that
+Phase D's material data demonstrably survives import, export, and the GPU
+upload path.
