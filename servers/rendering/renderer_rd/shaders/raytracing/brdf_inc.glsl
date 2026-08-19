@@ -352,9 +352,12 @@ float luminance(float3 rgb) {
 //    cannot drift out of sync.
 // -------------------------------------------------------------------------
 
+float sqr(float x) {
+	return x * x;
+}
+
 float F0_from_ior(float ior) {
-	float t = (ior - 1.0f) / (ior + 1.0f);
-	return t * t;
+	return sqr((ior - 1.0f) / (ior + 1.0f));
 }
 
 float ior_from_F0(float f0) {
@@ -376,20 +379,20 @@ float ior_from_F0(float f0) {
 // imports it without complaint; the TIR branch handles it correctly, but an
 // eagerly-evaluated reciprocal would already be an infinity.
 float fresnel_dielectric(float cos_theta_i, float eta, OUT_PARAMETER(float) r_cos_theta_t) {
-	float eta_cos_theta_t_sq = eta * eta - (1.0f - cos_theta_i * cos_theta_i);
+	float eta_cos_theta_t_sq = sqr(eta) - (1.0f - sqr(cos_theta_i));
 	if (eta_cos_theta_t_sq <= 0.0f) {
 		return 1.0f; // Total internal reflection.
 	}
-	float ci = abs(cos_theta_i);
+	cos_theta_i = abs(cos_theta_i);
 	float cos_theta_t = -sqrt(eta_cos_theta_t_sq) / eta;
 	r_cos_theta_t = cos_theta_t;
 
 	// Amplitudes of the reflected s- and p-polarised waves.
-	float r_s = (ci + eta * cos_theta_t) / (ci - eta * cos_theta_t);
-	float r_p = (cos_theta_t + eta * ci) / (eta * ci - cos_theta_t);
+	float r_s = (cos_theta_i + eta * cos_theta_t) / (cos_theta_i - eta * cos_theta_t);
+	float r_p = (cos_theta_t + eta * cos_theta_i) / (eta * cos_theta_i - cos_theta_t);
 
 	// Squared amplitude gives the fraction of reflected energy.
-	return (r_s * r_s + r_p * r_p) * 0.5f;
+	return (sqr(r_s) + sqr(r_p)) * 0.5f;
 }
 
 // `incident` points AWAY from the surface (toward the viewer), matching V.

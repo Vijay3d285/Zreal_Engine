@@ -69,8 +69,11 @@ static float fresnel_dielectric(float p_cos_theta_i, float p_eta, float *r_cos_t
 	if (r_cos_theta_t) {
 		*r_cos_theta_t = cos_theta_t;
 	}
+	// Amplitudes of the reflected s- and p-polarised waves.
 	const float r_s = (cos_theta_i + p_eta * cos_theta_t) / (cos_theta_i - p_eta * cos_theta_t);
 	const float r_p = (cos_theta_t + p_eta * cos_theta_i) / (p_eta * cos_theta_i - cos_theta_t);
+
+	// Squared amplitude gives the fraction of reflected energy.
 	return (sqr(r_s) + sqr(r_p)) * 0.5f;
 }
 
