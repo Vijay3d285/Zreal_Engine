@@ -40,6 +40,8 @@ TEST_FORCE_LINK(test_gltf_document)
 
 #include "tests/test_utils.h"
 
+#include "core/io/file_access.h"
+#include "core/io/json.h"
 #include "modules/gltf/extensions/gltf_document_extension_convert_importer_mesh.h"
 #include "modules/gltf/gltf_document.h"
 #include "scene/3d/mesh_instance_3d.h"
@@ -367,6 +369,15 @@ TEST_CASE("[SceneTree][GLTFDocument] Import glTF material extension edge cases")
 	// than partially imported with the bad component silently coerced to
 	// 0; the property stays at its class default of white.
 	CHECK(mat->get_specular_tint().is_equal_approx(Color(1, 1, 1)));
+
+	// An extension whose value is not a JSON object at all. Converting such a
+	// Variant to a Dictionary yields an empty one, so every has() below it
+	// returns false and the extension would disappear with no diagnostic --
+	// the only malformed input in these blocks that used not to warn. The
+	// property must stay at its default, and a warning must be emitted (the
+	// warning text is verified by eye; this pins the behaviour).
+	CHECK(mat->get_transmission() == doctest::Approx(0.0f));
+	CHECK(mat->get_sheen_color().is_equal_approx(Color(0, 0, 0)));
 }
 
 TEST_CASE("[SceneTree][GLTFDocument] Material extensions survive a full round-trip") {
@@ -438,6 +449,130 @@ TEST_CASE("[SceneTree][GLTFDocument] Material extensions survive a full round-tr
 	CHECK(out->get_attenuation_color().is_equal_approx(mat->get_attenuation_color()));
 	CHECK(out->get_specular_tint().is_equal_approx(mat->get_specular_tint()));
 	CHECK(out->get_sheen_color().is_equal_approx(mat->get_sheen_color()));
+
+	memdelete(mesh_instance);
+}
+
+TEST_CASE("[SceneTree][GLTFDocument] A zero clearcoat_roughness survives the round-trip") {
+	register_gltf_extension();
+
+	// REGRESSION: clearcoat_roughness's Godot class default is 0.5, but glTF's
+	// clearcoatRoughnessFactor default is 0.0. An exporter that omits keys
+	// equal to the glTF default therefore drops an authored 0.0 -- a
+	// mirror-smooth coat -- and the importer, finding no key, leaves the class
+	// default in place. 0.0 silently becomes 0.5.
+	//
+	// clearcoatFactor is exercised at 0.0 for the mirror-image reason: its class
+	// default is 1.0, so an authored 0.0 that is omitted comes back as 1.0.
+	Ref<StandardMaterial3D> mat;
+	mat.instantiate();
+	mat->set_feature(BaseMaterial3D::FEATURE_CLEARCOAT, true);
+	mat->set_clearcoat(0.0f);
+	mat->set_clearcoat_roughness(0.0f);
+
+	Ref<BoxMesh> mesh;
+	mesh.instantiate();
+	mesh->surface_set_material(0, mat);
+
+	MeshInstance3D *mesh_instance = memnew(MeshInstance3D);
+	mesh_instance->set_mesh(mesh);
+	SceneTree::get_singleton()->get_root()->add_child(mesh_instance);
+
+	Ref<GLTFDocument> doc_save;
+	doc_save.instantiate();
+	Ref<GLTFState> state_save;
+	state_save.instantiate();
+	REQUIRE(doc_save->append_from_scene(mesh_instance, state_save) == OK);
+	const String path = TestUtils::get_temp_path("clearcoat_zero_roundtrip.gltf");
+	REQUIRE(doc_save->write_to_filesystem(state_save, path) == OK);
+
+	Ref<GLTFDocument> doc_load;
+	doc_load.instantiate();
+	Ref<GLTFState> state_load;
+	state_load.instantiate();
+	REQUIRE(doc_load->append_from_file(path, state_load) == OK);
+
+	const Vector<Ref<Material>> &materials = state_load->get_materials();
+	REQUIRE(materials.size() >= 1);
+	Ref<StandardMaterial3D> out = materials[0];
+	REQUIRE(out.is_valid());
+
+	CHECK(out->get_clearcoat() == doctest::Approx(0.0f));
+	CHECK(out->get_clearcoat_roughness() == doctest::Approx(0.0f));
+	// The feature must come back on, or the values are neither inspectable nor
+	// published to the path tracer.
+	CHECK(out->get_feature(BaseMaterial3D::FEATURE_CLEARCOAT));
+
+	memdelete(mesh_instance);
+}
+
+TEST_CASE("[SceneTree][GLTFDocument] Out-of-range values export inside glTF's legal ranges") {
+	register_gltf_extension();
+
+	// Godot's property hints do not clamp, so these are all reachable from
+	// GDScript. glTF gives transmissionFactor/specularFactor/anisotropyStrength
+	// a range of [0, 1] and thicknessFactor a minimum of 0; emitting a negative
+	// or >1 value produces JSON that a validator rejects.
+	//
+	// anisotropy is the interesting one: Godot's range is signed [-1, 1], where
+	// the negative half encodes a 90-degree tangent rotation that glTF has no
+	// way to express. Composing sign and rotation is a Phase E decision, so
+	// export clamps and warns rather than guessing.
+	Ref<StandardMaterial3D> mat;
+	mat.instantiate();
+	mat->set_transmission(1.8f);
+	mat->set_thickness(-2.0f);
+	mat->set_specular_factor(-0.5f);
+	mat->set_sheen_roughness(2.5f);
+	mat->set_feature(BaseMaterial3D::FEATURE_CLEARCOAT, true);
+	mat->set_clearcoat(4.0f);
+	mat->set_clearcoat_roughness(-1.0f);
+	mat->set_feature(BaseMaterial3D::FEATURE_ANISOTROPY, true);
+	mat->set_anisotropy(-0.5f);
+
+	Ref<BoxMesh> mesh;
+	mesh.instantiate();
+	mesh->surface_set_material(0, mat);
+
+	MeshInstance3D *mesh_instance = memnew(MeshInstance3D);
+	mesh_instance->set_mesh(mesh);
+	SceneTree::get_singleton()->get_root()->add_child(mesh_instance);
+
+	Ref<GLTFDocument> doc_save;
+	doc_save.instantiate();
+	Ref<GLTFState> state_save;
+	state_save.instantiate();
+	REQUIRE(doc_save->append_from_scene(mesh_instance, state_save) == OK);
+	const String path = TestUtils::get_temp_path("material_extensions_clamped.gltf");
+	REQUIRE(doc_save->write_to_filesystem(state_save, path) == OK);
+
+	// Read the emitted JSON directly. Re-importing would hide the defect: our
+	// own importer does not range-check, so an invalid value would round-trip
+	// happily and only a third-party validator would ever complain.
+	Ref<FileAccess> f = FileAccess::open(path, FileAccess::READ);
+	REQUIRE(f.is_valid());
+	Ref<JSON> json;
+	json.instantiate();
+	REQUIRE(json->parse(f->get_as_text()) == OK);
+	const Dictionary root = json->get_data();
+	const Array json_materials = root["materials"];
+	REQUIRE(json_materials.size() >= 1);
+	const Dictionary json_mat = json_materials[0];
+	const Dictionary ext = json_mat["extensions"];
+
+	CHECK(((Dictionary)ext["KHR_materials_transmission"])["transmissionFactor"].operator double() == doctest::Approx(1.0));
+	CHECK(((Dictionary)ext["KHR_materials_specular"])["specularFactor"].operator double() == doctest::Approx(0.0));
+	CHECK(((Dictionary)ext["KHR_materials_sheen"])["sheenRoughnessFactor"].operator double() == doctest::Approx(1.0));
+	CHECK(((Dictionary)ext["KHR_materials_clearcoat"])["clearcoatFactor"].operator double() == doctest::Approx(1.0));
+	CHECK(((Dictionary)ext["KHR_materials_clearcoat"])["clearcoatRoughnessFactor"].operator double() == doctest::Approx(0.0));
+	// A negative thickness clamps to 0, which is the glTF default, so the key is
+	// omitted -- and with it the whole extension, since nothing else in
+	// KHR_materials_volume is non-default here.
+	CHECK_FALSE(ext.has("KHR_materials_volume"));
+	// Likewise a negative anisotropyStrength: clamped to 0, hence not written.
+	// KHR_materials_anisotropy is absent altogether here because
+	// anisotropy_rotation is also at its default.
+	CHECK_FALSE(ext.has("KHR_materials_anisotropy"));
 
 	memdelete(mesh_instance);
 }

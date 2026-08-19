@@ -19,6 +19,12 @@ extends "res://tests/pt_validation.gd"
 ## wrong struct offset, or a C++/GLSL layout disagreement all show up here as a
 ## specific field reading the wrong number.
 ##
+## It then renders a SECOND material with clearcoat and anisotropy disabled and
+## asserts the shader reads 0 for all three of those fields. That case is not
+## redundant: clearcoat's class default is 1.0 and clearcoat_roughness's is 0.5,
+## so a material with the feature off is exactly where a wrong value is most
+## likely and least visible. See the comment at the feature-off block below.
+##
 ## SCOPE: this proves arrival for the StandardMaterial3D path ONLY.
 ## debug_visualize() has two call sites in scene_raytracing_raygen.glsl, and
 ## they are mutually exclusive at compile time: the one at :495-508 (which
@@ -130,6 +136,34 @@ func _ready() -> void:
 			"sheen_color",
 			Vector3(V_SHEEN_COLOR.r, V_SHEEN_COLOR.g, V_SHEEN_COLOR.b))
 
+	# FEATURE-OFF CASE.
+	#
+	# Everything above renders a material with clearcoat_enabled and
+	# anisotropy_enabled BOTH true, which is why the feature-off path went
+	# unrendered for the whole of Phase D -- and it is the path almost every
+	# real material takes.
+	#
+	# It matters because clearcoat's class default is 1.0 and
+	# clearcoat_roughness's is 0.5, pushed into the parameter map by
+	# BaseMaterial3D's constructor for every material ever created, regardless
+	# of the feature flag. The path tracer reads that map by name and has no
+	# route back to the Feature array, so without the feature gating in
+	# BaseMaterial3D::set_clearcoat()/set_feature() every surface in every scene
+	# would arrive at the shader carrying a full-strength clear coat.
+	#
+	# The values below are set but NOT enabled. All three must read 0.
+	var mat_off := StandardMaterial3D.new()
+	mat_off.clearcoat = V_CLEARCOAT
+	mat_off.clearcoat_roughness = V_CLEARCOAT_ROUGHNESS
+	mat_off.anisotropy = V_ANISOTROPY
+	# A fresh material means a fresh RID, so the RT material cache misses and
+	# rebuilds rather than serving the previous material's entry.
+	mesh_instance.material_override = mat_off
+
+	await _check_mode(env, MODE_CLEARCOAT_ANISOTROPY,
+			"feature-off clearcoat/clearcoat_roughness/anisotropy",
+			Vector3(0.0, 0.0, 0.0), true)
+
 	print("")
 	if _failures == 0:
 		print("PASS: all %d material fields arrived in the shader intact." % _checks)
@@ -137,14 +171,19 @@ func _ready() -> void:
 		print("FAIL: %d of %d material field checks did not match." % [_failures, _checks])
 	get_tree().quit(1 if _failures > 0 else 0)
 
-func _check_mode(p_env: Environment, p_mode: int, p_label: String, p_expected: Vector3) -> void:
+## p_check_all forces all three channels to be compared. The default skips
+## channels 1 and 2 when they are expected to be 0, because in single-value modes
+## those carry nothing -- but a mode where every field is legitimately expected
+## to be 0 (the feature-off case) needs them checked, not skipped.
+func _check_mode(p_env: Environment, p_mode: int, p_label: String, p_expected: Vector3,
+		p_check_all: bool = false) -> void:
 	p_env.set_pathtracing_debug_mode(p_mode)
 	var img: Image = await _render_accum(p_env, get_viewport().get_viewport_rid(), 1)
 	# Sample the image centre, which the quad fills.
 	var px: Color = img.get_pixel(img.get_width() / 2, img.get_height() / 2)
 	var got := Vector3(px.r, px.g, px.b)
 	for i in 3:
-		if p_expected[i] == 0.0 and i > 0:
+		if not p_check_all and p_expected[i] == 0.0 and i > 0:
 			continue # Unused channel in single-value modes.
 		_checks += 1
 		var delta: float = abs(got[i] - p_expected[i])

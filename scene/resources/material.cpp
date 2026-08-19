@@ -2240,9 +2240,31 @@ float BaseMaterial3D::get_ao_light_affect() const {
 	return ao_light_affect;
 }
 
+// FEATURE-GATED PARAMETER PUBLISHING (clearcoat, clearcoat_roughness, anisotropy)
+//
+// These three parameters are read straight out of the material parameter map by
+// the path tracer (render_raytracing.cpp), which holds only a material RID and
+// therefore has no route back to this object's `features[]` array. The parameter
+// map is the only channel, so it has to carry the feature gate itself.
+//
+// Without this, every material in existence publishes clearcoat = 1.0 and
+// clearcoat_roughness = 0.5 -- those are the class defaults, pushed by the
+// constructor while `features[]` is still all-false -- and a path tracer that
+// reads them would coat the whole scene in a clear layer nobody enabled.
+//
+// Forward+ is unaffected: when the feature is off, _get_shader_code() emits no
+// `uniform float clearcoat` / `clearcoat_roughness` / `anisotropy_ratio`
+// (material.cpp, the `if (features[FEATURE_CLEARCOAT])` / `[FEATURE_ANISOTROPY]`
+// blocks), and MaterialData::update_uniform_buffer() iterates *shader uniforms*
+// and looks each one up in the parameter map (material_storage.cpp), never the
+// other way round. A parameter with no matching uniform is never read. When the
+// feature is on, the real member value is published exactly as before.
+//
+// _apply_feature_gated_params() below re-publishes on every set_feature() toggle,
+// which is what keeps the map in step after the member values were set.
 void BaseMaterial3D::set_clearcoat(float p_clearcoat) {
 	clearcoat = p_clearcoat;
-	_material_set_param(shader_names->clearcoat, p_clearcoat);
+	_material_set_param(shader_names->clearcoat, features[FEATURE_CLEARCOAT] ? p_clearcoat : 0.0f);
 }
 
 float BaseMaterial3D::get_clearcoat() const {
@@ -2251,7 +2273,7 @@ float BaseMaterial3D::get_clearcoat() const {
 
 void BaseMaterial3D::set_clearcoat_roughness(float p_clearcoat_roughness) {
 	clearcoat_roughness = p_clearcoat_roughness;
-	_material_set_param(shader_names->clearcoat_roughness, p_clearcoat_roughness);
+	_material_set_param(shader_names->clearcoat_roughness, features[FEATURE_CLEARCOAT] ? p_clearcoat_roughness : 0.0f);
 }
 
 float BaseMaterial3D::get_clearcoat_roughness() const {
@@ -2260,7 +2282,7 @@ float BaseMaterial3D::get_clearcoat_roughness() const {
 
 void BaseMaterial3D::set_anisotropy(float p_anisotropy) {
 	anisotropy = p_anisotropy;
-	_material_set_param(shader_names->anisotropy, p_anisotropy);
+	_material_set_param(shader_names->anisotropy, features[FEATURE_ANISOTROPY] ? p_anisotropy : 0.0f);
 }
 
 float BaseMaterial3D::get_anisotropy() const {
@@ -2603,7 +2625,24 @@ void BaseMaterial3D::set_feature(Feature p_feature, bool p_enabled) {
 	}
 
 	features[p_feature] = p_enabled;
+	_apply_feature_gated_params(p_feature);
 	_queue_shader_change();
+}
+
+// Re-publishes the parameters whose map value is gated on a feature flag. See
+// the block comment above set_clearcoat().
+void BaseMaterial3D::_apply_feature_gated_params(Feature p_feature) {
+	switch (p_feature) {
+		case FEATURE_CLEARCOAT: {
+			_material_set_param(shader_names->clearcoat, features[FEATURE_CLEARCOAT] ? clearcoat : 0.0f);
+			_material_set_param(shader_names->clearcoat_roughness, features[FEATURE_CLEARCOAT] ? clearcoat_roughness : 0.0f);
+		} break;
+		case FEATURE_ANISOTROPY: {
+			_material_set_param(shader_names->anisotropy, features[FEATURE_ANISOTROPY] ? anisotropy : 0.0f);
+		} break;
+		default:
+			break;
+	}
 }
 
 bool BaseMaterial3D::get_feature(Feature p_feature) const {
@@ -4059,7 +4098,24 @@ void BaseMaterial3D::_bind_methods() {
 BaseMaterial3D::BaseMaterial3D(bool p_orm) :
 		element(this) {
 	orm = p_orm;
-	// Initialize to the same values as the shader
+	// Initialize to the same values as the shader.
+	//
+	// The ten path-tracer-only parameters (transmission, ior, thickness,
+	// attenuation_distance/color, specular_factor/tint, sheen_color/roughness,
+	// anisotropy_rotation) are DELIBERATELY absent from this list. They have no
+	// shader uniform to agree with, so there is nothing to initialise them "to
+	// the same values as". Their in-class member initialisers
+	// (scene/resources/material.h) hold the defaults, and the path tracer's
+	// per-material default fill (render_raytracing.cpp) covers the case where
+	// the parameter was never pushed into the map. Adding them here would put a
+	// third copy of every default in play with nothing keeping the three in step.
+	//
+	// clearcoat / clearcoat_roughness / anisotropy below are a different case:
+	// they DO have shader uniforms, so they are initialised, but their published
+	// map value is feature-gated -- see the block comment above set_clearcoat().
+	// Note that `features[]` is still all-false at this point, so the three
+	// set_*() calls below publish 0 into the parameter map, not the class
+	// defaults they assign to the members.
 	set_albedo(Color(1.0, 1.0, 1.0, 1.0));
 	set_specular(0.5);
 	set_roughness(1.0);

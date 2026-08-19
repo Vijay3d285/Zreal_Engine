@@ -540,6 +540,7 @@ private:
 	_FORCE_INLINE_ void _queue_shader_change();
 	void _check_material_rid();
 	void _material_set_param(const StringName &p_name, const Variant &p_value);
+	void _apply_feature_gated_params(Feature p_feature);
 
 	bool orm;
 	RID shader_rid;

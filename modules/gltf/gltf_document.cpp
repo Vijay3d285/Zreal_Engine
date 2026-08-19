@@ -2932,11 +2932,28 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 		// Path-tracer material parameters. Each extension is written only when
 		// it differs from the glTF default, so ordinary materials produce no
 		// extension bloat. Colours convert sRGB -> linear, inverting import.
-		if (!Math::is_zero_approx(base_material->get_transmission())) {
-			Dictionary ext;
-			ext["transmissionFactor"] = base_material->get_transmission();
-			extensions["KHR_materials_transmission"] = ext;
-			p_state->add_used_extension("KHR_materials_transmission");
+		//
+		// TWO RULES APPLY HERE, both learned the hard way:
+		//
+		// 1. "Omit when it equals the glTF default" is only lossless when the
+		//    Godot class default and the glTF default AGREE. That holds for
+		//    every property below EXCEPT clearcoat (class 1.0 vs glTF 0.0) and
+		//    clearcoat_roughness (class 0.5 vs glTF 0.0), which are therefore
+		//    written unconditionally -- see the clearcoat block.
+		//
+		// 2. Godot's property hints do not clamp, and several of these
+		//    properties have a wider Godot range than glTF permits (notably
+		//    anisotropy, which is signed [-1,1] in Godot and [0,1] in glTF).
+		//    Every value written below is clamped to its glTF-legal range, so
+		//    we never emit JSON a validator would reject.
+		{
+			const float transmission = CLAMP(base_material->get_transmission(), 0.0f, 1.0f);
+			if (!Math::is_zero_approx(transmission)) {
+				Dictionary ext;
+				ext["transmissionFactor"] = transmission;
+				extensions["KHR_materials_transmission"] = ext;
+				p_state->add_used_extension("KHR_materials_transmission");
+			}
 		}
 
 		if (!Math::is_equal_approx(base_material->get_ior(), 1.5f)) {
@@ -2948,8 +2965,10 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 
 		{
 			Dictionary ext;
-			if (!Math::is_zero_approx(base_material->get_thickness())) {
-				ext["thicknessFactor"] = base_material->get_thickness();
+			// glTF's thicknessFactor has a minimum of 0.
+			const float thickness = MAX(base_material->get_thickness(), 0.0f);
+			if (!Math::is_zero_approx(thickness)) {
+				ext["thicknessFactor"] = thickness;
 			}
 			// 0 is our representation of glTF's infinite default, which is
 			// expressed by omitting the key.
@@ -2972,8 +2991,10 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 
 		{
 			Dictionary ext;
-			if (!Math::is_equal_approx(base_material->get_specular_factor(), 1.0f)) {
-				ext["specularFactor"] = base_material->get_specular_factor();
+			// glTF's specularFactor is [0, 1]; Godot's property is unclamped.
+			const float specular_factor = CLAMP(base_material->get_specular_factor(), 0.0f, 1.0f);
+			if (!Math::is_equal_approx(specular_factor, 1.0f)) {
+				ext["specularFactor"] = specular_factor;
 			}
 			const Color tint = base_material->get_specular_tint().srgb_to_linear();
 			if (!tint.is_equal_approx(Color(1, 1, 1))) {
@@ -2990,17 +3011,19 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 		}
 
 		if (base_material->get_feature(BaseMaterial3D::FEATURE_CLEARCOAT)) {
+			// BOTH keys are written unconditionally, deliberately. Unlike every
+			// other property here, these two have Godot class defaults (1.0 and
+			// 0.5, set in BaseMaterial3D's constructor) that DISAGREE with the
+			// glTF defaults (both 0.0). Omitting a key that equals the glTF
+			// default would therefore be lossy: an authored clearcoat_roughness
+			// of exactly 0.0 -- a mirror-smooth coat -- would be dropped on
+			// export and come back as 0.5 on import, silently roughening it.
+			// Two floats is not extension bloat.
 			Dictionary ext;
-			if (!Math::is_zero_approx(base_material->get_clearcoat())) {
-				ext["clearcoatFactor"] = base_material->get_clearcoat();
-			}
-			if (!Math::is_zero_approx(base_material->get_clearcoat_roughness())) {
-				ext["clearcoatRoughnessFactor"] = base_material->get_clearcoat_roughness();
-			}
-			if (!ext.is_empty()) {
-				extensions["KHR_materials_clearcoat"] = ext;
-				p_state->add_used_extension("KHR_materials_clearcoat");
-			}
+			ext["clearcoatFactor"] = CLAMP(base_material->get_clearcoat(), 0.0f, 1.0f);
+			ext["clearcoatRoughnessFactor"] = CLAMP(base_material->get_clearcoat_roughness(), 0.0f, 1.0f);
+			extensions["KHR_materials_clearcoat"] = ext;
+			p_state->add_used_extension("KHR_materials_clearcoat");
 		}
 
 		{
@@ -3013,8 +3036,10 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 				arr.push_back(sheen.b);
 				ext["sheenColorFactor"] = arr;
 			}
-			if (!Math::is_zero_approx(base_material->get_sheen_roughness())) {
-				ext["sheenRoughnessFactor"] = base_material->get_sheen_roughness();
+			// glTF's sheenRoughnessFactor is [0, 1]; Godot's property is unclamped.
+			const float sheen_roughness = CLAMP(base_material->get_sheen_roughness(), 0.0f, 1.0f);
+			if (!Math::is_zero_approx(sheen_roughness)) {
+				ext["sheenRoughnessFactor"] = sheen_roughness;
 			}
 			if (!ext.is_empty()) {
 				extensions["KHR_materials_sheen"] = ext;
@@ -3024,8 +3049,19 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 
 		if (base_material->get_feature(BaseMaterial3D::FEATURE_ANISOTROPY)) {
 			Dictionary ext;
-			if (!Math::is_zero_approx(base_material->get_anisotropy())) {
-				ext["anisotropyStrength"] = base_material->get_anisotropy();
+			// Godot's anisotropy is signed [-1, 1], where the negative half
+			// encodes a 90-degree rotation of the tangent frame. glTF's
+			// anisotropyStrength is [0, 1] and has no such encoding: a negative
+			// value here is invalid JSON that any validator rejects. Composing
+			// the sign with anisotropy_rotation is explicitly a Phase E decision
+			// (design §8), so we do not attempt it -- we clamp, and we say so.
+			const float raw_anisotropy = base_material->get_anisotropy();
+			if (raw_anisotropy < 0.0f) {
+				WARN_PRINT_ONCE("glTF export: BaseMaterial3D.anisotropy is negative, which glTF's anisotropyStrength ([0, 1]) cannot represent. Clamping to 0; the 90-degree rotation the sign encodes is not exported. Use anisotropy_rotation to express the angle instead.");
+			}
+			const float anisotropy = CLAMP(raw_anisotropy, 0.0f, 1.0f);
+			if (!Math::is_zero_approx(anisotropy)) {
+				ext["anisotropyStrength"] = anisotropy;
 			}
 			if (!Math::is_zero_approx(base_material->get_anisotropy_rotation())) {
 				ext["anisotropyRotation"] = base_material->get_anisotropy_rotation();
@@ -3145,6 +3181,23 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 				return true;
 			};
 
+			// Fetches an extension's value as a Dictionary. glTF requires each
+			// extension value to be an object, but nothing stops a file from
+			// carrying `"KHR_materials_ior": 5`. Converting that Variant to a
+			// Dictionary yields an empty one, every subsequent has() returns
+			// false, and the whole extension vanishes without a word -- the one
+			// malformed input in these blocks that would not warn. Returning an
+			// empty Dictionary keeps the caller's shape (all reads decline) but
+			// the author now hears about it.
+			auto read_ext_dict = [&](const char *p_name) -> Dictionary {
+				const Variant v = material_extensions[p_name];
+				if (v.get_type() != Variant::DICTIONARY) {
+					WARN_PRINT(vformat("glTF material '%s': ignoring '%s' because its value is not an object.", material->get_name(), p_name));
+					return Dictionary();
+				}
+				return v;
+			};
+
 			auto note_dropped_texture = [&](const Dictionary &p_ext, const char *p_key) {
 				if (p_ext.has(p_key)) {
 					dropped_textures.push_back(p_key);
@@ -3152,7 +3205,7 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			};
 
 			if (material_extensions.has("KHR_materials_transmission")) {
-				const Dictionary &ext = material_extensions["KHR_materials_transmission"];
+				const Dictionary ext = read_ext_dict("KHR_materials_transmission");
 				float v = 0.0f;
 				if (read_ext_float(ext, "transmissionFactor", v)) {
 					material->set_transmission(v);
@@ -3161,7 +3214,7 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			}
 
 			if (material_extensions.has("KHR_materials_ior")) {
-				const Dictionary &ext = material_extensions["KHR_materials_ior"];
+				const Dictionary ext = read_ext_dict("KHR_materials_ior");
 				float v = 1.5f;
 				if (read_ext_float(ext, "ior", v)) {
 					// No clamping, matching Blender's importer. ior == 0.0 is
@@ -3171,7 +3224,7 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			}
 
 			if (material_extensions.has("KHR_materials_volume")) {
-				const Dictionary &ext = material_extensions["KHR_materials_volume"];
+				const Dictionary ext = read_ext_dict("KHR_materials_volume");
 				float v = 0.0f;
 				if (read_ext_float(ext, "thicknessFactor", v)) {
 					material->set_thickness(v);
@@ -3190,7 +3243,7 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			}
 
 			if (material_extensions.has("KHR_materials_specular")) {
-				const Dictionary &ext = material_extensions["KHR_materials_specular"];
+				const Dictionary ext = read_ext_dict("KHR_materials_specular");
 				float v = 1.0f;
 				if (read_ext_float(ext, "specularFactor", v)) {
 					material->set_specular_factor(v);
@@ -3204,7 +3257,7 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			}
 
 			if (material_extensions.has("KHR_materials_clearcoat")) {
-				const Dictionary &ext = material_extensions["KHR_materials_clearcoat"];
+				const Dictionary ext = read_ext_dict("KHR_materials_clearcoat");
 				bool any = false;
 				float v = 0.0f;
 				if (read_ext_float(ext, "clearcoatFactor", v)) {
@@ -3217,9 +3270,22 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 					any = true;
 				}
 				if (any) {
-					// _validate_property hides clearcoat while the feature is
-					// off, so without this the data imports but is not
-					// inspectable.
+					// Two reasons, both necessary:
+					//
+					// 1. Inspectability. `clearcoat_enabled` carries
+					//    PROPERTY_HINT_GROUP_ENABLE (material.cpp, the
+					//    ADD_GROUP("Clearcoat", ...) block), so the Inspector
+					//    greys the whole group out while the feature is off and
+					//    the imported values are not visible. (This is NOT done
+					//    by _validate_property -- that only hides clearcoat when
+					//    shading_mode is not per-pixel.)
+					//
+					// 2. Correctness of the value the path tracer sees.
+					//    BaseMaterial3D publishes `clearcoat` /
+					//    `clearcoat_roughness` into the material parameter map
+					//    as 0 while the feature is off, so without this call the
+					//    factors would be stored on the object but uploaded as
+					//    zero.
 					material->set_feature(BaseMaterial3D::FEATURE_CLEARCOAT, true);
 				}
 				note_dropped_texture(ext, "clearcoatTexture");
@@ -3228,7 +3294,7 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			}
 
 			if (material_extensions.has("KHR_materials_sheen")) {
-				const Dictionary &ext = material_extensions["KHR_materials_sheen"];
+				const Dictionary ext = read_ext_dict("KHR_materials_sheen");
 				Color c;
 				if (read_ext_color(ext, "sheenColorFactor", c)) {
 					material->set_sheen_color(c);
@@ -3242,7 +3308,7 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			}
 
 			if (material_extensions.has("KHR_materials_anisotropy")) {
-				const Dictionary &ext = material_extensions["KHR_materials_anisotropy"];
+				const Dictionary ext = read_ext_dict("KHR_materials_anisotropy");
 				bool any = false;
 				float s = 0.0f;
 				if (read_ext_float(ext, "anisotropyStrength", s)) {
@@ -3255,6 +3321,12 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 					any = true;
 				}
 				if (any) {
+					// Same two reasons as the clearcoat block above: Inspector
+					// visibility (PROPERTY_HINT_GROUP_ENABLE on
+					// `anisotropy_enabled`) and the feature-gated parameter-map
+					// value the path tracer reads. Note the ordering -- the
+					// setters above ran while the feature was still off and so
+					// published 0; set_feature() re-publishes the real value.
 					material->set_feature(BaseMaterial3D::FEATURE_ANISOTROPY, true);
 				}
 				note_dropped_texture(ext, "anisotropyTexture");

@@ -32,6 +32,10 @@
 
 TEST_FORCE_LINK(test_standard_material_3d)
 
+#include "tests/test_utils.h"
+
+#include "core/io/resource_loader.h"
+#include "core/io/resource_saver.h"
 #include "scene/resources/material.h"
 
 // NOTE ON COVERAGE: the headless test renderer discards material parameters
@@ -110,6 +114,75 @@ TEST_CASE("[SceneTree][StandardMaterial3D] Path tracing parameters are registere
 		CHECK_MESSAGE(valid, "Property \"", color_names[i], "\" is not registered.");
 		CHECK_MESSAGE((Color)read == color_values[i], "Property \"", color_names[i], "\" did not round-trip.");
 	}
+}
+
+TEST_CASE("[SceneTree][StandardMaterial3D] Path tracing parameters survive .tres serialisation") {
+	// These are the first BaseMaterial3D properties that exist SOLELY to be
+	// persisted and re-read: nothing in the editor renders them, so a
+	// serialisation defect would stay invisible until someone opened a saved
+	// scene in the path tracer. Hence an explicit save/load round-trip.
+	Ref<StandardMaterial3D> mat;
+	mat.instantiate();
+
+	// Distinct from each other and from their own defaults, so a property that
+	// silently failed to serialise reads back as its default and fails here.
+	mat->set_transmission(0.35f);
+	mat->set_ior(1.72f);
+	mat->set_thickness(2.4f);
+	mat->set_attenuation_distance(5.0f);
+	mat->set_attenuation_color(Color(0.9f, 0.4f, 0.15f));
+	mat->set_specular_factor(0.62f);
+	mat->set_specular_tint(Color(0.8f, 0.7f, 0.55f));
+	mat->set_sheen_color(Color(0.25f, 0.5f, 0.75f));
+	mat->set_sheen_roughness(0.45f);
+	mat->set_anisotropy_rotation(1.1f);
+
+	const String path = TestUtils::get_temp_path("pt_material_params.tres");
+	REQUIRE(ResourceSaver::save(mat, path) == OK);
+
+	Ref<StandardMaterial3D> loaded = ResourceLoader::load(path, "", ResourceFormatLoader::CACHE_MODE_IGNORE);
+	REQUIRE(loaded.is_valid());
+
+	CHECK(loaded->get_transmission() == doctest::Approx(0.35f));
+	CHECK(loaded->get_ior() == doctest::Approx(1.72f));
+	CHECK(loaded->get_thickness() == doctest::Approx(2.4f));
+	CHECK(loaded->get_attenuation_distance() == doctest::Approx(5.0f));
+	CHECK(loaded->get_attenuation_color().is_equal_approx(Color(0.9f, 0.4f, 0.15f)));
+	CHECK(loaded->get_specular_factor() == doctest::Approx(0.62f));
+	CHECK(loaded->get_specular_tint().is_equal_approx(Color(0.8f, 0.7f, 0.55f)));
+	CHECK(loaded->get_sheen_color().is_equal_approx(Color(0.25f, 0.5f, 0.75f)));
+	CHECK(loaded->get_sheen_roughness() == doctest::Approx(0.45f));
+	CHECK(loaded->get_anisotropy_rotation() == doctest::Approx(1.1f));
+}
+
+TEST_CASE("[SceneTree][StandardMaterial3D] Clearcoat and anisotropy defaults") {
+	// The design assumed clearcoat/clearcoat_roughness defaulted to 0.0. They do
+	// not -- BaseMaterial3D's constructor sets 1.0 and 0.5 (matching the
+	// documented defaults in doc/classes/BaseMaterial3D.xml). This pins the real
+	// values so the next phase reads them from a test rather than from prose.
+	Ref<StandardMaterial3D> mat;
+	mat.instantiate();
+
+	CHECK(mat->get_clearcoat() == doctest::Approx(1.0f));
+	CHECK(mat->get_clearcoat_roughness() == doctest::Approx(0.5f));
+	CHECK(mat->get_anisotropy() == doctest::Approx(0.0f));
+
+	// The features are off by default. What the path tracer reads is therefore
+	// 0 for all three regardless of the member values above -- see the
+	// feature-gating block comment above BaseMaterial3D::set_clearcoat(). That
+	// gating is only observable on a real rendering backend (the headless test
+	// renderer discards material parameters), so it is proven by the GPU gate,
+	// pipeline_references/tests/pt_material_data_gate.gd.
+	CHECK_FALSE(mat->get_feature(BaseMaterial3D::FEATURE_CLEARCOAT));
+	CHECK_FALSE(mat->get_feature(BaseMaterial3D::FEATURE_ANISOTROPY));
+
+	// Toggling the feature must not disturb the member values themselves.
+	mat->set_feature(BaseMaterial3D::FEATURE_CLEARCOAT, true);
+	CHECK(mat->get_clearcoat() == doctest::Approx(1.0f));
+	CHECK(mat->get_clearcoat_roughness() == doctest::Approx(0.5f));
+	mat->set_feature(BaseMaterial3D::FEATURE_CLEARCOAT, false);
+	CHECK(mat->get_clearcoat() == doctest::Approx(1.0f));
+	CHECK(mat->get_clearcoat_roughness() == doctest::Approx(0.5f));
 }
 
 } // namespace TestStandardMaterial3D

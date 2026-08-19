@@ -86,6 +86,7 @@
 		</member>
 		<member name="anisotropy" type="float" setter="set_anisotropy" getter="get_anisotropy" default="0.0">
 			The strength of the anisotropy effect. This is multiplied by [member anisotropy_flowmap]'s alpha channel if a texture is defined there and the texture contains an alpha channel.
+			[b]Note:[/b] While [member anisotropy_enabled] is [code]false[/code], the path tracer reads this as [code]0.0[/code] regardless of the value set here.
 		</member>
 		<member name="anisotropy_enabled" type="bool" setter="set_feature" getter="get_feature" default="false">
 			If [code]true[/code], anisotropy is enabled. Anisotropy changes the shape of the specular blob and aligns it to tangent space. This is useful for brushed aluminum and hair reflections.
@@ -151,6 +152,7 @@
 		</member>
 		<member name="clearcoat" type="float" setter="set_clearcoat" getter="get_clearcoat" default="1.0">
 			Sets the strength of the clearcoat effect. Setting to [code]0[/code] looks the same as disabling the clearcoat effect.
+			[b]Note:[/b] While [member clearcoat_enabled] is [code]false[/code], the path tracer reads this as [code]0.0[/code] regardless of the value set here. This matters because the default is [code]1.0[/code], not [code]0.0[/code].
 		</member>
 		<member name="clearcoat_enabled" type="bool" setter="set_feature" getter="get_feature" default="false">
 			If [code]true[/code], clearcoat rendering is enabled. Adds a secondary transparent pass to the lighting calculation resulting in an added specular blob. This makes materials appear as if they have a clear layer on them that can be either glossy or rough.
@@ -158,6 +160,7 @@
 		</member>
 		<member name="clearcoat_roughness" type="float" setter="set_clearcoat_roughness" getter="get_clearcoat_roughness" default="0.5">
 			Sets the roughness of the clearcoat pass. A higher value results in a rougher clearcoat while a lower value results in a smoother clearcoat.
+			[b]Note:[/b] While [member clearcoat_enabled] is [code]false[/code], the path tracer reads this as [code]0.0[/code] regardless of the value set here. This matters because the default is [code]0.5[/code], not [code]0.0[/code].
 		</member>
 		<member name="clearcoat_texture" type="Texture2D" setter="set_texture" getter="get_texture">
 			Texture that defines the strength of the clearcoat effect and the glossiness of the clearcoat. Strength is specified in the red channel while glossiness is specified in the green channel.
