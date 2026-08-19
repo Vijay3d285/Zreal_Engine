@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- **Phase D adds no shading.** No BSDF reads any new value. Do not modify BSDF evaluation, sampling, or forward+ shading.
+- **Phase D adds no shading.** No BSDF reads any new value. Do not modify BSDF evaluation or sampling. Carrying data that nothing reads yet **is** the deliverable, not dead code — see spec §1.
+- **The no-pixel-change invariant is scoped, not absolute.** Phase D changes zero pixels for content carrying none of the seven extensions. Forward+ output changes only for materials that carry clearcoat or anisotropy data, because Task 2 must enable `FEATURE_CLEARCOAT` / `FEATURE_ANISOTROPY` for those values to be inspectable (spec §3.3, §7.2). RT output is unchanged unconditionally.
 - **Factors only.** Per-parameter extension textures are out of scope and must be dropped with a warning, never silently.
 - **`RT_MaterialData` and its GLSL twin must agree byte-for-byte.** Sizes, member order, `alignas`/std430 layout, and `static_assert` must all agree on both sides.
 - **After touching any `.glsl`, run a full `scons` build** so the `.glsl.gen.h` regenerates. Never hand-edit a `.gen.h`.
