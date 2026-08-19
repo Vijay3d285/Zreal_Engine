@@ -42,6 +42,10 @@ TEST_FORCE_LINK(test_gltf_document)
 
 #include "modules/gltf/extensions/gltf_document_extension_convert_importer_mesh.h"
 #include "modules/gltf/gltf_document.h"
+#include "scene/3d/mesh_instance_3d.h"
+#include "scene/main/scene_tree.h"
+#include "scene/main/window.h"
+#include "scene/resources/3d/primitive_meshes.h"
 #include "scene/resources/material.h"
 
 namespace TestGLTFDocument {
@@ -363,6 +367,79 @@ TEST_CASE("[SceneTree][GLTFDocument] Import glTF material extension edge cases")
 	// than partially imported with the bad component silently coerced to
 	// 0; the property stays at its class default of white.
 	CHECK(mat->get_specular_tint().is_equal_approx(Color(1, 1, 1)));
+}
+
+TEST_CASE("[SceneTree][GLTFDocument] Material extensions survive a full round-trip") {
+	register_gltf_extension();
+
+	// Build a scene with one mesh carrying a fully-populated material. Every
+	// value is distinct from every other and from its own default, so a field
+	// swap anywhere in import or export shows up here.
+	Ref<StandardMaterial3D> mat;
+	mat.instantiate();
+	mat->set_transmission(0.35f);
+	mat->set_ior(1.72f);
+	mat->set_thickness(2.4f);
+	mat->set_attenuation_distance(5.0f);
+	mat->set_attenuation_color(Color(0.9f, 0.4f, 0.15f).linear_to_srgb());
+	mat->set_specular_factor(0.62f);
+	mat->set_specular_tint(Color(0.8f, 0.7f, 0.55f).linear_to_srgb());
+	mat->set_sheen_color(Color(0.25f, 0.5f, 0.75f).linear_to_srgb());
+	mat->set_sheen_roughness(0.45f);
+	mat->set_anisotropy_rotation(1.1f);
+	mat->set_feature(BaseMaterial3D::FEATURE_CLEARCOAT, true);
+	mat->set_clearcoat(0.55f);
+	mat->set_clearcoat_roughness(0.28f);
+	mat->set_feature(BaseMaterial3D::FEATURE_ANISOTROPY, true);
+	mat->set_anisotropy(0.83f);
+
+	Ref<BoxMesh> mesh;
+	mesh.instantiate();
+	mesh->surface_set_material(0, mat);
+
+	MeshInstance3D *mesh_instance = memnew(MeshInstance3D);
+	mesh_instance->set_mesh(mesh);
+	SceneTree::get_singleton()->get_root()->add_child(mesh_instance);
+
+	Ref<GLTFDocument> doc_save;
+	doc_save.instantiate();
+	Ref<GLTFState> state_save;
+	state_save.instantiate();
+	REQUIRE(doc_save->append_from_scene(mesh_instance, state_save) == OK);
+	const String path = TestUtils::get_temp_path("material_extensions_roundtrip.gltf");
+	REQUIRE(doc_save->write_to_filesystem(state_save, path) == OK);
+
+	Ref<GLTFDocument> doc_load;
+	doc_load.instantiate();
+	Ref<GLTFState> state_load;
+	state_load.instantiate();
+	REQUIRE(doc_load->append_from_file(path, state_load) == OK);
+
+	const Vector<Ref<Material>> &materials = state_load->get_materials();
+	REQUIRE(materials.size() >= 1);
+	Ref<StandardMaterial3D> out = materials[0];
+	REQUIRE(out.is_valid());
+
+	// Scalars survive exactly: nothing transforms them in either direction.
+	CHECK(out->get_transmission() == doctest::Approx(0.35f));
+	CHECK(out->get_ior() == doctest::Approx(1.72f));
+	CHECK(out->get_thickness() == doctest::Approx(2.4f));
+	CHECK(out->get_attenuation_distance() == doctest::Approx(5.0f));
+	CHECK(out->get_specular_factor() == doctest::Approx(0.62f));
+	CHECK(out->get_sheen_roughness() == doctest::Approx(0.45f));
+	CHECK(out->get_anisotropy_rotation() == doctest::Approx(1.1f));
+	CHECK(out->get_clearcoat() == doctest::Approx(0.55f));
+	CHECK(out->get_clearcoat_roughness() == doctest::Approx(0.28f));
+	CHECK(out->get_anisotropy() == doctest::Approx(0.83f));
+
+	// Colours go sRGB -> linear on export and back on import. That is the
+	// identity only to float precision, so this must be approximate. Comparing
+	// for equality here would produce a flaky suite.
+	CHECK(out->get_attenuation_color().is_equal_approx(mat->get_attenuation_color()));
+	CHECK(out->get_specular_tint().is_equal_approx(mat->get_specular_tint()));
+	CHECK(out->get_sheen_color().is_equal_approx(mat->get_sheen_color()));
+
+	memdelete(mesh_instance);
 }
 
 } // namespace TestGLTFDocument

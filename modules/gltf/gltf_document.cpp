@@ -2928,6 +2928,114 @@ Error GLTFDocument::_serialize_materials(Ref<GLTFState> p_state) {
 			extensions["KHR_materials_emissive_strength"] = mat_emissive_strength;
 			p_state->add_used_extension("KHR_materials_emissive_strength");
 		}
+
+		// Path-tracer material parameters. Each extension is written only when
+		// it differs from the glTF default, so ordinary materials produce no
+		// extension bloat. Colours convert sRGB -> linear, inverting import.
+		if (!Math::is_zero_approx(base_material->get_transmission())) {
+			Dictionary ext;
+			ext["transmissionFactor"] = base_material->get_transmission();
+			extensions["KHR_materials_transmission"] = ext;
+			p_state->add_used_extension("KHR_materials_transmission");
+		}
+
+		if (!Math::is_equal_approx(base_material->get_ior(), 1.5f)) {
+			Dictionary ext;
+			ext["ior"] = base_material->get_ior();
+			extensions["KHR_materials_ior"] = ext;
+			p_state->add_used_extension("KHR_materials_ior");
+		}
+
+		{
+			Dictionary ext;
+			if (!Math::is_zero_approx(base_material->get_thickness())) {
+				ext["thicknessFactor"] = base_material->get_thickness();
+			}
+			// 0 is our representation of glTF's infinite default, which is
+			// expressed by omitting the key.
+			if (base_material->get_attenuation_distance() > 0.0f) {
+				ext["attenuationDistance"] = base_material->get_attenuation_distance();
+			}
+			const Color atten = base_material->get_attenuation_color().srgb_to_linear();
+			if (!atten.is_equal_approx(Color(1, 1, 1))) {
+				Array arr;
+				arr.push_back(atten.r);
+				arr.push_back(atten.g);
+				arr.push_back(atten.b);
+				ext["attenuationColor"] = arr;
+			}
+			if (!ext.is_empty()) {
+				extensions["KHR_materials_volume"] = ext;
+				p_state->add_used_extension("KHR_materials_volume");
+			}
+		}
+
+		{
+			Dictionary ext;
+			if (!Math::is_equal_approx(base_material->get_specular_factor(), 1.0f)) {
+				ext["specularFactor"] = base_material->get_specular_factor();
+			}
+			const Color tint = base_material->get_specular_tint().srgb_to_linear();
+			if (!tint.is_equal_approx(Color(1, 1, 1))) {
+				Array arr;
+				arr.push_back(tint.r);
+				arr.push_back(tint.g);
+				arr.push_back(tint.b);
+				ext["specularColorFactor"] = arr;
+			}
+			if (!ext.is_empty()) {
+				extensions["KHR_materials_specular"] = ext;
+				p_state->add_used_extension("KHR_materials_specular");
+			}
+		}
+
+		if (base_material->get_feature(BaseMaterial3D::FEATURE_CLEARCOAT)) {
+			Dictionary ext;
+			if (!Math::is_zero_approx(base_material->get_clearcoat())) {
+				ext["clearcoatFactor"] = base_material->get_clearcoat();
+			}
+			if (!Math::is_zero_approx(base_material->get_clearcoat_roughness())) {
+				ext["clearcoatRoughnessFactor"] = base_material->get_clearcoat_roughness();
+			}
+			if (!ext.is_empty()) {
+				extensions["KHR_materials_clearcoat"] = ext;
+				p_state->add_used_extension("KHR_materials_clearcoat");
+			}
+		}
+
+		{
+			Dictionary ext;
+			const Color sheen = base_material->get_sheen_color().srgb_to_linear();
+			if (!sheen.is_equal_approx(Color(0, 0, 0))) {
+				Array arr;
+				arr.push_back(sheen.r);
+				arr.push_back(sheen.g);
+				arr.push_back(sheen.b);
+				ext["sheenColorFactor"] = arr;
+			}
+			if (!Math::is_zero_approx(base_material->get_sheen_roughness())) {
+				ext["sheenRoughnessFactor"] = base_material->get_sheen_roughness();
+			}
+			if (!ext.is_empty()) {
+				extensions["KHR_materials_sheen"] = ext;
+				p_state->add_used_extension("KHR_materials_sheen");
+			}
+		}
+
+		if (base_material->get_feature(BaseMaterial3D::FEATURE_ANISOTROPY)) {
+			Dictionary ext;
+			if (!Math::is_zero_approx(base_material->get_anisotropy())) {
+				ext["anisotropyStrength"] = base_material->get_anisotropy();
+			}
+			if (!Math::is_zero_approx(base_material->get_anisotropy_rotation())) {
+				ext["anisotropyRotation"] = base_material->get_anisotropy_rotation();
+			}
+			if (!ext.is_empty()) {
+				extensions["KHR_materials_anisotropy"] = ext;
+				p_state->add_used_extension("KHR_materials_anisotropy");
+			}
+		}
+
 		if (!extensions.is_empty()) {
 			mat_dict["extensions"] = extensions;
 		}
