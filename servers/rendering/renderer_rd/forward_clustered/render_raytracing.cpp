@@ -1709,7 +1709,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// these yet; they are carried so Phase E has data to consume.
 	Variant transmission_var = material_storage->material_get_param(p_material_rid, "transmission");
 	if (transmission_var.get_type() == Variant::FLOAT) {
-		mat.transmission = transmission_var;
+		mat.transmission = CLAMP((float)transmission_var, 0.0f, 1.0f);
 	}
 
 	Variant ior_var = material_storage->material_get_param(p_material_rid, "ior");
@@ -1719,7 +1719,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 	Variant thickness_var = material_storage->material_get_param(p_material_rid, "thickness");
 	if (thickness_var.get_type() == Variant::FLOAT) {
-		mat.thickness = thickness_var;
+		mat.thickness = MAX(0.0f, (float)thickness_var);
 	}
 
 	// The property is a distance; the GPU carries its reciprocal so density 0
@@ -1733,9 +1733,17 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	Variant attenuation_color_var = material_storage->material_get_param(p_material_rid, "attenuation_color");
 	if (attenuation_color_var.get_type() == Variant::COLOR) {
 		Color c = ((Color)attenuation_color_var).srgb_to_linear();
-		mat.attenuation_color[0] = c.r;
-		mat.attenuation_color[1] = c.g;
-		mat.attenuation_color[2] = c.b;
+		// Clamped because E1 consumes this as sigma_a = (1 - color) * density.
+		// Godot's Color is unbounded; a component above 1.0 makes sigma_a NEGATIVE
+		// and exp(-sigma_a * d) then GROWS without bound -- an energy-creating
+		// firefly generator, not a cosmetic issue.
+		//
+		// This closes the RENDERING consequence of the parked backlog item
+		// (unclamped glTF colour-factor export, PATH_TRACER_QUALITY_ROADMAP.md).
+		// It does NOT touch the export path; that item stays open.
+		mat.attenuation_color[0] = CLAMP(c.r, 0.0f, 1.0f);
+		mat.attenuation_color[1] = CLAMP(c.g, 0.0f, 1.0f);
+		mat.attenuation_color[2] = CLAMP(c.b, 0.0f, 1.0f);
 	}
 
 	Variant specular_factor_var = material_storage->material_get_param(p_material_rid, "specular_factor");

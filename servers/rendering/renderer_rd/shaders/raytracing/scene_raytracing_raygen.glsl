@@ -484,6 +484,16 @@ void main() {
 	m.emissive = emissive_apply_exposure(emission);
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
 
+	// Custom hit groups have no MaterialData to draw extension parameters from,
+	// and a user shader has no way to author them. Opaque, which keeps this path
+	// on the pre-E1 dispatch branch in shade_and_bounce.
+	m.transmission = 0.0;
+	m.ior = 1.5;
+	m.thickness = 0.0;
+	m.attenuation = vec3(0.0);
+	m.specular_tint = vec3(1.0);
+	m.specular_factor = 1.0;
+
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
 		vec3 ts_normal;
@@ -556,6 +566,18 @@ void main() {
 	m.specular = mat.specular;
 	m.emissive = emissive;
 	m.normal = final_normal;
+
+	// Roadmap E1. `mat` is the MaterialData Phase D widened to 176 bytes.
+	// ior is left RAW here; shade_and_bounce resolves it against `specular`
+	// alongside F0, because the two must be derived together or reflectance and
+	// refraction can disagree (spec section 3.2).
+	m.transmission = mat.transmission;
+	m.ior = mat.ior;
+	m.thickness = mat.thickness;
+	// Cycles' Volume Absorption coefficient, svm/closure.h:1236-1241.
+	m.attenuation = (vec3(1.0) - mat.attenuation_color) * mat.attenuation_density;
+	m.specular_tint = mat.specular_tint;
+	m.specular_factor = mat.specular_factor;
 
 #ifdef RT_DEBUG_ENABLED
 	{

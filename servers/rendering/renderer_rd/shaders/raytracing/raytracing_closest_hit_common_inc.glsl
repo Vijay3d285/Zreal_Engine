@@ -612,7 +612,29 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.baseColor = m.albedo;
 	brdf_mat.metalness = m.metalness;
 	brdf_mat.roughness = m.roughness;
-	brdf_mat.dielectricF0 = vec3(specular_to_f0(m.specular));
+	// F0 / IOR arbitration (roadmap E1, spec section 3.2). Phase D left F0
+	// double-specified between Godot's `specular` and the glTF ior /
+	// specular_factor / specular_tint triple; this is where it is resolved.
+	//
+	// Structure is Cycles' (kernel/svm/closure.h:426-431): IOR is the source of
+	// truth, the artist-facing specular knob is a multiplier that no-ops at its
+	// 0.5 default, and eta is re-derived from the modified F0 when it is not 0.5
+	// so reflectance and refraction cannot disagree.
+	//
+	// The RESPONSE CURVE is Godot's, not Blender's: 4*specular^2 is
+	// specular_to_f0 (0.16*s^2) normalised against the 0.04 reference, so it is
+	// EXACTLY 1.0 at 0.5 and preserves Godot's shape away from it. Blender uses
+	// 2*level; the two agree only at 0.5 (0.08 vs 0.16 at specular = 1.0).
+	//
+	// At every default -- ior 1.5, specular 0.5, specular_factor 1.0, white tint
+	// -- this yields exactly vec3(0.04) and eta 1.5, identical to the
+	// specular_to_f0(0.5) this line replaced. That is arithmetic, not a
+	// measurement, and it is why untouched materials cannot shift.
+	// See resolveDielectricF0 in brdf_inc.glsl for why IOR wins and why the
+	// specular knob is a multiplier that no-ops at 0.5.
+	float resolved_eta;
+	resolveDielectricF0(m.ior, m.specular, m.specular_factor, m.specular_tint,
+			brdf_mat.dielectricF0, resolved_eta);
 	brdf_mat.emissive = m.emissive;
 	brdf_mat.transmissivness = 0.0;
 	brdf_mat.opacity = 1.0;

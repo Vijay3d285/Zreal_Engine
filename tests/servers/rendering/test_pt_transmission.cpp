@@ -161,4 +161,105 @@ TEST_CASE("[PathTracer][Transmission] Refraction at normal incidence does not be
 	CHECK(wo.z == doctest::Approx(-1.0f).epsilon(1e-6));
 }
 
+// CPU mirror of the F0 arbitration in
+// raytracing_closest_hit_common_inc.glsl (roadmap E1, spec section 3.2).
+// Structure ported from Cycles kernel/svm/closure.h:426-431, with Godot's
+// 0.16*specular^2 response curve substituted for Blender's 2*level.
+static void resolve_f0(float p_ior, float p_specular, float p_specular_factor,
+		const Vector3 &p_specular_tint, Vector3 *r_f0, float *r_eta) {
+	const float f0_scalar = f0_from_ior(p_ior);
+	Vector3 f0 = Vector3(f0_scalar, f0_scalar, f0_scalar) * p_specular_factor;
+	f0.x *= p_specular_tint.x;
+	f0.y *= p_specular_tint.y;
+	f0.z *= p_specular_tint.z;
+
+	// Godot's specular_to_f0 is 0.16*s^2, normalised against the 0.04 reference
+	// so this factor is EXACTLY 1.0 at the 0.5 default. That exactness is what
+	// makes an untouched material bit-identical to pre-E1.
+	f0 *= 4.0f * p_specular * p_specular;
+
+	*r_f0 = f0;
+	// Cycles re-derives eta from the modified F0 so reflectance and refraction
+	// cannot disagree (svm/closure.h:429-431). Only when the knob is off-default.
+	const float lum = 0.2126f * f0.x + 0.7152f * f0.y + 0.0722f * f0.z;
+	*r_eta = (p_specular != 0.5f) ? ior_from_f0(lum) : p_ior;
+}
+
+TEST_CASE("[PathTracer][Transmission] F0 arbitration is a no-op at every default") {
+	Vector3 f0;
+	float eta = 0.0f;
+	resolve_f0(1.5f, 0.5f, 1.0f, Vector3(1, 1, 1), &f0, &eta);
+
+	// 0.04 is what specular_to_f0(0.5) produced before E1. Bit-exactness here is
+	// the whole no-pixel-change guarantee for untouched materials.
+	CHECK(f0.x == doctest::Approx(0.04f).epsilon(1e-6));
+	CHECK(f0.y == doctest::Approx(0.04f).epsilon(1e-6));
+	CHECK(f0.z == doctest::Approx(0.04f).epsilon(1e-6));
+	CHECK(eta == doctest::Approx(1.5f).epsilon(1e-9));
+}
+
+TEST_CASE("[PathTracer][Transmission] F0 arbitration honours tint and factor") {
+	Vector3 f0;
+	float eta = 0.0f;
+	resolve_f0(1.5f, 0.5f, 0.62f, Vector3(0.8f, 0.7f, 0.55f), &f0, &eta);
+
+	CHECK(f0.x == doctest::Approx(0.04f * 0.62f * 0.8f).epsilon(1e-6));
+	CHECK(f0.y == doctest::Approx(0.04f * 0.62f * 0.7f).epsilon(1e-6));
+	CHECK(f0.z == doctest::Approx(0.04f * 0.62f * 0.55f).epsilon(1e-6));
+	// specular is still 0.5, so eta must NOT be re-derived.
+	CHECK(eta == doctest::Approx(1.5f).epsilon(1e-9));
+}
+
+TEST_CASE("[PathTracer][Transmission] Off-default specular re-derives eta") {
+	Vector3 f0;
+	float eta = 0.0f;
+	resolve_f0(1.5f, 1.0f, 1.0f, Vector3(1, 1, 1), &f0, &eta);
+
+	// 4 * 1.0^2 = 4, so F0 quadruples to Godot's 0.16 at specular = 1.0.
+	CHECK(f0.x == doctest::Approx(0.16f).epsilon(1e-6));
+	// eta must follow F0 upward, or the surface would refract like glass while
+	// reflecting like something denser.
+	CHECK(eta > 1.5f);
+	CHECK(eta == doctest::Approx(ior_from_f0(0.16f)).epsilon(1e-5));
+}
+
+TEST_CASE("[PathTracer][Transmission] ior == 0 yields a fully reflective surface") {
+	Vector3 f0;
+	float eta = 0.0f;
+	resolve_f0(0.0f, 0.5f, 1.0f, Vector3(1, 1, 1), &f0, &eta);
+
+	CHECK(f0.x == doctest::Approx(1.0f).epsilon(1e-6));
+	CHECK(!Math::is_nan(f0.x));
+	CHECK(eta == doctest::Approx(0.0f).epsilon(1e-9));
+
+	// And the closure's Fresnel must report TIR for it at every incidence,
+	// so the caller never reaches the 1.0/eta division.
+	float cos_t = -999.0f;
+	CHECK(fresnel_dielectric(1.0f, 0.0f, &cos_t) == doctest::Approx(1.0f).epsilon(1e-9));
+	CHECK(cos_t == -999.0f);
+}
+
+TEST_CASE("[PathTracer][Transmission] Absorption follows Beer-Lambert") {
+	// sigma_a = (1 - color) * density, matching Cycles' Volume Absorption
+	// (kernel/svm/closure.h:1236-1241). NOT the glTF spec's -log(color)/distance;
+	// see spec section 4.3 for why Blender's is chosen.
+	const Vector3 color = Vector3(0.9f, 0.4f, 0.15f);
+	const float density = 0.2f; // attenuation_distance 5.0 -> density 1/5.
+	const float d = 3.0f;
+
+	const Vector3 sigma = (Vector3(1, 1, 1) - color) * density;
+	// Explicit expected values, computed by hand:
+	CHECK(Math::exp(-sigma.x * d) == doctest::Approx(0.941765f).epsilon(1e-5));
+	CHECK(Math::exp(-sigma.y * d) == doctest::Approx(0.697676f).epsilon(1e-5));
+	CHECK(Math::exp(-sigma.z * d) == doctest::Approx(0.600496f).epsilon(1e-5));
+
+	// A white attenuation colour absorbs nothing regardless of density.
+	const Vector3 white_sigma = (Vector3(1, 1, 1) - Vector3(1, 1, 1)) * 999.0f;
+	CHECK(Math::exp(-white_sigma.x * d) == doctest::Approx(1.0f).epsilon(1e-9));
+
+	// Zero density (attenuation_distance 0 == infinite) absorbs nothing.
+	const Vector3 zero_sigma = (Vector3(1, 1, 1) - color) * 0.0f;
+	CHECK(Math::exp(-zero_sigma.y * d) == doctest::Approx(1.0f).epsilon(1e-9));
+}
+
 } // namespace TestPTTransmission
