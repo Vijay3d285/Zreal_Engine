@@ -18,6 +18,21 @@ extends "res://tests/pt_validation.gd"
 ## GDScript and reads them back out of the shader. A wrong parameter name, a
 ## wrong struct offset, or a C++/GLSL layout disagreement all show up here as a
 ## specific field reading the wrong number.
+##
+## SCOPE: this proves arrival for the StandardMaterial3D path ONLY.
+## debug_visualize() has two call sites in scene_raytracing_raygen.glsl, and
+## they are mutually exclusive at compile time: the one at :495-508 (which
+## fetches `materials[h.geometry_idx]` because no MaterialData is otherwise in
+## scope there) only builds under RT_CUSTOM_HIT_GROUP, and the one at :560-572
+## (which passes the already-in-scope `mat`) only builds in the #else branch.
+## This gate's scene uses `StandardMaterial3D.new()` as material_override, which
+## can only ever take the second path. The custom-hit-group fetch is therefore
+## exercised by successful shader compilation and nothing else at runtime -- no
+## test in this repo drives it with real values. The residual risk is low
+## because that fetch expression is textually identical to the one this gate
+## does verify (`materials[h.geometry_idx]` vs. the tested `materials[...]`
+## indexing used to build `mat` on the other path), but it is unverified, and a
+## custom-hit-group gate scene is out of scope for Phase D.
 
 const MODE_TRANSMISSION_IOR_THICKNESS := 23
 const MODE_DENSITY_SPECULAR_SHEENROUGH := 24
@@ -27,9 +42,21 @@ const MODE_ATTENUATION_COLOR := 27
 const MODE_SPECULAR_TINT := 28
 const MODE_SHEEN_COLOR := 29
 
-## Values are pairwise distinct and every one differs from its own default, so a
-## field swap between any two of them fails a specific assertion rather than
-## cancelling out.
+## Values are distinct EXCEPT for one pair: V_CLEARCOAT and the blue channel of
+## V_SPECULAR_TINT are both 0.55. That collision means this fixture set cannot
+## catch every possible layout error: a struct-layout bug that aliased
+## `clearcoat` (RT_MaterialData offset 160) onto `specular_tint.b` (offset 136)
+## would read 0.55 in both checks and both would pass.
+##
+## Accepted as residual risk, not fixed by re-cutting the fixture, because those
+## two offsets are 24 bytes apart with several other fields between them -- no
+## plausible off-by-one (a dropped/duplicated field, a wrong vec3 alignment)
+## produces exactly that mapping. A layout bug big enough to alias those two
+## specific offsets would have to shift the whole tail of the struct, and any
+## such shift disturbs most of the other eleven fields too: 18 of these 19
+## checks would still fail. Every other value here is pairwise distinct and
+## differs from its own default, so any OTHER field swap fails a specific
+## assertion rather than cancelling out.
 const V_TRANSMISSION := 0.35
 const V_IOR := 1.72
 const V_THICKNESS := 2.4
