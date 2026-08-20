@@ -534,9 +534,22 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	//
 	// KNOWN LIMITATION: exact for a single closed mesh, wrong for nested or
 	// interpenetrating transmissive volumes, which would need a medium stack.
+	//
+	// This multiply is unconditional and does NOT touch INSIDE_MEDIUM_FLAG: the
+	// ray really did traverse gl_HitTEXT of medium to reach this hit regardless
+	// of what the BSDF dispatch below decides to do next (transmit out, or
+	// reflect internally and stay inside). The flag means "the ray about to be
+	// traced is inside a solid," which is not knowable until AFTER that
+	// dispatch runs -- see the symmetric toggle at the bounce-accounting block
+	// below (fix round 1, C2). Clearing it here unconditionally was the bug:
+	// a back-face hit that samples an internal reflection (TIR near the
+	// critical angle, or a stray diffuse-lobe draw) would clear the flag while
+	// the ray is still inside, so its next segment re-enables back-face
+	// culling, misses the interior wall it needs to find, and escapes to sky
+	// -- leaked, over-bright energy at grazing angles on any solid glass
+	// sphere or gem.
 	if (RT_GET_TRANSMISSION_ENABLED() && !h.is_front_face && m.transmission > 0.0 && m.thickness > 0.0) {
 		ps.throughput *= exp(-m.attenuation * gl_HitTEXT);
-		ps.packed_bounces_flags = clear_inside_medium(ps.packed_bounces_flags);
 	}
 
 	RNGState rng = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
@@ -627,7 +640,16 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// C1's emissive enable are project settings rather than Environment params
 	// (scene_shader_raytracing.cpp:643-648). resolve_bounce_cap is reused because
 	// this field also uses 0-as-unset.
-	const uint max_transmission = resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), max_total);
+	//
+	// min(..., 15u) (fix round 1, M1) is load-bearing, not defensive: the
+	// transmission-bounce counter is only 4 bits (raytracing_inc.glsl) and
+	// inc_transmission_bounce does not itself saturate at 15 -- incrementing
+	// past it carries into INSIDE_MEDIUM_FLAG (bit 31) and can wrap the whole
+	// packed word to zero if that bit was already set, silently clearing every
+	// counter and flag. resolve_bounce_cap alone can return up to max_total
+	// (16) when RT_GET_MAX_TRANSMISSION_BOUNCE() is 0 (a raw RenderingServer
+	// with the setting unset), so this clamp is what actually prevents that.
+	const uint max_transmission = min(resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), max_total), 15u);
 	const uint transmission_bounces = get_transmission_bounces(ps.packed_bounces_flags);
 	if (total_bounces >= max_total || diffuse_bounces >= max_diffuse || glossy_bounces >= max_glossy ||
 			transmission_bounces >= max_transmission) {
@@ -682,25 +704,33 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// inside the medium, about to exit), decided the same way Cycles keys eta
 	// off SD_BACKFACING (kernel/svm/closure.h:426-431). is_inside_medium is
 	// path-history bookkeeping for raygen's ray-flags decision (Step 8), not a
-	// per-hit fact, and it is unusable here besides: the absorption block above
-	// already calls clear_inside_medium() on exactly the exit hit, before this
-	// line runs, so reading the flag at this point would report "not inside"
-	// for the one hit that needs the flipped ratio. h.is_front_face carries no
-	// such ordering dependency and is also correct for thin-walled materials,
-	// where no medium is ever entered but a back-side hit still needs the
-	// flipped Fresnel split.
+	// per-hit fact, and stays wrong for one case even after fix round 1 (C2)
+	// made its maintenance symmetric with the actual transmit/reflect outcome:
+	// a THIN-walled material (m.thickness == 0.0) never sets the flag at all
+	// (Step 5 gates it on thickness > 0), yet a back-side hit on a thin
+	// surface still needs the flipped Fresnel split -- is_inside_medium would
+	// read false there and silently skip the flip. h.is_front_face carries no
+	// such gap; it is correct for both the thick-medium and the thin-walled
+	// case from the same one-line expression.
 	brdf_mat.eta = h.is_front_face ? resolved_eta : (1.0 / resolved_eta);
 	brdf_mat.opacity = 1.0;
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
-	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
-	// Transmission mixes against the base layer, matching Blender routing
-	// transmissionFactor into the Principled BSDF's transmission weight
-	// (io_scene_gltf2 .../pbrMetallicRoughness.py:281-310). Required for energy
-	// conservation. This is the one E1 change that also dims NEE at a glass
-	// surface -- deliberately, since that energy now goes into the transmitted
-	// lobe. Factor is exactly 1.0 when transmissivness is 0.
-	diffuseReflectance *= (1.0 - brdf_mat.transmissivness);
+	// Fix round 1, I2: the transmission weight used to be applied to THIS
+	// local via a separate `*=` below, but this local's only consumer is
+	// diffuseLum a few lines down (lobe-selection probability) -- it never
+	// reached any BSDF VALUE, since NEE and evalIndirectCombinedBRDF both get
+	// their diffuseReflectance from prepareBRDFData's own (until this fix,
+	// unscaled) call. The estimator then divided by brdfProbability
+	// afterwards, so the diffuse layer was delivered at FULL strength: glass
+	// emitted a full diffuse lobe plus the full dielectric closure, and the
+	// old comment here claiming this "dims NEE" and is "required for energy
+	// conservation" was false. Now baseColorToDiffuseReflectance itself
+	// applies the transmission weight (brdf_inc.glsl), so this call,
+	// prepareBRDFData's, and combinedPdf's all derive from one formula with
+	// one input and cannot desync. Factor is exactly 1.0 when transmissivness
+	// is 0 -- bit-identical to pre-E1 on every non-glass material.
+	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.transmissivness);
 
 	// =================================================================
 	// DLSS Ray Reconstruction output (primary ray, sample 0 only)
@@ -937,21 +967,32 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			transmissive_sample_ok = true;
 			took_transmissive_lobe = isTransmit;
 
-			if (isTransmit && m.thickness == 0.0) {
-				// Thin-walled: no bend. Continue straight through.
-				next_dir = -V;
-			}
-
 			// Cycles' hemisphere-consistency rejection (bsdf_microfacet.h:864):
 			// a sample must land on the side of BOTH the shading and the geometry
 			// normal that its label implies. This replaces
 			// recoverBelowHemisphereSample for the transmissive branch -- the
 			// mirror-recovery hack is meaningless when the sample is SUPPOSED to
 			// be below the hemisphere.
+			//
+			// Fix round 1, I1: MUST run against the direction
+			// sampleDielectricMicrofacet actually produced, BEFORE the
+			// thin-walled override below can replace it with -V.
+			// h.geometry_normal is always flipped toward V (compute_hit_data),
+			// so dot(-V, Ng) < 0 and dot(-V, N) < 0 are unconditionally true --
+			// checking AFTER the override made both comparisons vacuously equal
+			// to `isTransmit == true` every time, so the guard could never fire
+			// in thin-walled mode, exactly where VNDF can produce a wrong-side
+			// sample at high roughness (the failure mode this guard exists to
+			// catch in the thick case).
 			bool wrongNg = (dot(next_dir, h.geometry_normal) < 0.0) != isTransmit;
 			bool wrongN = (dot(next_dir, N) < 0.0) != isTransmit;
 			if (wrongNg || wrongN) {
 				transmissive_sample_ok = false;
+			}
+
+			if (isTransmit && m.thickness == 0.0) {
+				// Thin-walled: no bend. Continue straight through.
+				next_dir = -V;
 			}
 		}
 		if (!transmissive_sample_ok || luminance(brdf_weight) == 0.0) {
@@ -987,11 +1028,21 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	if (took_transmissive_lobe) {
 		ps.packed_bounces_flags = inc_transmission_bounce(ps.packed_bounces_flags);
-		// Entering a SOLID means the next ray must find the far side of the
-		// glass -- a back face, which RT_RAY_FLAGS otherwise culls. Thin-walled
-		// surfaces enter no medium and need no such visibility.
-		if (m.thickness > 0.0 && h.is_front_face) {
-			ps.packed_bounces_flags = set_inside_medium(ps.packed_bounces_flags);
+		// Symmetric toggle (fix round 1, C2), replacing a one-way set: a
+		// transmit sample crossing a THICK surface either enters the solid
+		// (front face) or leaves it (back face) -- the flag must follow
+		// whichever direction this transmit actually went, every time, not
+		// just be set once on entry. Any OTHER outcome at this hit --
+		// internal reflection (took_transmissive_lobe false) or a diffuse-lobe
+		// draw -- leaves the flag exactly as it already was, which is correct:
+		// the ray's medium residency did not change because it did not cross
+		// the interface. Thin-walled surfaces (m.thickness == 0.0) never enter
+		// a medium at all, so the flag is untouched for them regardless of
+		// isTransmit.
+		if (m.thickness > 0.0) {
+			ps.packed_bounces_flags = h.is_front_face
+					? set_inside_medium(ps.packed_bounces_flags)
+					: clear_inside_medium(ps.packed_bounces_flags);
 		}
 	} else if (brdfType == DIFFUSE_TYPE) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);

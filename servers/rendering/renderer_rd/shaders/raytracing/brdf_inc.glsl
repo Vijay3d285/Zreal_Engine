@@ -451,8 +451,25 @@ float3 baseColorToSpecularF0(float3 baseColor, float metalness, float3 dielectri
 	return lerp(dielectricF0, baseColor, metalness);
 }
 
-float3 baseColorToDiffuseReflectance(float3 baseColor, float metalness) {
-	return baseColor * (1.0f - metalness);
+// SINGLE SOURCE OF TRUTH for the diffuse-layer weight (fix round 1, I2/C1).
+// The `transmissivness` factor mixes the diffuse layer against the base layer,
+// matching Blender routing transmissionFactor into the Principled BSDF's
+// transmission weight (io_scene_gltf2 .../pbrMetallicRoughness.py:281-310) --
+// required for energy conservation, since that energy now goes into the
+// transmitted lobe instead. Every caller (prepareBRDFData, so NEE and
+// evalIndirectCombinedBRDF's diffuse sample weight; combinedPdf's lobe
+// selection; shade_and_bounce's lobe selection) MUST go through this one
+// function with the SAME material.transmissivness, or the estimator (what
+// evalIndirectCombinedBRDF/NEE actually deliver) and the density
+// (combinedPdf's pSpec, shade_and_bounce's brdfProbability) desync -- exactly
+// the defect a locally-scaled copy at one call site produced originally: a
+// full-strength diffuse lobe on top of the full dielectric closure, AND
+// (independently) a diffuse/specular lobe-selection probability that no
+// longer matches what combinedPdf reports for the same direction. Exactly
+// 1.0 - metalness when transmissivness is 0.0, i.e. every non-glass material
+// -- bit-identical to the pre-E1 formula.
+float3 baseColorToDiffuseReflectance(float3 baseColor, float metalness, float transmissivness) {
+	return baseColor * (1.0f - metalness) * (1.0f - transmissivness);
 }
 
 float none(const BrdfData data) {
@@ -1272,7 +1289,7 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 
 	// Unpack material properties
 	data.specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
-	data.diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness);
+	data.diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
 
 	// Unpack 'perceptively linear' -> 'linear' -> 'squared' roughness
 	data.roughness = material.roughness;
@@ -1325,9 +1342,20 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 		return 0.0f;
 	}
 
-	// Lobe selection probability, mirroring shade_and_bounce.
+	// Lobe selection probability, mirroring shade_and_bounce. Fix round 1, C1:
+	// this MUST go through the same baseColorToDiffuseReflectance(...,
+	// transmissivness) as shade_and_bounce's own lobe-selection diffuseLum
+	// (raytracing_closest_hit_common_inc.glsl) and prepareBRDFData's
+	// data.diffuseReflectance below -- one function, one set of inputs, so
+	// pSpec here and brdfProbability there cannot desync. Before this fix,
+	// this line called the 2-arg (pre-I2) form directly, independent of
+	// prepareBRDFData's, and pSpec was measured desynced from the sampler's
+	// brdfProbability by roughly 2x on a representative transmissive material
+	// (albedo 0.8, metalness 0, transmission 0.5: sampler 0.0909, this
+	// function 0.0476) -- live on every transmissive surface, through
+	// mis_ray_pdf, env NEE and emissive NEE.
 	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
-	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness);
+	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
 	float specularLum = luminance(specularF0);
 	float diffuseLum = luminance(diffuseReflectance);
 

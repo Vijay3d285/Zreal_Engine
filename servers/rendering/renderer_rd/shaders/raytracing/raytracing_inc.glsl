@@ -152,8 +152,19 @@ uint inc_glossy_bounce(uint packed) {
 
 // Transmission bounce counter, bits 27-30 (roadmap E1). The byte lanes for
 // total/diffuse/glossy are full, so this lives in the flags region above the
-// terminated flag at 26. 4 bits, saturating at 15 -- matched by Environment's
-// CLAMP(1, 15) on the cap.
+// terminated flag at 26. 4 bits -- 0 to 15 -- but inc_transmission_bounce does
+// NOT saturate there itself (fix round 1, M1): it is a plain `+ 0x08000001u`,
+// so incrementing PAST 15 carries into bit 31, INSIDE_MEDIUM_FLAG, flipping it
+// unpredictably; if that bit was already set, the add wraps the ENTIRE word
+// to zero, silently clearing every bounce counter and every flag. The caller
+// is therefore responsible for never calling this once
+// get_transmission_bounces() == 15 -- see the `min(..., 15u)` clamp on
+// max_transmission at the cap site in shade_and_bounce
+// (raytracing_closest_hit_common_inc.glsl), which is what actually keeps this
+// safe. Reachable without it whenever RT_GET_MAX_TRANSMISSION_BOUNCE() is 0
+// (a raw RenderingServer with the setting unset resolves the cap to
+// max_total, up to 16) -- matched by Environment's own CLAMP(1, 15) on the
+// cap for the normal (non-raw) path.
 uint get_transmission_bounces(uint packed) {
 	return (packed >> 27u) & 0xFu;
 }
