@@ -647,6 +647,7 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 	// only ever needed CPU-side, to build the specialization constant -- see the
 	// spec's section 3.1a.
 	uint32_t min_bounce = 3;
+	uint32_t max_transmission_bounce = 12;
 
 	if (p_env_params) {
 		if (p_env_params[RT_PARAM_VIS_MODE] != 0.0f) {
@@ -686,6 +687,10 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		flags |= RT_FLAG_EMISSIVE_LIGHTS_ENABLED;
 	}
 
+	if (GLOBAL_GET("rendering/pathtracer/transmission_enabled")) {
+		flags |= RT_FLAG_TRANSMISSION_ENABLED;
+	}
+
 	{
 		// (int)Variant on a nil/non-numeric value converts to 0 -- the MOST
 		// aggressive setting (roulette from the first bounce), not a safe
@@ -698,7 +703,19 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		min_bounce = (uint32_t)CLAMP(raw, 0, 16);
 	}
 
-	return rt_flags_pack(flags, sample_count, max_bounces, min_bounce);
+	{
+		// Same reasoning as min_bounce directly above: (int)Variant on a
+		// nil/non-numeric value converts to 0, which here means "unset" and
+		// resolves to max_total -- effectively unlimited, the opposite of a safe
+		// fallback. GLOBAL_DEF runs in RenderingServer::init() before any frame
+		// reaches this function, so the setting is unreachable-nil today, but
+		// fall back to the documented default rather than trust the coercion.
+		const Variant raw_variant = GLOBAL_GET("rendering/pathtracer/max_transmission_bounce");
+		const int raw = raw_variant.is_num() ? (int)raw_variant : 12;
+		max_transmission_bounce = (uint32_t)CLAMP(raw, 1, 15);
+	}
+
+	return rt_flags_pack(flags, sample_count, max_bounces, min_bounce, max_transmission_bounce);
 }
 
 SceneShaderRaytracing *SceneShaderRaytracing::get_singleton() {

@@ -3846,6 +3846,16 @@ void RenderingServer::init() {
 	// scene that already places an analytic light inside an emissive fixture mesh
 	// would then be lit twice.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/emissive_mesh_lights"), false);
+	// Transmission / rough glass (roadmap E1). Defaults to true, unlike C1's
+	// emissive_mesh_lights: the feature is already data-gated (transmission
+	// defaults to 0.0 and no pre-Phase-D content can set it), so an untouched
+	// scene is inert either way.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/transmission_enabled"), true);
+	// CLAMP range is 1-15, NOT the 1-16 the diffuse/glossy Environment caps use:
+	// the shader-side counter is 4 bits and saturates at 15, so a cap of 16 could
+	// never fire and would silently behave as "unlimited". Cycles' own
+	// max_transmission_bounce default is 12.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/max_transmission_bounce", PROPERTY_HINT_RANGE, "1,15,1"), 12);
 
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);

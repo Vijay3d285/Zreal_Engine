@@ -3,7 +3,9 @@
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
 // Specialization constant. Bits 0-3: feature flags, 4-8: Russian Roulette
-// min_bounce (roadmap B4), 9-19: free, 20-27: sample count, 28-31: max bounces.
+// min_bounce (roadmap B4), 9: emissive-mesh NEE (C1), 10-14: transmission
+// enable + bounce cap (roadmap E1), 15-19: free, 20-27: sample count, 28-31:
+// max bounces.
 // Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
 // 16; sample count's shift moved down by one to make room without touching
 // its own 8-bit width (the feature-flags region only ever used bits 0-3).
@@ -35,6 +37,26 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // carries a static_assert proving no feature flag has encroached on min_bounce.
 #define RT_FLAG_EMISSIVE_LIGHTS_ENABLED 512u // 1 << 9
 #define RT_GET_EMISSIVE_ENABLED() ((RT_FLAGS & RT_FLAG_EMISSIVE_LIGHTS_ENABLED) != 0u)
+
+// Transmission / rough glass (roadmap E1). Bit 10 -- the first free bit above
+// C1's emissive flag at 9. MUST match RT_FLAG_TRANSMISSION_ENABLED in
+// scene_shader_raytracing.h; the C++ side carries a static_assert proving the
+// whole 10-14 region misses min_bounce, the sample count and max bounces.
+#define RT_FLAG_TRANSMISSION_ENABLED 1024u // 1 << 10
+#define RT_GET_TRANSMISSION_ENABLED() ((RT_FLAGS & RT_FLAG_TRANSMISSION_ENABLED) != 0u)
+
+// Per-lobe transmission bounce cap, bits 11-14. Stored UNBIASED with 0 meaning
+// "unset", matching resolve_bounce_cap's convention for the diffuse and glossy
+// caps -- unlike min_bounce, 0 is not a legitimate value here (a cap of 0 would
+// mean "no transmission at all", which is what the enable flag is for).
+//
+// 4 bits, so the range is 1-15 rather than the 1-16 the other caps use. The
+// counter in packed_bounces_flags is also 4 bits and saturates at 15, so a cap
+// of 16 could never fire. Environment clamps to (1, 15) to match. Cycles'
+// own max_transmission_bounce default is 12.
+#define RT_MAX_TRANSMISSION_BOUNCE_SHIFT 11u
+#define RT_MAX_TRANSMISSION_BOUNCE_MASK 0xFu
+#define RT_GET_MAX_TRANSMISSION_BOUNCE() ((RT_FLAGS >> RT_MAX_TRANSMISSION_BOUNCE_SHIFT) & RT_MAX_TRANSMISSION_BOUNCE_MASK)
 
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT

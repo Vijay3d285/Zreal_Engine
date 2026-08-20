@@ -71,7 +71,9 @@ public:
 	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines).
 	// Bits 0-3:   Feature flags
 	// Bits 4-8:   Russian Roulette min_bounce (roadmap B4, biased +1; see RT_MIN_BOUNCE_SHIFT)
-	// Bits 9-19:  Free
+	// Bit 9:      Emissive-mesh NEE (roadmap C1)
+	// Bits 10-14: Transmission enable + bounce cap (roadmap E1)
+	// Bits 15-19: Free
 	// Bits 20-27: Sample count
 	// Bits 28-31: Max bounce count (offset by 1: 0=1 bounce, 15=16 bounces)
 	// Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
@@ -85,6 +87,7 @@ public:
 		RT_FLAG_SER_ENABLED = (1 << 3),
 		// Bits 4-8 belong to RT_MIN_BOUNCE (below), so the next feature flag is 9.
 		RT_FLAG_EMISSIVE_LIGHTS_ENABLED = (1 << 9),
+		RT_FLAG_TRANSMISSION_ENABLED = (1 << 10),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
@@ -102,12 +105,29 @@ public:
 	constexpr static uint32_t RT_MIN_BOUNCE_SHIFT = 4;
 	constexpr static uint32_t RT_MIN_BOUNCE_MASK = 0x1F;
 
+	// Transmission bounce cap (roadmap E1), bits 11-14. UNBIASED, 0 = unset --
+	// unlike min_bounce, 0 is not a legitimate cap value. Range 1-15 rather than
+	// 1-16 because the shader-side counter is 4 bits and saturates at 15.
+	constexpr static uint32_t RT_MAX_TRANSMISSION_BOUNCE_SHIFT = 11;
+	constexpr static uint32_t RT_MAX_TRANSMISSION_BOUNCE_MASK = 0xF;
+
 	// Compile-time guard: a new RT_FLAG_* added at (1 << 4) or above would silently
 	// alias the Russian Roulette min_bounce field, corrupt the readback, and leave
 	// the rendered image merely plausible instead of visibly wrong. Keep this in
 	// sync whenever RT_FLAG_* gains a member.
-	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
+	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
 			"RT_FLAG_* bit overlaps the Russian Roulette min_bounce field (bits 4-8)");
+
+	// The transmission cap field must miss every neighbouring field. A collision
+	// corrupts the neighbour's readback and leaves the render plausible rather
+	// than visibly wrong.
+	static_assert(((RT_MAX_TRANSMISSION_BOUNCE_MASK << RT_MAX_TRANSMISSION_BOUNCE_SHIFT) &
+						  ((RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT) |
+								  (RT_SAMPLE_COUNT_MASK << RT_SAMPLE_COUNT_SHIFT) |
+								  (RT_MAX_BOUNCES_MASK << RT_MAX_BOUNCES_SHIFT) |
+								  RT_FLAG_EMISSIVE_LIGHTS_ENABLED |
+								  RT_FLAG_TRANSMISSION_ENABLED)) == 0,
+			"RT_MAX_TRANSMISSION_BOUNCE field (bits 11-14) overlaps another RT_FLAGS field");
 
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).
 	// 1: primary/bounce from raygen
@@ -132,13 +152,15 @@ public:
 	static constexpr int RT_PARAM_LIGHT_COUNT = RSE::PT_PARAM_LIGHT_COUNT;
 	static constexpr int RT_PARAM_FRAME_INDEX = RSE::PT_PARAM_FRAME_INDEX;
 
-	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces, uint32_t p_min_bounce) {
+	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces, uint32_t p_min_bounce, uint32_t p_max_transmission_bounce) {
 		uint32_t result = p_flags;
 		result |= (p_sample_count & RT_SAMPLE_COUNT_MASK) << RT_SAMPLE_COUNT_SHIFT;
 		// Max bounces is offset by 1 (0=1 bounce, 15=16 bounces)
 		result |= (MAX(1u, MIN(16u, p_max_bounces)) - 1u) << RT_MAX_BOUNCES_SHIFT;
 		// Min bounce is offset by 1 so stored 0 can mean "unset" -- see above.
 		result |= ((MIN(16u, p_min_bounce) + 1u) & RT_MIN_BOUNCE_MASK) << RT_MIN_BOUNCE_SHIFT;
+		// Transmission cap is UNBIASED: 0 already means "unset" here.
+		result |= (MIN(15u, p_max_transmission_bounce) & RT_MAX_TRANSMISSION_BOUNCE_MASK) << RT_MAX_TRANSMISSION_BOUNCE_SHIFT;
 		return result;
 	}
 

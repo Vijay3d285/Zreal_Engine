@@ -262,4 +262,90 @@ TEST_CASE("[PathTracer][Transmission] Absorption follows Beer-Lambert") {
 	CHECK(Math::exp(-zero_sigma.y * d) == doctest::Approx(1.0f).epsilon(1e-9));
 }
 
+// CPU mirrors of the RT_FLAGS packing in scene_shader_raytracing.h and the
+// payload bit helpers in raytracing_inc.glsl (roadmap E1).
+static const uint32_t MIRROR_TRANSMISSION_ENABLED = (1u << 10);
+static const uint32_t MIRROR_MAX_TRANSMISSION_SHIFT = 11u;
+static const uint32_t MIRROR_MAX_TRANSMISSION_MASK = 0xFu;
+static const uint32_t MIRROR_MIN_BOUNCE_SHIFT = 4u;
+static const uint32_t MIRROR_MIN_BOUNCE_MASK = 0x1Fu;
+static const uint32_t MIRROR_SAMPLE_COUNT_SHIFT = 20u;
+
+static uint32_t mirror_get_max_transmission(uint32_t p_flags) {
+	return (p_flags >> MIRROR_MAX_TRANSMISSION_SHIFT) & MIRROR_MAX_TRANSMISSION_MASK;
+}
+
+static uint32_t mirror_inc_transmission_bounce(uint32_t p_packed) {
+	return p_packed + 0x08000001u; // +1 to bits 27-30 and +1 to total (bits 0-7).
+}
+
+static uint32_t mirror_get_transmission_bounces(uint32_t p_packed) {
+	return (p_packed >> 27u) & 0xFu;
+}
+
+TEST_CASE("[PathTracer][Transmission] RT_FLAGS transmission field does not collide") {
+	// Bit 10 and the 11-14 field must miss min_bounce (4-8), the emissive flag
+	// (9), the sample count (20-27) and max bounces (28-31). A collision here
+	// corrupts a NEIGHBOURING field's readback and leaves the render merely
+	// plausible rather than visibly wrong -- which is why this is asserted
+	// rather than eyeballed.
+	const uint32_t transmission_region = MIRROR_TRANSMISSION_ENABLED |
+			(MIRROR_MAX_TRANSMISSION_MASK << MIRROR_MAX_TRANSMISSION_SHIFT);
+	const uint32_t min_bounce_region = MIRROR_MIN_BOUNCE_MASK << MIRROR_MIN_BOUNCE_SHIFT;
+	const uint32_t emissive_flag = (1u << 9);
+	const uint32_t sample_count_region = 0xFFu << MIRROR_SAMPLE_COUNT_SHIFT;
+	const uint32_t max_bounces_region = 0xFu << 28u;
+
+	CHECK((transmission_region & min_bounce_region) == 0u);
+	CHECK((transmission_region & emissive_flag) == 0u);
+	CHECK((transmission_region & sample_count_region) == 0u);
+	CHECK((transmission_region & max_bounces_region) == 0u);
+	CHECK(transmission_region == 0x7C00u); // bits 10-14
+}
+
+TEST_CASE("[PathTracer][Transmission] Bounce cap uses 0-as-unset") {
+	// Matches resolve_bounce_cap's existing convention for the diffuse and glossy
+	// caps (raytracing_inc.glsl), so the same helper is reused and no bias is
+	// needed. Cap range is 1-15, NOT 1-16 like its siblings: the counter is 4
+	// bits and saturates at 15, so a cap of 16 would silently never fire.
+	CHECK(mirror_get_max_transmission(0u) == 0u); // unset
+	CHECK(mirror_get_max_transmission(12u << MIRROR_MAX_TRANSMISSION_SHIFT) == 12u);
+	CHECK(mirror_get_max_transmission(15u << MIRROR_MAX_TRANSMISSION_SHIFT) == 15u);
+}
+
+TEST_CASE("[PathTracer][Transmission] Transmission counter increments total too") {
+	uint32_t packed = 0u;
+	packed = mirror_inc_transmission_bounce(packed);
+	CHECK(mirror_get_transmission_bounces(packed) == 1u);
+	CHECK((packed & 0xFFu) == 1u); // total bounces
+
+	for (int i = 0; i < 14; i++) {
+		packed = mirror_inc_transmission_bounce(packed);
+	}
+	CHECK(mirror_get_transmission_bounces(packed) == 15u);
+	CHECK((packed & 0xFFu) == 15u);
+
+	// The counter must not bleed into the diffuse (8-15) or glossy (16-23) lanes.
+	CHECK(((packed >> 8u) & 0xFFu) == 0u);
+	CHECK(((packed >> 16u) & 0xFFu) == 0u);
+}
+
+TEST_CASE("[PathTracer][Transmission] Inside-medium flag is bit 31 and independent") {
+	const uint32_t INSIDE = (1u << 31);
+	uint32_t packed = 0u;
+	packed = mirror_inc_transmission_bounce(packed);
+	packed |= INSIDE;
+
+	CHECK((packed & INSIDE) != 0u);
+	CHECK(mirror_get_transmission_bounces(packed) == 1u); // counter unaffected
+	packed &= ~INSIDE;
+	CHECK((packed & INSIDE) == 0u);
+	CHECK(mirror_get_transmission_bounces(packed) == 1u);
+
+	// Must not collide with sample-zero (24), shadow-ray (25) or terminated (26).
+	CHECK((INSIDE & (1u << 24)) == 0u);
+	CHECK((INSIDE & (1u << 25)) == 0u);
+	CHECK((INSIDE & (1u << 26)) == 0u);
+}
+
 } // namespace TestPTTransmission

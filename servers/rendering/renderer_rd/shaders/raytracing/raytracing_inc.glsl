@@ -150,6 +150,17 @@ uint inc_glossy_bounce(uint packed) {
 	return packed + 0x10001u;
 } // +1 to both total and glossy
 
+// Transmission bounce counter, bits 27-30 (roadmap E1). The byte lanes for
+// total/diffuse/glossy are full, so this lives in the flags region above the
+// terminated flag at 26. 4 bits, saturating at 15 -- matched by Environment's
+// CLAMP(1, 15) on the cap.
+uint get_transmission_bounces(uint packed) {
+	return (packed >> 27u) & 0xFu;
+}
+uint inc_transmission_bounce(uint packed) {
+	return packed + 0x08000001u;
+} // +1 to both total and transmission
+
 /// Resolve a per-lobe cap, treating 0 as "unset" and falling back to the total
 /// limit. Environment always writes >= 1; 0 only arrives from a raw
 /// RenderingServer environment that never set the pathtracing params, and
@@ -190,6 +201,22 @@ uint clear_path_terminated(uint packed) {
 }
 bool is_path_terminated(uint packed) {
 	return (packed & PATH_TERMINATED_FLAG) != 0u;
+}
+
+// Inside-medium flag (bit 31). Set when a ray refracts INTO a solid, cleared
+// when it exits. Raygen reads it to decide whether to drop
+// gl_RayFlagsCullBackFacingTrianglesEXT for the next trace: a refracted ray
+// must hit the FAR side of the glass, which is a back face and is otherwise
+// invisible. Every non-transmissive path traces with byte-identical flags.
+const uint INSIDE_MEDIUM_FLAG = (1u << 31);
+uint set_inside_medium(uint packed) {
+	return packed | INSIDE_MEDIUM_FLAG;
+}
+uint clear_inside_medium(uint packed) {
+	return packed & ~INSIDE_MEDIUM_FLAG;
+}
+bool is_inside_medium(uint packed) {
+	return (packed & INSIDE_MEDIUM_FLAG) != 0u;
 }
 
 // Bounce limits
@@ -276,7 +303,8 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 #define RT_PRNG_ENV 7u // 2D: direction sample on the environment (C3).
 #define RT_PRNG_EMISSIVE_SELECT 8u // 1D: emissive instance + triangle (C1).
 #define RT_PRNG_EMISSIVE_POINT 9u // 2D: barycentric point on that triangle (C1).
-// Slots 10-15 are free. Earlier dimensions are better stratified, so the
+#define RT_PRNG_TRANSMIT 11u // 1D: reflect-vs-transmit choice inside the dielectric closure (E1).
+// Slots 10, 12-15 are free. Earlier dimensions are better stratified, so the
 // highest-variance decision (the BSDF direction) keeps 0.
 
 /// Sampler state for one path. `pixel` is the per-pixel Owen scramble seed,
