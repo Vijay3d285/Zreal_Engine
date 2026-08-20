@@ -367,10 +367,27 @@ Bits 10-19 of `RT_FLAGS` are free: 0-3 are feature flags (`DEBUG_VIS`, `DLSS_RR`
 The cap uses **0-as-unset**, matching `resolve_bounce_cap`'s existing convention
 for the diffuse and glossy caps (`raytracing_inc.glsl:159-168`), so the same
 helper is reused and no `+1` bias is needed.
-`Environment::set_pathtracing_max_transmission_bounce` clamps to `(1, 15)`, not
-the `(1, 16)` its siblings use (`environment.cpp:717`, `:726`), because a 4-bit
-counter saturating at 15 against a cap of 16 would silently never fire. Cycles'
-own default is 12.
+**CORRECTION (2026-08-19, user ruling).** An earlier revision of this section
+said the cap arrives via an `Environment` property. **It cannot.**
+`pathtracing_params` is a `float[16]` with every slot assigned, which is exactly
+why B4's `min_bounce` and C1's emissive enable are **project settings** rather
+than Environment params -- `scene_shader_raytracing.cpp:643-648` documents that
+in a comment. Both E1 values follow the same precedent:
+`rendering/pathtracer/transmission_enabled` (BOOL, default **true**) and
+`rendering/pathtracer/max_transmission_bounce` (INT, default 12), registered by
+`GLOBAL_DEF` in `rendering_server.cpp` beside `:3843` and `:3848`, and read in
+`compute_rt_flags`.
+
+The cap clamps to `(1, 15)`, not the `(1, 16)` the diffuse and glossy
+*Environment* caps use (`environment.cpp:717`, `:726`), because a 4-bit counter
+saturating at 15 against a cap of 16 would silently never fire. Cycles' own
+default is 12.
+
+The practical consequence: the transmission bounce cap is **per project**, not
+per `Environment`, unlike `max_diffuse_bounce` and `max_glossy_bounce`. Accepted
+rather than widening `pathtracing_params`, which would change the
+`PackedFloat32Array` API surface that `pipeline_references`' own scripts write
+to and that Phase D's GPU gate exercises.
 
 Cycles keeps `transmission_bounce` distinct from `transparent_bounce`
 (`path_state.h:204`, `:121`). Only the former is needed here: alpha cutout is

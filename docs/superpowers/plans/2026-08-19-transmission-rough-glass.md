@@ -40,7 +40,8 @@
 | `.../shaders/raytracing/raytracing_emissive_inc.glsl` | `dielectricF0` call site | 2 |
 | `.../forward_clustered/scene_shader_raytracing.h` | C++ twins, `rt_flags_pack` | 4 |
 | `.../forward_clustered/render_raytracing.cpp` | Upload clamps | 3 |
-| `scene/resources/environment.h` / `.cpp` | `max_transmission_bounce`, vis-mode enums | 4, 7 |
+| `scene/resources/environment.h` / `.cpp` | vis-mode enums only | 7 |
+| `servers/rendering/rendering_server.cpp` | 2 `GLOBAL_DEF` project settings | 4 |
 | `pipeline_references/tests/pt_transmission_gate.gd` / `_scene.tscn` | GPU arrival + physics gate | 7 |
 | `PATH_TRACER_QUALITY_ROADMAP.md` | E1 closeout | 8 |
 
@@ -785,12 +786,22 @@ git commit -m "feat(pt): carry transmission data into MaterialResult and resolve
 - Modify: `servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl:165-193`, `:269-278`
 - Modify: `servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h:71-145`
 - Modify: `servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.cpp` (`compute_rt_flags`)
-- Modify: `scene/resources/environment.h`, `scene/resources/environment.cpp`
+- Modify: `servers/rendering/rendering_server.cpp` (two `GLOBAL_DEF` registrations, beside `:3843` and `:3848`)
 - Modify: `tests/servers/rendering/test_pt_transmission.cpp`
 
 **Interfaces:**
 - Produces (GLSL): `RT_GET_TRANSMISSION_ENABLED()`, `RT_GET_MAX_TRANSMISSION_BOUNCE()`, `get_transmission_bounces(uint)`, `inc_transmission_bounce(uint)`, `set_inside_medium(uint)`, `clear_inside_medium(uint)`, `is_inside_medium(uint)`, `RT_PRNG_TRANSMIT`.
-- Produces (C++): `RT_FLAG_TRANSMISSION_ENABLED`, `RT_MAX_TRANSMISSION_BOUNCE_SHIFT/_MASK`, `Environment::set/get_pathtracing_max_transmission_bounce`.
+- Produces (C++): `RT_FLAG_TRANSMISSION_ENABLED`, `RT_MAX_TRANSMISSION_BOUNCE_SHIFT/_MASK`, and two project settings — `rendering/pathtracer/transmission_enabled` and `rendering/pathtracer/max_transmission_bounce`.
+
+**PLUMBING CORRECTION (user ruling, supersedes the spec's section 4.3).** An
+earlier draft of this task and of spec section 4.3 said these values reach the
+shader through an `Environment` property. **They cannot.** `pathtracing_params`
+is a `float[16]` and every slot is assigned, which is precisely why B4's
+`min_bounce` and C1's emissive enable are **project settings** rather than
+Environment params — `scene_shader_raytracing.cpp:643-648` says so in a comment.
+Both new values follow that same precedent. No `Environment` property is added
+by this task, and `environment.h` / `environment.cpp` are NOT touched here (Task
+7 still edits them, for the two debug-vis enum constants).
 
 **Bit layout this task establishes.** `RT_FLAGS` bit 10 = enable; bits 11-14 = `max_transmission_bounce` with **0 meaning unset** (matching `resolve_bounce_cap`'s existing convention for the diffuse and glossy caps, so no `+1` bias). `packed_bounces_flags` bits 27-30 = transmission counter (0-15); bit 31 = inside-medium / no-cull.
 
@@ -1018,33 +1029,59 @@ Extend `rt_flags_pack` to take and pack the cap:
 	}
 ```
 
-Update every `rt_flags_pack` call site — `grep -rn "rt_flags_pack" servers/` to find them — and set `RT_FLAG_TRANSMISSION_ENABLED` in `compute_rt_flags` in `scene_shader_raytracing.cpp`, **defaulting to on** (spec §3.6). Follow how `RT_FLAG_EMISSIVE_LIGHTS_ENABLED` is derived there and mirror the structure, reading the new environment parameter.
+`rt_flags_pack` has exactly one call site — `scene_shader_raytracing.cpp:701`, inside `compute_rt_flags`. Verify with `grep -rn "rt_flags_pack" servers/` (ignoring `*.gen.h`) rather than assuming. Step 6 supplies the new fifth argument.
 
-- [ ] **Step 6: Add the Environment property**
+- [ ] **Step 6: Register the two project settings**
 
-In `environment.h`, beside `pathtracing_max_glossy_bounce`, add `int pathtracing_max_transmission_bounce = 12;` and declare the setter/getter. In `environment.cpp`, beside `set_pathtracing_max_glossy_bounce` at `:725`:
-
-```cpp
-void Environment::set_pathtracing_max_transmission_bounce(int p_bounces) {
-	// CLAMP(1, 15), NOT the (1, 16) its siblings use: the shader-side counter is
-	// 4 bits and saturates at 15, so a cap of 16 could never fire and would
-	// silently behave as "unlimited". Cycles' own default is 12.
-	pathtracing_max_transmission_bounce = CLAMP(p_bounces, 1, 15);
-	_update_pathtracing();
-}
-
-int Environment::get_pathtracing_max_transmission_bounce() const {
-	return pathtracing_max_transmission_bounce;
-}
-```
-
-Bind it beside the glossy binding at `:1611` and add the property beside `:1620`:
+In `servers/rendering/rendering_server.cpp`, beside the existing pathtracer
+settings at `:3843` and `:3848`:
 
 ```cpp
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_transmission_bounce", PROPERTY_HINT_RANGE, "1,15,1"), "set_pathtracing_max_transmission_bounce", "get_pathtracing_max_transmission_bounce");
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/transmission_enabled"), true);
+	// CLAMP range is 1-15, NOT the 1-16 the diffuse/glossy Environment caps use:
+	// the shader-side counter is 4 bits and saturates at 15, so a cap of 16 could
+	// never fire and would silently behave as "unlimited". Cycles' own
+	// max_transmission_bounce default is 12.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/max_transmission_bounce", PROPERTY_HINT_RANGE, "1,15,1"), 12);
 ```
 
-`_update_pathtracing()` writes into `pathtracing_params`, which is **full** — do not add a slot. Route this value into the spec constant instead: follow how `min_bounce` reaches `compute_rt_flags` and mirror it exactly.
+Note `transmission_enabled` defaults to **true** (spec section 3.6), unlike C1's
+`emissive_mesh_lights` which ships false. The feature is already data-gated —
+`transmission` defaults to 0.0 and no pre-Phase-D content can set it — so an
+untouched scene is inert either way.
+
+Then read both in `compute_rt_flags` (`scene_shader_raytracing.cpp:641-701`),
+following the two precedents already in that function:
+
+```cpp
+	if (GLOBAL_GET("rendering/pathtracer/transmission_enabled")) {
+		flags |= RT_FLAG_TRANSMISSION_ENABLED;
+	}
+```
+
+and, beside the `min_bounce` block at `:689-700`, whose defensive style you
+should copy rather than invent a new one:
+
+```cpp
+	{
+		// Same reasoning as min_bounce directly above: (int)Variant on a
+		// nil/non-numeric value converts to 0, which here means "unset" and
+		// resolves to max_total -- effectively unlimited, the opposite of a safe
+		// fallback. GLOBAL_DEF runs in RenderingServer::init() before any frame
+		// reaches this function, so the setting is unreachable-nil today, but
+		// fall back to the documented default rather than trust the coercion.
+		const Variant raw_variant = GLOBAL_GET("rendering/pathtracer/max_transmission_bounce");
+		const int raw = raw_variant.is_num() ? (int)raw_variant : 12;
+		max_transmission_bounce = (uint32_t)CLAMP(raw, 1, 15);
+	}
+```
+
+declaring `uint32_t max_transmission_bounce = 12;` beside `min_bounce` at `:649`
+and passing it as `rt_flags_pack`'s new fifth argument at `:701`.
+
+`compute_rt_flags` has exactly one caller,
+`render_forward_clustered.cpp:2441` — its signature does not change, so that
+call site needs no edit. Confirm that by grep rather than assuming.
 
 - [ ] **Step 7: Build, test, and prove no pixels changed**
 
@@ -1054,12 +1091,12 @@ bin\godot.windows.editor.x86_64.console.exe --test
 bin\godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_validation_scene.tscn
 ```
 
-Expected: 0 failed; MEAN unchanged to six significant figures. Nothing reads the new flag yet.
+Expected: 0 failed; `mean_luma` still `1.19321` to six significant figures. Nothing reads the new flag or the new counter yet — this task only reserves and plumbs the bits, so any movement in the mean means a packing collision has corrupted a neighbouring field.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add servers/rendering/renderer_rd/shaders/raytracing/raytracing_common_inc.glsl servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.cpp scene/resources/environment.h scene/resources/environment.cpp tests/servers/rendering/test_pt_transmission.cpp
+git add servers/rendering/renderer_rd/shaders/raytracing/raytracing_common_inc.glsl servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.cpp servers/rendering/rendering_server.cpp tests/servers/rendering/test_pt_transmission.cpp
 git commit -m "feat(pt): transmission spec constant, bounce budget and payload bits"
 ```
 
@@ -1435,7 +1472,9 @@ In the per-lobe limit block at `:600-608`, extend the condition:
 	const uint max_diffuse = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_DIFFUSE_BOUNCE), max_total);
 	const uint max_glossy = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_GLOSSY_BOUNCE), max_total);
 	// Roadmap E1. The cap comes from RT_FLAGS rather than rt_params because all
-	// sixteen rt_params slots are assigned; resolve_bounce_cap is reused because
+	// sixteen rt_params slots are assigned -- the same reason B4's min_bounce and
+	// C1's emissive enable are project settings rather than Environment params
+	// (scene_shader_raytracing.cpp:643-648). resolve_bounce_cap is reused because
 	// this field also uses 0-as-unset.
 	const uint max_transmission = resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), max_total);
 	const uint transmission_bounces = get_transmission_bounces(ps.packed_bounces_flags);
