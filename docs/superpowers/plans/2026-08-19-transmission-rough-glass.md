@@ -23,6 +23,15 @@
 - **The glTF export path stays untouched.** The unclamped colour-factor export is a parked backlog item recorded in `PATH_TRACER_QUALITY_ROADMAP.md`. Do not fix it here.
 - **C++/GLSL twins must stay in sync.** `RT_FLAGS` bit definitions exist in both `raytracing_common_inc.glsl` and `scene_shader_raytracing.h` and are hand-maintained. Any new field needs a matching `static_assert`.
 - **Opaque materials must stay bit-identical.** Every task that touches shading code must preserve this. Task 8 measures it; earlier tasks must not break it.
+- **The no-pixel-change metric has a noise floor.** **MEASURED TOLERANCE (Task 4).** `mean_luma` carries ~1e-5 run-to-run jitter on
+an *identical binary* — six readings during Task 4, which reserves bits nothing
+reads and therefore cannot change rendering, spanned 1.19320-1.19321 both before
+and after its edit. This is GPU floating-point non-associativity in the
+accumulation reduction, not a code difference. So **run the scene three times and
+report all three readings; the pass condition is that they stay within 2e-5
+absolute of the baseline**, not that a single reading matches to six significant
+figures. A change smaller than that band is invisible to this metric — state that
+limitation rather than claiming precision the measurement does not have.
 
 ---
 
@@ -399,7 +408,7 @@ Expected: clean build. A type error here means a call site was missed — `grep 
 bin\godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_validation_scene.tscn
 ```
 
-Record the MEAN. It must match the value from before this task to **six significant figures**. If it does not, a call site was changed in a way that altered operands — find it before continuing. Capture the before-value by running the same command on the previous commit if you did not already record it.
+Record the MEAN. It must match the value from before this task within **2e-5 absolute** (see Global Constraints — the metric has a ~1e-5 run-to-run noise floor). If it does not, a call site was changed in a way that altered operands — find it before continuing. Capture the before-value by running the same command on the previous commit if you did not already record it.
 
 - [ ] **Step 7: Run the full suite**
 
@@ -760,7 +769,7 @@ Expected: 0 failed.
 bin\godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_validation_scene.tscn
 ```
 
-MEAN must still match the Task 2 value to six significant figures. Nothing yet reads `transmission`, and the F0 arbitration is arithmetically identical at defaults, so any drift is a bug in this task.
+MEAN must still match the Task 2 value within 2e-5 absolute (Global Constraints). Nothing yet reads `transmission`, and the F0 arbitration is arithmetically identical at defaults, so drift beyond the noise floor is a bug in this task.
 
 - [ ] **Step 9: Verify Phase D's material gate still passes**
 
@@ -1091,7 +1100,7 @@ bin\godot.windows.editor.x86_64.console.exe --test
 bin\godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_validation_scene.tscn
 ```
 
-Expected: 0 failed; `mean_luma` still `1.19321` to six significant figures. Nothing reads the new flag or the new counter yet — this task only reserves and plumbs the bits, so any movement in the mean means a packing collision has corrupted a neighbouring field.
+Expected: 0 failed; `mean_luma` within 2e-5 of `1.19321` across three readings. Nothing reads the new flag or the new counter yet — this task only reserves and plumbs the bits, so movement BEYOND the noise floor means a packing collision has corrupted a neighbouring field.
 
 - [ ] **Step 8: Commit**
 
@@ -1384,7 +1393,7 @@ Expected: 0 failed. The closure is not yet called from `shade_and_bounce`, so th
 bin\godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_validation_scene.tscn
 ```
 
-MEAN unchanged to six significant figures. `transmissivness` is still 0.0 everywhere, so `transmitScale` is 1.0 and `combinedPdf` returns exactly what it returned before.
+MEAN within 2e-5 across three readings (Global Constraints). `transmissivness` is still 0.0 everywhere, so `transmitScale` is 1.0 and `combinedPdf` returns exactly what it returned before — this check is a guard against an accidental unconditional code path, not a precision measurement.
 
 - [ ] **Step 7: Commit**
 
@@ -1633,7 +1642,27 @@ bin\godot.windows.editor.x86_64.console.exe --path pipeline_references res://tes
 bin\godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_emissive_gate_scene.tscn
 ```
 
-The validation MEAN must still match to six significant figures and all three gates must pass. **This is the most important verification in the plan** — it is where a mistake in the dispatch, the bounce accounting, or the ray flags would show up. If the MEAN moves, do not proceed; the dispatch is leaking into the opaque path.
+All three gates must pass, and the validation MEAN must stay within 2e-5 across three readings (Global Constraints).
+
+**This is the most important verification in the plan** — it is where a mistake in
+the dispatch, the bounce accounting, or the ray flags would show up. Movement
+beyond the noise floor means the dispatch is leaking into the opaque path: do not
+proceed, report it.
+
+**But the mean alone is weak evidence here, and this task is where that matters
+most.** A metric with a 1e-5 floor cannot distinguish "no change" from "a small
+change", and `shade_and_bounce` is being restructured. So do NOT rely on the mean
+by itself. Also confirm structurally, and say so explicitly in your report:
+
+- Every new branch is guarded by `RT_GET_TRANSMISSION_ENABLED()` **and** a
+  `transmission > 0` / `took_transmissive_lobe` test, so an opaque material
+  reaches none of them.
+- `diffuseReflectance *= (1.0 - brdf_mat.transmissivness)` multiplies by exactly
+  1.0 when `transmissivness` is 0.
+- The ray-flags expression in raygen returns exactly `RT_RAY_FLAGS` when the
+  inside-medium bit is clear.
+- The three existing gates (energy, light, emissive) pass, which exercise far more
+  of the integrator than the validation scene's single mean does.
 
 - [ ] **Step 11: Commit**
 
@@ -1703,7 +1732,7 @@ Create `pipeline_references/tests/pt_transmission_gate.gd`, extending `res://tes
 2. **Tinted F0.** `specular_factor = 0.62`, `specular_tint = Color(0.8, 0.7, 0.55)` (authored sRGB — the gate must compare against the linearised values, exactly as Phase D's gate does for its colour fields). Vis mode 30 must read `0.04 * 0.62 * linear(tint)` per channel.
 3. **Thin-walled straight-through.** A single quad with `transmission = 1.0`, `thickness = 0.0`, `roughness = 0.0`, in front of a known solid-colour background. The rendered MEAN must equal the background MEAN scaled by the Fresnel transmittance at normal incidence (0.96), within 2%. This proves the thin-walled branch does not bend and does not absorb.
 4. **Volumetric absorption.** A closed box of known thickness `d` with `transmission = 1.0`, `attenuation_distance = 5.0` (density 0.2), `attenuation_color = Color(0.9, 0.4, 0.15)` in **linear** terms. Compare the per-channel transmitted MEAN against the analytic `exp(-(1 - color) * 0.2 * d)`, within 3%. This is the probe that proves absorption, the exit-hit detection, and the back-face visibility all work — if back faces were still culled, the ray would never exit and this reads black.
-5. **Opaque control.** A `transmission = 0.0` material rendered in the same scene; its MEAN must match the value recorded from the pre-E1 build to six significant figures.
+5. **Opaque control.** A `transmission = 0.0` material rendered in the same scene; its MEAN must match the value recorded from the pre-E1 build within 2e-5 absolute (Global Constraints — the metric's run-to-run noise floor is ~1e-5). Report three readings, not one.
 
 Give the file a header comment in Phase D's style stating what it proves and what it does not — in particular that it exercises the `StandardMaterial3D` path only, and that the custom-hit-group `debug_visualize` branch remains compile-verified only.
 
