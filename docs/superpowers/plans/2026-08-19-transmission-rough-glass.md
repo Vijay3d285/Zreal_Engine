@@ -1238,7 +1238,7 @@ around `:915`), first insert the helper:
 // transmittance, and the cosine of the transmitted angle (only meaningful when
 // the return value is below 1.0 -- under TIR no transmitted direction exists
 // and cos_theta_t is left untouched).
-float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmission, OUT_PARAMETER(float3) reflectance, OUT_PARAMETER(float) transmittance, OUT_PARAMETER(float) cos_theta_t) {
+float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmission, OUT_PARAMETER(float3) reflectance, OUT_PARAMETER(float3) transmittance, OUT_PARAMETER(float) cos_theta_t) {
 	float F_real = fresnel_dielectric(HdotV, eta, cos_theta_t);
 
 	// Remap the real Fresnel curve onto the tinted [F0, 1] range -- Cycles'
@@ -1249,7 +1249,12 @@ float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmissi
 	float F0_real = F0_from_ior(eta);
 	float s = saturate((F_real - F0_real) / max(1.0f - F0_real, 0.00001f));
 	reflectance = lerp(F0, float3(1.0f, 1.0f, 1.0f), s);
-	transmittance = (1.0f - F_real) * transmission;
+	// Per-channel, and from the REMAPPED F rather than F_real, so reflectance and
+	// transmittance sum to exactly 1 at transmission = 1 -- matching Cycles
+	// (bsdf_microfacet.h:329). Using F_real here would make tinted glass gain or
+	// lose energy, and a scalar would leave the transmitted lobe achromatic so
+	// coloured glass could not tint what passes THROUGH it.
+	transmittance = (float3(1.0f, 1.0f, 1.0f) - reflectance) * transmission;
 
 	float avg_reflectance = dot(reflectance, float3(1.0f, 1.0f, 1.0f)) / 3.0f;
 	float denom = avg_reflectance + transmittance;

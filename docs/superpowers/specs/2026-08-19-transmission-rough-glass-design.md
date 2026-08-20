@@ -209,7 +209,7 @@ F_real  = fresnel_dielectric(dot(H, V), eta, cos_theta_t)       // scalar
 // Fresnel cannot carry the tint.
 s             = saturate(inverse_lerp(F0_from_ior(eta), 1.0, F_real))
 reflectance   = mix(F0, vec3(1.0), s)                           // vec3
-transmittance = (1.0 - F_real) * transmission                   // scalar
+transmittance = (vec3(1.0) - reflectance) * transmission        // vec3
 
 denom       = average(reflectance) + transmittance
 pdf_reflect = (denom > 0.0) ? average(reflectance) / denom : 1.0
@@ -256,6 +256,27 @@ at `transmission = 0` will not be infinitesimally close in reflectance. This is 
 deliberate discontinuity bought to protect existing renders, and unifying it —
 moving everything onto the real-Fresnel remap and re-baselining — is E2's call to
 make, not E1's.
+
+**Transmittance uses the REMAPPED Fresnel, not the raw one, and is per-channel.**
+`reflectance` and `transmittance` sum to exactly `vec3(1.0)` at `transmission =
+1`, matching Cycles (`bsdf_microfacet.h:329`: `*r_transmittance =
+(one_spectrum() - F) * fresnel->transmission_tint`).
+
+*Correction, 2026-08-19, user ruling.* An earlier revision of this section wrote
+`transmittance = (1.0 - F_real) * transmission` — the **raw** Fresnel, and a
+scalar. That is wrong in two ways, and both only bite once `specular_tint` is
+set, which is the entire reason §4.1 tints F0 at all:
+
+- Using `F_real` where the reflectance uses the remapped `F` makes
+  `reflectance + transmittance != 1`, so tinted glass gains or loses energy.
+  Cycles is exactly conserving there.
+- A scalar transmittance makes the transmitted lobe achromatic: coloured glass
+  could tint what reflects off it but not what passes *through* it.
+
+Both are shading errors, not MIS partition errors — the estimator and the weights
+share one function (§3.5), so they continue to describe the same integrand. But
+the default-tint case cannot reveal either, so §7.3's Cycles comparison must
+include a **deliberately tinted** glass sample or it will pass while wrong.
 
 **Ordering constraint.** `1.0 / eta` must not be evaluated before the TIR test
 short-circuits. `ior == 0.0` is legal glTF (§5.1) and would produce an infinity.
