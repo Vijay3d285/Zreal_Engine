@@ -19,25 +19,42 @@ extends "res://tests/pt_validation.gd"
 ## rendered a transmissive material through the real GPU pipeline. This gate
 ## is what closes that gap.
 ##
-## Seven probes:
-##   1. F0 arbitration at default inputs (vis mode 30/31, no rendering).
+## Eight probes:
+##   1. F0 arbitration at default inputs, PLUS a non-default-specular fixture
+##      (vis mode 30/31, no rendering) -- see P1B_SPECULAR's doc comment for
+##      why the default-specular case alone cannot catch a curve regression.
 ##   2. F0 arbitration with a tinted, non-default specular_factor (vis mode 30).
 ##   3. Thin-walled straight-through transmittance (real render, ratio-based).
 ##   4. Volumetric absorption, isolated from Fresnel loss via a white-vs-tinted
 ##      attenuation_color RATIO on the same geometry (real render).
-##   5. Opaque (transmission = 0) self-consistency, three readings (real render).
-##   6. Total internal reflection: a glass rod engineered so a ray undergoes
-##      guaranteed TIR against a side wall, with a bright trap surface
-##      reachable ONLY if the medium flag's lifecycle regresses to the old
-##      unconditional clear (real render).
+##   5. Opaque (transmission = 0): three-reading self-consistency PLUS a
+##      captured-reference correctness assertion (real render).
+##   6. Total internal reflection: a glass box engineered so a ray undergoes
+##      guaranteed TIR against a side wall, then reaches a generous backdrop
+##      whose brightness sits in a two-sided band around a captured reference
+##      -- undiminished if the medium flag's lifecycle regresses to the old
+##      unconditional clear, dimmer if the transmit weight is corrupted
+##      (real render).
 ##   7. Tinted-glass energy conservation: reflectance + transmittance must sum
 ##      to 1 per channel even under a saturated specular_tint, checked against
 ##      a uniform-radiance sky so the sum is directly observable as "unchanged
 ##      total" (real render).
+##   8. Rough (roughness 0.5), partially transmissive (transmission 0.5)
+##      energy, the only probe where BOTH parameters sit strictly inside their
+##      degenerate corners -- structurally the only real render in this gate
+##      that exercises combinedPdf's non-degenerate specular-density branch
+##      (Task 5/6 defect a's mechanism) and sampleDielectricMicrofacet's
+##      non-delta VNDF path (defect c's mechanism) at all. Reintroducing EITHER
+##      historical defect was tried, across three scene configurations each,
+##      and none moved this probe's reading outside its band -- see
+##      _probe8_rough_partial_transmission's "HONEST LIMITATION" comment and
+##      task-7-report.md's fix-round-1 addendum for the full investigation and
+##      a working theory of why (real render, captured-reference two-sided
+##      band).
 ##
 ## SCOPE: probes 1-2 exercise resolveDielectricF0 directly through vis modes,
 ## which is the SAME function shade_and_bounce calls -- not a re-inlined copy.
-## Probes 3-7 render real StandardMaterial3D geometry through the production
+## Probes 3-8 render real StandardMaterial3D geometry through the production
 ## shade_and_bounce path. Every probe in this file therefore proves the
 ## StandardMaterial3D path ONLY. debug_visualize() has two call sites in
 ## scene_raytracing_raygen.glsl (HG0's materials[]-in-scope form and the
@@ -107,6 +124,18 @@ const P4_TOLERANCE := 0.03 # 3%, per the brief.
 # ---------------------------------------------------------------------------
 const P5_FRAMES := 256
 const P5_TOLERANCE := 2e-5 # Global Constraints: noise floor ~1e-5.
+## Fix round 1, I3: the three-reading self-consistency check can only fail on
+## harness non-determinism -- it has no external reference, so it cannot
+## detect any actual renderer regression (a bug that shifted the opaque
+## reading to, say, 1.5 and did so deterministically would pass all three
+## comparisons). P5_REF_CORRECT freezes the reading captured from this build
+## (mean_luma 0.998713 across all three original readings) as a forward-looking
+## correctness guard, using the same captured-reference pattern as
+## P6_REF_CORRECT. The determinism check is kept alongside it, not replaced --
+## it is still useful for catching non-determinism specifically.
+const P5_REF_CORRECT := 0.998713
+const P5_REF_TOLERANCE := 2e-5 # Global Constraints noise floor, same as P5_TOLERANCE.
+const P5_FLOOR := 1e-6 # I2.
 
 # ---------------------------------------------------------------------------
 # Probe 6: total internal reflection / medium-flag lifecycle.
@@ -116,18 +145,76 @@ const P6_FRAMES := 256
 ## derivation): three consecutive correct-code runs of this exact scene read
 ## 4.068884 / 4.068838 / 4.069076 (spread ~0.00006). The same scene under the
 ## reintroduced medium-flag bug (old unconditional clear_inside_medium) read
-## 4.490434 -- see task-7-report.md for the verbatim failure message. The
-## threshold sits roughly halfway, with four orders of magnitude of margin
-## over the measured noise floor on both sides.
+## 4.490431 -- see task-7-report.md for the verbatim failure message.
+##
+## Fix round 1, I1: this was previously a ONE-SIDED check (`mean >
+## P6_THRESHOLD`), which cannot see a regression that makes the probe DIMMER
+## -- and the fix-round-1 review caught exactly that: Break E (probe 3's
+## bogus 0.85 transmit-weight scale, unrelated to this probe) made probe 6
+## read 2.937198, 28% below reference, and the one-sided check passed it
+## silently. P6_LOW is chosen to sit above that measured false-negative and
+## comfortably below the noise floor on the correct-code side.
 const P6_REF_CORRECT := 4.069
-const P6_THRESHOLD := 4.2
+const P6_LOW := 3.9
+const P6_HIGH := 4.2
+const P6_FLOOR := 1e-6 # I2.
 
 # ---------------------------------------------------------------------------
 # Probe 7: tinted-glass energy conservation.
 # ---------------------------------------------------------------------------
 const P7_FRAMES := 96
 const P7_TINT_SRGB := Color(0.95, 0.15, 0.10) # saturated, authored sRGB.
-const P7_TOLERANCE := 0.02 # 2%.
+## Fix round 1, I5: 0.02 (2%) was ~300x the observed run-to-run spread
+## (~0.006%), and Break D (reverted tinted-transmittance formula) only cleared
+## it by 1.96x on 2 of 3 channels (3.923% / 3.961% measured against a 2%
+## limit) -- comfortable, but not the margin the rest of this gate holds
+## everywhere else. Tightened to 0.5%, still >80x the noise floor.
+const P7_TOLERANCE := 0.005 # 0.5%.
+const P7_FLOOR := 1e-6 # I2: a black render must not read as "0% error".
+
+# ---------------------------------------------------------------------------
+# Probe 8: rough, partial transmission (roughness 0.5, transmission 0.5).
+#
+# Fix round 1, C1 (Critical): every other real-render probe sits at one of the
+# two degenerate corners of the (roughness, transmission) parameter space --
+# roughness 0.0 (probes 3, 4, 6, 7) or transmission 0.0 (probe 5). At
+# roughness 0, sampleDielectricMicrofacet takes the `alpha == 0.0f` fast path
+# with Hlocal exactly (0,0,1), so both hemisphere dot products in the
+# wrongNg/wrongN guard are deterministic and correct BY CONSTRUCTION -- the
+# guard this probe exists to exercise is structurally unreachable at
+# roughness 0. And at transmission 1.0, diffuseLum is exactly 0, so pSpec
+# collapses to 1 and combinedPdf's specular density is the ONLY term -- but
+# roughness 0 is also below RT_MIS_DELTA_ROUGHNESS (0.03), so combinedPdf
+# zeroes that term too and shade_and_bounce bypasses it entirely for the BSDF
+# ray. Neither combinedPdf's lobe-probability desync (Task 5/6 defect a) nor
+# the hemisphere guard (defect c) can be observed by any probe in this gate
+# without a fixture that is BOTH rough AND partially transmissive. This is
+# that fixture -- "rough glass" is the phase's own name for exactly this
+# regime.
+# ---------------------------------------------------------------------------
+const P8_FRAMES := 128
+const P8_ROUGHNESS := 0.5
+const P8_TRANSMISSION := 0.5
+## No analytic invariant survives at these settings, so this is a
+## captured-reference probe (see P6_REF_CORRECT for the same pattern), tested
+## with a symmetric band per fix round 1, I1, rather than an exact prediction:
+## diffuseReflectance and the dielectric closure's reflectance+transmittance
+## are independent, additively-combined terms here (baseColorToSpecularF0/
+## baseColorToDiffuseReflectance, brdf_inc.glsl), not a single energy-
+## conserving split, so there is no simple rho*L-style closed form the way
+## there is for a pure Lambertian (pt_energy_gate.gd's Gate 1) or a
+## transmission=1.0 dielectric alone (probe 7). Captured from a correct build:
+## three consecutive runs read 0.994691 / 0.994692 / 0.994690 (spread
+## ~0.000001). Note this landed close to the sky radiance L (1.0), not
+## "measurably below" it as originally guessed before running it -- the
+## transmitted lobe's single-scatter-only weighting (brdf_inc.glsl's
+## sampleDielectricMicrofacet transmit branch has no
+## evalMultiScatterApproximation call) is a real, documented deficit, but at
+## these settings it is evidently a small contributor next to the additive
+## diffuse layer.
+const P8_REF_CORRECT := 0.994691
+const P8_TOLERANCE := 0.02 # 2%; see task-7-report.md fix-round-1 addendum for the capture run.
+const P8_FLOOR := 1e-6 # I2.
 
 var _failures: Array[String] = []
 var _checks: int = 0
@@ -165,6 +252,9 @@ func _ready() -> void:
 	print("\n=== PROBE 7: tinted-glass energy conservation ===")
 	await _probe7_tinted_energy()
 
+	print("\n=== PROBE 8: rough, partial transmission ===")
+	await _probe8_rough_partial_transmission()
+
 	print("")
 	if _failures.is_empty():
 		print("PASS: all %d transmission-gate checks passed." % _checks)
@@ -195,6 +285,11 @@ func _build_vis_scene() -> Dictionary:
 	add_child(cam)
 	cam.make_current()
 
+	# BG_COLOR here is fine, unlike _new_env's use for the real-render probes
+	# (see that function's header comment): vis modes write ps.radiance
+	# directly from the material fields and terminate the path immediately, so
+	# nothing ever reads the sky/radiance octmap this scene never populates.
+	# Do not copy this construct into a real-render probe.
 	var env := Environment.new()
 	env.background_mode = Environment.BG_COLOR
 	env.background_color = Color(0, 0, 0)
@@ -233,9 +328,9 @@ func _probe1_f0_arbitration() -> void:
 	# channels and eta = 1.5 -- this is arithmetic, not a measurement: it is
 	# what makes an untouched material bit-identical to pre-E1.
 	await _check_vis_mode(s["env"], MODE_RESOLVED_F0, "probe1 resolved F0",
-			Vector3(0.04, 0.04, 0.04), true)
+			Vector3(0.04, 0.04, 0.04))
 	await _check_vis_mode(s["env"], MODE_RESOLVED_ETA, "probe1 resolved eta",
-			Vector3(1.5, 1.5, 1.5), true)
+			Vector3(1.5, 1.5, 1.5))
 
 	# Non-default-specular fixture (see P1B_SPECULAR doc comment): the ONLY
 	# check in this gate that can distinguish Godot's 4*specular^2 curve from
@@ -249,7 +344,17 @@ func _probe1_f0_arbitration() -> void:
 	(s["mesh"] as MeshInstance3D).material_override = mat_b
 	var expected_f0_b: float = 0.04 * (4.0 * P1B_SPECULAR * P1B_SPECULAR)
 	await _check_vis_mode(s["env"], MODE_RESOLVED_F0, "probe1b non-default-specular F0",
-			Vector3(expected_f0_b, expected_f0_b, expected_f0_b), true)
+			Vector3(expected_f0_b, expected_f0_b, expected_f0_b))
+
+	# Fix round 1, I4: mode 31 (resolved eta) was checked ONLY at specular ==
+	# 0.5 (probes 1, 2), which is the trivial `eta = ior` pass-through branch
+	# in resolveDielectricF0. P1B_SPECULAR = 1.0 is the one fixture in this
+	# gate that reaches the OTHER branch -- `eta = ior_from_F0(luminance(F0))`
+	# -- and mode 31 was never read there. ior_from_F0(f) = (1+sqrt(f))/(1-sqrt(f));
+	# at F0 = 0.16, sqrt(F0) = 0.4, giving (1.4)/(0.6) = 2.333333.
+	var expected_eta_b: float = (1.0 + sqrt(expected_f0_b)) / (1.0 - sqrt(expected_f0_b))
+	await _check_vis_mode(s["env"], MODE_RESOLVED_ETA, "probe1b non-default-specular eta",
+			Vector3(expected_eta_b, expected_eta_b, expected_eta_b))
 
 
 func _probe2_tinted_f0() -> void:
@@ -268,24 +373,28 @@ func _probe2_tinted_f0() -> void:
 	# left at 0.5 (4*0.5^2 == 1.0, a no-op multiplier).
 	var tint_linear := P2_TINT_SRGB.srgb_to_linear()
 	var expected_f0 := Vector3(tint_linear.r, tint_linear.g, tint_linear.b) * 0.04 * P2_SPECULAR_FACTOR
-	await _check_vis_mode(s["env"], MODE_RESOLVED_F0, "probe2 tinted F0", expected_f0, true)
+	await _check_vis_mode(s["env"], MODE_RESOLVED_F0, "probe2 tinted F0", expected_f0)
 
 	# eta must stay at the untouched ior (1.5): the re-derivation in
 	# resolveDielectricF0 only fires when specular != 0.5, and specular was
 	# not touched by this fixture.
 	await _check_vis_mode(s["env"], MODE_RESOLVED_ETA, "probe2 eta unchanged",
-			Vector3(1.5, 1.5, 1.5), true)
+			Vector3(1.5, 1.5, 1.5))
 
 
+## All seven call sites here have three legitimately distinct (or at least
+## legitimately non-zero-suppressible) channels, unlike Phase D's material-data
+## gate this pattern was borrowed from -- so this always checks all three
+## channels. Fix round 1: dropped the p_check_all parameter and its dead
+## "skip zero-expected channels 1/2" branch, which every call site passed
+## `true` past.
 func _check_vis_mode(p_env: Environment, p_mode: int, p_label: String,
-		p_expected: Vector3, p_check_all: bool) -> void:
+		p_expected: Vector3) -> void:
 	p_env.set_pathtracing_debug_mode(p_mode)
 	var img: Image = await _render_accum(p_env, get_viewport().get_viewport_rid(), 1)
 	var px: Color = img.get_pixel(img.get_width() / 2, img.get_height() / 2)
 	var got := Vector3(px.r, px.g, px.b)
 	for i in 3:
-		if not p_check_all and p_expected[i] == 0.0 and i > 0:
-			continue
 		_checks += 1
 		var delta: float = abs(got[i] - p_expected[i])
 		if delta > TOL_VIS:
@@ -605,6 +714,24 @@ func _probe5_opaque_control() -> void:
 					+ "delta %.6f exceeds %.6f")
 					% [i + 1, readings[i], ref, delta, P5_TOLERANCE])
 
+	# Fix round 1, I3: the three-reading comparison above can only fail on
+	# harness non-determinism -- with no external reference it cannot detect a
+	# renderer regression that shifts the (still self-consistent) reading to a
+	# wrong value. This is the correctness assertion that closes that gap.
+	for i in range(readings.size()):
+		_checks += 1
+		if readings[i] < P5_FLOOR:
+			_failures.append(("probe5 opaque control: reading %d (%.6f) is indistinguishable from "
+					+ "zero (floor %.6f)") % [i + 1, readings[i], P5_FLOOR])
+			continue
+		var ref_delta: float = absf(readings[i] - P5_REF_CORRECT)
+		print("  reading %d vs captured reference %.6f: delta %.6f (limit %.6f)"
+				% [i + 1, P5_REF_CORRECT, ref_delta, P5_REF_TOLERANCE])
+		if ref_delta > P5_REF_TOLERANCE:
+			_failures.append(("probe5 opaque control: reading %d (%.6f) vs captured reference "
+					+ "%.6f, delta %.6f exceeds %.6f")
+					% [i + 1, readings[i], P5_REF_CORRECT, ref_delta, P5_REF_TOLERANCE])
+
 
 # ===========================================================================
 # PROBE 6: total internal reflection / medium-flag lifecycle.
@@ -666,10 +793,11 @@ func _probe5_opaque_control() -> void:
 ## geometry, which is what makes this small difference measurable at all:
 ## three consecutive correct-code runs read 4.068884 / 4.068838 / 4.069076
 ## (spread ~0.00006, i.e. ~0.001%), and the same scene under the reintroduced
-## bug read 4.490434 -- a ~10% jump, four orders of magnitude above the noise
-## floor. REF_BACKDROP_CORRECT below is that captured baseline; see
-## pt_energy_gate.gd's REF_* constants for the same captured-reference pattern
-## used elsewhere in this codebase.
+## bug read 4.490431 -- a ~10% jump, four orders of magnitude above the noise
+## floor. P6_REF_CORRECT below is that captured baseline, checked as a
+## two-sided band (P6_LOW/P6_HIGH) per fix round 1, I1; see pt_energy_gate.gd's
+## REF_* constants for the same captured-reference pattern used elsewhere in
+## this codebase.
 func _probe6_tir() -> void:
 	for c in get_children():
 		c.queue_free()
@@ -702,8 +830,17 @@ func _probe6_tir() -> void:
 	# point, not a compromise): large enough to catch both a correctly-exited
 	# (refracted) ray and a leaked (unbent) one, positioned along the unbent
 	# TIR-reflected continuation.
+	#
+	# Fix round 1 (minor): backdrop_center is now DERIVED from h1 + leak_dir
+	# rather than being an independent magic vector -- it used to be a second,
+	# separately hand-computed constant with no visible relationship to
+	# leak_dir, which was assigned and otherwise unused.
+	# h1 is the TIR bounce point on the +X wall (world entry (0,0,1.5), 45deg
+	# incidence, ior 1.5 refraction -- see the header derivation).
+	var h1 := Vector3(1.0, 0.0, -0.37082869338697044)
 	var leak_dir := Vector3(-0.47140452079103173, 0.0, -0.8819171036881969)
-	var backdrop_center := Vector3(-1.0177810138476415, 0.0, -4.145751311064591)
+	var backdrop_t := 4.280359913523402 # distance along leak_dir from h1.
+	var backdrop_center := h1 + leak_dir * backdrop_t
 	var backdrop := MeshInstance3D.new()
 	var backdrop_mesh := BoxMesh.new()
 	backdrop_mesh.size = Vector3(3.0, 3.0, 3.0)
@@ -740,14 +877,23 @@ func _probe6_tir() -> void:
 
 	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), P6_FRAMES)
 	var stats := _measure_crop(img, 0.1, 0.9)
-	print("  measured mean : %.6f  (r %.6f g %.6f b %.6f) -- reference %.6f, threshold %.6f"
-			% [stats["mean"], stats["r"], stats["g"], stats["b"], P6_REF_CORRECT, P6_THRESHOLD])
+	print("  measured mean : %.6f  (r %.6f g %.6f b %.6f) -- reference %.6f, band [%.6f, %.6f]"
+			% [stats["mean"], stats["r"], stats["g"], stats["b"], P6_REF_CORRECT, P6_LOW, P6_HIGH])
 	_checks += 1
-	if stats["mean"] > P6_THRESHOLD:
-		_failures.append(("probe6 TIR: measured mean %.6f exceeds threshold %.6f (correct-code "
-				+ "reference %.6f) -- undiminished throughput is reaching the backdrop, "
-				+ "consistent with the far-face hit never being registered")
-				% [stats["mean"], P6_THRESHOLD, P6_REF_CORRECT])
+	if stats["mean"] < P6_FLOOR:
+		_failures.append(("probe6 TIR: measured mean %.6f is indistinguishable from zero (floor "
+				+ "%.6f) -- the backdrop is not being reached at all")
+				% [stats["mean"], P6_FLOOR])
+	elif stats["mean"] > P6_HIGH:
+		_failures.append(("probe6 TIR: measured mean %.6f exceeds the band's high bound %.6f "
+				+ "(correct-code reference %.6f) -- undiminished throughput is reaching the "
+				+ "backdrop, consistent with the far-face hit never being registered")
+				% [stats["mean"], P6_HIGH, P6_REF_CORRECT])
+	elif stats["mean"] < P6_LOW:
+		_failures.append(("probe6 TIR: measured mean %.6f falls below the band's low bound %.6f "
+				+ "(correct-code reference %.6f) -- less throughput is reaching the backdrop than "
+				+ "the reference build produced")
+				% [stats["mean"], P6_LOW, P6_REF_CORRECT])
 
 
 # ===========================================================================
@@ -824,6 +970,24 @@ func _probe7_tinted_energy() -> void:
 		var tint_c: float = tint_stats[channels[i]]
 		var white_c: float = white_stats[channels[i]]
 
+		# Fix round 1, I2: err = |tint - ref| / max(ref, 1e-9) reads exactly 0
+		# (a trivial PASS) if BOTH tint and ref are 0 -- an all-black render,
+		# e.g. from a regressed sky pipeline, would pass silently otherwise.
+		# This gate hit exactly that failure mode during authoring (the
+		# BG_COLOR trap documented in _new_env's header comment): every
+		# real-render probe read 0.0 across the board until it was fixed.
+		_checks += 1
+		if l_c < P7_FLOOR:
+			_failures.append(("probe7 tinted energy[%s]: sky-only reading %.6f is "
+					+ "indistinguishable from zero (floor %.6f) -- cannot measure energy "
+					+ "conservation against it") % [channels[i], l_c, P7_FLOOR])
+			continue
+		_checks += 1
+		if white_c < P7_FLOOR:
+			_failures.append(("probe7 tinted energy[%s]: white-tint reading %.6f is "
+					+ "indistinguishable from zero (floor %.6f)") % [channels[i], white_c, P7_FLOOR])
+			continue
+
 		_checks += 1
 		var err_vs_sky: float = absf(tint_c - l_c) / maxf(l_c, 1e-9)
 		print("  channel %s vs sky L      : tinted %.6f vs L %.6f, err %.3f%% (limit %.1f%%)"
@@ -853,3 +1017,141 @@ func _p7_glass_material(p_tint_srgb: Color) -> StandardMaterial3D:
 	mat.ior = 1.5
 	mat.specular_tint = p_tint_srgb
 	return mat
+
+
+# ===========================================================================
+# PROBE 8: rough, partial transmission (fix round 1, C1).
+# ===========================================================================
+##
+## Same uniform-sky rig as probe 7 (a thin-walled quad floating in a
+## spatially uniform sky, so any directional dependence in the result comes
+## from the material, not the lighting) but at roughness 0.5 / transmission
+## 0.5 instead of roughness 0.0 / transmission 1.0. This is deliberately the
+## only probe in the gate where BOTH parameters sit strictly inside their
+## degenerate corners:
+##
+##   - roughness > RT_MIS_DELTA_ROUGHNESS (0.03): combinedPdf's specular
+##     density term is no longer zeroed, so its lobe-probability arbitration
+##     against the diffuse term (the mechanism behind Task 5/6 defect a, the
+##     combinedPdf desync) runs for the first time in this gate, instead of
+##     being compiled-out-by-value the way it is at roughness 0.
+##   - alpha = roughness^2 > 0: sampleDielectricMicrofacet no longer takes the
+##     alpha==0 fast path (Hlocal forced to (0,0,1)); VNDF CAN produce a
+##     genuinely wrong-side sample, which is what the wrongNg/wrongN
+##     hemisphere guard (Task 5/6 defect c) exists to catch.
+##   - transmission strictly between 0 and 1: diffuseReflectance is nonzero
+##     (baseColorToDiffuseReflectance uses (1-transmissivness)), so pSpec sits
+##     strictly between 0 and 1 and BOTH the diffuse and specular/transmissive
+##     lobes carry real energy simultaneously -- neither probe 7
+##     (transmissivness 1, diffuseReflectance forced to 0) nor probe 5
+##     (transmissivness 0, no dielectric closure at all) can exercise that.
+##
+## No exact analytic invariant survives here (see P8_REF_CORRECT's doc
+## comment for why), so this is a captured-reference probe with a two-sided
+## band, following the exact pattern fix round 1, I1 established for probe 6.
+##
+## HONEST LIMITATION (fix round 1 verification -- read this before trusting
+## this probe as a regression detector for defects a or c specifically).
+## Three deliberate-break attempts, across three different scene
+## configurations, ALL failed to move this probe's reading outside its band:
+##
+##   1. Hemisphere guard (defect c): reintroduced the pre-fix-round-1 ordering
+##      (thin-walled -V override applied BEFORE wrongNg/wrongN, so both
+##      comparisons become vacuously `isTransmit == true`). Normal-incidence
+##      camera (the one shipped below): 0.994690 under the break vs a
+##      0.994691 correct-code reference. A grazing-incidence variant tried
+##      during investigation: 0.970174 under the break vs 0.969589-0.970442
+##      across three correct-code runs at the same geometry -- statistically
+##      indistinguishable, inside that configuration's own ~0.09% run-to-run
+##      noise.
+##   2. combinedPdf desync (defect a): reintroduced the pre-fix-round-1 form
+##      by passing 0.0 instead of material.transmissivness into
+##      baseColorToDiffuseReflectance inside combinedPdf specifically (the
+##      exact historical bug -- see brdf_inc.glsl:1345-1356's own comment,
+##      which documents the original 0.0909-vs-0.0476 pSpec split this
+##      reproduces). Same uniform-sky quad shipped below: 0.994685 under the
+##      break vs 0.994691 correct -- a 0.000006 delta, four orders of
+##      magnitude under the 2% tolerance.
+##   3. Same combinedPdf break, tried again against pt_energy_gate.gd's own
+##      directional-sky methodology (a bright 20.0-vs-0.02 patch, chosen
+##      specifically because that gate's header comment explains a uniform
+##      sky is "blind to every direction-dependent defect"), first on a flat
+##      quad (1.309403 under the break vs 1.309548-1.309570 correct -- still
+##      indistinguishable) and then on a sphere, matching that same gate's
+##      own reasoning for why a sphere and not a flat mirror ("a flat
+##      mirror's single reflected direction could land on dim sky... a sphere
+##      reflects essentially every direction at once") (0.813891 under the
+##      break vs a 0.813740 correct-code reading -- a 0.00015 delta, again
+##      far under any plausible detection threshold).
+##
+## Working theory for why defect a stayed invisible across all three
+## variants: the MIS weights on both sides of every comparison this scene
+## exercises (the BSDF ray's mis_ray_pdf, and env-NEE's bsdf_pdf_for_dir) are
+## computed by the SAME (broken) combinedPdf call, just at different
+## directions. Power-heuristic weights are ratios, so a SYSTEMATIC bias that
+## shifts combinedPdf's output the same way regardless of which direction it
+## is evaluated at can cancel in the weighted sum even though the underlying
+## density is wrong in an absolute sense -- unlike the ORIGINAL discovery
+## context for this defect (Task 6 review), which compared combinedPdf's
+## output directly against the SAMPLER's own realised brdfProbability as two
+## numbers side by side, not through a rendered image. Reproducing that
+## detection would need a comparison against a BSDF-only reference build
+## (pt_energy_gate.gd's Gate 2 methodology, which explicitly captures its
+## REF_* constants from a build with environment NEE/MIS not yet added) rather
+## than a live single-build rendered mean -- out of scope for this fix round.
+##
+## What this probe's shipped form DOES demonstrably provide, independent of
+## whether defects a/c specifically regress: it is the only real render in
+## this gate exercising combinedPdf's non-degenerate specular-density branch
+## and sampleDielectricMicrofacet's non-delta VNDF path at all, closing the
+## STRUCTURAL coverage gap fix round 1's C1 identified (every other probe sat
+## at roughness 0 or transmission 0/1). Whether it can also catch a live
+## regression in either mechanism remains open; see task-7-report.md's
+## fix-round-1 addendum for the full investigation.
+func _probe8_rough_partial_transmission() -> void:
+	for c in get_children():
+		c.queue_free()
+
+	var quad := MeshInstance3D.new()
+	var quad_mesh := BoxMesh.new()
+	quad_mesh.size = Vector3(4, 4, 0.05)
+	quad.mesh = quad_mesh
+	var mat := StandardMaterial3D.new()
+	mat.transmission = P8_TRANSMISSION
+	mat.roughness = P8_ROUGHNESS
+	mat.metallic = 0.0
+	mat.ior = 1.5
+	mat.thickness = 0.0 # thin-walled: isolates the rough dielectric lobe from
+	# absorption/medium-flag interactions, which are already covered by
+	# probes 4 and 6.
+	quad.material_override = mat
+	add_child(quad)
+
+	var cam := Camera3D.new()
+	cam.position = Vector3(0, 0, 4)
+	cam.fov = 25.0
+	add_child(cam)
+	cam.make_current()
+
+	var env := _new_env(Color(1, 1, 1)) # uniform sky in every direction, as probe 7.
+	env.set_pathtracing_max_bounces(4)
+	await _settle_sky()
+
+	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), P8_FRAMES)
+	var stats := _measure_crop(img, 0.3, 0.7)
+	print("  measured mean : %.6f  (r %.6f g %.6f b %.6f) -- reference %.6f, tolerance %.1f%%"
+			% [stats["mean"], stats["r"], stats["g"], stats["b"], P8_REF_CORRECT, P8_TOLERANCE * 100.0])
+
+	_checks += 1
+	if stats["mean"] < P8_FLOOR:
+		_failures.append(("probe8 rough partial transmission: measured mean %.6f is "
+				+ "indistinguishable from zero (floor %.6f)") % [stats["mean"], P8_FLOOR])
+		return
+
+	_checks += 1
+	var err: float = absf(stats["mean"] - P8_REF_CORRECT) / P8_REF_CORRECT
+	print("  rel err vs reference: %.3f%% (limit %.1f%%)" % [err * 100.0, P8_TOLERANCE * 100.0])
+	if err > P8_TOLERANCE:
+		_failures.append(("probe8 rough partial transmission: measured mean %.6f vs captured "
+				+ "reference %.6f, %.3f%% off (limit %.1f%%)")
+				% [stats["mean"], P8_REF_CORRECT, err * 100.0, P8_TOLERANCE * 100.0])
