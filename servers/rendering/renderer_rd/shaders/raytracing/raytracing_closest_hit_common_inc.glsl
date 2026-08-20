@@ -504,6 +504,21 @@ void debug_visualize(
 		ps.radiance = dbg_material.specular_tint;
 	} else if (vis_mode == 29) {
 		ps.radiance = dbg_material.sheen_color;
+	} else if (vis_mode == 30 || vis_mode == 31) {
+		// Resolved dielectric F0 (30) and resolved eta (31) after the E1
+		// arbitration, RAW and unscaled.
+		//
+		// This calls the SAME resolveDielectricF0 that shade_and_bounce calls
+		// (Task 3). That is the entire point of the gate: a second inlined copy
+		// of the formula here would let the gate pass while the renderer used
+		// something else -- validating the test's own arithmetic rather than the
+		// shipped code. F0 is the value most able to fail silently, because a
+		// wrong one still looks like plausible glass.
+		vec3 dbg_f0;
+		float dbg_eta;
+		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
+				dbg_material.specular_tint, dbg_f0, dbg_eta);
+		ps.radiance = (vis_mode == 30) ? dbg_f0 : vec3(dbg_eta);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
