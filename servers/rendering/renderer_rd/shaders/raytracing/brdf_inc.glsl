@@ -279,10 +279,18 @@ struct MaterialProperties {
 	// float before E1; widening is a no-op at the default white tint.
 	float3 dielectricF0;
 	float transmissivness;
-	// IOR the dielectric closure resolves eta from (roadmap E1). Only consulted
-	// when transmissivness > 0 -- see combinedPdf's transmitScale. Defaulted to
-	// 1.5 (glass) at every call site until Task 6 sets it from resolved_eta.
-	float ior;
+	// RELATIVE index of refraction (eta), NOT the absolute material IOR --
+	// dielectricFresnelSplit's eta parameter and combinedPdf's transmitScale
+	// both consume this directly. On an interior hit (ray already inside the
+	// medium) this must already be the FLIPPED ratio (1/ior), matching
+	// whatever sampleDielectricMicrofacet used to sample the direction being
+	// evaluated -- combinedPdf and the closure disagreeing about absolute vs.
+	// relative IOR here would silently partition a different integrand on
+	// every interior bounce, the same defect class as B2. Only consulted when
+	// transmissivness > 0 -- see combinedPdf's transmitScale. Defaulted to 1.5
+	// (glass, exterior) at every call site until Task 6 sets it from
+	// resolved_eta / its interior-hit flip.
+	float eta;
 	float opacity;
 };
 
@@ -1026,11 +1034,13 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 // describe a different integrand than the estimator evaluates. Do not inline
 // a second copy.
 //
-// Returns pdf_reflect. Writes the remapped per-channel reflectance, the scalar
-// transmittance, and the cosine of the transmitted angle (only meaningful when
-// the return value is below 1.0 -- under TIR no transmitted direction exists
-// and cos_theta_t is left untouched).
-float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmission, OUT_PARAMETER(float3) reflectance, OUT_PARAMETER(float) transmittance, OUT_PARAMETER(float) cos_theta_t) {
+// Returns pdf_reflect. Writes the remapped per-channel reflectance, the
+// per-channel transmittance (Cycles bsdf_microfacet.h:329: 1 - remapped F,
+// tinted, NOT the raw Fresnel -- so a tinted dielectric conserves energy and
+// the transmitted lobe can carry colour), and the cosine of the transmitted
+// angle (only meaningful when the return value is below 1.0 -- under TIR no
+// transmitted direction exists and cos_theta_t is left untouched).
+float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmission, OUT_PARAMETER(float3) reflectance, OUT_PARAMETER(float3) transmittance, OUT_PARAMETER(float) cos_theta_t) {
 	float F_real = fresnel_dielectric(HdotV, eta, cos_theta_t);
 
 	// Remap the real Fresnel curve onto the tinted [F0, 1] range -- Cycles'
@@ -1041,10 +1051,16 @@ float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmissi
 	float F0_real = F0_from_ior(eta);
 	float s = saturate((F_real - F0_real) / max(1.0f - F0_real, 0.00001f));
 	reflectance = lerp(F0, float3(1.0f, 1.0f, 1.0f), s);
-	transmittance = (1.0f - F_real) * transmission;
+	// Per-channel and derived from the REMAPPED (tinted) reflectance, not the
+	// raw Fresnel -- bsdf_microfacet.h:329. reflectance + transmittance == 1
+	// per channel this way, which is what makes tinted glass energy-conserving
+	// and lets the transmitted lobe carry the tint through the surface, not
+	// just reflect it.
+	transmittance = (float3(1.0f, 1.0f, 1.0f) - reflectance) * transmission;
 
 	float avg_reflectance = dot(reflectance, float3(1.0f, 1.0f, 1.0f)) / 3.0f;
-	float denom = avg_reflectance + transmittance;
+	float avg_transmittance = dot(transmittance, float3(1.0f, 1.0f, 1.0f)) / 3.0f;
+	float denom = avg_reflectance + avg_transmittance;
 
 	// The guard is LOAD-BEARING, not defensive. At eta == 1.0 with
 	// transmission == 0, F_real is 0, reflectance is F0 == 0, transmittance is
@@ -1086,7 +1102,7 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	// TIR the helper returns 1.0 and leaves it alone.
 	float cos_theta_t = 0.0f;
 	float3 reflectance;
-	float transmittance;
+	float3 transmittance;
 	float pdf_reflect = dielectricFresnelSplit(HdotV, eta, F0, transmission,
 			reflectance, transmittance, cos_theta_t);
 
@@ -1109,7 +1125,9 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		// reflection-only GGX and applying it to the transmitted lobe would add
 		// energy its derivation does not cover, so this lobe is single-scatter
 		// and slightly dark at high roughness. Cycles has the same limitation.
-		weight = float3(transmittance, transmittance, transmittance) / denom_t *
+		// transmittance is per-channel (bsdf_microfacet.h:329), so a tinted
+		// dielectric's transmitted lobe carries colour, not just its reflection.
+		weight = transmittance / denom_t *
 				specularSampleWeight(alpha, alphaSquared, abs(NdotL), NdotV, HdotL, NdotH);
 	} else {
 		Llocal = reflect(-Vlocal, Hlocal);
@@ -1393,9 +1411,9 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float transmitScale = 1.0f;
 	if (material.transmissivness > 0.0f) {
 		float3 reflectance_unused;
-		float transmittance_unused;
+		float3 transmittance_unused;
 		float cos_theta_t_unused = 0.0f;
-		transmitScale = dielectricFresnelSplit(max(0.00001f, LdotH), material.ior,
+		transmitScale = dielectricFresnelSplit(max(0.00001f, LdotH), material.eta,
 				data.specularF0, material.transmissivness,
 				reflectance_unused, transmittance_unused, cos_theta_t_unused);
 	}

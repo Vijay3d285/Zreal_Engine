@@ -348,17 +348,21 @@ TEST_CASE("[PathTracer][Transmission] Inside-medium flag is bit 31 and independe
 	CHECK((INSIDE & (1u << 26)) == 0u);
 }
 
-// CPU mirror of the reflect-vs-transmit split in sampleDielectricMicrofacet
-// (brdf_inc.glsl). Ported from Cycles bsdf_microfacet.h:844-851.
+// CPU mirror of the reflect-vs-transmit split in dielectricFresnelSplit
+// (brdf_inc.glsl). Ported from Cycles bsdf_microfacet.h:844-851 and :299-305.
 static float mirror_pdf_reflect(float p_f_real, const Vector3 &p_f0, float p_transmission, float p_eta) {
 	// Real Fresnel remapped onto the tinted [F0, 1] range -- Cycles'
 	// generalized-Schlick "exponent < 0" branch, bsdf_microfacet.h:299-305.
 	const float f0_real = f0_from_ior(p_eta);
-	const float s = CLAMP((p_f_real - f0_real) / (1.0f - f0_real), 0.0f, 1.0f);
+	const float s = CLAMP((p_f_real - f0_real) / MAX(1.0f - f0_real, 0.00001f), 0.0f, 1.0f);
 	const Vector3 reflectance = p_f0.lerp(Vector3(1, 1, 1), s);
-	const float transmittance = (1.0f - p_f_real) * p_transmission;
+	// Per-channel and derived from the REMAPPED (tinted) reflectance, not the
+	// raw Fresnel -- bsdf_microfacet.h:329. This is what makes a tinted
+	// dielectric energy-conserving and lets the transmitted lobe carry colour.
+	const Vector3 transmittance = (Vector3(1, 1, 1) - reflectance) * p_transmission;
 	const float avg_r = (reflectance.x + reflectance.y + reflectance.z) / 3.0f;
-	const float denom = avg_r + transmittance;
+	const float avg_t = (transmittance.x + transmittance.y + transmittance.z) / 3.0f;
+	const float denom = avg_r + avg_t;
 	return (denom > 0.0f) ? (avg_r / denom) : 1.0f;
 }
 
@@ -389,19 +393,18 @@ TEST_CASE("[PathTracer][Transmission] Degenerate ior 1.0 with transmission 0 doe
 	// F_real == 0 and F0 == 0 make both terms zero. The guard must return 1.0
 	// rather than NaN -- an unguarded 0/0 here would be silently zeroed by
 	// sanitize_payload_value and poison the pixel with no failing test.
+	//
+	// MUST go through mirror_pdf_reflect itself, not an inline re-derivation:
+	// an inline copy with s hardcoded to 0.0f bypasses the remap -- the only
+	// real logic in the function under test -- and can't fail when either
+	// guard (this one, or mirror_pdf_reflect's) breaks. See the manufactured
+	// RED in this task's report for the difference that makes.
 	float cos_t = 0.0f;
 	const float f = fresnel_dielectric(0.7f, 1.0f, &cos_t);
 	CHECK(f == doctest::Approx(0.0f).epsilon(1e-6));
 
-	const Vector3 zero_f0 = Vector3(0, 0, 0);
-	const float s = 0.0f;
-	const Vector3 reflectance = zero_f0.lerp(Vector3(1, 1, 1), s);
-	const float transmittance = (1.0f - f) * 0.0f;
-	const float avg_r = (reflectance.x + reflectance.y + reflectance.z) / 3.0f;
-	const float denom = avg_r + transmittance;
-	const float p = (denom > 0.0f) ? (avg_r / denom) : 1.0f;
+	const float p = mirror_pdf_reflect(f, Vector3(0, 0, 0), 0.0f, 1.0f);
 
-	CHECK(denom == doctest::Approx(0.0f).epsilon(1e-9));
 	CHECK(p == doctest::Approx(1.0f).epsilon(1e-9));
 	CHECK(!Math::is_nan(p));
 }
@@ -413,7 +416,10 @@ TEST_CASE("[PathTracer][Transmission] Reflect and transmit probabilities sum to 
 		const float p = mirror_pdf_reflect(f, Vector3(0.04f, 0.04f, 0.04f), 1.0f, 1.5f);
 		CHECK(p >= 0.0f);
 		CHECK(p <= 1.0f);
-		CHECK((p + (1.0f - p)) == doctest::Approx(1.0f).epsilon(1e-9));
+		// NOTE: "(p + (1 - p)) == Approx(1)" was deleted here -- it is an
+		// identity true for any finite p, including one from a completely
+		// broken split, and cannot fail. The p >= 0 / p <= 1 bounds above are
+		// the real content of this test.
 	}
 }
 
