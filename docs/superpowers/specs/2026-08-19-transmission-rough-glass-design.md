@@ -480,6 +480,33 @@ Shadow rays remain blocked by transmissive geometry.
 
 §4.2. Slightly dark at high roughness, same as Cycles.
 
+### 6.4 NEE and the BSDF strategy estimate different integrands on glass
+
+**Found in Task 6's review; recorded rather than fixed, by explicit decision.**
+
+On a transmissive surface the two MIS halves no longer describe one integrand:
+
+- Next-event estimation's specular value comes from `evalCombinedBRDFSeparate`
+  -> Schlick `evalFresnel(specularF0, ...)`, with no `pdf_reflect` factor.
+- The BSDF strategy realises `sampleDielectricMicrofacet`'s **remapped real
+  Fresnel** -- which §4.2 deliberately makes *not* equal to Schlick, because
+  Schlick cannot express TIR -- scaled by `1 / pdf_reflect`.
+- `combinedPdf`'s density matches the closure, not NEE.
+
+`power_heuristic` then combines two halves that do not partition a single
+integrand. This is the same structural error class as B2's open +2.4%
+converged-mean defect, on a different pair of strategies.
+
+It is inherited from §3.5's closure design rather than introduced by the path
+integration, and it is bounded to transmissive surfaces: every opaque material
+takes `sampleSpecularMicrofacet` and Schlick on both sides, unchanged.
+
+**Not fixed here** because the repair touches `evalCombinedBRDFSeparate`, the
+shared evaluation path for analytic lights, the environment and emissive meshes
+-- the code Phases B and C spent three phases stabilising -- and it would have
+landed in the same fix round as two Critical corrections. **§7.3's Cycles
+comparison must quantify it**, and the E2 handoff (§9) carries it forward.
+
 ---
 
 ## 7. Testing
@@ -523,6 +550,11 @@ glass vase under a matched HDRI, matched camera and exposure, compared against a
 Cycles EXR by MSE and SSIM. This is what converts "refracts correctly" into a
 number.
 
+**At least one sample must use deliberately TINTED glass** -- non-white
+`specular_tint` and non-white `attenuation_color`. A white-glass-only comparison
+cannot reveal §4.2's tinted-transmittance behaviour and cannot reveal §6.4's
+Fresnel mismatch: it would pass while both are wrong.
+
 ### 7.4 Blender cross-check
 
 Headless, confirming the `specular_ior_level` arbitration matches
@@ -560,6 +592,12 @@ pass. The workaround retires **for content that adopts transmission**.
   single-scatter (§4.2).
 - NEE through refractive lobes is unimplemented (§6.1). E2 or later, if
   rough-glass noise proves objectionable in production.
+- **NEE and the BSDF strategy use different Fresnel formulations on glass
+  (§6.4)** -- an unpartitioned MIS pair, deferred with measurement owed from
+  §7.3. The highest-value correctness item E2 inherits.
+- Opaque and transmissive materials use different Fresnel formulations at all
+  (§4.2's dispatch). Deliberate, bought to protect existing renders; unifying it
+  and re-baselining is E2's call.
 - Phase D's two accepted gate residuals stand: the `V_CLEARCOAT` / specular-tint
   fixture collision, and the custom-hit-group `debug_visualize` path being
   compile-verified only.
