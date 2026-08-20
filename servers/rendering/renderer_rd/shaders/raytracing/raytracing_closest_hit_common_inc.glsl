@@ -519,6 +519,26 @@ void debug_visualize(
 /// Also handles DLSS-RR G-buffer output on primary ray.
 void shade_and_bounce(HitData h, MaterialResult m) {
 	PathState ps = path_unpack(payload);
+
+	// Beer-Lambert absorption through a solid (roadmap E1).
+	//
+	// Applied at the EXIT hit: a back-face hit on a transmissive material with
+	// thickness > 0. gl_HitTEXT at that hit IS the distance travelled inside a
+	// closed mesh, so this needs no payload state and no medium stack.
+	//
+	// attenuation is (1 - attenuation_color) * attenuation_density, Cycles'
+	// Volume Absorption coefficient (kernel/svm/closure.h:1236-1241). Note this
+	// diverges from the glTF spec's attenuationColor^(d/attenuationDistance);
+	// Blender's is chosen because acceptance is a Cycles reference image and
+	// Blender renders imported glTF this way. See spec section 4.3.
+	//
+	// KNOWN LIMITATION: exact for a single closed mesh, wrong for nested or
+	// interpenetrating transmissive volumes, which would need a medium stack.
+	if (RT_GET_TRANSMISSION_ENABLED() && !h.is_front_face && m.transmission > 0.0 && m.thickness > 0.0) {
+		ps.throughput *= exp(-m.attenuation * gl_HitTEXT);
+		ps.packed_bounces_flags = clear_inside_medium(ps.packed_bounces_flags);
+	}
+
 	RNGState rng = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
 
 	vec3 V = -gl_WorldRayDirectionEXT;
@@ -602,7 +622,15 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	const uint max_total = RT_GET_MAX_BOUNCES();
 	const uint max_diffuse = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_DIFFUSE_BOUNCE), max_total);
 	const uint max_glossy = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_GLOSSY_BOUNCE), max_total);
-	if (total_bounces >= max_total || diffuse_bounces >= max_diffuse || glossy_bounces >= max_glossy) {
+	// Roadmap E1. The cap comes from RT_FLAGS rather than rt_params because all
+	// sixteen rt_params slots are assigned -- the same reason B4's min_bounce and
+	// C1's emissive enable are project settings rather than Environment params
+	// (scene_shader_raytracing.cpp:643-648). resolve_bounce_cap is reused because
+	// this field also uses 0-as-unset.
+	const uint max_transmission = resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), max_total);
+	const uint transmission_bounces = get_transmission_bounces(ps.packed_bounces_flags);
+	if (total_bounces >= max_total || diffuse_bounces >= max_diffuse || glossy_bounces >= max_glossy ||
+			transmission_bounces >= max_transmission) {
 		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 		path_pack(payload, ps);
 		return;
@@ -637,12 +665,42 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	resolveDielectricF0(m.ior, m.specular, m.specular_factor, m.specular_tint,
 			brdf_mat.dielectricF0, resolved_eta);
 	brdf_mat.emissive = m.emissive;
-	brdf_mat.transmissivness = 0.0;
-	brdf_mat.eta = 1.5; // Unused while transmissivness is 0.0; Task 6 sets this from resolved_eta (flipped on interior hits).
+	// Roadmap E1. This replaces the `transmissivness = 0.0` hardcode that made
+	// glass vanish. RT_GET_TRANSMISSION_ENABLED() is a specialization constant,
+	// folded at compile time, so a build with the feature off compiles the whole
+	// transmissive path away rather than paying a runtime branch.
+	brdf_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? m.transmission : 0.0;
+	// eta must be the RELATIVE index for the interface THIS hit represents, and
+	// it must be flipped identically to how sampleDielectricMicrofacet sampled
+	// the direction being evaluated -- combinedPdf reads brdf_mat.eta too, and
+	// the two disagreeing here is the exact defect class already open as B2's
+	// +2.4% converged-mean error (PATH_TRACER_QUALITY_ROADMAP.md).
+	//
+	// h.is_front_face, not is_inside_medium(ps.packed_bounces_flags), is
+	// authoritative: it is a property of THIS interface (front face = ray
+	// currently outside the medium, about to enter; back face = ray currently
+	// inside the medium, about to exit), decided the same way Cycles keys eta
+	// off SD_BACKFACING (kernel/svm/closure.h:426-431). is_inside_medium is
+	// path-history bookkeeping for raygen's ray-flags decision (Step 8), not a
+	// per-hit fact, and it is unusable here besides: the absorption block above
+	// already calls clear_inside_medium() on exactly the exit hit, before this
+	// line runs, so reading the flag at this point would report "not inside"
+	// for the one hit that needs the flipped ratio. h.is_front_face carries no
+	// such ordering dependency and is also correct for thin-walled materials,
+	// where no medium is ever entered but a back-side hit still needs the
+	// flipped Fresnel split.
+	brdf_mat.eta = h.is_front_face ? resolved_eta : (1.0 / resolved_eta);
 	brdf_mat.opacity = 1.0;
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
 	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
+	// Transmission mixes against the base layer, matching Blender routing
+	// transmissionFactor into the Principled BSDF's transmission weight
+	// (io_scene_gltf2 .../pbrMetallicRoughness.py:281-310). Required for energy
+	// conservation. This is the one E1 change that also dims NEE at a glass
+	// surface -- deliberately, since that energy now goes into the transmitted
+	// lobe. Factor is exactly 1.0 when transmissivness is 0.
+	diffuseReflectance *= (1.0 - brdf_mat.transmissivness);
 
 	// =================================================================
 	// DLSS Ray Reconstruction output (primary ray, sample 0 only)
@@ -857,7 +915,53 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec3 next_dir;
 	vec3 brdf_weight;
 	bool recovered_sample = false;
-	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
+
+	bool took_transmissive_lobe = false;
+	bool transmissive_sample_ok = false;
+	if (brdfType == SPECULAR_TYPE && brdf_mat.transmissivness > 0.0) {
+		// Thin-walled: glTF says thicknessFactor == 0 is an infinitesimally thin
+		// surface and no refraction bend applies. The ray continues straight and
+		// no medium is entered, so single-sided window panes and foliage cards
+		// work without any back-face hit.
+		float4 qRotationToZ = getRotationToZAxis(N);
+		float3 Vlocal = rotatePoint(qRotationToZ, V);
+		float3 Llocal;
+		float3 wgt;
+		bool isTransmit;
+		float alpha = brdf_mat.roughness * brdf_mat.roughness;
+		float3 u3 = float3(u, rng_1d(rng, RT_PRNG_TRANSMIT));
+		if (sampleDielectricMicrofacet(Vlocal, alpha, alpha * alpha, specularF0,
+					brdf_mat.eta, brdf_mat.transmissivness, u3, Llocal, wgt, isTransmit)) {
+			next_dir = normalize(rotatePoint(invertRotation(qRotationToZ), Llocal));
+			brdf_weight = wgt;
+			transmissive_sample_ok = true;
+			took_transmissive_lobe = isTransmit;
+
+			if (isTransmit && m.thickness == 0.0) {
+				// Thin-walled: no bend. Continue straight through.
+				next_dir = -V;
+			}
+
+			// Cycles' hemisphere-consistency rejection (bsdf_microfacet.h:864):
+			// a sample must land on the side of BOTH the shading and the geometry
+			// normal that its label implies. This replaces
+			// recoverBelowHemisphereSample for the transmissive branch -- the
+			// mirror-recovery hack is meaningless when the sample is SUPPOSED to
+			// be below the hemisphere.
+			bool wrongNg = (dot(next_dir, h.geometry_normal) < 0.0) != isTransmit;
+			bool wrongN = (dot(next_dir, N) < 0.0) != isTransmit;
+			if (wrongNg || wrongN) {
+				transmissive_sample_ok = false;
+			}
+		}
+		if (!transmissive_sample_ok || luminance(brdf_weight) == 0.0) {
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+	}
+
+	if (!transmissive_sample_ok && !evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
 		//   2) Sampled direction is below the geometry plane. Recover by
@@ -881,7 +985,15 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	ps.throughput *= brdf_weight;
 
-	if (brdfType == DIFFUSE_TYPE) {
+	if (took_transmissive_lobe) {
+		ps.packed_bounces_flags = inc_transmission_bounce(ps.packed_bounces_flags);
+		// Entering a SOLID means the next ray must find the far side of the
+		// glass -- a back face, which RT_RAY_FLAGS otherwise culls. Thin-walled
+		// surfaces enter no medium and need no such visibility.
+		if (m.thickness > 0.0 && h.is_front_face) {
+			ps.packed_bounces_flags = set_inside_medium(ps.packed_bounces_flags);
+		}
+	} else if (brdfType == DIFFUSE_TYPE) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {
 		ps.packed_bounces_flags = inc_glossy_bounce(ps.packed_bounces_flags);
@@ -940,7 +1052,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.
 	ps.hit_t = gl_HitTEXT;
-	ps.offset_normal = h.geometry_normal;
+	// Raygen offsets the next ray origin ALONG this normal
+	// (scene_raytracing_raygen.glsl). A refracted ray is heading INTO the
+	// surface, so it must be offset the other way or it restarts outside the
+	// glass and immediately re-hits the face it just crossed. Negating here
+	// costs no payload space -- the field is already oct-packed.
+	ps.offset_normal = took_transmissive_lobe ? -h.geometry_normal : h.geometry_normal;
 	ps.next_ray_dir = next_dir;
 	// Next bounce gets its own dimension block, so decision k at depth d always
 	// draws from the same dimension across every path in the frame.
@@ -1009,7 +1126,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	//   - near-delta specular. Env NEE drops its specular VALUE in exactly that
 	//     regime (see the env-NEE block above), so the BSDF strategy owns delta
 	//     lobes outright. Mirrors Cycles' PATH_RAY_MIS_SKIP.
-	if (recovered_sample || dot(N, V) <= 0.0 ||
+	//
+	//   - took_transmissive_lobe. Environment NEE draws only directions with
+	//     dot(env_dir, N) > 0 and combinedPdf returns 0 for NdotL <= 0, so NO
+	//     NEE strategy can reach a transmitted direction. The BSDF strategy owns
+	//     it outright and must take full weight -- sky seen through glass is
+	//     paid once, in full. This is the same rule as the near-delta case, not
+	//     a new exception.
+	if (took_transmissive_lobe || recovered_sample || dot(N, V) <= 0.0 ||
 			(brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)) {
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
 	} else {

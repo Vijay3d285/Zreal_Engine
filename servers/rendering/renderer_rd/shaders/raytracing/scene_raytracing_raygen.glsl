@@ -65,9 +65,16 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	[[dont_unroll]] for (uint bounce = 0u; bounce <= p_max_bounces; bounce++) {
 		path_pack(payload, ps);
 
+		// Roadmap E1: a ray travelling INSIDE a solid must see back faces to find
+		// the far surface. Every other ray traces with byte-identical flags to
+		// pre-E1, which is what keeps opaque scenes unchanged.
+		uint ray_flags = is_inside_medium(ps.packed_bounces_flags)
+				? (RT_RAY_FLAGS & ~gl_RayFlagsCullBackFacingTrianglesEXT)
+				: RT_RAY_FLAGS;
+
 #ifdef USE_SER
 		hitObjectEXT hitObject;
-		hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+		hitObjectTraceRayEXT(hitObject, tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 
 		// Reorder with a coherence hint that has 8 bits
 		uint hint = 0;
@@ -79,7 +86,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 		hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-		traceRayEXT(tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+		traceRayEXT(tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
 #endif
 
 		ps = path_unpack(payload);
