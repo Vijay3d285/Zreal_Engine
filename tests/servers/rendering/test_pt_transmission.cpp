@@ -348,4 +348,73 @@ TEST_CASE("[PathTracer][Transmission] Inside-medium flag is bit 31 and independe
 	CHECK((INSIDE & (1u << 26)) == 0u);
 }
 
+// CPU mirror of the reflect-vs-transmit split in sampleDielectricMicrofacet
+// (brdf_inc.glsl). Ported from Cycles bsdf_microfacet.h:844-851.
+static float mirror_pdf_reflect(float p_f_real, const Vector3 &p_f0, float p_transmission, float p_eta) {
+	// Real Fresnel remapped onto the tinted [F0, 1] range -- Cycles'
+	// generalized-Schlick "exponent < 0" branch, bsdf_microfacet.h:299-305.
+	const float f0_real = f0_from_ior(p_eta);
+	const float s = CLAMP((p_f_real - f0_real) / (1.0f - f0_real), 0.0f, 1.0f);
+	const Vector3 reflectance = p_f0.lerp(Vector3(1, 1, 1), s);
+	const float transmittance = (1.0f - p_f_real) * p_transmission;
+	const float avg_r = (reflectance.x + reflectance.y + reflectance.z) / 3.0f;
+	const float denom = avg_r + transmittance;
+	return (denom > 0.0f) ? (avg_r / denom) : 1.0f;
+}
+
+TEST_CASE("[PathTracer][Transmission] Opaque material never transmits") {
+	// transmission == 0 must give pdf_reflect == 1 exactly, so the transmit
+	// branch is unreachable. This is what makes the dispatch safe.
+	float cos_t = 0.0f;
+	const float f = fresnel_dielectric(0.7f, 1.5f, &cos_t);
+	CHECK(mirror_pdf_reflect(f, Vector3(0.04f, 0.04f, 0.04f), 0.0f, 1.5f) == doctest::Approx(1.0f).epsilon(1e-9));
+}
+
+TEST_CASE("[PathTracer][Transmission] Full transmission mostly transmits at normal incidence") {
+	float cos_t = 0.0f;
+	const float f = fresnel_dielectric(1.0f, 1.5f, &cos_t);
+	const float p = mirror_pdf_reflect(f, Vector3(0.04f, 0.04f, 0.04f), 1.0f, 1.5f);
+	// At normal incidence 4% reflects, 96% transmits.
+	CHECK(p == doctest::Approx(0.04f).epsilon(1e-4));
+}
+
+TEST_CASE("[PathTracer][Transmission] Grazing incidence mostly reflects") {
+	float cos_t = 0.0f;
+	const float f = fresnel_dielectric(0.02f, 1.5f, &cos_t);
+	const float p = mirror_pdf_reflect(f, Vector3(0.04f, 0.04f, 0.04f), 1.0f, 1.5f);
+	CHECK(p > 0.85f);
+}
+
+TEST_CASE("[PathTracer][Transmission] Degenerate ior 1.0 with transmission 0 does not divide by zero") {
+	// F_real == 0 and F0 == 0 make both terms zero. The guard must return 1.0
+	// rather than NaN -- an unguarded 0/0 here would be silently zeroed by
+	// sanitize_payload_value and poison the pixel with no failing test.
+	float cos_t = 0.0f;
+	const float f = fresnel_dielectric(0.7f, 1.0f, &cos_t);
+	CHECK(f == doctest::Approx(0.0f).epsilon(1e-6));
+
+	const Vector3 zero_f0 = Vector3(0, 0, 0);
+	const float s = 0.0f;
+	const Vector3 reflectance = zero_f0.lerp(Vector3(1, 1, 1), s);
+	const float transmittance = (1.0f - f) * 0.0f;
+	const float avg_r = (reflectance.x + reflectance.y + reflectance.z) / 3.0f;
+	const float denom = avg_r + transmittance;
+	const float p = (denom > 0.0f) ? (avg_r / denom) : 1.0f;
+
+	CHECK(denom == doctest::Approx(0.0f).epsilon(1e-9));
+	CHECK(p == doctest::Approx(1.0f).epsilon(1e-9));
+	CHECK(!Math::is_nan(p));
+}
+
+TEST_CASE("[PathTracer][Transmission] Reflect and transmit probabilities sum to one") {
+	float cos_t = 0.0f;
+	for (float c = 0.05f; c <= 1.0f; c += 0.15f) {
+		const float f = fresnel_dielectric(c, 1.5f, &cos_t);
+		const float p = mirror_pdf_reflect(f, Vector3(0.04f, 0.04f, 0.04f), 1.0f, 1.5f);
+		CHECK(p >= 0.0f);
+		CHECK(p <= 1.0f);
+		CHECK((p + (1.0f - p)) == doctest::Approx(1.0f).epsilon(1e-9));
+	}
+}
+
 } // namespace TestPTTransmission

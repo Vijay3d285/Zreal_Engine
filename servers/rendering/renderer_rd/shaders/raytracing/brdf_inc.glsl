@@ -279,6 +279,10 @@ struct MaterialProperties {
 	// float before E1; widening is a no-op at the default white tint.
 	float3 dielectricF0;
 	float transmissivness;
+	// IOR the dielectric closure resolves eta from (roadmap E1). Only consulted
+	// when transmissivness > 0 -- see combinedPdf's transmitScale. Defaulted to
+	// 1.5 (glass) at every call site until Task 6 sets it from resolved_eta.
+	float ior;
 	float opacity;
 };
 
@@ -1013,6 +1017,118 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	return Llocal;
 }
 
+// Fresnel-weighted reflect-vs-transmit split for a dielectric microfacet.
+// Ported from Cycles bsdf_microfacet.h:844-851 and :299-305.
+//
+// SINGLE SOURCE OF TRUTH for the split. sampleDielectricMicrofacet uses it to
+// CHOOSE a lobe; combinedPdf uses it to report that choice's DENSITY. Two
+// copies that disagree would make every MIS weight on a transmissive surface
+// describe a different integrand than the estimator evaluates. Do not inline
+// a second copy.
+//
+// Returns pdf_reflect. Writes the remapped per-channel reflectance, the scalar
+// transmittance, and the cosine of the transmitted angle (only meaningful when
+// the return value is below 1.0 -- under TIR no transmitted direction exists
+// and cos_theta_t is left untouched).
+float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmission, OUT_PARAMETER(float3) reflectance, OUT_PARAMETER(float) transmittance, OUT_PARAMETER(float) cos_theta_t) {
+	float F_real = fresnel_dielectric(HdotV, eta, cos_theta_t);
+
+	// Remap the real Fresnel curve onto the tinted [F0, 1] range -- Cycles'
+	// generalized-Schlick "exponent < 0" branch (bsdf_microfacet.h:299-305).
+	// This is how a tinted F0 (from specular_tint) coexists with a real Fresnel
+	// term that TIR depends on: plain Schlick cannot express TIR, and plain
+	// real Fresnel cannot carry the tint.
+	float F0_real = F0_from_ior(eta);
+	float s = saturate((F_real - F0_real) / max(1.0f - F0_real, 0.00001f));
+	reflectance = lerp(F0, float3(1.0f, 1.0f, 1.0f), s);
+	transmittance = (1.0f - F_real) * transmission;
+
+	float avg_reflectance = dot(reflectance, float3(1.0f, 1.0f, 1.0f)) / 3.0f;
+	float denom = avg_reflectance + transmittance;
+
+	// The guard is LOAD-BEARING, not defensive. At eta == 1.0 with
+	// transmission == 0, F_real is 0, reflectance is F0 == 0, transmittance is
+	// 0, and the unguarded ratio is 0/0. sanitize_payload_value would silently
+	// zero the resulting NaN and poison the pixel with no failing test. Falling
+	// back to 1.0 routes the degenerate case down the reflective branch with a
+	// zero weight, terminating the path cleanly.
+	return (denom > 0.0f) ? (avg_reflectance / denom) : 1.0f;
+}
+
+// Dielectric microfacet closure: reflection AND transmission as one closure
+// that splits internally on a Fresnel-weighted probability. Structure ported
+// from Cycles bsdf_microfacet_sample (bsdf_microfacet.h:844-914).
+//
+// CALLED ONLY WHEN transmission > 0. An opaque material takes
+// sampleSpecularMicrofacet above, unchanged. That dispatch is deliberate and
+// load-bearing: the Fresnel remap below is NOT equal to that function's Schlick
+// evalFresnel, so routing everything through here would change the reflectance
+// of every specular surface in every existing scene. See spec section 4.2.
+//
+// Returns false when no usable direction was produced (TIR with no reflective
+// energy, or a degenerate half-vector). Resulting weight includes the cosine
+// term, matching sampleSpecularMicrofacet's convention.
+bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit) {
+	const float3 Nlocal = float3(0.0f, 0.0f, 1.0f);
+
+	float3 Hlocal;
+	if (alpha == 0.0f) {
+		// Fast path for zero roughness, and it also prevents the NaNs a
+		// division by zero would produce inside VNDF sampling.
+		Hlocal = float3(0.0f, 0.0f, 1.0f);
+	} else {
+		Hlocal = sampleSpecularHalfVector(Vlocal, float2(alpha, alpha), u.xy);
+	}
+
+	float HdotV = dot(Hlocal, Vlocal);
+
+	// cos_theta_t is only written when a transmitted direction exists; under
+	// TIR the helper returns 1.0 and leaves it alone.
+	float cos_theta_t = 0.0f;
+	float3 reflectance;
+	float transmittance;
+	float pdf_reflect = dielectricFresnelSplit(HdotV, eta, F0, transmission,
+			reflectance, transmittance, cos_theta_t);
+
+	isTransmit = (u.z >= pdf_reflect);
+
+	if (isTransmit) {
+		// TIR returned F_real == 1.0, so transmittance is 0 and pdf_reflect is 1;
+		// u.z < 1.0 always (rng_1d's divisor is 2^32 + 512), so this branch is
+		// unreachable under TIR and cos_theta_t is guaranteed to have been written.
+		Llocal = refract_angle(Vlocal, Hlocal, cos_theta_t, 1.0f / eta);
+		float denom_t = 1.0f - pdf_reflect;
+		if (denom_t <= 0.0f) {
+			return false;
+		}
+		float NdotL = min(-0.00001f, dot(Nlocal, Llocal));
+		float NdotV = max(0.00001f, min(1.0f, dot(Nlocal, Vlocal)));
+		float NdotH = max(0.00001f, min(1.0f, dot(Nlocal, Hlocal)));
+		float HdotL = max(0.00001f, min(1.0f, abs(dot(Hlocal, Llocal))));
+		// NOTE: no evalMultiScatterApproximation here. It is derived for
+		// reflection-only GGX and applying it to the transmitted lobe would add
+		// energy its derivation does not cover, so this lobe is single-scatter
+		// and slightly dark at high roughness. Cycles has the same limitation.
+		weight = float3(transmittance, transmittance, transmittance) / denom_t *
+				specularSampleWeight(alpha, alphaSquared, abs(NdotL), NdotV, HdotL, NdotH);
+	} else {
+		Llocal = reflect(-Vlocal, Hlocal);
+		float HdotL = max(0.00001f, min(1.0f, dot(Hlocal, Llocal)));
+		float NdotL = max(0.00001f, min(1.0f, dot(Nlocal, Llocal)));
+		float NdotV = max(0.00001f, min(1.0f, dot(Nlocal, Vlocal)));
+		float NdotH = max(0.00001f, min(1.0f, dot(Nlocal, Hlocal)));
+#if MICROFACET_DISTRIBUTION == GGX
+		float3 ms = evalMultiScatterApproximation(alpha, NdotV, F0);
+#else
+		float3 ms = float3(1.0f, 1.0f, 1.0f);
+#endif
+		weight = ms * (reflectance / pdf_reflect) *
+				specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
+	}
+
+	return true;
+}
+
 // Evaluates microfacet specular BRDF
 float3 evalMicrofacet(const BrdfData data) {
 	float D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
@@ -1260,7 +1376,31 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 			? 0.0f
 			: specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH);
 
-	return pSpec * specularContribution + (1.0f - pSpec) * pdfDiffuse;
+	// Roadmap E1: when the surface transmits, the dielectric closure only
+	// REFLECTS with probability pdf_reflect, so the density it assigns to an
+	// upper-hemisphere direction is scaled by that factor. Without this, every
+	// MIS weight on a transmissive surface describes a different integrand than
+	// the estimator evaluates -- exactly the class of bug B2 shipped and C3
+	// measured.
+	//
+	// Gated on transmissivness > 0 so an opaque material's density is unchanged
+	// INSTRUCTION-FOR-INSTRUCTION, matching the sampling dispatch. The two must
+	// agree about which formulation generated the sample.
+	// Same function sampleDielectricMicrofacet calls to CHOOSE the lobe. It must
+	// be the same function, not a copy: the density reported here and the density
+	// actually sampled there are the two halves of every MIS weight on a
+	// transmissive surface.
+	float transmitScale = 1.0f;
+	if (material.transmissivness > 0.0f) {
+		float3 reflectance_unused;
+		float transmittance_unused;
+		float cos_theta_t_unused = 0.0f;
+		transmitScale = dielectricFresnelSplit(max(0.00001f, LdotH), material.ior,
+				data.specularF0, material.transmissivness,
+				reflectance_unused, transmittance_unused, cos_theta_t_unused);
+	}
+
+	return pSpec * specularContribution * transmitScale + (1.0f - pSpec) * pdfDiffuse;
 }
 
 // Version that returns diffuse and specular separately.

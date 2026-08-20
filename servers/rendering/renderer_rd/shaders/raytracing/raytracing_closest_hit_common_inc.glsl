@@ -454,6 +454,7 @@ void debug_visualize(
 		dbg_mat.dielectricF0 = vec3(specular_to_f0(specular));
 		dbg_mat.emissive = vec3(0.0);
 		dbg_mat.transmissivness = 0.0;
+		dbg_mat.ior = 1.5; // Unused while transmissivness is 0.0; see MaterialProperties.ior.
 		dbg_mat.opacity = 1.0;
 
 		vec3 dbg_dir;
@@ -637,6 +638,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			brdf_mat.dielectricF0, resolved_eta);
 	brdf_mat.emissive = m.emissive;
 	brdf_mat.transmissivness = 0.0;
+	brdf_mat.ior = 1.5; // Unused while transmissivness is 0.0; Task 6 sets this from resolved_eta.
 	brdf_mat.opacity = 1.0;
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
