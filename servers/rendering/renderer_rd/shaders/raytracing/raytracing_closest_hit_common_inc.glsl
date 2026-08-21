@@ -519,6 +519,130 @@ void debug_visualize(
 		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
 				dbg_material.specular_tint, dbg_f0, dbg_eta);
 		ps.radiance = (vis_mode == 30) ? dbg_f0 : vec3(dbg_eta);
+	} else if (vis_mode == 32) {
+		// Fix round 2, detector 1: pdf parity. combinedPdf's own
+		// lobe-selection probability (pSpec) against shade_and_bounce's own
+		// (brdfProbability), calling the ACTUAL production functions each
+		// site calls -- combinedPdfLobeProbability / samplerLobeProbability
+		// (brdf_inc.glsl) -- not a re-inlined copy.
+		//
+		// Why a rendered mean cannot do this job (Task 5/6 defect a): MIS is
+		// unbiased for ANY set of weights satisfying sum(w) == 1 pointwise,
+		// and combinedPdf appears ONLY inside such weights
+		// (raytracing_closest_hit_common_inc.glsl's env-NEE and mis_ray_pdf
+		// sites, raytracing_emissive_inc.glsl's emissive NEE) -- never as an
+		// estimator divisor. The BSDF ray's actual f/p comes from the
+		// sampler's own realised weight, not from combinedPdf. A pdf-only
+		// desync between combinedPdfLobeProbability and samplerLobeProbability
+		// is therefore MEAN-PRESERVING BY CONSTRUCTION: fix round 1's Probe 8
+		// measured a 0.000006 delta under a reintroduced desync, across three
+		// scene configurations, and that was the CORRECT answer (zero), not a
+		// weak signal. This vis mode reads the two probabilities directly,
+		// the same comparison that originally exposed the historical defect
+		// as two numbers side by side (0.0909 sampler vs 0.0476 combinedPdf).
+		//
+		// Emits vec3(pSpec, brdfProbability, ratio). Correct code: ratio ==
+		// 1.0 exactly, for any material -- both functions consume the same
+		// baseColorToSpecularF0/baseColorToDiffuseReflectance with the same
+		// inputs, just from two independently-maintained call sites.
+		MaterialProperties dbg_mat;
+		dbg_mat.baseColor = albedo;
+		dbg_mat.metalness = metalness;
+		dbg_mat.roughness = roughness;
+		vec3 dbg_f0_32;
+		float dbg_eta_32;
+		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
+				dbg_material.specular_tint, dbg_f0_32, dbg_eta_32);
+		dbg_mat.dielectricF0 = dbg_f0_32;
+		dbg_mat.emissive = vec3(0.0);
+		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
+		dbg_mat.eta = dbg_eta_32;
+		dbg_mat.opacity = 1.0;
+
+		float pSpec = combinedPdfLobeProbability(dbg_mat);
+		float brdfProbability = samplerLobeProbability(dbg_mat);
+		float ratio = (brdfProbability > 0.0) ? (pSpec / brdfProbability) : ((pSpec == 0.0) ? 1.0 : 0.0);
+		ps.radiance = vec3(pSpec, brdfProbability, ratio);
+	} else if (vis_mode == 33) {
+		// Fix round 2, detector 2: hemisphere-guard firing rate. Accumulates
+		// float(wrongNg || wrongN) across many samples via the standard
+		// accumulation buffer -- each accumulated frame draws ONE independent
+		// stochastic transmissive-lobe sample (calling sampleTransmissiveLobe,
+		// the SAME production function shade_and_bounce calls, not a
+		// re-inlined copy) and this mode emits 1.0 if the guard would have
+		// rejected it, 0.0 otherwise. The average over N accumulated frames is
+		// the empirical guard-firing rate.
+		//
+		// Why "high variance, lost in Monte Carlo noise" is NOT the right
+		// mental model here (corrected from an earlier, wrong explanation):
+		// brdf_inc.glsl's transmit branch clamps NdotL to -1e-5, and
+		// specularSampleWeight -> Smith_G2_Over_G1_Height_Correlated goes to
+		// ~0 as NdotL -> 0. Every sample the hemisphere guard would reject
+		// ALREADY carries weight ~1e-5 regardless of whether the guard fires
+		// -- the effect on a RENDERED MEAN is bounded at ~1e-5 by that
+		// unrelated downstream clamp, not "buried in noise". This detector
+		// sidesteps that entirely by measuring the RAW REJECTION RATE
+		// directly, before any weight is ever applied.
+		MaterialProperties dbg_mat;
+		dbg_mat.baseColor = albedo;
+		dbg_mat.metalness = metalness;
+		dbg_mat.roughness = roughness;
+		vec3 dbg_f0_33;
+		float dbg_eta_33;
+		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
+				dbg_material.specular_tint, dbg_f0_33, dbg_eta_33);
+		dbg_mat.dielectricF0 = dbg_f0_33;
+		dbg_mat.emissive = vec3(0.0);
+		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
+		dbg_mat.eta = dbg_eta_33;
+		dbg_mat.opacity = 1.0;
+
+		vec3 dbg_specularF0 = baseColorToSpecularF0(dbg_mat.baseColor, dbg_mat.metalness, dbg_mat.dielectricF0);
+		float dbg_alpha = dbg_mat.roughness * dbg_mat.roughness;
+
+		// MUST use the CLAMPED shading normal, exactly as shade_and_bounce's
+		// own `N = clampShadingNormal(m.normal, h.geometry_normal, V,
+		// RT_SHADING_NORMAL_CLAMP_THRESHOLD)` does -- fix round 2 self-review
+		// caught this: reading the raw final_normal here does not carry the
+		// "always on V's side" guarantee geometry_normal has by construction
+		// (compute_hit_data flips geometry_normal toward V; nothing flips the
+		// raw shading normal), which the hemisphere check's own correctness
+		// (and this detector's ability to show the pre-fix ordering
+		// collapsing the rate to ~0) depends on.
+		vec3 dbg_N = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+
+		RNGState dbg_rng = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
+		vec2 dbg_u_xy = rng_2d(dbg_rng, RT_PRNG_SURFACE_BSDF);
+		float dbg_u_z = rng_1d(dbg_rng, RT_PRNG_TRANSMIT);
+		vec3 dbg_u3 = vec3(dbg_u_xy, dbg_u_z);
+
+		vec3 dbg_next_dir;
+		vec3 dbg_weight;
+		bool dbg_is_transmit;
+		bool dbg_wrong_hemisphere;
+		bool dbg_ok = sampleTransmissiveLobe(V, dbg_N, geometry_normal, dbg_alpha, dbg_alpha * dbg_alpha,
+				dbg_specularF0, dbg_mat.eta, dbg_mat.transmissivness, dbg_material.thickness == 0.0, dbg_u3,
+				dbg_next_dir, dbg_weight, dbg_is_transmit, dbg_wrong_hemisphere);
+		// Fix round 2 self-review: the thin-walled override this defect
+		// reorders around ONLY applies when isTransmit is true (`if
+		// (isTransmit && thin_walled)`), so only TRANSMIT-lobe rejections are
+		// affected by the ordering bug -- REFLECT-lobe rejections (a
+		// completely separate, unrelated below-hemisphere phenomenon at high
+		// roughness, the same kind clampShadingNormal/recoverBelowHemisphereSample
+		// exist to handle for opaque materials) are untouched either way and,
+		// at these settings, turned out to dominate the unconditional rate,
+		// masking the defect entirely (measured identically with and without
+		// the break in early testing). Channels, all as float(ok && ...):
+		//   r: wrong_hemisphere AND is_transmit -- the numerator for the
+		//      TRANSMIT-conditional rate, the one this defect can move to 0.
+		//   g: is_transmit -- the denominator (fraction of samples that took
+		//      the transmit lobe at all).
+		//   b: wrong_hemisphere unconditionally -- kept for reference/context
+		//      only, NOT the detector's pass/fail signal.
+		ps.radiance = vec3(
+				(dbg_ok && dbg_is_transmit && dbg_wrong_hemisphere) ? 1.0 : 0.0,
+				(dbg_ok && dbg_is_transmit) ? 1.0 : 0.0,
+				(dbg_ok && dbg_wrong_hemisphere) ? 1.0 : 0.0);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
@@ -946,7 +1070,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	} else if (specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
-		float brdfProbability = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
+		// Fix round 2: calls samplerLobeProbability (brdf_inc.glsl) rather than
+		// re-inlining the clamp(...) formula here -- see that function's doc
+		// comment for why it is a separate function from combinedPdf's own
+		// combinedPdfLobeProbability rather than a shared call, and
+		// RT_DEBUG_PDF_PARITY for the detector this pair makes possible.
+		float brdfProbability = samplerLobeProbability(brdf_mat);
 		if (rng_1d(rng, RT_PRNG_LOBE) < brdfProbability) {
 			brdfType = SPECULAR_TYPE;
 			ps.throughput /= brdfProbability;
@@ -964,51 +1093,21 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	bool took_transmissive_lobe = false;
 	bool transmissive_sample_ok = false;
 	if (brdfType == SPECULAR_TYPE && brdf_mat.transmissivness > 0.0) {
-		// Thin-walled: glTF says thicknessFactor == 0 is an infinitesimally thin
-		// surface and no refraction bend applies. The ray continues straight and
-		// no medium is entered, so single-sided window panes and foliage cards
-		// work without any back-face hit.
-		float4 qRotationToZ = getRotationToZAxis(N);
-		float3 Vlocal = rotatePoint(qRotationToZ, V);
-		float3 Llocal;
-		float3 wgt;
-		bool isTransmit;
 		float alpha = brdf_mat.roughness * brdf_mat.roughness;
 		float3 u3 = float3(u, rng_1d(rng, RT_PRNG_TRANSMIT));
-		if (sampleDielectricMicrofacet(Vlocal, alpha, alpha * alpha, specularF0,
-					brdf_mat.eta, brdf_mat.transmissivness, u3, Llocal, wgt, isTransmit)) {
-			next_dir = normalize(rotatePoint(invertRotation(qRotationToZ), Llocal));
-			brdf_weight = wgt;
-			transmissive_sample_ok = true;
+		// Fix round 2: calls sampleTransmissiveLobe (brdf_inc.glsl), which
+		// encapsulates sampling, the hemisphere-consistency guard, and the
+		// thin-walled override IN THE ORDER fix round 1's I1 established --
+		// see that function's doc comment for the full reasoning and
+		// RT_DEBUG_GUARD_FIRING_RATE for the detector this extraction makes
+		// possible.
+		bool isTransmit;
+		bool wrongHemisphere;
+		if (sampleTransmissiveLobe(V, N, h.geometry_normal, alpha, alpha * alpha, specularF0,
+					brdf_mat.eta, brdf_mat.transmissivness, m.thickness == 0.0, u3,
+					next_dir, brdf_weight, isTransmit, wrongHemisphere)) {
+			transmissive_sample_ok = !wrongHemisphere;
 			took_transmissive_lobe = isTransmit;
-
-			// Cycles' hemisphere-consistency rejection (bsdf_microfacet.h:864):
-			// a sample must land on the side of BOTH the shading and the geometry
-			// normal that its label implies. This replaces
-			// recoverBelowHemisphereSample for the transmissive branch -- the
-			// mirror-recovery hack is meaningless when the sample is SUPPOSED to
-			// be below the hemisphere.
-			//
-			// Fix round 1, I1: MUST run against the direction
-			// sampleDielectricMicrofacet actually produced, BEFORE the
-			// thin-walled override below can replace it with -V.
-			// h.geometry_normal is always flipped toward V (compute_hit_data),
-			// so dot(-V, Ng) < 0 and dot(-V, N) < 0 are unconditionally true --
-			// checking AFTER the override made both comparisons vacuously equal
-			// to `isTransmit == true` every time, so the guard could never fire
-			// in thin-walled mode, exactly where VNDF can produce a wrong-side
-			// sample at high roughness (the failure mode this guard exists to
-			// catch in the thick case).
-			bool wrongNg = (dot(next_dir, h.geometry_normal) < 0.0) != isTransmit;
-			bool wrongN = (dot(next_dir, N) < 0.0) != isTransmit;
-			if (wrongNg || wrongN) {
-				transmissive_sample_ok = false;
-			}
-
-			if (isTransmit && m.thickness == 0.0) {
-				// Thin-walled: no bend. Continue straight through.
-				next_dir = -V;
-			}
 		}
 		if (!transmissive_sample_ok || luminance(brdf_weight) == 0.0) {
 			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

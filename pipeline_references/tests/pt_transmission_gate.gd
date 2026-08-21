@@ -19,7 +19,7 @@ extends "res://tests/pt_validation.gd"
 ## rendered a transmissive material through the real GPU pipeline. This gate
 ## is what closes that gap.
 ##
-## Eight probes:
+## Ten probes:
 ##   1. F0 arbitration at default inputs, PLUS a non-default-specular fixture
 ##      (vis mode 30/31, no rendering) -- see P1B_SPECULAR's doc comment for
 ##      why the default-specular case alone cannot catch a curve regression.
@@ -41,21 +41,30 @@ extends "res://tests/pt_validation.gd"
 ##      total" (real render).
 ##   8. Rough (roughness 0.5), partially transmissive (transmission 0.5)
 ##      energy, the only probe where BOTH parameters sit strictly inside their
-##      degenerate corners -- structurally the only real render in this gate
-##      that exercises combinedPdf's non-degenerate specular-density branch
-##      (Task 5/6 defect a's mechanism) and sampleDielectricMicrofacet's
-##      non-delta VNDF path (defect c's mechanism) at all. Reintroducing EITHER
-##      historical defect was tried, across three scene configurations each,
-##      and none moved this probe's reading outside its band -- see
-##      _probe8_rough_partial_transmission's "HONEST LIMITATION" comment and
-##      task-7-report.md's fix-round-1 addendum for the full investigation and
-##      a working theory of why (real render, captured-reference two-sided
-##      band).
+##      degenerate corners, closing the STRUCTURAL coverage gap where every
+##      other probe sat at roughness 0 or transmission 0/1. Cannot itself
+##      detect the two historical defects that live in this regime -- see
+##      probes 9/10, which were built specifically because it can't (real
+##      render, captured-reference two-sided band).
+##   9. PDF PARITY (vis mode 32, no rendering): reads combinedPdf's own
+##      lobe-selection probability and the sampler's own, side by side, the
+##      exact comparison that originally exposed Task 5/6 defect a. A pdf-only
+##      desync is mean-preserving by construction (MIS is unbiased for any
+##      weights summing to 1 pointwise) -- no rendered probe, including probe
+##      8, can ever catch it. This is the only way.
+##   10. HEMISPHERE-GUARD FIRING RATE (vis mode 33, real render but reading a
+##       raw rejection rate, not a shaded value): accumulates whether Task 5/6
+##       defect c's guard would fire, across many independent samples. A
+##       rendered mean's sensitivity to this defect is bounded to ~1e-5 by an
+##       unrelated downstream clamp on NdotL -- this detector sidesteps that
+##       by measuring the rejection rate directly, before any weight is ever
+##       applied.
 ##
-## SCOPE: probes 1-2 exercise resolveDielectricF0 directly through vis modes,
-## which is the SAME function shade_and_bounce calls -- not a re-inlined copy.
-## Probes 3-8 render real StandardMaterial3D geometry through the production
-## shade_and_bounce path. Every probe in this file therefore proves the
+## SCOPE: probes 1-2 and 9-10 exercise the underlying formulas directly
+## through vis modes, calling the SAME functions shade_and_bounce and
+## combinedPdf call -- not re-inlined copies. Probes 3-8 render real
+## StandardMaterial3D geometry through the production shade_and_bounce path.
+## Every probe in this file therefore proves the
 ## StandardMaterial3D path ONLY. debug_visualize() has two call sites in
 ## scene_raytracing_raygen.glsl (HG0's materials[]-in-scope form and the
 ## RT_CUSTOM_HIT_GROUP form fetching materials[h.geometry_idx] directly), and
@@ -101,7 +110,14 @@ const P2_TINT_SRGB := Color(0.8, 0.7, 0.55) # authored sRGB, per the brief.
 # ---------------------------------------------------------------------------
 const P3_FRAMES := 96
 const P3_EXPECTED_T := 0.96 # Fresnel transmittance at normal incidence, ior 1.5.
-const P3_TOLERANCE := 0.02 # 2%, per the brief.
+## Fix round 2 correction: 2% (per the brief) was sized around a probe that
+## rendered at max_bounces = 4, where a real +0.93% second-order GI offset
+## (see the I5 investigation in task-7-report.md) ate nearly half the budget.
+## Now that the probe renders at max_bounces = 2 -- matching where the
+## analytic model actually holds (0.015% measured) -- 0.2% is ~13x that
+## measured precision, a comparable margin to every other tightened tolerance
+## in this gate.
+const P3_TOLERANCE := 0.002 # 0.2%.
 
 # ---------------------------------------------------------------------------
 # Probe 4: volumetric absorption, isolated via a white-vs-tinted ratio on
@@ -213,8 +229,95 @@ const P8_TRANSMISSION := 0.5
 ## these settings it is evidently a small contributor next to the additive
 ## diffuse layer.
 const P8_REF_CORRECT := 0.994691
-const P8_TOLERANCE := 0.02 # 2%; see task-7-report.md fix-round-1 addendum for the capture run.
+## Fix round 2 correction: 0.02 (2%) was 20,000x the measured 0.000001
+## run-to-run spread, and unjustified in its own doc comment -- while THE
+## SAME fix-round-1 commit tightened P7_TOLERANCE from 0.02 to 0.005 on the
+## explicit reasoning that 300x the noise floor was "not the margin the rest
+## of this gate holds everywhere else." 0.005 is still 5000x the noise floor,
+## and Break E (fix round 1's bogus 0.85 transmit-weight scale) moved this
+## probe 7.2%, comfortably outside it.
+const P8_TOLERANCE := 0.005 # 0.5%.
 const P8_FLOOR := 1e-6 # I2.
+
+# ---------------------------------------------------------------------------
+# Probe 9: pdf parity (fix round 2, detector 1 -- Task 5/6 defect a).
+#
+# Vis mode 32 reads combinedPdfLobeProbability(dbg_mat) and
+# samplerLobeProbability(dbg_mat) (brdf_inc.glsl) DIRECTLY -- the exact
+# production functions combinedPdf and shade_and_bounce respectively call,
+# not a re-inlined copy -- and emits vec3(pSpec, brdfProbability, ratio).
+#
+# WHY THIS, AND NOT A RENDERED MEAN (see also probe 8's header comment and
+# the fix-round-1 addendum in task-7-report.md): MIS is unbiased for ANY set
+# of weights satisfying sum(w) == 1 pointwise, and combinedPdf appears ONLY
+# inside such weights (raytracing_closest_hit_common_inc.glsl's env-NEE and
+# mis_ray_pdf sites, raytracing_emissive_inc.glsl's emissive NEE) -- never as
+# an estimator divisor. A pdf-only desync between the two functions is
+# therefore MEAN-PRESERVING BY CONSTRUCTION: no rendered probe, at any
+# roughness or transmission, can ever detect it. This is the only way.
+# ---------------------------------------------------------------------------
+const MODE_PDF_PARITY := 32
+const TOL_PDF_PARITY_RATIO := 1e-4
+const P9_ROUGHNESS := 0.5
+const P9_TRANSMISSION := 0.5
+## Analytic, not captured: default StandardMaterial3D albedo is white (1,1,1),
+## ior 1.5 / specular 0.5 give F0 = 0.04 (probe 1's own invariant), and
+## diffuseReflectance = albedo * (1-metalness) * (1-transmissivness) =
+## 1 * 1 * 0.5 = 0.5. luminance() of a uniform-channel colour equals that
+## channel value (the Rec.709 weights sum to 1), so pSpec = 0.04 / (0.04 +
+## 0.5) exactly -- both channels well clear of the 0.0001 degenerate
+## thresholds on either side, so this exercises the actual clamp(...) branch,
+## not one of its trivial 0.0/1.0 short-circuits.
+const P9_EXPECTED_PSPEC := 0.04 / (0.04 + 0.5) # 0.074074...
+
+# ---------------------------------------------------------------------------
+# Probe 10: hemisphere-guard firing rate (fix round 2, detector 2 -- Task 5/6
+# defect c).
+#
+# Vis mode 33 accumulates float(wrongNg || wrongN) over many samples by
+# calling sampleTransmissiveLobe (brdf_inc.glsl) directly -- the exact
+# production function shade_and_bounce calls, not a re-inlined copy -- once
+# per accumulated frame. The mean of the accumulator is the empirical
+# guard-firing rate.
+#
+# WHY THIS, AND NOT A RENDERED MEAN: the transmit branch clamps NdotL to
+# -1e-5 (brdf_inc.glsl:1136, sampleDielectricMicrofacet), and
+# specularSampleWeight -> Smith_G2_Over_G1_Height_Correlated goes to ~0 as
+# NdotL -> 0. Every sample the guard would reject already carries weight
+# ~1e-5 regardless of whether the guard fires -- a rendered mean's
+# sensitivity to this defect is bounded at ~1e-5 by that unrelated
+# downstream clamp, not by Monte Carlo noise (an earlier draft of this gate's
+# documentation blamed noise; that was wrong -- see the fix-round-2 addendum
+# in task-7-report.md). This detector measures the RAW rejection rate,
+# before any weight is ever applied.
+#
+# NEEDS a grazing view angle AND a normal map (diverging the shading normal
+# from geometry_normal): getting a non-zero correct-code rate at all took an
+# honest, recorded search across four fixture attempts, three of which read
+# exactly 0.0. See _probe10_guard_firing_rate's header comment for the full
+# search and the measured correct-code rate.
+# ---------------------------------------------------------------------------
+const MODE_GUARD_FIRING_RATE := 33
+const P10_FRAMES := 16384 # High sample count: the transmit-conditional statistic is noisy (see below).
+const P10_ROUGHNESS := 1.0
+const P10_IOR := 3.0
+const P10_TRANSMISSION := 1.0
+const P10_CAM_POS := Vector3(3.99, 0.0, 0.05) # grazing: V close to the quad's own plane.
+## Captured reference (transmit-conditional rate; see _probe10_guard_firing_rate's
+## header comment for the full search that found this fixture): three
+## consecutive correct-code runs read 0.001916 / 0.001975 / 0.001933 (spread
+## ~0.00003, but the underlying sample count is small -- ~11.2% of P10_FRAMES
+## take the transmit lobe at all, so this statistic is noisier than most in
+## this gate). P10_RATE_LOW sits well below all three readings while staying
+## orders of magnitude above the 0.0 defect c drives this to on a FLAT
+## fixture. P10_RATE_HIGH is not just a loose sanity bound here: reintroducing
+## defect c against THIS (normal-mapped) fixture measured 0.080879, a ~42x
+## INCREASE rather than a collapse to zero, because the override's
+## "vacuously consistent" property only holds when N == geometry_normal (see
+## the header comment) -- so both bounds are load-bearing.
+const P10_RATE_LOW := 0.0005
+const P10_RATE_HIGH := 0.02
+const P10_FLOOR := 1e-6 # I2 pattern: a zero transmit-sample fraction can't be conditioned on.
 
 var _failures: Array[String] = []
 var _checks: int = 0
@@ -254,6 +357,12 @@ func _ready() -> void:
 
 	print("\n=== PROBE 8: rough, partial transmission ===")
 	await _probe8_rough_partial_transmission()
+
+	print("\n=== PROBE 9: pdf parity (combinedPdf vs sampler) ===")
+	await _probe9_pdf_parity()
+
+	print("\n=== PROBE 10: hemisphere-guard firing rate ===")
+	await _probe10_guard_firing_rate()
 
 	print("")
 	if _failures.is_empty():
@@ -382,12 +491,13 @@ func _probe2_tinted_f0() -> void:
 			Vector3(1.5, 1.5, 1.5))
 
 
-## All seven call sites here have three legitimately distinct (or at least
+## All six call sites here have three legitimately distinct (or at least
 ## legitimately non-zero-suppressible) channels, unlike Phase D's material-data
 ## gate this pattern was borrowed from -- so this always checks all three
 ## channels. Fix round 1: dropped the p_check_all parameter and its dead
 ## "skip zero-expected channels 1/2" branch, which every call site passed
-## `true` past.
+## `true` past. (Fix round 2 correction: this comment previously miscounted
+## the call sites as seven.)
 func _check_vis_mode(p_env: Environment, p_mode: int, p_label: String,
 		p_expected: Vector3) -> void:
 	p_env.set_pathtracing_debug_mode(p_mode)
@@ -535,7 +645,26 @@ func _probe3_thin_walled() -> void:
 	cam.make_current()
 
 	var env := _new_env(Color(0, 0, 0))
-	env.set_pathtracing_max_bounces(4)
+	# Fix round 2 correction: was 4. The I5 investigation's own bounce sweep
+	# (task-7-report.md) showed this probe matches its analytic model to
+	# 0.015% at max_bounces <= 2, and only picks up the +0.93% second-order GI
+	# offset (emitter light bouncing off the glass's own back face and
+	# returning) once a third bounce is available. 2 is not tuning the offset
+	# away -- it is aligning the experiment with the closed form P3_TOLERANCE
+	# actually asserts against, which the offset at 4 bounces was never a
+	# fair test of.
+	# Fix round 2 correction: was 4. The I5 investigation's own bounce sweep
+	# (task-7-report.md) showed this probe matches its analytic model to
+	# 0.015% at max_bounces <= 2, and only picks up the +0.93% second-order GI
+	# offset (emitter light bouncing off the glass's own back face and
+	# returning) once a third bounce is available. 2 is not tuning the offset
+	# away -- it is aligning the experiment with the closed form P3_TOLERANCE
+	# actually asserts against, which the offset at 4 bounces was never a
+	# fair test of. Independently confirmed via a black-albedo control (kills
+	# the backdrop's own reflectivity, removing the GI path outright) at
+	# max_bounces = 4: measured T = 0.959957, 0.004% off -- collapses the
+	# offset from the black-albedo side too, not just the bounce-count side.
+	env.set_pathtracing_max_bounces(2)
 	await _settle_sky()
 
 	quad.visible = false
@@ -1050,64 +1179,58 @@ func _p7_glass_material(p_tint_srgb: Color) -> StandardMaterial3D:
 ## comment for why), so this is a captured-reference probe with a two-sided
 ## band, following the exact pattern fix round 1, I1 established for probe 6.
 ##
-## HONEST LIMITATION (fix round 1 verification -- read this before trusting
-## this probe as a regression detector for defects a or c specifically).
-## Three deliberate-break attempts, across three different scene
-## configurations, ALL failed to move this probe's reading outside its band:
+## FIX ROUND 1 FOUND, AND FIX ROUND 2 EXPLAINS AND RESOLVES, A REAL LIMITATION
+## OF THIS PROBE AS A REGRESSION DETECTOR FOR DEFECTS A/C -- read this before
+## reusing the "clone probe 7 at rough settings" pattern for anything similar.
 ##
-##   1. Hemisphere guard (defect c): reintroduced the pre-fix-round-1 ordering
-##      (thin-walled -V override applied BEFORE wrongNg/wrongN, so both
-##      comparisons become vacuously `isTransmit == true`). Normal-incidence
-##      camera (the one shipped below): 0.994690 under the break vs a
-##      0.994691 correct-code reference. A grazing-incidence variant tried
-##      during investigation: 0.970174 under the break vs 0.969589-0.970442
-##      across three correct-code runs at the same geometry -- statistically
-##      indistinguishable, inside that configuration's own ~0.09% run-to-run
-##      noise.
-##   2. combinedPdf desync (defect a): reintroduced the pre-fix-round-1 form
-##      by passing 0.0 instead of material.transmissivness into
-##      baseColorToDiffuseReflectance inside combinedPdf specifically (the
-##      exact historical bug -- see brdf_inc.glsl:1345-1356's own comment,
-##      which documents the original 0.0909-vs-0.0476 pSpec split this
-##      reproduces). Same uniform-sky quad shipped below: 0.994685 under the
-##      break vs 0.994691 correct -- a 0.000006 delta, four orders of
-##      magnitude under the 2% tolerance.
-##   3. Same combinedPdf break, tried again against pt_energy_gate.gd's own
-##      directional-sky methodology (a bright 20.0-vs-0.02 patch, chosen
-##      specifically because that gate's header comment explains a uniform
-##      sky is "blind to every direction-dependent defect"), first on a flat
-##      quad (1.309403 under the break vs 1.309548-1.309570 correct -- still
-##      indistinguishable) and then on a sphere, matching that same gate's
-##      own reasoning for why a sphere and not a flat mirror ("a flat
-##      mirror's single reflected direction could land on dim sky... a sphere
-##      reflects essentially every direction at once") (0.813891 under the
-##      break vs a 0.813740 correct-code reading -- a 0.00015 delta, again
-##      far under any plausible detection threshold).
+## Fix round 1 tried reintroducing both historical defects against this probe
+## (three scene configurations total, including pt_energy_gate.gd's
+## directional-sky and sphere patterns) and NONE moved the rendered mean
+## outside its band -- deltas of 0.000006 to 0.00015 against a 2% tolerance,
+## four to five orders of magnitude too small to detect.
 ##
-## Working theory for why defect a stayed invisible across all three
-## variants: the MIS weights on both sides of every comparison this scene
-## exercises (the BSDF ray's mis_ray_pdf, and env-NEE's bsdf_pdf_for_dir) are
-## computed by the SAME (broken) combinedPdf call, just at different
-## directions. Power-heuristic weights are ratios, so a SYSTEMATIC bias that
-## shifts combinedPdf's output the same way regardless of which direction it
-## is evaluated at can cancel in the weighted sum even though the underlying
-## density is wrong in an absolute sense -- unlike the ORIGINAL discovery
-## context for this defect (Task 6 review), which compared combinedPdf's
-## output directly against the SAMPLER's own realised brdfProbability as two
-## numbers side by side, not through a rendered image. Reproducing that
-## detection would need a comparison against a BSDF-only reference build
-## (pt_energy_gate.gd's Gate 2 methodology, which explicitly captures its
-## REF_* constants from a build with environment NEE/MIS not yet added) rather
-## than a live single-build rendered mean -- out of scope for this fix round.
+## This was NOT a weak-signal problem to fix with a better fixture. The
+## fix-round-2 review established why, precisely, for each defect:
 ##
-## What this probe's shipped form DOES demonstrably provide, independent of
-## whether defects a/c specifically regress: it is the only real render in
-## this gate exercising combinedPdf's non-degenerate specular-density branch
-## and sampleDielectricMicrofacet's non-delta VNDF path at all, closing the
-## STRUCTURAL coverage gap fix round 1's C1 identified (every other probe sat
-## at roughness 0 or transmission 0/1). Whether it can also catch a live
-## regression in either mechanism remains open; see task-7-report.md's
-## fix-round-1 addendum for the full investigation.
+##   Defect a (combinedPdf desync) is MEAN-PRESERVING BY CONSTRUCTION. MIS is
+##   unbiased for ANY set of weights satisfying sum(w) == 1 pointwise, and
+##   combinedPdf appears ONLY inside such weights (env-NEE and mis_ray_pdf
+##   below, emissive NEE in raytracing_emissive_inc.glsl) -- never as an
+##   estimator divisor. The BSDF ray's actual f/p comes from the sampler's own
+##   realised weight, not from combinedPdf. No rendered probe, at any
+##   roughness or transmission, can ever detect a pdf-only desync between
+##   combinedPdf and the sampler. Recommending a BSDF-only reference build
+##   (mirroring pt_energy_gate.gd's Gate 2) to chase this down -- which an
+##   earlier draft of this comment did -- was a CATEGORY ERROR: that pattern
+##   tests MIS *unbiasedness*, which is precisely the property a pdf-only
+##   desync preserves. It would have produced a guaranteed null.
+##
+##   Defect c (hemisphere guard) is bounded, not buried in noise. The transmit
+##   branch clamps NdotL to -1e-5 (brdf_inc.glsl, sampleDielectricMicrofacet),
+##   and specularSampleWeight -> Smith_G2_Over_G1_Height_Correlated goes to ~0
+##   as NdotL -> 0. Every sample the guard would reject already carries weight
+##   ~1e-5 regardless of whether the guard fires -- a rendered mean's
+##   sensitivity is bounded at ~1e-5 by that unrelated downstream clamp. An
+##   earlier draft of this comment blamed "Monte Carlo noise"; that was wrong
+##   -- the effect is deterministic and small, not variance.
+##
+## The ACTUAL fix: two vis modes that read the relevant quantities directly
+## instead of through a rendered mean -- RT_DEBUG_PDF_PARITY (mode 32, probe
+## 9) reads combinedPdfLobeProbability and samplerLobeProbability (brdf_inc.glsl)
+## side by side, the same two-numbers comparison that originally exposed
+## defect a; RT_DEBUG_GUARD_FIRING_RATE (mode 33, probe 10) accumulates the
+## guard's raw rejection rate directly, before any weight is ever applied. See
+## probes 9 and 10 below -- both catch their respective defect, verified by
+## reintroducing each (task-7-report.md's fix-round-2 addendum has the
+## verbatim failure messages).
+##
+## What THIS probe (8) demonstrably provides, independent of the above: it is
+## the only real render in this gate exercising combinedPdf's non-degenerate
+## specular-density branch and sampleDielectricMicrofacet's non-delta VNDF
+## path at all, closing the STRUCTURAL coverage gap fix round 1's C1
+## identified (every other probe sat at roughness 0 or transmission 0/1). That
+## coverage is real and worth keeping even though probes 9/10, not this one,
+## are what actually catch defects a/c.
 func _probe8_rough_partial_transmission() -> void:
 	for c in get_children():
 		c.queue_free()
@@ -1155,3 +1278,188 @@ func _probe8_rough_partial_transmission() -> void:
 		_failures.append(("probe8 rough partial transmission: measured mean %.6f vs captured "
 				+ "reference %.6f, %.3f%% off (limit %.1f%%)")
 				% [stats["mean"], P8_REF_CORRECT, err * 100.0, P8_TOLERANCE * 100.0])
+
+
+func _probe9_pdf_parity() -> void:
+	var s := await _build_vis_scene()
+	var mat := StandardMaterial3D.new()
+	mat.transmission = P9_TRANSMISSION
+	mat.roughness = P9_ROUGHNESS
+	mat.metallic = 0.0
+	mat.ior = 1.5
+	(s["mesh"] as MeshInstance3D).material_override = mat
+
+	(s["env"] as Environment).set_pathtracing_debug_mode(MODE_PDF_PARITY)
+	var img: Image = await _render_accum(s["env"], get_viewport().get_viewport_rid(), 1)
+	var px: Color = img.get_pixel(img.get_width() / 2, img.get_height() / 2)
+	var pSpec: float = px.r
+	var brdfProbability: float = px.g
+	var ratio: float = px.b
+	print("  pSpec=%.6f  brdfProbability=%.6f  ratio=%.6f  (expected pSpec %.6f)"
+			% [pSpec, brdfProbability, ratio, P9_EXPECTED_PSPEC])
+	(s["env"] as Environment).set_pathtracing_debug_mode(0)
+
+	# Primary detector assertion: the two functions must agree exactly.
+	_checks += 1
+	var ratio_delta: float = absf(ratio - 1.0)
+	if ratio_delta > TOL_PDF_PARITY_RATIO:
+		_failures.append(("probe9 pdf parity: ratio %.6f (pSpec %.6f, brdfProbability %.6f) vs "
+				+ "expected 1.0, delta %.6f exceeds %.6f")
+				% [ratio, pSpec, brdfProbability, ratio_delta, TOL_PDF_PARITY_RATIO])
+	else:
+		print("  ok    probe9 pdf parity ratio: %.6f" % ratio)
+
+	# Secondary assertions: both functions individually match the analytic
+	# prediction, not just each other -- catches the case where both are
+	# wrong in the SAME way (ratio would still read 1.0).
+	_checks += 1
+	var pspec_delta: float = absf(pSpec - P9_EXPECTED_PSPEC)
+	if pspec_delta > TOL_PDF_PARITY_RATIO:
+		_failures.append(("probe9 pdf parity: combinedPdfLobeProbability %.6f vs analytic %.6f, "
+				+ "delta %.6f exceeds %.6f") % [pSpec, P9_EXPECTED_PSPEC, pspec_delta, TOL_PDF_PARITY_RATIO])
+	else:
+		print("  ok    probe9 combinedPdfLobeProbability: %.6f" % pSpec)
+
+	_checks += 1
+	var brdfprob_delta: float = absf(brdfProbability - P9_EXPECTED_PSPEC)
+	if brdfprob_delta > TOL_PDF_PARITY_RATIO:
+		_failures.append(("probe9 pdf parity: samplerLobeProbability %.6f vs analytic %.6f, "
+				+ "delta %.6f exceeds %.6f") % [brdfProbability, P9_EXPECTED_PSPEC, brdfprob_delta, TOL_PDF_PARITY_RATIO])
+	else:
+		print("  ok    probe9 samplerLobeProbability: %.6f" % brdfProbability)
+
+
+## Finding this fixture took an honest search, and the search itself is worth
+## recording (task-7-report.md's fix-round-2 addendum has the full numbers).
+## Every attempt below measured the TRANSMIT-CONDITIONAL rate (see the vis
+## mode 33 comment for why unconditional is the wrong signal):
+##
+##   1. Straight-on camera (probe 8/9's normal incidence), roughness 0.9:
+##      exactly 0.0 in 1024 correct-code frames.
+##   2. Grazing camera (V near the quad's own plane), same roughness: still
+##      exactly 0.0, even at 16384 frames.
+##   3. Grazing + roughness 1.0 + ior 3.0 (near the most extreme parameters
+##      this material model allows): STILL exactly 0.0 at 16384 frames.
+##
+## The pattern across 1-3: with N == geometry_normal exactly (a flat quad, no
+## normal map), refract_angle's transmitted direction is apparently ALWAYS
+## hemisphere-consistent for this codebase's VNDF sampling, regardless of
+## roughness, eta, or view angle -- the guard's transmit side may be
+## structurally unreachable on a perfectly flat surface, whatever the
+## theoretical "VNDF can produce a wrong-side sample at high roughness"
+## concern the original comment raises. What actually triggers it: a normal
+## map, diverging the SHADING normal from geometry_normal (mirrors
+## pt_energy_gate.gd's own bumpy-surface probe, built for an unrelated
+## purpose -- forcing shading-normal/geometry-normal divergence -- but the
+## same mechanism). With one, grazing incidence, roughness 1.0, ior 3.0: three
+## correct-code runs read 0.001916 / 0.001933 / 0.001975 (noisy -- only
+## ~11.2% of samples take the transmit lobe at all at this geometry, so the
+## effective sample count behind this statistic is small).
+##
+## One more thing worth recording precisely: the coordinator's prediction that
+## the pre-fix ordering "drives this to exactly 0.0 by construction" is
+## correct FOR A FLAT FIXTURE (dot(-V, N) is unconditionally negative when
+## N == geometry_normal, since geometry_normal is flipped toward V by
+## construction -- compute_hit_data -- which makes the post-override
+## comparison vacuously consistent). It does NOT hold once N diverges from
+## geometry_normal: dot(-V, N) is no longer guaranteed negative, so the
+## override can just as easily manufacture a NEW inconsistency as suppress an
+## existing one. Reintroducing the defect against THIS fixture moved the rate
+## to 0.080879 -- a ~42x jump, not a collapse to zero -- and the probe below
+## still fails decisively on it, just via the high bound rather than the low
+## one. Both directions are asserted for exactly this reason.
+func _probe10_guard_firing_rate() -> void:
+	for c in get_children():
+		c.queue_free()
+
+	var quad := MeshInstance3D.new()
+	var quad_mesh := BoxMesh.new()
+	quad_mesh.size = Vector3(4, 4, 0.05)
+	quad.mesh = quad_mesh
+	var mat := StandardMaterial3D.new()
+	mat.transmission = P10_TRANSMISSION
+	mat.roughness = P10_ROUGHNESS
+	mat.metallic = 0.0
+	mat.ior = P10_IOR
+	mat.thickness = 0.0 # thin-walled, matching the brief's "thin-walled transmissive fixture".
+	mat.normal_enabled = true # diverges N from geometry_normal -- see the header comment for why this is required.
+	mat.normal_scale = 1.0
+	mat.normal_texture = _p10_bump_normal_map()
+	quad.material_override = mat
+	add_child(quad)
+
+	var cam := Camera3D.new()
+	var cam_pos := P10_CAM_POS # grazing: V close to the quad's own plane.
+	cam.look_at_from_position(cam_pos, Vector3.ZERO, Vector3.UP)
+	cam.fov = 20.0
+	add_child(cam)
+	cam.make_current()
+
+	var env := Environment.new()
+	env.background_mode = Environment.BG_COLOR
+	env.background_color = Color(0, 0, 0)
+	var we := WorldEnvironment.new()
+	we.environment = env
+	add_child(we)
+	env.set_pathtracing_enabled(true)
+	env.set_pathtracing_max_bounces(1)
+	env.set_pathtracing_samples_per_pixel(1)
+	env.set_pathtracing_denoiser(0)
+	env.set_pathtracing_oidn_denoise(false)
+	env.set_pathtracing_dlss_rr_final(false)
+	env.set_pathtracing_debug_mode(MODE_GUARD_FIRING_RATE)
+
+	for _i in range(3):
+		await get_tree().process_frame
+
+	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), P10_FRAMES)
+	var stats := _measure_crop(img, 0.3, 0.7)
+	# r = wrong_hemisphere AND is_transmit; g = is_transmit; b = wrong_hemisphere
+	# unconditionally (reference only -- see the vis-mode-33 comment for why
+	# the unconditional rate is NOT the detector signal: the thin-walled
+	# override this defect reorders around only ever applies to transmit
+	# samples, so reflect-lobe hemisphere rejections -- a real but unrelated
+	# effect at high roughness -- dilute or even dominate the unconditional
+	# rate and mask the defect completely. Confirmed empirically during
+	# authoring: the unconditional rate read IDENTICALLY with and without the
+	# break reintroduced.
+	var transmit_rate: float = stats["g"]
+	var conditional_rate: float = stats["r"] / maxf(transmit_rate, 1e-9)
+	print("  unconditional rate (reference only): %.6f" % stats["b"])
+	print("  transmit sample fraction: %.6f" % transmit_rate)
+	print("  transmit-conditional guard firing rate: %.6f  (reference band [%.6f, %.6f])"
+			% [conditional_rate, P10_RATE_LOW, P10_RATE_HIGH])
+
+	_checks += 1
+	if transmit_rate < P10_FLOOR:
+		_failures.append(("probe10 guard firing rate: transmit sample fraction %.6f is "
+				+ "indistinguishable from zero (floor %.6f) -- cannot measure a "
+				+ "transmit-conditional rate against it") % [transmit_rate, P10_FLOOR])
+	elif conditional_rate < P10_RATE_LOW:
+		_failures.append(("probe10 guard firing rate: transmit-conditional rate %.6f falls "
+				+ "below %.6f -- consistent with the hemisphere guard never firing on transmit "
+				+ "samples (defect c: the pre-fix thin-walled-override-before-check ordering "
+				+ "drives this to exactly 0.0 by construction)") % [conditional_rate, P10_RATE_LOW])
+	elif conditional_rate > P10_RATE_HIGH:
+		_failures.append(("probe10 guard firing rate: transmit-conditional rate %.6f exceeds %.6f")
+				% [conditional_rate, P10_RATE_HIGH])
+	else:
+		print("  ok    probe10 transmit-conditional guard firing rate: %.6f" % conditional_rate)
+
+
+## Steep bump map for probe 10, mirroring pt_energy_gate.gd's own
+## _bump_normal_map (built there for an unrelated purpose -- forcing
+## shading-normal/geometry-normal divergence on a rough metal sphere -- but
+## the same mechanism this probe needs). z = 0.2 keeps the tilt close to 78
+## degrees at the extremes, steeper than pt_energy_gate.gd's own 0.45/65
+## degrees; probe 10's header comment explains why this fixture needs it.
+func _p10_bump_normal_map() -> ImageTexture:
+	var n := 128
+	var img := Image.create(n, n, false, Image.FORMAT_RGB8)
+	for y in range(n):
+		for x in range(n):
+			var u := float(x) / float(n) * TAU * 8.0
+			var v := float(y) / float(n) * TAU * 8.0
+			var nv := Vector3(0.97 * sin(u), 0.97 * sin(v), 0.2).normalized()
+			img.set_pixel(x, y, Color(nv.x * 0.5 + 0.5, nv.y * 0.5 + 0.5, nv.z * 0.5 + 0.5))
+	return ImageTexture.create_from_image(img)

@@ -1164,6 +1164,67 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	return true;
 }
 
+// World-space wrapper around sampleDielectricMicrofacet that ALSO applies
+// Cycles' hemisphere-consistency rejection (bsdf_microfacet.h:864) and the
+// thin-walled straight-through override, IN THAT ORDER. Extracted (fix round
+// 2) so a debug vis mode can exercise the EXACT production ordering instead
+// of a re-inlined copy that could silently drift from it -- see
+// RT_DEBUG_GUARD_FIRING_RATE (raytracing_closest_hit_common_inc.glsl).
+//
+// Order is load-bearing (fix round 1, I1): geometry_normal is always flipped
+// toward V (compute_hit_data), so dot(-V, geometry_normal) < 0 and
+// dot(-V, N) < 0 are unconditionally true -- computing the hemisphere check
+// AFTER the thin-walled override replaces next_dir with -V makes both
+// comparisons vacuously equal to `isTransmit == true` every time, silently
+// disabling the guard in thin-walled mode, exactly where VNDF can produce a
+// wrong-side sample at high roughness. This function computes the check
+// against the RAW sampled direction first, then applies the override.
+//
+// Returns false only if sampleDielectricMicrofacet itself failed (e.g. TIR
+// with no reflective energy) -- r_next_dir/r_weight/r_is_transmit are
+// undefined in that case, matching the underlying function's contract.
+// r_wrong_hemisphere reports whether the hemisphere-consistency guard
+// rejected the RAW (pre-override) sample; the caller must treat that as
+// "this sample must be discarded" the same way the guard's callers always
+// have. Does NOT report false through the boolean return for a
+// wrong-hemisphere sample -- the caller decides how to treat r_wrong_hemisphere,
+// matching shade_and_bounce's own `transmissive_sample_ok = false` handling.
+bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float alpha, float alphaSquared,
+		float3 specularF0, float eta, float transmissivness, bool thin_walled, float3 u3,
+		OUT_PARAMETER(float3) r_next_dir, OUT_PARAMETER(float3) r_weight, OUT_PARAMETER(bool) r_is_transmit,
+		OUT_PARAMETER(bool) r_wrong_hemisphere) {
+	float4 qRotationToZ = getRotationToZAxis(N);
+	float3 Vlocal = rotatePoint(qRotationToZ, V);
+	float3 Llocal;
+	r_wrong_hemisphere = false;
+	// Writes DIRECTLY into this function's own out-parameters rather than
+	// through an intermediate local -- avoids a two-level out-parameter
+	// chain (sampleDielectricMicrofacet's out -> local -> this function's
+	// out -> caller's local), which is where an earlier version of this
+	// function produced a live regression on the transmissive path (fix
+	// round 2 self-review: the tree was 42/42 green before this extraction
+	// and failed only on the real transmission gate, nothing else).
+	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness, u3, Llocal, r_weight, r_is_transmit)) {
+		return false;
+	}
+
+	float3 next_dir = normalize(rotatePoint(invertRotation(qRotationToZ), Llocal));
+
+	bool wrongNg = (dot(next_dir, geometry_normal) < 0.0f) != r_is_transmit;
+	bool wrongN = (dot(next_dir, N) < 0.0f) != r_is_transmit;
+	r_wrong_hemisphere = wrongNg || wrongN;
+
+	if (r_is_transmit && thin_walled) {
+		// Thin-walled: glTF says thicknessFactor == 0 is an infinitesimally
+		// thin surface and no refraction bend applies. The ray continues
+		// straight and no medium is entered, so single-sided window panes
+		// and foliage cards work without any back-face hit.
+		next_dir = -V;
+	}
+	r_next_dir = next_dir;
+	return true;
+}
+
 // Evaluates microfacet specular BRDF
 float3 evalMicrofacet(const BrdfData data) {
 	float D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
@@ -1325,6 +1386,57 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 #endif
 }
 
+// combinedPdf's own lobe-selection probability (pSpec), extracted to its own
+// function (fix round 2) so a debug vis mode can call the EXACT code
+// combinedPdf uses instead of re-inlining a copy that could silently drift
+// from it. See samplerLobeProbability below for its sibling: the two are
+// INTENTIONALLY separate functions rather than one shared helper, computing
+// the identical formula from the identical inputs -- that is what makes a
+// future divergence between them representable and catchable at all, the
+// same failure mode Task 5/6's original combinedPdf desync was (pSpec here
+// measured 0.0476 against the sampler's 0.0909 on a representative
+// transmissive material before that fix). Fully unifying them into one
+// function would make such a divergence structurally impossible to
+// reintroduce, which sounds better until you need a regression test for
+// exactly that class of bug -- see fix round 2's pdf-parity detector
+// (RT_DEBUG_PDF_PARITY, raytracing_closest_hit_common_inc.glsl).
+float combinedPdfLobeProbability(MaterialProperties material) {
+	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
+	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
+	float specularLum = luminance(specularF0);
+	float diffuseLum = luminance(diffuseReflectance);
+
+	if (diffuseLum < 0.0001f) {
+		return 1.0f;
+	} else if (specularLum < 0.0001f) {
+		return 0.0f;
+	}
+	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
+}
+
+// The SAMPLER's own lobe-selection probability (brdfProbability) -- what
+// shade_and_bounce's BRDF-importance-sampling block (raytracing_closest_hit_
+// common_inc.glsl) actually uses to pick a lobe and scale throughput.
+// Deliberately a SEPARATE function from combinedPdfLobeProbability above, not
+// a shared call from both sites, even though the formula is currently
+// identical -- see that function's doc comment for why. shade_and_bounce
+// calls this one; combinedPdf calls the other. A future edit to either site
+// without the other is exactly the historical failure mode this pair exists
+// to make representable.
+float samplerLobeProbability(MaterialProperties material) {
+	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
+	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
+	float specularLum = luminance(specularF0);
+	float diffuseLum = luminance(diffuseReflectance);
+
+	if (diffuseLum < 0.0001f) {
+		return 1.0f;
+	} else if (specularLum < 0.0001f) {
+		return 0.0f;
+	}
+	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
+}
+
 // PDF that the combined diffuse+specular sampler in evalIndirectCombinedBRDF
 // would assign to an arbitrary direction L.
 //
@@ -1354,19 +1466,7 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// (albedo 0.8, metalness 0, transmission 0.5: sampler 0.0909, this
 	// function 0.0476) -- live on every transmissive surface, through
 	// mis_ray_pdf, env NEE and emissive NEE.
-	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
-	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
-	float specularLum = luminance(specularF0);
-	float diffuseLum = luminance(diffuseReflectance);
-
-	float pSpec;
-	if (diffuseLum < 0.0001f) {
-		pSpec = 1.0f;
-	} else if (specularLum < 0.0001f) {
-		pSpec = 0.0f;
-	} else {
-		pSpec = clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
-	}
+	float pSpec = combinedPdfLobeProbability(material);
 
 	// Diffuse lobe: cosine-weighted hemisphere.
 	float pdfDiffuse = diffusePdf(NdotL);

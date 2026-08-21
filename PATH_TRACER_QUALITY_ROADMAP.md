@@ -810,6 +810,31 @@ Remove `recoverBelowHemisphereSample` (`brdf_inc.glsl:998-1009`); its own commen
 **F2. Volumetrics** — *Gap #16*
 Homogeneous fog/god-rays via a volume integrator (`shade_volume.h`), with `max_volume_bounce` from B3.
 
+**F3. `Environment.BG_COLOR` silently produces a black world for the path
+tracer.** *(Found authoring Phase E1 Task 7's transmission gate;
+`pipeline_references/tests/pt_transmission_gate.gd`'s `_new_env` header
+comment has the full writeup.)* `env_sky_radiance()` / `env_sample()`
+(`raytracing_lights_inc.glsl` / the env-sampling headers) read
+`radiance_octmap`, which the sky pass only populates for `BG_SKY` with an
+actual `Sky` resource — `SkyRD::draw_sky`'s `BG_COLOR`/`BG_CLEAR_COLOR` branch
+feeds the RASTER fog-sky material instead, a completely different consumer.
+A scene authored with `background_mode = BG_COLOR` (the natural first choice
+for "I just want a flat colour background," and Godot's raster viewport
+renders it correctly) reads as **pure black** to every path-traced ray that
+misses geometry, with no warning and no fallback. This is NOT the narrower
+`pt_validation_scene.tscn` caveat noted above (§3, "MEASUREMENT CAVEAT") —
+that one is about one specific scene's Environment sky assignment; this is
+the general trap in the underlying mechanism, and it will bite the next
+person who writes ANY path-traced scene with a flat-colour background,
+Cornell-box-style test scenes very much included. Fix options: either make
+the sky pass populate `radiance_octmap` from a flat colour when
+`BG_COLOR`/`BG_CLEAR_COLOR` is set (matching what the raster path already
+visually does), or fail loudly (editor warning) when path tracing is enabled
+on an Environment whose background mode cannot contribute environment
+lighting. Workaround in the meantime: use `BG_SKY` with a
+`PanoramaSkyMaterial` over a flat-filled `Image` for any authored background
+colour (`_new_env`, above, does exactly this).
+
 ---
 
 ## 5. Validation harness
