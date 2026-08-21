@@ -213,6 +213,7 @@ Verified on a real interior render (256 vs 1024 samples, OIDN on/off, same scene
 
 **Workaround:** keep the Phase A final pass at `none` and buy cleanliness with samples instead.
 **Proper fixes, in order of preference:** (a) Phase E1 — once transmission is handled *inside* the path tracer there is no separate raster transparent pass to clobber, which is also how Cycles works; (b) make the OIDN pass write back into the accumulator and let the normal pipeline composite, rather than overwriting `internal_texture`; (c) feed OIDN the transparency-composited buffer plus correct AOVs.
+**Status update (E1, 2026-08-21): retires *conditionally*, not unconditionally — see the Phase E1 closeout in §6 for the corrected claim.** The defect above is specifically the raster transparent pass clobbering the accumulator, and it fires for materials using `transparency = ALPHA`. E1 makes `transmission > 0` work *inside* the tracer — the fix option (a) above — but it does not migrate any existing content, and Forward+/raster was deliberately left untouched (E1 spec §2). A scene authored against this defect with `transparency = ALPHA` still hits it unchanged; only content that adopts `transmission > 0` sidesteps the raster pass entirely and stops needing the `final=none` workaround. Fix options (b) and (c) remain open for whoever needs the raster path fixed directly.
 
 **Known deferrals:** adaptive-sampling mask dilation is not implemented (Cycles `adaptive_sampling.h:95-138`) — if check 6 shows seams, add it rather than lowering the threshold. `MIN_ADAPTIVE_SAMPLES = 16` may be low for a white-noise sampler; consider 32 pending check 6's result. Both become moot-ish once Phase B5 replaces the sampler.
 
@@ -789,9 +790,9 @@ Add transmission, IOR, clearcoat (+roughness), sheen (+tint), anisotropy (+rotat
 
 ### Phase E — BSDF completeness *(~3 weeks, parallelizable after D)*
 
-**E1. Transmission / rough glass** — *Gap #13*
+**E1. Transmission / rough glass** — *Gap #13* — **COMPLETE**
 GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_hit_common:474`). Handle front/back faces, IOR sides, total internal reflection. Wire `max_transmission_bounce` from B3.
-*Accept:* a glass vase refracts correctly; rough glass blurs plausibly; retire the "glass vanishing" workaround.
+*Accept:* a glass vase refracts correctly; rough glass blurs plausibly; retire the "glass vanishing" workaround **for content that adopts transmission** (see the corrected OIDN claim above and the full closeout in §6).
 
 **E2. Anisotropy, clearcoat, sheen**
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
@@ -1052,3 +1053,358 @@ alongside the thirteen user-facing parameters).
 **The next item is Phase E** (BSDF completeness), which is unblocked now that
 Phase D's material data demonstrably survives import, export, and the GPU
 upload path.
+
+---
+
+## 7. Phase E1 closeout — transmission and rough glass
+
+**Phase E1 is complete.** The dielectric microfacet closure (reflection and
+transmission as one closure, real Fresnel, TIR, thin-walled and volumetric
+paths, Beer-Lambert absorption) lands on `vijay_PTEngine_v12_PhaseE`, 22
+commits over `986ebc2ee1..83161b784f`. The `transmissivness = 0.0` hardcode
+(`raytracing_closest_hit_common_inc.glsl:617`) is removed. As with Phases B–D,
+this closeout measures rather than asserts; three divergences from Cycles were
+already known and expected going in (§6.1, §6.3, §6.4 of the design spec),
+and this phase's own review process found and fixed four Critical/Important
+defects the standing test suite could not see at all (task-7-report.md) —
+**that pattern, not a clean bill of health, is the headline finding worth
+carrying forward.**
+
+**Suite and gates, measured at `83161b784f`:**
+
+| Check | Result |
+|---|---|
+| doctest | 1511 test cases, 1511 passed, 0 failed, 3 skipped; 2,066,447 assertions, 0 failed |
+| `pt_transmission_gate` | **PASS**, all 46 checks across 10 probes (§7.2 of the design spec) |
+| `pt_material_data_gate` | PASS, all 25 material fields |
+| `pt_energy_gate` | PASS |
+| `pt_light_gate` | PASS |
+| `pt_emissive_gate` | PASS |
+| `pt_validation_scene` mean_luma | 1.19322 / 1.19320 / 1.19321 (2e-5 band; ~1e-5 measured run-to-run noise floor) — **no pixel change** on opaque content |
+
+### 7.1 Cycles reference comparison
+
+Harness: `pipeline_references/tests/pt_transmission_reference.gd` /
+`_scene.tscn`. A grey ground plane, a **white** glass slab (`transmission 1.0,
+ior 1.5, roughness 0`) and a **deliberately tinted** glass vase
+(`specular_tint (0.75, 0.55, 1.0)`, `attenuation_color (0.15, 0.85, 0.35)`,
+`roughness 0.06` — non-white on both axes spec §7.3 requires), lit by one
+shared procedurally-baked equirect HDRI (256×128, a dim gradient dome plus a
+small bright warm patch) consumed identically by both renderers — not two
+independently-authored approximations of "the same sky." Rendered here to a
+linear EXR via `Image.save_exr()` (Phase A2 path) at 320×320, 1024 accumulated
+frames; rendered in Blender 4.5.3 LTS/Cycles headless
+(`blender.exe -b --python`) at 320×320, 1024 samples, `view_transform =
+Standard`, `exposure/gamma` neutral, denoising off (this is a converged-mean
+comparison, not a production-noise comparison), caustics off. Geometry and
+camera are matched by explicit numeric transform under the mapping
+`blender(x,y,z) = godot(x,-z,y)` — the same convention Blender's own glTF
+importer applies — documented inline in `pt_transmission_reference.gd`'s
+comments. Comparison (per-channel MSE, a box-filter SSIM on a Reinhard-
+tonemapped copy of both images) runs in Blender's bundled Python/numpy,
+because neither a plain Python install on this machine nor this engine has an
+EXR reader with array access (checked: no `OpenEXR`/`imageio`/`skimage`/
+`scipy` module available). The driver scripts (`gen_panorama.py`,
+`render_cycles_ref.py`, `compare_exr.py`) are kept outside the repo per the
+brief's file list and are reproduced in `task-8-report.md`.
+
+**A pre-existing, glass-unrelated divergence was found and isolated before
+trusting the raw numbers.** The first full comparison read ours ≈ 20–23%
+dimmer than Cycles **uniformly across every region of the image, including
+the ground plane far from either glass object.** A no-glass control render
+(ground + sky only, both renderers, otherwise identical) confirmed the gap
+persists with zero transmissive geometry in the scene:
+
+| | ours | Cycles | ratio |
+|---|---|---|---|
+| R | 0.181181 | 0.234934 | 0.7712 |
+| G | 0.182560 | 0.236366 | 0.7724 |
+| B | 0.192737 | 0.248631 | 0.7752 |
+
+This is **not an E1/transmission defect** — it reproduces on a scene with no
+glass at all, and is therefore a pre-existing gap in this engine's
+environment-lit diffuse response relative to Cycles, orthogonal to everything
+this phase touched. It does not fit any of the design spec's three named
+expected divergences (§6.1 no-NEE-through-glass noise, §6.3 single-scatter
+dimming, §6.4 the Fresnel-formulation mismatch), so per the brief's own rule —
+"a divergence fitting none of those is a defect" — **it is recorded here as a
+new, standalone open item** (§7.4 below), not folded into E1's own account.
+Root cause was not chased (out of scope for a measurement task); candidates
+include environment-map filtering/resolution loss of the HDRI's small bright
+patch during octmap conversion, and pre-existing environment-NEE energy gaps
+already catalogued elsewhere in this document. Both the raw and a
+calibration-divided comparison are reported below so this gap does not swamp
+the glass-specific signal E1 actually needs judged.
+
+**Raw comparison** (uncorrected):
+
+| Channel | MSE | SSIM (Reinhard-tonemapped) | mean ours | mean Cycles |
+|---|---|---|---|---|
+| R | 0.00437485 | 0.891681 | 0.171349 | 0.216344 |
+| G | 0.00481927 | 0.877777 | 0.176044 | 0.220835 |
+| B | 0.00480192 | 0.890914 | 0.182751 | 0.229962 |
+| avg | MSE 0.00466535, RMSE 0.06830 | | | |
+
+| Region | RMSE | mean ours | mean Cycles |
+|---|---|---|---|
+| left third (slab) | 0.06491 | 0.184060 | 0.228229 |
+| right third (vase) | 0.06793 | 0.164820 | 0.204930 |
+| middle third (floor/sky) | 0.07186 | 0.181334 | 0.234035 |
+
+**Calibrated comparison** (ours divided by the per-channel no-glass control
+ratio above, isolating glass-specific divergence from the pre-existing
+environment gap):
+
+| Channel | MSE | SSIM | mean ours (cal.) | mean Cycles |
+|---|---|---|---|---|
+| R | 0.00510231 | 0.925809 | 0.222185 | 0.216344 |
+| G | 0.00567817 | 0.910673 | 0.227930 | 0.220835 |
+| B | 0.00566272 | 0.924671 | 0.235750 | 0.229962 |
+| avg | MSE 0.00548107, RMSE 0.07403 | | | |
+
+| Region | RMSE (cal.) | mean ours (cal.) | mean Cycles |
+|---|---|---|---|
+| left third (slab) | 0.07204 | 0.238123 | 0.228229 |
+| right third (vase) | 0.07511 | 0.213234 | 0.204930 |
+| middle third (floor/sky) | 0.07489 | 0.234596 | 0.234035 |
+
+**Attribution.** After calibration the floor/sky region's mean matches Cycles
+to within 0.3% (0.2346 vs 0.2340) — confirming the calibration correctly
+isolates the pre-existing gap — while its RMSE (0.0749) stays comparable to
+the slab and vase regions', showing the *residual* RMSE across the whole image
+is dominated by ordinary Monte Carlo noise at this sample count (1024, chosen
+to keep this measurement inside the task's time budget — noticeably fewer
+than the "high sample count" a longer-running acceptance pass would use), not
+a directional bias. The slab and vase regions run 4.0–4.2% brighter than
+Cycles after calibration — small, in the direction opposite the expected
+single-scatter dimming (§6.3, which predicts *darker*, not brighter, at
+nonzero roughness), and not confidently separable from the noise floor
+established by the floor/sky control at this sample count. **No divergence
+here is large enough, or in the right direction, to confidently attribute to
+any single one of §6.1/§6.3/§6.4 individually** — a longer, dedicated
+convergence run (thousands of samples, per-source ablation) would be needed to
+split them apart quantitatively, which is out of scope for this measurement
+pass. What this comparison *does* establish: geometry, camera and material
+transform all matched correctly (the calibrated floor/sky control agreeing to
+0.3% is the proof), the tinted vase renders recognizably glass-like and in the
+right brightness neighborhood as Cycles, and no defect was found that isn't
+already named in the design spec's accepted-consequences list or the new
+environment-lighting item below.
+
+### 7.2 Frame-time delta, `RT_FLAG_TRANSMISSION_ENABLED` on vs off
+
+Measured on `pt_light_rmse_scene.tscn` (§7.3's mixed-light interior scene,
+timing pass only, `ZR_LIGHT_SKIP_SWEEP=1`), 256×256, 512 accumulated frames,
+vsync off, 3 passes per build taking the best — an **entirely opaque**
+scene (every light-selection scene in this repo is opaque; no material in it
+carries `transmission > 0`), so any difference measures pure register-pressure
+/ code-size cost, not glass shading cost.
+
+Build A (HEAD, `transmission_enabled` default true, flag live):
+`compute_rt_flags` unmodified. Build B: the `GLOBAL_GET` read at
+`scene_shader_raytracing.cpp:690` guarded with `false &&` so the flag can
+never be set, forcing every RT pipeline to compile with the transmission
+branch permanently spec-constant-folded false — then reverted afterward
+(`git checkout` + rebuild back to HEAD; `git status --short` confirmed clean
+of any source diff beyond the user's own six `pipeline_references` files,
+both immediately after the revert and at the end of this task).
+
+| Build | Run 1 | Run 2 | Run 3 | Run 4 |
+|---|---|---|---|---|
+| ON (HEAD) | 1.2031 | 1.0629 | 1.0976 | 1.0866 |
+| OFF (forced) | 1.1617 | 1.0931 | 1.0753 | — |
+
+ms/frame, BEST-of-3-internal-passes per run. Mean ON = 1.11255 ms/frame
+(σ ≈ 0.0538, ~4.8% of mean). Mean OFF = 1.11003 ms/frame (σ ≈ 0.0373, ~3.4% of
+mean). **Delta = +0.0025 ms/frame (+0.23%), smaller than either build's own
+run-to-run standard deviation.** Reported as measured, not rounded up to a
+claim of significance: at this scene size and resolution, the register-
+pressure cost of leaving the transmission closure compiled in (but disabled
+via specialization constant) is **not distinguishable from run-to-run driver/
+thermal noise** — a real number, and the honest number, even though it is not
+the precise percentage the brief's phrasing might suggest one would find. A
+larger or more RT-hardware-bound scene could still show a resolvable delta;
+this measurement bounds it at "at most a few tenths of a percent on this
+scene," not "zero."
+
+### 7.3 Blender cross-check: F0 arbitration
+
+Headless: a `StandardMaterial3D` with `ior = 1.33` (non-default), `specular_factor
+= 0.6` (non-default; default 1.0), `specular_tint = (0.8, 0.9, 1.0)` (non-white,
+sRGB-authored), and Godot's native `metallic_specular` **left at its 0.5
+default** (see the Task 7 trap note below), exported via
+`GLTFDocument.append_from_scene` + `write_to_filesystem`, imported into Blender
+4.5 headless (`bpy.ops.import_scene.gltf`), read back from the Principled
+BSDF, and run through Cycles' own arbitration
+(`kernel/svm/closure.h:426-431`, transcribed in the driver script) to compute
+`F0`/`eta`. Cross-checked a second way, independent of the Blender round trip:
+this engine's own `resolveDielectricF0` (`brdf_inc.glsl:443-448`) read back
+live via debug vis modes 30/31 on a `StandardMaterial3D` carrying the exact
+same four values.
+
+| Parameter | Godot source | glTF JSON | Blender import | Cycles/ours F0 | Verdict |
+|---|---|---|---|---|---|
+| `ior` | 1.330000 | `ior: 1.33` | IOR 1.330000 | eta re-derives to 1.246451 (Cycles only — see below) | round-trips exactly |
+| `specular_factor` | 0.600000 | `specularFactor: 0.6` | Specular IOR Level 0.300000 | matches spec's documented `0.5 × specularFactor` mapping exactly | round-trips exactly |
+| `specular_tint` | (0.8, 0.9, 1.0) sRGB | `specularColorFactor` (linear) | Specular Tint (0.603827, 0.787412, 1.0) | — | round-trips exactly (sRGB↔linear both ways) |
+| resolved F0 | — | — | Cycles: (0.007267, 0.009477, 0.012036) | Ours (vis mode 30, GPU-read): **(0.007267, 0.009477, 0.012036)** | **exact match, all 6 decimals, both derivations** |
+| resolved eta | — | — | Cycles: **1.246451** (re-derived, `specular_ior_level 0.3 ≠ 0.5`) | Ours (vis mode 31, GPU-read): **1.330000** (unchanged — `ior`) | **diverges from Cycles, by design (see below)** |
+
+**F0 matches Cycles exactly** — both by hand-computing `resolveDielectricF0`'s
+formula and by reading it straight off the GPU via vis mode 30, confirming
+Phase E1's F0 arbitration (design spec §3.2) is correctly implemented and
+correctly round-trips through a real glTF export/Blender-import cycle, not
+just against this repo's own fixtures.
+
+**`eta` does not match Cycles here — deliberately, and already known.**
+`resolveDielectricF0`'s eta re-derivation is gated on Godot's *native*
+`specular` parameter only (`brdf_inc.glsl:447`:
+`eta = (specular != 0.5f) ? ior_from_F0(luminance(F0)) : ior;`), not on
+`specular_factor`/`specular_tint`. This fixture varies only `specular_factor`
+(the glTF-round-trippable knob) and leaves `metallic_specular` at its 0.5
+no-op point, so `eta` stays pinned to the raw `ior` — matching the design
+spec's formula verbatim (§3.2) and independently asserted by the existing
+gate's probe 2 (`pt_transmission_gate.gd:489-493`: *"eta must stay at the
+untouched ior... the re-derivation... only fires when specular != 0.5, and
+specular was not touched by this fixture"*). Cycles has no such split: its
+single `specular_ior_level` knob absorbs what our engine keeps as two
+separate parameters (`specular_factor` from glTF, `specular` native), and
+re-derives eta whenever *that* knob leaves 0.5 — which the glTF round trip
+does, at `specular_ior_level = 0.3`. **Consequence, stated plainly: for any
+glTF-imported glass material with a non-default `specularFactor` (the normal
+case for Blender-authored content, since Phase D's own worked example used
+exactly this), our F0 matches Cycles' at normal incidence but our TIR/
+refraction angle (which depends on `eta`, not `F0`) will not, because Cycles
+re-derives its IOR from the tinted F0 and we do not.** This is not a defect
+Task 8 introduced or newly discovered — it is the literal, intended behavior
+of the shipped formula, confirmed correct against its own spec and its own
+gate — but it had not previously been cross-checked against a *real* Blender
+round trip, only against this repo's hand-written fixtures, and it is
+recorded here explicitly because "F0 matches" is easy to over-read as "the
+whole arbitration matches."
+
+**Trap avoided (found in Task 7, reused here):** `StandardMaterial3D.specular`
+is not a real property — the GDScript-visible name is `metallic_specular`
+(`scene/resources/material.cpp:3768`); writing `.specular` silently no-ops via
+Godot's legacy 3.x-remap `_set()` path.
+
+### 7.4 Open items carried to E2
+
+**From the design spec (§9), verbatim intent, restated with this phase's
+measurements attached where relevant:**
+
+- **NEE and the BSDF strategy use different Fresnel formulations on
+  transmissive surfaces** (spec §6.4). NEE evaluates Schlick with no
+  `pdf_reflect` factor; the BSDF strategy realises the remapped real Fresnel
+  scaled by `1/pdf_reflect`; `combinedPdf`'s density matches the closure, not
+  NEE. Same structural class as B2's open +2.4% converged-mean defect. **The
+  highest-value correctness item E2 inherits.** §7.1's Cycles comparison could
+  not cleanly separate this contribution's magnitude from §6.1/§6.3 and the
+  newly-found environment-lighting gap (§7.1's attribution paragraph) — a
+  longer, source-ablated convergence run is needed to give this a number on
+  its own, and is left for whoever picks this up next.
+- **Opaque and transmissive materials use different Fresnel formulations at
+  all** (spec §4.2's dispatch on `transmission > 0`) — deliberate, bought to
+  protect existing renders from a reflectance change at every specular
+  surface. Unifying it and re-baselining is E2's call, not a bug to fix
+  reactively.
+- The transmissive lobe is single-scatter (§6.3: `evalMultiScatterApproximation`
+  is reflection-only) — slightly dark at high roughness, same limitation
+  Cycles has.
+- NEE through refractive lobes is unimplemented (§6.1) — rough glass is
+  noisier than Cycles at equal sample count; this is a convergence-rate gap
+  measured by §7.1, not a bias.
+- Nested/overlapping media are unsupported (§5.4) — the absorption mechanism
+  reads the exit hit's own material and `gl_HitTEXT` as path length, which is
+  exact for one closed mesh and wrong for interpenetrating transmissive
+  volumes.
+- Shadow rays are still blocked by glass, so there are no caustics (§6.2) —
+  matches Cycles without its caustics path.
+- **`resolveDielectricF0`'s `eta` re-derivation is gated on Godot's native
+  `specular` only, not `specular_factor`/`specular_tint`** (§7.3 above) — by
+  design, but worth E2 revisiting given how common a non-default
+  `specularFactor` is in real glTF-imported content. Whether to also
+  re-derive `eta` from `specular_factor` deviating from 1.0 (closer to
+  Cycles' single-knob model) or to leave the two-knob split as-is is a design
+  decision, not a bug fix.
+
+**Two defect classes are undetectable by any rendered image, which is why the
+gate carries dedicated vis-mode detectors (32 and 33) instead of relying on a
+rendered mean:**
+
+- A `combinedPdf` lobe-probability desync (Task 5/6's defect a) is
+  **mean-preserving by construction** — MIS is unbiased for any set of
+  weights summing to 1 pointwise, and `combinedPdf` appears only inside such
+  weights (never as an estimator divisor). No rendered mean, at any sample
+  count or scene, can ever detect it; vis mode 32 reads `combinedPdf`'s and
+  the sampler's own lobe probabilities side by side, calling the same
+  production functions on both sides.
+- The hemisphere-guard-ordering defect (Task 5/6's defect c) is
+  **deterministically suppressed** rather than noise-buried: the transmit
+  branch clamps `NdotL` to `-1e-5` (`brdf_inc.glsl:1136`) and
+  `Smith_G2_Over_G1_Height_Correlated` goes to ~0 as `NdotL → 0`, so every
+  sample the guard would reject already carries weight ~1e-5 regardless of
+  whether the guard fires. Vis mode 33 accumulates the raw rejection rate
+  before any weight is applied, sidestepping that clamp entirely.
+
+**Vis mode 33's detector only exercises `eta > 1` (entering a medium), the
+half of the guard that is provably unreachable by theorem** (`sampleGGXVNDF`
+returns `H.z ≥ 0`, and for `eta > 1` that forces `L.z < 0` strictly — `wrongN`
+cannot fire). Its whole nonzero signal in the gate comes from `wrongNg`
+firing off normal-map divergence, not from the branch it was named for. **The
+guard *is* live code for `eta < 1`** — exiting a dense medium, production's
+back-face case (`raytracing_closest_hit_common_inc.glsl:854`) — where it was
+shown to fire on ordinary flat geometry at roughness ≳ 0.5. Do not read
+detector 2's narrow coverage as evidence the guard is dead code; it is dead
+only on the half detector 2 happens to reach.
+
+**An unexplained shader regression, found only by this phase's own gate.**
+Mid-phase, an uncommitted production refactor (extracting
+`combinedPdfLobeProbability`/`samplerLobeProbability` as shared helpers)
+broke the transmissive path — doctest (1511/1511), all four opaque gates, and
+the validation mean all passed through it clean; only `pt_transmission_gate`
+caught it (probe 6 read 5.042604 against a 4.2 high bound, a correct-code
+reference of 4.069). The implementer's working theory (chained GLSL
+out-parameters mis-compiling) was **disproved by the shipped fix itself**,
+which still contains a structurally identical two-level out-parameter chain
+and works correctly — and the pattern the fix adopted (`evalIndirectCombinedBRDF`
+passing its own out-parameter straight into `sampleSpecular`) has shipped
+correctly for phases. A plain authoring error in `isTransmit` propagation is
+at least as likely a cause. The broken version was never committed, so the
+hypothesis is now untestable. **Recorded as unexplained; no cause is
+asserted.** The finding that matters is structural, not the root cause: four
+previously-clean checks (suite, three opaque gates, validation mean) all
+passed through a real, live break in the transmissive path, and only the
+gate purpose-built for this phase caught it.
+
+**New, standalone (not E1-specific) open item found while building this
+task's own measurement harness:** this engine's environment-lit diffuse
+response reads **~23% dimmer than Cycles under a matched HDRI**, reproduced
+on a scene with zero glass objects (§7.1's no-glass control). Root cause not
+chased — candidates include HDRI resolution/filtering loss during
+octahedral-map conversion (a small bright source averaged away by a coarse
+box filter would dim GI system-wide, matching the *uniform* nature of the
+observed gap) and pre-existing environment-NEE energy behavior already
+catalogued elsewhere in this document. Whoever picks this up should start
+from the calibration numbers in §7.1 and the `gen_panorama.py` /
+`render_cycles_ref.py` scripts referenced there (kept in `task-8-report.md`,
+not the repo) as a ready-made repro.
+
+**Parked backlog item, still open, untouched by this phase:** glTF **export**
+still writes `sheenColorFactor`, `specularColorFactor`, `attenuationColor`
+unclamped (Phase D open item, restated in the E1 spec §2). E1 clamped
+`attenuation_color` at the *RT upload* site only (spec §5.2), closing the
+rendering-side energy-creation risk; the export-side spec-invalidity risk is
+unchanged.
+
+**Phase D residuals, still open:** `anisotropy` is signed in Godot with the
+sign encoding a 90° rotation that glTF export drops with a warning
+(unresolved from Phase D); the custom-hit-group `debug_visualize` path
+remains compile-verified only, never executed by any scene in this repo.
+
+**Lobe selection is still two-way** (diffuse vs. dielectric-microfacet, spec
+§3.5) — E2 owns the N-way rewrite for anisotropy/clearcoat/sheen.
+
+**The next item is Phase E2** (anisotropy, clearcoat, sheen), which inherits
+the Fresnel-formulation-mismatch item above as its highest-value correctness
+target alongside its own scope.
