@@ -418,33 +418,78 @@ float3 refract_angle(float3 incident, float3 normal, float cos_theta_t, float in
 	return (inv_eta * dot(normal, incident) + cos_theta_t) * normal - inv_eta * incident;
 }
 
-// F0 / IOR arbitration (roadmap E1, spec section 3.2). Phase D left F0
-// double-specified between Godot's `specular` and the glTF ior /
-// specular_factor / specular_tint triple; this resolves it.
+// F0 / IOR arbitration (roadmap E1, spec section 3.2; corrected in the E1
+// final fix wave -- F1/F2/F3 below). Phase D left F0 double-specified
+// between Godot's `specular` and the glTF ior / specular_factor /
+// specular_tint triple; this resolves it.
 //
-// Structure is Cycles' (kernel/svm/closure.h:426-431): IOR is the source of
-// truth, the artist-facing specular knob is a multiplier that no-ops at its
-// 0.5 default, and eta is re-derived from the modified F0 when it is not 0.5
-// so reflectance and refraction cannot disagree.
+// Structure is Cycles' (kernel/svm/closure.h:425-435), verified against that
+// source directly rather than against the design spec's transcription of it,
+// which dropped one statement and conflated two others:
+//
+//   F1. Cycles' block ends with `if (ior < 1.0f) eta = 1.0f / eta;` after
+//       re-deriving eta from F0 (closure.h:432-434). ior_from_F0 always
+//       returns >= 1, so for ior < 1 (authorable: material.cpp's ior hint is
+//       "0,3,0.001,or_greater") the un-flipped eta lands on the wrong side
+//       of 1. Restored below.
+//   F2. Cycles keeps f0/eta derivation and the specular_tint completely
+//       separate: `eta = ior_from_F0(f0)` uses the UNTINTED scalar `f0`
+//       (closure.h:429-431), and `specular_tint` is multiplied in only
+//       afterward, at closure.h:453 (`fresnel->f0 = f0 * specular_tint`),
+//       where it can no longer affect eta. eta is therefore derived below
+//       from the untinted scalar `f0_untinted`, never from luminance() of a
+//       tinted F0.
+//   F3. Cycles re-derives whenever its single `specular_ior_level` knob
+//       leaves 0.5. Our engine splits that one knob into two independent
+//       parameters -- Godot's native `specular` and glTF's
+//       `specular_factor` -- and per spec section 3.2 (also recorded in
+//       PATH_TRACER_QUALITY_ROADMAP.md's Phase E1 closeout, `specular_factor
+//       -> specular_ior_level = 0.5 * specular_factor`), a non-default
+//       `specular_factor` maps to a non-0.5 `specular_ior_level` exactly as
+//       much as a non-default `specular` does. The gate below therefore
+//       triggers on EITHER parameter leaving its default, not `specular`
+//       alone -- otherwise glTF glass that varies only `specular_factor`
+//       (the common case for Blender-authored/imported content) gets a
+//       correct F0 and a silently un-re-derived eta, shifting its TIR/
+//       refraction angle away from Cycles'. Measured magnitude at ior 1.33,
+//       specular_factor 0.6 (specular left at its 0.5 default): Cycles/
+//       corrected eta 1.246451 vs the previous 1.33 -- critical angle 53.4°
+//       vs 48.8°, a 4.6° shift.
 //
 // The RESPONSE CURVE is Godot's, not Blender's: 4*specular^2 is
 // specular_to_f0 (0.16*s^2) normalised against the 0.04 reference, so it is
 // EXACTLY 1.0 at 0.5 and preserves Godot's shape away from it. Blender uses
 // 2*level; the two agree only at 0.5 (0.08 vs 0.16 at specular = 1.0).
+// specular_factor multiplies f0 directly, matching Cycles' `f0 *= 2.0f *
+// specular_ior_level` under the `specular_ior_level = 0.5 * specular_factor`
+// mapping (2 * 0.5 * specular_factor == specular_factor).
 //
 // At every default -- ior 1.5, specular 0.5, specular_factor 1.0, white tint
 // -- this yields exactly float3(0.04) and eta 1.5, identical to the
-// specular_to_f0(0.5) it replaces. That is arithmetic, not a measurement, and
-// it is why untouched materials cannot shift.
+// specular_to_f0(0.5) it replaces: with both knobs at default the gate below
+// is false, f0_untinted == f0_scalar == F0_from_ior(1.5) == 0.04, and F0 ==
+// 0.04 * float3(1,1,1) == float3(0.04). That is arithmetic, not a
+// measurement, and it is why untouched materials cannot shift.
 //
 // SINGLE SOURCE OF TRUTH. shade_and_bounce and debug_visualize's vis modes 30
 // and 31 both call this. Do not inline a second copy -- a gate that validates
 // a divergent copy of the formula proves nothing about the renderer.
 void resolveDielectricF0(float ior, float specular, float specular_factor, float3 specular_tint, OUT_PARAMETER(float3) F0, OUT_PARAMETER(float) eta) {
 	float f0_scalar = F0_from_ior(ior);
-	F0 = float3(f0_scalar, f0_scalar, f0_scalar) * specular_tint * specular_factor;
-	F0 *= 4.0f * specular * specular;
-	eta = (specular != 0.5f) ? ior_from_F0(luminance(F0)) : ior;
+	// UNTINTED scalar F0 (F2): specular_tint is applied only below, to F0,
+	// and must never reach eta.
+	float f0_untinted = f0_scalar * specular_factor;
+	f0_untinted *= 4.0f * specular * specular;
+
+	eta = ior;
+	if (specular != 0.5f || specular_factor != 1.0f) { // F3: gate widened to specular_factor.
+		eta = ior_from_F0(f0_untinted);
+		if (ior < 1.0f) { // F1: restored ior<1 flip (closure.h:432-434).
+			eta = 1.0f / eta;
+		}
+	}
+
+	F0 = float3(f0_untinted, f0_untinted, f0_untinted) * specular_tint;
 }
 
 float3 baseColorToSpecularF0(float3 baseColor, float metalness, float3 dielectricF0) {

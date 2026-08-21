@@ -486,11 +486,27 @@ func _probe2_tinted_f0() -> void:
 	var expected_f0 := Vector3(tint_linear.r, tint_linear.g, tint_linear.b) * 0.04 * P2_SPECULAR_FACTOR
 	await _check_vis_mode(s["env"], MODE_RESOLVED_F0, "probe2 tinted F0", expected_f0)
 
-	# eta must stay at the untouched ior (1.5): the re-derivation in
-	# resolveDielectricF0 only fires when specular != 0.5, and specular was
-	# not touched by this fixture.
-	await _check_vis_mode(s["env"], MODE_RESOLVED_ETA, "probe2 eta unchanged",
-			Vector3(1.5, 1.5, 1.5))
+	# CHANGED by the E1 final fix wave (F3): resolveDielectricF0's re-derivation
+	# gate used to check `specular != 0.5` only, so this probe (specular left at
+	# its 0.5 default, only specular_factor touched) previously asserted eta
+	# stayed pinned at the untouched ior (1.5). That was wrong against the
+	# Cycles source it claims to port (kernel/svm/closure.h:425-435): Blender
+	# maps specularFactor -> specular_ior_level = 0.5 * specular_factor (spec
+	# section 3.2), so specular_factor != 1.0 already means
+	# specular_ior_level != 0.5, and Cycles DOES re-derive eta in that case.
+	# The gate now triggers on `specular != 0.5 || specular_factor != 1.0`.
+	#
+	# Also fixed in the same wave (F2): eta must be re-derived from the
+	# UNTINTED scalar F0, never from luminance() of the tinted vector -- so
+	# specular_tint (P2_TINT_SRGB, non-white) here must NOT move eta.
+	# By hand: f0_untinted = F0_from_ior(1.5) * specular_factor * (4*0.5^2)
+	#        = 0.04 * 0.62 * 1.0 = 0.0248
+	#          eta = ior_from_F0(0.0248) = (1+sqrt(0.0248))/(1-sqrt(0.0248))
+	#              = 1.157480 / 0.842520 = 1.373831
+	# (ior 1.5 >= 1, so F1's ior<1 flip does not apply here.)
+	const EXPECTED_ETA_P2 := 1.373831
+	await _check_vis_mode(s["env"], MODE_RESOLVED_ETA, "probe2 eta re-derives from specular_factor (F3)",
+			Vector3(EXPECTED_ETA_P2, EXPECTED_ETA_P2, EXPECTED_ETA_P2))
 
 
 ## All six call sites here have three legitimately distinct (or at least

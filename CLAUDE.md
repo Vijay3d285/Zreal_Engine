@@ -57,10 +57,23 @@ The unit-test suite is **doctest** (`thirdparty/doctest`, wrapped by `tests/test
 
 ```powershell
 scons platform=windows tests=yes target=editor
-bin\godot.windows.editor.x86_64.exe --test                         # all tests
-bin\godot.windows.editor.x86_64.exe --test "ies_parser*"           # doctest filter (substring/wildcard)
-bin\godot.windows.editor.x86_64.exe --test gdscript-parser          # run a named registered command
-bin\godot.windows.editor.x86_64.exe --test --no-skip                # include TEST_CASE_PENDING
+bin\godot.windows.editor.x86_64.exe --test                                 # all tests
+bin\godot.windows.editor.x86_64.exe --test --test-case="*ies_parser*"      # doctest filter (wildcard, name-substring match)
+bin\godot.windows.editor.x86_64.exe --test gdscript-parser                  # run a named registered command
+bin\godot.windows.editor.x86_64.exe --test --no-skip                        # include TEST_CASE_PENDING
+```
+
+**A bare positional after `--test` (e.g. `--test "ies_parser*"`) is silently ignored and runs
+the whole suite, not a filtered subset.** `tests/test_main.cpp` strips only the literal
+`--test` token and forwards everything else to `doctest::Context::applyCommandLine`, which
+(per `thirdparty/doctest/doctest.h`'s `parseOptionImpl`) only recognizes filter arguments
+prefixed with `-`/`--`, such as `-tc=<filters>` / `--test-case=<filters>`. A bare word never
+matches that parsing and is dropped with no error, no warning, and no indication the filter
+did not apply -- confirmed by reading the source and by an invocation whose tail output still
+reported the full 1497-test-case suite. Use `--test-case=` (or `-tc=`) explicitly:
+
+```powershell
+bin\godot.windows.editor.x86_64.exe --test --test-case="*ies_parser*"
 ```
 
 There is no separate lint/test runner script; conventions follow upstream Godot.

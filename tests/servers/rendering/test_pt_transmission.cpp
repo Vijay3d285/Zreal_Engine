@@ -166,23 +166,59 @@ TEST_CASE("[PathTracer][Transmission] Refraction at normal incidence does not be
 }
 
 // CPU mirror of the F0 arbitration in
-// raytracing_closest_hit_common_inc.glsl (roadmap E1, spec section 3.2).
-// Structure ported from Cycles kernel/svm/closure.h:426-431, with Godot's
-// 0.16*specular^2 response curve substituted for Blender's 2*level.
+// raytracing_closest_hit_common_inc.glsl (roadmap E1, spec section 3.2;
+// corrected in the E1 final fix wave -- F1/F2/F3 below).
+// Structure ported from Cycles kernel/svm/closure.h:425-435, verified against
+// that source directly rather than against the design spec's transcription
+// of it, which dropped one statement and conflated two others:
+//
+//   F1. Cycles' block ends with `if (ior < 1.0f) eta = 1.0f / eta;` after
+//       re-deriving eta from F0 (closure.h:432-434). ior_from_f0 always
+//       returns >= 1, so for ior < 1 (authorable: material.cpp's ior hint is
+//       "0,3,0.001,or_greater") the un-flipped eta lands on the wrong side
+//       of 1. Restored below.
+//   F2. Cycles keeps f0/eta derivation and the specular_tint completely
+//       separate: `eta = ior_from_F0(f0)` uses the UNTINTED scalar `f0`
+//       (closure.h:429-431); `specular_tint` is multiplied in only
+//       afterward, at closure.h:453, where it can no longer affect eta. eta
+//       is therefore derived below from the untinted scalar f0_untinted,
+//       never from luminance() of a tinted F0.
+//   F3. Cycles re-derives whenever its single `specular_ior_level` knob
+//       leaves 0.5. This engine splits that into two independent
+//       parameters -- Godot's native `specular` and glTF's
+//       `specular_factor` -- and per spec section 3.2
+//       (`specular_factor -> specular_ior_level = 0.5 * specular_factor`), a
+//       non-default `specular_factor` maps to a non-0.5 `specular_ior_level`
+//       exactly as much as a non-default `specular` does. The gate below
+//       therefore triggers on EITHER parameter leaving its default.
+//
+// Godot's 0.16*specular^2 response curve is substituted for Blender's
+// 2*level (see brdf_inc.glsl's resolveDielectricF0 for the full derivation);
+// specular_factor multiplies f0 directly, matching Cycles' `f0 *= 2.0f *
+// specular_ior_level` under that mapping.
 static void resolve_f0(float p_ior, float p_specular, float p_specular_factor,
 		const Vector3 &p_specular_tint, Vector3 *r_f0, float *r_eta) {
 	const float f0_scalar = f0_from_ior(p_ior);
-	Vector3 f0 = Vector3(f0_scalar, f0_scalar, f0_scalar) * p_specular_tint * p_specular_factor;
-
+	// UNTINTED scalar F0 (F2): specular_tint is applied only below, to f0,
+	// and must never reach eta.
+	float f0_untinted = f0_scalar * p_specular_factor;
 	// Godot's specular_to_f0 is 0.16*s^2, normalised against the 0.04 reference
 	// so this factor is EXACTLY 1.0 at the 0.5 default. That exactness is what
 	// makes an untouched material bit-identical to pre-E1.
-	f0 *= 4.0f * p_specular * p_specular;
+	f0_untinted *= 4.0f * p_specular * p_specular;
 
-	*r_f0 = f0;
-	// Cycles re-derives eta from the modified F0 so reflectance and refraction
-	// cannot disagree (svm/closure.h:429-431). Only when the knob is off-default.
-	*r_eta = (p_specular != 0.5f) ? ior_from_f0(luminance(f0)) : p_ior;
+	float eta = p_ior;
+	if (p_specular != 0.5f || p_specular_factor != 1.0f) { // F3: gate widened to specular_factor.
+		// Cycles re-derives eta from the modified F0 so reflectance and
+		// refraction cannot disagree (svm/closure.h:429-431).
+		eta = ior_from_f0(f0_untinted);
+		if (p_ior < 1.0f) { // F1: restored ior<1 flip (closure.h:432-434).
+			eta = 1.0f / eta;
+		}
+	}
+
+	*r_f0 = Vector3(f0_untinted, f0_untinted, f0_untinted) * p_specular_tint;
+	*r_eta = eta;
 }
 
 TEST_CASE("[PathTracer][Transmission] F0 arbitration is a no-op at every default") {
@@ -198,7 +234,7 @@ TEST_CASE("[PathTracer][Transmission] F0 arbitration is a no-op at every default
 	CHECK(eta == doctest::Approx(1.5f).epsilon(1e-9));
 }
 
-TEST_CASE("[PathTracer][Transmission] F0 arbitration honours tint and factor") {
+TEST_CASE("[PathTracer][Transmission] F0 arbitration honours tint and factor, and (F3) specular_factor alone re-derives eta") {
 	Vector3 f0;
 	float eta = 0.0f;
 	resolve_f0(1.5f, 0.5f, 0.62f, Vector3(0.8f, 0.7f, 0.55f), &f0, &eta);
@@ -206,8 +242,12 @@ TEST_CASE("[PathTracer][Transmission] F0 arbitration honours tint and factor") {
 	CHECK(f0.x == doctest::Approx(0.04f * 0.62f * 0.8f).epsilon(1e-6));
 	CHECK(f0.y == doctest::Approx(0.04f * 0.62f * 0.7f).epsilon(1e-6));
 	CHECK(f0.z == doctest::Approx(0.04f * 0.62f * 0.55f).epsilon(1e-6));
-	// specular is still 0.5, so eta must NOT be re-derived.
-	CHECK(eta == doctest::Approx(1.5f).epsilon(1e-9));
+	// F3: specular is still 0.5, but specular_factor (0.62) is not, so eta
+	// MUST be re-derived now -- from the UNTINTED f0 (0.04 * 0.62 = 0.0248),
+	// not from luminance(f0) of the tinted vector above (F2). By hand:
+	// ior_from_f0(0.0248) = (1 + sqrt(0.0248)) / (1 - sqrt(0.0248)) = 1.373831.
+	CHECK(eta == doctest::Approx(1.373831f).epsilon(1e-5));
+	CHECK(eta == doctest::Approx(ior_from_f0(0.04f * 0.62f)).epsilon(1e-6));
 }
 
 TEST_CASE("[PathTracer][Transmission] Off-default specular re-derives eta") {
@@ -221,6 +261,45 @@ TEST_CASE("[PathTracer][Transmission] Off-default specular re-derives eta") {
 	// reflecting like something denser.
 	CHECK(eta > 1.5f);
 	CHECK(eta == doctest::Approx(ior_from_f0(0.16f)).epsilon(1e-5));
+}
+
+TEST_CASE("[PathTracer][Transmission] F2: specular_tint must not leak into eta") {
+	// Same off-default specular as above, but with a strongly saturated,
+	// non-uniform tint. luminance() of the OLD (tinted) F0 would have pulled
+	// eta toward the tint's luminance; F2 requires eta to come out identical
+	// to the untinted case regardless of how extreme the tint is.
+	Vector3 f0_white, f0_tinted;
+	float eta_white = 0.0f, eta_tinted = 0.0f;
+	resolve_f0(1.5f, 1.0f, 1.0f, Vector3(1, 1, 1), &f0_white, &eta_white);
+	resolve_f0(1.5f, 1.0f, 1.0f, Vector3(0.05f, 0.9f, 0.95f), &f0_tinted, &eta_tinted);
+
+	// F0 itself DOES pick up the tint...
+	CHECK(f0_tinted.x == doctest::Approx(0.16f * 0.05f).epsilon(1e-6));
+	CHECK(f0_tinted.y == doctest::Approx(0.16f * 0.9f).epsilon(1e-6));
+	CHECK(f0_tinted.z == doctest::Approx(0.16f * 0.95f).epsilon(1e-6));
+	// ...but eta must be bit-identical to the untinted derivation, not pulled
+	// toward luminance(f0_tinted) (which would be far below 0.16).
+	CHECK(eta_tinted == doctest::Approx(eta_white).epsilon(1e-6));
+	CHECK(eta_tinted == doctest::Approx(ior_from_f0(0.16f)).epsilon(1e-5));
+}
+
+TEST_CASE("[PathTracer][Transmission] F1: ior < 1 flips the re-derived eta") {
+	// ior 0.8 (< 1, legal glTF/KHR_materials_ior) with specular off-default
+	// (1.0) so the re-derivation branch fires. f0_untinted =
+	// F0_from_ior(0.8) * 4*1.0^2 = ((0.8-1)/(0.8+1))^2 * 4 = 0.049382716.
+	// ior_from_f0 of that is 1.571542 -- WITHOUT the ior<1 flip, eta would
+	// wrongly land above 1 despite ior itself being below 1. F1 requires the
+	// final eta to be the reciprocal, below 1, matching ior's own side of 1.
+	Vector3 f0;
+	float eta = 0.0f;
+	resolve_f0(0.8f, 1.0f, 1.0f, Vector3(1, 1, 1), &f0, &eta);
+
+	const float f0_scalar_expected = f0_from_ior(0.8f) * 4.0f;
+	CHECK(f0.x == doctest::Approx(f0_scalar_expected).epsilon(1e-6));
+	const float eta_unflipped = ior_from_f0(f0_scalar_expected);
+	CHECK(eta_unflipped > 1.0f); // sanity: without F1 this is what eta would wrongly be.
+	CHECK(eta == doctest::Approx(1.0f / eta_unflipped).epsilon(1e-5));
+	CHECK(eta < 1.0f);
 }
 
 TEST_CASE("[PathTracer][Transmission] ior == 0 yields a fully reflective surface") {

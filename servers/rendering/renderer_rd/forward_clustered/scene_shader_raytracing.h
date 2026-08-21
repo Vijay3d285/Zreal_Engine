@@ -101,7 +101,11 @@ public:
 	// min_bounce (roulette from the first bounce), so it cannot double as the
 	// sentinel the way PT_PARAM_MAX_DIFFUSE_BOUNCE's 0 does.
 	// 5 bits so the range reaches 16 and Russian Roulette can be fully disabled at
-	// max_bounces = 16. Bits 4-19 of the flags word are otherwise unused.
+	// max_bounces = 16. Bits 4-19 of the flags word were unused when this was
+	// written; E1 took bits 11-14 for RT_MAX_TRANSMISSION_BOUNCE_SHIFT below --
+	// updated here (E1 final fix wave, doc-fix list item 3) because its GLSL
+	// twin (raytracing_common_inc.glsl) was updated correctly at the time and
+	// this comment was the one left contradicting it.
 	constexpr static uint32_t RT_MIN_BOUNCE_SHIFT = 4;
 	constexpr static uint32_t RT_MIN_BOUNCE_MASK = 0x1F;
 

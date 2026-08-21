@@ -687,20 +687,43 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// KNOWN LIMITATION: exact for a single closed mesh, wrong for nested or
 	// interpenetrating transmissive volumes, which would need a medium stack.
 	//
-	// This multiply is unconditional and does NOT touch INSIDE_MEDIUM_FLAG: the
-	// ray really did traverse gl_HitTEXT of medium to reach this hit regardless
-	// of what the BSDF dispatch below decides to do next (transmit out, or
-	// reflect internally and stay inside). The flag means "the ray about to be
+	// This multiply reads INSIDE_MEDIUM_FLAG (gate added below) but never
+	// WRITES it: once the gate below is satisfied, the ray really did
+	// traverse gl_HitTEXT of medium to reach this hit regardless of what the
+	// BSDF dispatch further down decides to do next (transmit out, or reflect
+	// internally and stay inside). The flag means "the ray about to be
 	// traced is inside a solid," which is not knowable until AFTER that
 	// dispatch runs -- see the symmetric toggle at the bounce-accounting block
-	// below (fix round 1, C2). Clearing it here unconditionally was the bug:
-	// a back-face hit that samples an internal reflection (TIR near the
-	// critical angle, or a stray diffuse-lobe draw) would clear the flag while
-	// the ray is still inside, so its next segment re-enables back-face
-	// culling, misses the interior wall it needs to find, and escapes to sky
-	// -- leaked, over-bright energy at grazing angles on any solid glass
-	// sphere or gem.
-	if (RT_GET_TRANSMISSION_ENABLED() && !h.is_front_face && m.transmission > 0.0 && m.thickness > 0.0) {
+	// below (fix round 1, C2). Clearing it here would be the old C2 bug all
+	// over again: a back-face hit that samples an internal reflection (TIR
+	// near the critical angle, or a stray diffuse-lobe draw) would clear the
+	// flag while the ray is still inside, so its next segment re-enables
+	// back-face culling, misses the interior wall it needs to find, and
+	// escapes to sky -- leaked, over-bright energy at grazing angles on any
+	// solid glass sphere or gem.
+	// Gated on is_inside_medium (E1 final fix wave, part 2), in addition to the
+	// pre-existing thickness/transmission checks. Without it, a CAMERA ray that
+	// hits a back face DIRECTLY -- reachable on any double-sided (CULL_DISABLED)
+	// transmissive material, since back-face culling is what would otherwise
+	// keep such a hit from ever being the FIRST hit of a path -- reads
+	// gl_HitTEXT as the whole camera-to-surface distance and applies Beer-
+	// Lambert over it as if that distance were a path length through glass.
+	// With a short attenuation_distance this reads solid black on a surface
+	// the camera ray never actually travelled through.
+	//
+	// is_inside_medium is exactly the right signal for THIS gate specifically
+	// (unlike its use at the eta flip a few dozen lines below, where the
+	// header comment there documents it as WRONG for thin-walled materials):
+	// set_inside_medium/clear_inside_medium are themselves gated on
+	// `m.thickness > 0.0` at the bounce-accounting block below, the identical
+	// condition already required to reach this line, so there is no thin-
+	// walled gap to inherit here. A ray only arrives at a back-face hit with
+	// the flag set if some earlier segment actually entered through a front
+	// face of a thickness > 0.0 material -- i.e. gl_HitTEXT is a real
+	// in-medium path length -- which is exactly the case this multiply is
+	// meant to model.
+	if (RT_GET_TRANSMISSION_ENABLED() && !h.is_front_face && m.transmission > 0.0 && m.thickness > 0.0 &&
+			is_inside_medium(ps.packed_bounces_flags)) {
 		ps.throughput *= exp(-m.attenuation * gl_HitTEXT);
 	}
 
@@ -864,7 +887,22 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// read false there and silently skip the flip. h.is_front_face carries no
 	// such gap; it is correct for both the thick-medium and the thin-walled
 	// case from the same one-line expression.
-	brdf_mat.eta = h.is_front_face ? resolved_eta : (1.0 / resolved_eta);
+	//
+	// Guard on the reciprocal itself (E1 final fix wave, part 2). ior == 0.0
+	// is legal glTF and resolveDielectricF0 correctly resolves it to
+	// resolved_eta == 0.0 (F0 == 1.0, fully reflective) -- but
+	// fresnel_dielectric's caller contract (brdf_inc.glsl:392-395) forbids
+	// computing 1.0/eta before it returns, and an eagerly-flipped eta == 0.0
+	// here is an infinity reaching every downstream consumer. Reachable on a
+	// CULL_DISABLED (double-sided) transmissive material even after
+	// render_raytracing.cpp floors ior at 0.0 at upload, because 0.0 itself
+	// is still legal: a back face is then directly camera-visible with no
+	// inside-medium flag set, so this ternary's else-branch is the very
+	// first thing to touch it. eta == 0.0 already means "always TIR" in
+	// fresnel_dielectric regardless of sign (eta_cos_theta_t_sq is <= 0.0 for
+	// every cos_theta_i when eta == 0.0), so leaving it un-flipped in that
+	// case is physically correct, not merely defensive.
+	brdf_mat.eta = h.is_front_face ? resolved_eta : ((resolved_eta > 0.0) ? (1.0 / resolved_eta) : resolved_eta);
 	brdf_mat.opacity = 1.0;
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);

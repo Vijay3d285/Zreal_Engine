@@ -163,8 +163,12 @@ uint inc_glossy_bounce(uint packed) {
 // (raytracing_closest_hit_common_inc.glsl), which is what actually keeps this
 // safe. Reachable without it whenever RT_GET_MAX_TRANSMISSION_BOUNCE() is 0
 // (a raw RenderingServer with the setting unset resolves the cap to
-// max_total, up to 16) -- matched by Environment's own CLAMP(1, 15) on the
-// cap for the normal (non-raw) path.
+// max_total, up to 16) -- matched by the project-setting-driven CLAMP(1, 15)
+// on the cap for the normal (non-raw) path (NOT Environment -- it has no such
+// property; see raytracing_common_inc.glsl's RT_MAX_TRANSMISSION_BOUNCE_SHIFT
+// comment for the actual source: scene_shader_raytracing.cpp's
+// compute_rt_flags(), reading rendering_server.cpp's
+// `rendering/pathtracer/max_transmission_bounce` GLOBAL_DEF).
 uint get_transmission_bounces(uint packed) {
 	return (packed >> 27u) & 0xFu;
 }

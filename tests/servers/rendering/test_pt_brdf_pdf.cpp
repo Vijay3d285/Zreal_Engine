@@ -208,17 +208,26 @@ static RGB rgb_specular_f0(RGB p_base_color, double p_metalness, double p_dielec
 	};
 }
 
-// brdf_inc.glsl: baseColorToDiffuseReflectance() -- baseColor * (1 - metalness).
-static RGB rgb_diffuse_reflectance(RGB p_base_color, double p_metalness) {
-	const double k = 1.0 - p_metalness;
+// brdf_inc.glsl: baseColorToDiffuseReflectance() -- baseColor * (1 - metalness)
+// * (1 - transmissivness). E1 final fix wave (roadmap doc-fix list item 2):
+// this mirror used to be the pre-E1 2-arg form, missing the `(1 -
+// transmissivness)` factor brdf_inc.glsl:516-518 has carried since E1 Task 3
+// -- a collision with this phase's own strict-mirror ruling, and it left the
+// pSpec-desync defect class (a transmissivness-dependent lobe-selection
+// weight drifting from the GLSL) with no CPU-side guard at all.
+static RGB rgb_diffuse_reflectance(RGB p_base_color, double p_metalness, double p_transmissivness) {
+	const double k = (1.0 - p_metalness) * (1.0 - p_transmissivness);
 	return RGB{ p_base_color.r * k, p_base_color.g * k, p_base_color.b * k };
 }
 
 // brdf_inc.glsl: combinedPdf()'s pSpec derivation, transcribed verbatim
-// (same epsilon branches, same clamp bounds).
-static double mixture_p_spec(RGB p_base_color, double p_metalness, double p_dielectric_f0) {
+// (same epsilon branches, same clamp bounds). p_transmissivness defaults to
+// 0.0 so every pre-existing call site (all opaque, pre-E1 fixtures) is
+// unaffected -- see the "transmissive" case below for the argument that
+// isn't.
+static double mixture_p_spec(RGB p_base_color, double p_metalness, double p_dielectric_f0, double p_transmissivness = 0.0) {
 	const RGB specular_f0 = rgb_specular_f0(p_base_color, p_metalness, p_dielectric_f0);
-	const RGB diffuse_reflectance = rgb_diffuse_reflectance(p_base_color, p_metalness);
+	const RGB diffuse_reflectance = rgb_diffuse_reflectance(p_base_color, p_metalness, p_transmissivness);
 	const double specular_lum = rgb_luminance(specular_f0);
 	const double diffuse_lum = rgb_luminance(diffuse_reflectance);
 	if (diffuse_lum < 0.0001) {
@@ -236,27 +245,37 @@ struct PSpecCase {
 	RGB base_color;
 	double metalness;
 	double dielectric_f0;
+	double transmissivness;
 	double expected_p_spec;
 };
 
 TEST_CASE("[PathTracer][BrdfPdf] lobe selection probability matches combinedPdf's pSpec formula") {
 	const PSpecCase cases[] = {
 		// Pure metal: diffuse reflectance is exactly zero -> diffuseLum < 0.0001 branch.
-		{ "pure metal", RGB{ 1.0, 1.0, 1.0 }, 1.0, 0.04, 1.0 },
+		{ "pure metal", RGB{ 1.0, 1.0, 1.0 }, 1.0, 0.04, 0.0, 1.0 },
 		// Zero dielectric F0, non-metal: specular reflectance is exactly zero -> specularLum < 0.0001 branch.
-		{ "zero-F0 dielectric", RGB{ 0.5, 0.5, 0.5 }, 0.0, 0.0, 0.0 },
+		{ "zero-F0 dielectric", RGB{ 0.5, 0.5, 0.5 }, 0.0, 0.0, 0.0, 0.0 },
 		// Near-metal: true ratio ~0.999 -> clamps to the 0.99 ceiling.
-		{ "near-metal (high clamp)", RGB{ 1.0, 1.0, 1.0 }, 0.999, 0.04, 0.99 },
+		{ "near-metal (high clamp)", RGB{ 1.0, 1.0, 1.0 }, 0.999, 0.04, 0.0, 0.99 },
 		// Near-zero specular contribution, still above the 0.0001 floor: true ratio ~0.002 -> clamps to the 0.01 floor.
-		{ "near-zero specular (low clamp)", RGB{ 1.0, 1.0, 1.0 }, 0.001, 0.001, 0.01 },
+		{ "near-zero specular (low clamp)", RGB{ 1.0, 1.0, 1.0 }, 0.001, 0.001, 0.0, 0.01 },
 		// Typical colored dielectric, unsaturated: exercises the plain ratio branch with no clamp.
 		// Reused below as the mixture-pdf test's material, so that test also
 		// exercises this exact formula rather than a magic constant.
-		{ "colored dielectric (unsaturated)", RGB{ 0.8, 0.2, 0.3 }, 0.0, 0.04, 0.10672928117829127 },
+		{ "colored dielectric (unsaturated)", RGB{ 0.8, 0.2, 0.3 }, 0.0, 0.04, 0.0, 0.10672928117829127 },
+		// E1 final fix wave: transmissive dielectric, non-trivial transmissivness.
+		// diffuse_lum is scaled by (1 - transmissivness) = 0.3 relative to the
+		// "colored dielectric" case above (same base_color/dielectric_f0/
+		// metalness), while specular_lum (F0 only, not transmissivness-scaled)
+		// is unchanged at 0.04 -- pushing the ratio up from ~0.1067 to ~0.2848.
+		// By hand: luminance(0.8,0.2,0.3) = 0.8*0.2126 + 0.2*0.7152 + 0.3*0.0722
+		// = 0.33478; diffuse_lum = 0.33478 * (1 - 0.7) = 0.100434;
+		// ratio = 0.04 / (0.04 + 0.100434) = 0.284831308657448.
+		{ "transmissive colored dielectric", RGB{ 0.8, 0.2, 0.3 }, 0.0, 0.04, 0.7, 0.284831308657448 },
 	};
 	for (const PSpecCase &c : cases) {
 		INFO("case: ", c.name);
-		const double p_spec = mixture_p_spec(c.base_color, c.metalness, c.dielectric_f0);
+		const double p_spec = mixture_p_spec(c.base_color, c.metalness, c.dielectric_f0, c.transmissivness);
 		// Closed-form, no quadrature -- tight absolute tolerance, just covers
 		// double round-trip precision between this file's hand-derived
 		// constants and the formula. NOTE: deliberately NOT using

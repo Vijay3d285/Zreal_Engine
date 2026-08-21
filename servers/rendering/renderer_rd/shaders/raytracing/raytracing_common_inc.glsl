@@ -52,8 +52,12 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 //
 // 4 bits, so the range is 1-15 rather than the 1-16 the other caps use. The
 // counter in packed_bounces_flags is also 4 bits and saturates at 15, so a cap
-// of 16 could never fire. Environment clamps to (1, 15) to match. Cycles'
-// own max_transmission_bounce default is 12.
+// of 16 could never fire. Clamped to (1, 15) to match -- NOT by Environment
+// (it has no such property); the clamp is CLAMP(raw, 1, 15) in
+// SceneShaderRaytracing::compute_rt_flags() (scene_shader_raytracing.cpp),
+// reading the `rendering/pathtracer/max_transmission_bounce` project setting
+// (GLOBAL_DEF in rendering_server.cpp). Cycles' own max_transmission_bounce
+// default is 12.
 #define RT_MAX_TRANSMISSION_BOUNCE_SHIFT 11u
 #define RT_MAX_TRANSMISSION_BOUNCE_MASK 0xFu
 #define RT_GET_MAX_TRANSMISSION_BOUNCE() ((RT_FLAGS >> RT_MAX_TRANSMISSION_BOUNCE_SHIFT) & RT_MAX_TRANSMISSION_BOUNCE_MASK)

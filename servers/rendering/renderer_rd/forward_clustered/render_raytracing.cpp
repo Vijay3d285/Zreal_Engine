@@ -1714,7 +1714,17 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 	Variant ior_var = material_storage->material_get_param(p_material_rid, "ior");
 	if (ior_var.get_type() == Variant::FLOAT) {
-		mat.ior = ior_var;
+		// E1 final fix wave: siblings (transmission, thickness, attenuation_color)
+		// were already clamped here; ior was not. material.cpp's property hint
+		// is "0,3,0.001,or_greater" -- negative is not authorable from the
+		// Inspector, but the RS API and glTF import both bypass the hint, and a
+		// negative ior reaches fresnel_dielectric's `1.0 / eta` back-face flip
+		// (raytracing_closest_hit_common_inc.glsl) as an eagerly-evaluated
+		// reciprocal, which that function's own caller contract
+		// (brdf_inc.glsl:392-395) forbids computing before TIR is checked.
+		// Lower-bound only: "or_greater" means there is no legitimate upper
+		// clamp to apply here.
+		mat.ior = MAX(0.0f, (float)ior_var);
 	}
 
 	Variant thickness_var = material_storage->material_get_param(p_material_rid, "thickness");
