@@ -1197,13 +1197,36 @@ bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float al
 	float3 Vlocal = rotatePoint(qRotationToZ, V);
 	float3 Llocal;
 	r_wrong_hemisphere = false;
-	// Writes DIRECTLY into this function's own out-parameters rather than
-	// through an intermediate local -- avoids a two-level out-parameter
-	// chain (sampleDielectricMicrofacet's out -> local -> this function's
-	// out -> caller's local), which is where an earlier version of this
-	// function produced a live regression on the transmissive path (fix
-	// round 2 self-review: the tree was 42/42 green before this extraction
-	// and failed only on the real transmission gate, nothing else).
+	// r_weight and r_is_transmit are written DIRECTLY from
+	// sampleDielectricMicrofacet's own out-parameters into this function's
+	// out-parameters, rather than through an intermediate local. An earlier
+	// version of this extraction routed them through locals first and
+	// produced a live regression on the transmissive path (fix round 2
+	// self-review: the tree was 42/42 green before this extraction and
+	// failed only on the real transmission gate, nothing else); switching to
+	// the direct-write form here made the regression go away.
+	//
+	// Fix round 3 correction: an earlier draft of this comment stated the
+	// two-level out-parameter chain itself AS THE CAUSE. That claim does not
+	// hold up -- this same function still routes r_next_dir through an
+	// intermediate local (Llocal, right below) because it needs the
+	// rotate-back transform applied first, and that path works correctly.
+	// The direct-write pattern used here is also not a new invention: it is
+	// the same shape evalIndirectCombinedBRDF already uses when it passes
+	// its own out-parameter `sampleWeight` straight into sampleSpecular(...)
+	// with no intermediate local (see this file, SPECULAR_TYPE branch). So
+	// "avoid chained out-parameters" is not a general rule this codebase
+	// follows, and this comment should not be read as prescribing one --
+	// only r_weight/r_is_transmit needed the direct-write change to fix the
+	// regression; r_next_dir did not. What actually broke is not fully
+	// pinned down: an equally plausible alternative hypothesis is that the
+	// pre-fix local-routed version lost the isTransmit boolean's propagation
+	// along the way (isTransmit gates the thin-walled override just below,
+	// so a stale or wrong value there would misfire exactly this path). The
+	// durable lesson is the one worth keeping: doctest, every existing gate,
+	// and the validation mean all passed through this regression untouched
+	// -- only this gate's probe 6 caught it, because it was the only check
+	// exercising the transmissive lobe's rendered output directly.
 	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness, u3, Llocal, r_weight, r_is_transmit)) {
 		return false;
 	}

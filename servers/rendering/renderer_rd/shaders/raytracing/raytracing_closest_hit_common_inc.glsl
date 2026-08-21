@@ -609,6 +609,19 @@ void debug_visualize(
 		// raw shading normal), which the hemisphere check's own correctness
 		// (and this detector's ability to show the pre-fix ordering
 		// collapsing the rate to ~0) depends on.
+		//
+		// Known, deliberate limitation (fix round 3): dbg_mat.eta above is set
+		// straight to dbg_eta_33 with no front/back-face inversion (compare
+		// shade_and_bounce's own `h.is_front_face ? resolved_eta :
+		// (1.0/resolved_eta)`), and debug_visualize only ever runs on primary,
+		// front-face hits -- so this detector only ever exercises eta > 1,
+		// which is the half of the guard that is unreachable BY THEOREM (see
+		// _probe10_guard_firing_rate's header comment in pt_transmission_gate.gd
+		// for the proof). Its non-zero signal comes entirely from wrongNg
+		// firing via normal-map divergence, never from wrongN via the eta < 1
+		// mechanism that matters on production's back-face exit path. This is
+		// a known coverage gap in this detector, not a claim that the guard is
+		// otherwise dead.
 		vec3 dbg_N = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
 
 		RNGState dbg_rng = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);

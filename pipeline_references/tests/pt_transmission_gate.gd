@@ -302,7 +302,9 @@ const P10_FRAMES := 16384 # High sample count: the transmit-conditional statisti
 const P10_ROUGHNESS := 1.0
 const P10_IOR := 3.0
 const P10_TRANSMISSION := 1.0
-const P10_CAM_POS := Vector3(3.99, 0.0, 0.05) # grazing: V close to the quad's own plane.
+const P10_CAM_POS := Vector3(3.99, 0.0, 0.05) # "grazing" is a misnomer here -- see the note
+# at the camera-setup site in _probe10_guard_firing_rate() for the actual geometry (near-normal
+# incidence on the box's thin edge face, not a shallow view angle against a broad surface).
 ## Captured reference (transmit-conditional rate; see _probe10_guard_firing_rate's
 ## header comment for the full search that found this fixture): three
 ## consecutive correct-code runs read 0.001916 / 0.001975 / 0.001933 (spread
@@ -645,14 +647,6 @@ func _probe3_thin_walled() -> void:
 	cam.make_current()
 
 	var env := _new_env(Color(0, 0, 0))
-	# Fix round 2 correction: was 4. The I5 investigation's own bounce sweep
-	# (task-7-report.md) showed this probe matches its analytic model to
-	# 0.015% at max_bounces <= 2, and only picks up the +0.93% second-order GI
-	# offset (emitter light bouncing off the glass's own back face and
-	# returning) once a third bounce is available. 2 is not tuning the offset
-	# away -- it is aligning the experiment with the closed form P3_TOLERANCE
-	# actually asserts against, which the offset at 4 bounces was never a
-	# fair test of.
 	# Fix round 2 correction: was 4. The I5 investigation's own bounce sweep
 	# (task-7-report.md) showed this probe matches its analytic model to
 	# 0.015% at max_bounces <= 2, and only picks up the +0.93% second-order GI
@@ -1329,7 +1323,9 @@ func _probe9_pdf_parity() -> void:
 		print("  ok    probe9 samplerLobeProbability: %.6f" % brdfProbability)
 
 
-## Finding this fixture took an honest search, and the search itself is worth
+## Finding a NON-ZERO CORRECT-CODE rate for THIS PROBE's specific fixture
+## (front-face hits only -- see debug_visualize's own limits, and the vis
+## mode 33 comment) took an honest search, and the search itself is worth
 ## recording (task-7-report.md's fix-round-2 addendum has the full numbers).
 ## Every attempt below measured the TRANSMIT-CONDITIONAL rate (see the vis
 ## mode 33 comment for why unconditional is the wrong signal):
@@ -1341,20 +1337,53 @@ func _probe9_pdf_parity() -> void:
 ##   3. Grazing + roughness 1.0 + ior 3.0 (near the most extreme parameters
 ##      this material model allows): STILL exactly 0.0 at 16384 frames.
 ##
-## The pattern across 1-3: with N == geometry_normal exactly (a flat quad, no
-## normal map), refract_angle's transmitted direction is apparently ALWAYS
-## hemisphere-consistent for this codebase's VNDF sampling, regardless of
-## roughness, eta, or view angle -- the guard's transmit side may be
-## structurally unreachable on a perfectly flat surface, whatever the
-## theoretical "VNDF can produce a wrong-side sample at high roughness"
-## concern the original comment raises. What actually triggers it: a normal
-## map, diverging the SHADING normal from geometry_normal (mirrors
-## pt_energy_gate.gd's own bumpy-surface probe, built for an unrelated
-## purpose -- forcing shading-normal/geometry-normal divergence -- but the
-## same mechanism). With one, grazing incidence, roughness 1.0, ior 3.0: three
-## correct-code runs read 0.001916 / 0.001933 / 0.001975 (noisy -- only
-## ~11.2% of samples take the transmit lobe at all at this geometry, so the
-## effective sample count behind this statistic is small).
+## Fix round 3 correction: an EARLIER draft of this comment concluded from
+## 1-3 that the guard's transmit side "may be structurally unreachable on a
+## perfectly flat surface" in general. That overstated what the experiment
+## showed, and the narrower, correct explanation matters, because the guard
+## is NOT dead code in production. The analytic result (fix round 3 review,
+## from sampleGGXVNDF returning H.z = max(0, Nh.z) >= 0 and
+## refract_angle's L.z = c*H.z - V.z/eta with
+## c = (a - sqrt(a^2 + (eta^2-1))) / eta, a = dot(H, V) > 0):
+##
+##   - eta > 1 (ENTERING a denser medium -- this is what attempts 1-3 above
+##     all rendered, and what every front-face transmit hit in this gate
+##     uses): eta^2-1 > 0, so sqrt(.) > a, so c < 0, so L.z < 0 STRICTLY,
+##     ALWAYS. wrongN is unreachable BY THEOREM here, for any roughness,
+##     ior, or view angle -- attempts 1-3 reading exactly 0.0 were not an
+##     empirical curiosity, they were the only possible outcome for that
+##     configuration.
+##   - eta < 1 (EXITING a denser medium -- production's back-face case, the
+##     `!h.is_front_face` branch in raytracing_closest_hit_common_inc.glsl's
+##     shade_and_bounce): c > 0, and L.z > 0 (i.e. the guard fires) exactly
+##     when (a^2 - k)*H.z^2 < (1 - a^2)*(1 - H.z^2), k = 1 - eta^2. At
+##     eta = 1/1.5, a = 0.8, that holds for any H.z < 0.9 -- an ordinary
+##     ~32-degree microfacet tilt at roughness >= ~0.5, no normal map
+##     required. This is exactly the configuration probes 4 and 6 render: a
+##     thick glass object, hit from inside on the way out. The guard is
+##     doing real work there.
+##
+## What attempt 4 below (the normal map, see mat.normal_enabled) actually
+## demonstrates is therefore narrower than the earlier draft claimed: it is
+## a way to trigger wrongN on a FRONT-FACE (eta > 1) hit specifically, since
+## this probe's vis mode 33 only ever visualizes primary (front-face) hits
+## -- see the mode-33 comment in raytracing_closest_hit_common_inc.glsl for
+## why that is this detector's own, separately-declared coverage limit. It
+## is not evidence that the guard is unreachable on flat geometry in
+## general; it is unreachable ONLY for eta > 1, which is a theorem, not a
+## fixture-dependent measurement.
+##
+## The pattern across 1-3, restated correctly: with N == geometry_normal
+## exactly (a flat quad, no normal map) AND eta > 1 (entering), wrongN is
+## mathematically unreachable, regardless of roughness or view angle. What
+## triggers a non-zero rate at eta > 1 is a normal map, diverging the
+## SHADING normal from geometry_normal (mirrors pt_energy_gate.gd's own
+## bumpy-surface probe, built for an unrelated purpose -- forcing
+## shading-normal/geometry-normal divergence -- but the same mechanism).
+## With one, grazing incidence, roughness 1.0, ior 3.0: three correct-code
+## runs read 0.001916 / 0.001933 / 0.001975 (noisy -- only ~11.2% of
+## samples take the transmit lobe at all at this geometry, so the effective
+## sample count behind this statistic is small).
 ##
 ## One more thing worth recording precisely: the coordinator's prediction that
 ## the pre-fix ordering "drives this to exactly 0.0 by construction" is
@@ -1364,8 +1393,15 @@ func _probe9_pdf_parity() -> void:
 ## comparison vacuously consistent). It does NOT hold once N diverges from
 ## geometry_normal: dot(-V, N) is no longer guaranteed negative, so the
 ## override can just as easily manufacture a NEW inconsistency as suppress an
-## existing one. Reintroducing the defect against THIS fixture moved the rate
-## to 0.080879 -- a ~42x jump, not a collapse to zero -- and the probe below
+## existing one. The mechanism: clampShadingNormal (brdf_inc.glsl) returns
+## shading_n UNCHANGED whenever dot(geometry_n, V) >= threshold, so with a
+## steep enough normal map dot(N, V) can still go negative even after that
+## clamp, making dot(-V, N) < 0 FALSE and wrongN fire under the override --
+## the "geometry_normal is flipped toward V, so dot(-V, geometry_normal) < 0
+## is unconditional" argument is specific to geometry_normal and does not
+## transfer to a diverged shading N. Reintroducing the defect against THIS
+## fixture moved the rate to 0.080879 -- a ~42x jump, not a collapse to
+## zero, which is exactly this mechanism at work -- and the probe below
 ## still fails decisively on it, just via the high bound rather than the low
 ## one. Both directions are asserted for exactly this reason.
 func _probe10_guard_firing_rate() -> void:
@@ -1389,7 +1425,20 @@ func _probe10_guard_firing_rate() -> void:
 	add_child(quad)
 
 	var cam := Camera3D.new()
-	var cam_pos := P10_CAM_POS # grazing: V close to the quad's own plane.
+	var cam_pos := P10_CAM_POS
+	# Fix round 3 correction: this fixture has been described as "grazing"
+	# elsewhere in this file, but that undersells what it actually is. The
+	# box is Vector3(4, 4, 0.05) (x,y half-extent 2, z half-extent 0.025).
+	# The camera ray from (3.99, 0, 0.05) to the origin crosses x = 2 (the
+	# box's +x face) at t = (3.99-2)/3.99 ~= 0.4987, i.e. at
+	# z ~= 0.05*(1-0.4987) ~= 0.025 -- exactly the box's z half-extent. So
+	# this ray lands on the SILHOUETTE EDGE where the +x face meets the top
+	# face, not at a shallow angle against a broad flat surface. That is
+	# near-normal incidence on a knife's-edge, not grazing incidence in the
+	# usual sense -- and it explains why this statistic is noisier than most
+	# in this gate (small perturbations move the hit between two differently
+	# angled faces). The fixture is not being re-cut for this; the existing
+	# P10_RATE_LOW/P10_RATE_HIGH band already accounts for the noise.
 	cam.look_at_from_position(cam_pos, Vector3.ZERO, Vector3.UP)
 	cam.fov = 20.0
 	add_child(cam)
