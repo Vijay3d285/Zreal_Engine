@@ -148,6 +148,12 @@ func _ready() -> void:
 
 	await _probe_a()
 
+	var b256: float = await _probe_b_at(Sky.RADIANCE_SIZE_256, "radiance 256")
+	_verdict["b256"] = b256
+	if b256 > 0.0 and absf(b256 - 1.0) > TOLERANCE:
+		_failures.append("probe B (radiance 256): ratio %.5f vs 1.0 (limit %.0f%%)"
+				% [b256, TOLERANCE * 100.0])
+
 	print("\n=== RESULT ===")
 	if _failures.is_empty():
 		print("PASS - sky energy gate green.")
@@ -191,3 +197,91 @@ func _probe_a() -> void:
 	if absf(ratio - 1.0) > TOLERANCE:
 		_failures.append("probe A: sky reads %.5f vs %.5f authored, ratio %.5f (limit %.0f%%)"
 				% [s["mean"], SKY_RADIANCE, ratio, TOLERANCE * 100.0])
+
+
+const PANO_W := 2048
+const PANO_H := 1024
+const BAND_BASE := 0.02
+const BAND_BRIGHT := 200.0
+
+
+## A dim base with two narrow bright bands, mirrored about the equator.
+##
+## MIRRORED ON PURPOSE. This gate must not assume whether the engine's lat-long
+## v = 0 is +Y or -Y. A top-bottom symmetric panorama presents identical content
+## to the upward hemisphere under either convention, so _analytic_outgoing_radiance()
+## is correct without the gate ever having to know -- and the probe measures
+## ENERGY rather than accidentally testing orientation.
+##
+## Each band is p_bright_rows texel rows out of PANO_H, an angular width of
+## p_bright_rows * PI / PANO_H. At the default of 1 row that is PI/1024, far
+## thinner than a 256px octmap texel (PI/256 at best). A point sampler either
+## hits it or misses it; an area average preserves it. That gap is what probe C
+## measures.
+func _banded_panorama(p_bright_rows: int) -> ImageTexture:
+	var pano := Image.create(PANO_W, PANO_H, false, Image.FORMAT_RGBF)
+	pano.fill(Color(BAND_BASE, BAND_BASE, BAND_BASE))
+	var y_top := int(PANO_H * 0.25)
+	var y_bot := PANO_H - 1 - y_top
+	for i in range(p_bright_rows):
+		for x in range(PANO_W):
+			pano.set_pixel(x, y_top + i, Color(BAND_BRIGHT, BAND_BRIGHT, BAND_BRIGHT))
+			pano.set_pixel(x, y_bot - i, Color(BAND_BRIGHT, BAND_BRIGHT, BAND_BRIGHT))
+	return ImageTexture.create_from_image(pano)
+
+
+## Outgoing radiance of an upward-facing Lambertian patch of reflectance ALBEDO
+## under the panorama, computed from the IMAGE -- never from a render.
+##
+##   E   = integral over upper hemisphere of L(w) cos(theta) dw
+##   L_o = ALBEDO * E / PI
+##
+## The panorama is azimuthally uniform by construction, so the phi integral is
+## just a factor of 2*PI and the sum runs over rows only:
+##
+##   E = sum over rows with theta < PI/2 of  L(row) * 2*PI * cos(theta) * sin(theta) * dtheta
+##
+## with dtheta = PI / PANO_H and theta measured from the pole at v = 0. Because
+## the panorama is mirrored, whichever pole that is, the upper hemisphere sees
+## the same values -- so summing the v < 0.5 half is correct either way.
+func _analytic_outgoing_radiance(p_img: Image) -> float:
+	var h := p_img.get_height()
+	var d_theta := PI / float(h)
+	var e := 0.0
+	for y in range(h):
+		var theta := (float(y) + 0.5) * d_theta
+		if theta >= PI * 0.5:
+			continue
+		# Azimuthally uniform: one sample per row is exact.
+		var c := p_img.get_pixel(0, y)
+		var l := (c.r + c.g + c.b) / 3.0
+		e += l * TAU * cos(theta) * sin(theta) * d_theta
+	return ALBEDO * e / PI
+
+
+## PROBE B -- peaked sky, Lambertian plane, against the analytic integral.
+##
+## Returns the measured/analytic ratio so probe C can compare two resolutions.
+## A Lambertian plane integrates the whole upper hemisphere, so its response is
+## proportional to the sky's INTEGRAL -- which is the energy quantity that a
+## point-subsampled radiance map fails to preserve.
+func _probe_b_at(p_radiance_size: int, p_label: String) -> float:
+	var pano_tex := _banded_panorama(1)
+	var env := _build_scene(pano_tex, p_radiance_size)
+	_plane.visible = true
+	_look_down()
+	await get_tree().create_timer(2.0).timeout
+
+	var analytic := _analytic_outgoing_radiance(pano_tex.get_image())
+
+	print("\n=== PROBE B [%s]: banded sky, Lambertian albedo %.3f ===" % [p_label, ALBEDO])
+	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), FRAMES)
+	if img == null:
+		_failures.append("probe B [%s]: accumulator readback returned null" % p_label)
+		return -1.0
+	var s := _measure_crop(img, 0.25, 0.75)
+	var ratio: float = s["mean"] / maxf(analytic, 1e-9)
+	print("  analytic L_o : %.5f  (from the panorama image)" % analytic)
+	print("  measured     : %.5f  (R %.5f  G %.5f  B %.5f)" % [s["mean"], s["r"], s["g"], s["b"]])
+	print("  ratio        : %.5f" % ratio)
+	return ratio
