@@ -1131,8 +1131,10 @@ this phase touched. It does not fit any of the design spec's three named
 expected divergences (§6.1 no-NEE-through-glass noise, §6.3 single-scatter
 dimming, §6.4 the Fresnel-formulation mismatch), so per the brief's own rule —
 "a divergence fitting none of those is a defect" — **it is recorded here as a
-new, standalone open item** (§7.4 below), not folded into E1's own account.
-Root cause was not chased (out of scope for a measurement task); candidates
+new, standalone open item** (§7.4 below; resolved there — see §7.7 — as a
+comparison-harness colour-space error in this section's own field-for-field
+material transcription, not an engine defect), not folded into E1's own
+account. Root cause was not chased (out of scope for a measurement task); candidates
 include environment-map filtering/resolution loss of the HDRI's small bright
 patch during octmap conversion, and pre-existing environment-NEE energy gaps
 already catalogued elsewhere in this document. Both the raw and a
@@ -1186,7 +1188,13 @@ specular reflection and refraction, not diffuse response.
 
 That question is exactly where the previously-"unattributed" ~4.0–4.2%
 residual (slab and vase running brighter than Cycles after calibration) turns
-out **not** to be a dead end. Both candidate root causes named above for the
+out **not** to be a dead end. *(Note: §7.7 has since shown the underlying
+~23% gap itself was a comparison-harness colour-space error, not either
+candidate renderer-side cause named below — see §7.4/§7.7. This paragraph's
+"candidate cause" framing predates that finding and was not revisited by this
+correction pass; it is left as the historical reasoning for the ~4% residual
+specifically, which is a separate, still-open question this correction does
+not resolve.)* Both candidate root causes named above for the
 underlying ~23% gap — HDRI resolution/filtering loss during octahedral-map
 conversion, and pre-existing environment-NEE energy behavior — are
 **path-type-dependent**: neither has any reason to apply the same gain to a
@@ -1485,35 +1493,56 @@ gate has since measured the engine side of it — see §7.6.** That gate
 eliminates a uniform exposure-scalar cause (probe A is bit-exact at 1.00000
 and probe D reads `IBL_exposure_normalization` at exactly 1.000000), and it
 demonstrates no energy loss at all at high radiance-map resolution (−1.6%
-against an analytic hemispherical-irradiance ground truth). **The ~23% gap
-versus Cycles is therefore still unexplained and fully open.**
+against an analytic hemispherical-irradiance ground truth).
 
-*(Erratum, corrected by the E2a fix wave. An earlier version of this
-paragraph declared the two candidates below superseded, and told readers not
-to re-open them, on the strength of a §7.6 result that was wrong — the gate's
-analytic ground truth omitted an sRGB albedo pre-encode. Both candidates are
-**restored as open**, and the octahedral-filtering one is now the better
-supported of the two: the corrected data shows the low-resolution radiance
-map reading 8.5% **high** on a sub-texel bright band, which is exactly the
-filtering-behaviour signature that candidate names — a gain rather than a
-loss, but the same mechanism.)*
+**RESOLVED (2026-08-22) — see §7.7. This was a comparison-harness
+colour-space error, not an engine defect.** §7.1's Cycles reference scene
+copied `StandardMaterial3D.albedo_color` RGB triples straight into Blender's
+Principled BSDF `Base Color` field-for-field. Godot's `albedo_color` is
+sRGB-authored and is converted to linear on RT upload; Blender's `Base Color`
+is already linear. The same numeric triple therefore fed the two BRDFs two
+different reflectances, and §7.7's independently-confirmed three-arm Cycles
+experiment shows that mismatch alone is large enough, and in the right
+direction, to produce the observed whole-image gap once blended with
+albedo-independent sky pixels. Neither renderer's physics is at fault. **No
+engine change is proposed or needed for this item.**
 
-- **HDRI resolution/filtering loss during octahedral-map conversion.** A
-  small bright source averaged, or aliased, by a coarse box filter changes GI
-  system-wide. §7.6's corrected probe B shows this filtering path is not
-  energy-neutral at low resolution (+8.5% at `RADIANCE_SIZE_256` on a
-  one-texel-row stimulus), so the behaviour is real and measured; its sign
-  and magnitude under a real, broadband HDRI are not.
+*(Erratum history, itself now superseded. An earlier version of this
+paragraph declared the two candidates below superseded on the strength of a
+§7.6 result that was wrong — the gate's analytic ground truth omitted an
+sRGB albedo pre-encode. A later revision then restored both candidates as
+open on the strength of the corrected §7.6 data. §7.7's confirmed experiment
+supersedes that revision in turn: the ~23% whole-image gap did not originate
+in the engine at all, so neither candidate below is needed to explain it.
+§7.6's own resolution-sensitivity finding is untouched by any of this — it is
+a real, separately-measured, ground-only result on its own analytic ground
+truth, unaffected by the comparison-harness question — and is restated below
+as what it actually is: a minor, still-open aliasing item, not a cause of the
+23%.)*
+
+- **HDRI resolution/filtering loss during octahedral-map conversion — NOT
+  NEEDED to explain the ~23% gap (§7.7).** What §7.6 measured under this name
+  is still real and still worth tracking on its own terms: the low-resolution
+  radiance map reads +8.5% **high** (not low) at `RADIANCE_SIZE_256` on a
+  deliberately sub-texel bright-band stimulus — an aliasing overshoot, not an
+  energy loss — resolving to −1.6% at `RADIANCE_SIZE_2048`. That is a genuine
+  resolution-sensitive response; it was never the mechanism behind the 23%,
+  and §7.6's own caveat already warns it is not shown to generalize beyond
+  the adversarial probe that found it.
 - **Pre-existing environment-NEE energy behaviour already catalogued
-  elsewhere in this document.** Untouched by §7.6, which measures the
-  panorama→render chain end-to-end and cannot separate the NEE contribution
-  from the BSDF-strategy one.
+  elsewhere in this document — NOT NEEDED to explain the ~23% gap (§7.7),**
+  for the same reason. Still untouched and unmeasured in its own right; §7.6
+  measures the panorama→render chain end-to-end and cannot separate an NEE
+  contribution from the BSDF-strategy one, so this remains an uncatalogued-
+  magnitude observation, not evidence of anything contributing to the 23%.
 
-Whoever picks this up should start from the calibration numbers in §7.1 and
-the `gen_panorama.py` / `render_cycles_ref.py` scripts referenced there (kept
-in `task-8-report.md`, not the repo) as a ready-made repro — and should read
-§7.6's caveat about probe C's adversarial sub-texel stimulus before treating
-any of its numbers as a statement about a uniform gap under a real HDRI.
+This item no longer needs anyone to pick it up as an engine investigation —
+see §7.7 for the closing evidence. The one piece of real follow-up work left
+behind is §7.6's resolution-sensitivity finding (+8.5% at `RADIANCE_SIZE_256`
+on a sub-texel stimulus); whoever picks *that* up should start from §7.6
+directly and read its caveat about probe C's adversarial stimulus before
+treating the number as a statement about behaviour under a real, broadband
+HDRI.
 
 **Parked backlog item, still open, untouched by this phase:** glTF **export**
 still writes `sheenColorFactor`, `specularColorFactor`, `attenuationColor`
@@ -1692,7 +1721,10 @@ fix.
 
 ### 7.6 E2a - environment energy: what was measured
 
-**Follows up §7.4's ~23%-dimmer-than-Cycles open item.** `pt_sky_energy_gate.gd`
+**Follows up §7.4's ~23%-dimmer-than-Cycles item (since resolved as a
+comparison-harness artefact, not an engine defect — see §7.7; this section's
+own probe results below are unaffected by that resolution and stand on their
+own).** `pt_sky_energy_gate.gd`
 runs four probes against a scene built directly from the source panorama
 image — never from another render — so nothing here can be faked by a global
 sky scale.
@@ -1754,9 +1786,17 @@ survives the albedo fix essentially unchanged (9.475% before, 9.338% after)
 because the albedo error cancelled in a ratio of two measured means — only
 its interpretation changes.
 
-**The ~23% gap versus Cycles remains UNEXPLAINED and open.** Nothing in this
-gate reproduces a ~23% uniform dimming. §7.4 carries the item, with both of
-its original candidates restored.
+**The ~23% gap versus Cycles is RESOLVED — see §7.7 — and nothing in this
+gate turned out to be the explanation.** Nothing in this gate reproduces a
+~23% uniform dimming, and §7.7's confirmed follow-up experiment shows nothing
+here needed to: the whole-image gap was traced to a comparison-harness
+colour-space error in the original Cycles reference scene, independent of
+anything this gate measures. §7.4 carries the resolution. What this gate does
+establish stands on its own regardless: the engine reproduces analytic
+hemispherical irradiance to −1.6% at `RADIANCE_SIZE_2048`, and the
+radiance-map response is resolution-sensitive, reading +8.5% high at
+`RADIANCE_SIZE_256` on a deliberately sub-texel stimulus — a real, separate,
+still-open aliasing item, not a cause of the 23%.
 
 **Caveat — probe C's stimulus is adversarial and licenses no claim about a
 real HDRI.** `_banded_panorama(1)` paints ONE texel row out of 1024, at
@@ -1767,7 +1807,9 @@ is close to a coin flip. This is a worst-case sub-texel aliasing probe,
 chosen to make a filtering difference visible at all. **It does not
 generalize**: a broadband HDRI has no such structure, and the +8.5%/−1.6%
 figures must not be read as predicting the sign or magnitude of any error
-under one, nor as explaining a uniform 23% gap.
+under one, nor as explaining a uniform 23% gap — which §7.7 has since shown
+originates outside the engine entirely and needs no probe here to account for
+it.
 
 **Erratum — why the first conclusion was wrong.** The gate authored
 `mat.albedo_color = Color(0.5, 0.5, 0.5)` and its analytic model assumed the
@@ -1808,11 +1850,24 @@ Its green status covers integrator correctness given whatever radiance the
 renderer sees; it does not, and was never designed to, cover whether that
 radiance is right.
 
-### 7.7 The 23% gap - leading hypothesis (UNTESTED)
+### 7.7 The 23% gap — CONFIRMED: comparison-harness colour-space error, not an engine defect
 
-**This is a hypothesis, not a finding.** It has not been tested. Nothing below
-proposes an engine fix.
+> **ERRATUM / CONFIRMATION (2026-08-22).** This section originally recorded
+> the mechanism below as a hypothesis, explicitly untested, with an
+> instruction not to treat it as a finding. It has since been tested with an
+> independent three-arm Cycles experiment run against the same analytic
+> ground truth §7.6 uses (full scripts, logs, and verification in
+> `.superpowers/sdd/2026-08-21-environment-energy-fidelity/cycles-hypothesis-report.md`),
+> and the hypothesis **holds**. The ~23% whole-image dimming this project has
+> carried since Phase E1 as its largest known fidelity gap was a
+> comparison-harness material-transcription error, not a defect in either
+> renderer's physics. **No engine fix is proposed here — there is nothing to
+> fix.** Read "What this experiment does NOT establish," below, before citing
+> this section elsewhere: the confirmed result is narrower than the original
+> 23% figure, and two supporting claims (the sky/ground split, the original
+> scene's crop composition) remain unconfirmed.
 
+**The mechanism (unchanged from the original hypothesis, now confirmed).**
 E1 Task 8's Cycles comparison built its Blender scene by mirroring
 `pipeline_references/tests/pt_transmission_reference.gd`'s `_build_scene()`
 "field-for-field" (the phrase is that task's own report's). That includes
@@ -1850,6 +1905,62 @@ To make the two agree, the Godot side would need the ground authored at
 **0.767376 sRGB** — which decodes to linear 0.55, matching Blender's Base
 Color directly.
 
+**The confirming experiment.** Rather than rebuilding the deleted original
+Task 8 harness (see below), the confirming test built a *new* Cycles scene
+mirroring `pipeline_references/tests/pt_sky_energy_gate.gd`'s own geometry
+and lighting — flat Lambertian plane with its specular lobe removed,
+equirectangular environment, camera framing only ground-plane pixels — and
+compared it against the SAME analytic ground truth that gate uses,
+independently, on three arms:
+
+| Arm | Base Color (linear) | Measured/Analytic — P1 (constant) | Measured/Analytic — P2 (banded) |
+|---|---|---|---|
+| ARM 1 "reconciled" — what Godot's BRDF actually sees for authored `Color(0.55, 0.55, 0.55)` sRGB | 0.263273 | 1.000000 | 0.999991 |
+| ARM 2 "field-for-field" — what the original harness put into Blender directly | 0.55 | 1.000000 | 0.999989 |
+
+**ARM 3, positive control:** the ARM1/ARM2 measured ratio (0.478678, both
+panoramas) matches the predicted ground-only dimming ratio
+(0.263273/0.55 = 0.478679) to **six significant figures**.
+
+**What this establishes:**
+
+- Cycles individually reproduces analytic ground truth on this quantity to
+  within 0.011%.
+- This engine individually reproduces the same analytic ground truth to
+  −1.6% (already recorded in §7.6, `RADIANCE_SIZE_2048`).
+- **Both renderers are therefore individually correct.** The 0.478679
+  ground-only factor is real physics on both sides, not a harness artefact —
+  ARM 3's positive control is what rules out the harness itself introducing a
+  bias: if the harness's material linearity, panorama radiometry, or crop
+  measurement carried their own bias, ARM1/ARM2 would not reproduce the
+  predicted ratio to six figures.
+- **Conclusion: the ~23% gap originated in the comparison harness's material
+  transcription, not in either renderer's physics. It was never an engine
+  defect.**
+
+**What this experiment does NOT establish — read these limits before citing
+this section elsewhere:**
+
+- This experiment measured a **ground-only** quantity. The original 23%
+  figure was a **whole-image** mean mixing ground pixels (albedo-dependent)
+  with sky pixels (albedo-independent — §7.6's probes A and D separately
+  confirm the sky-scalar path is clean, at 1.00000 and 1.000000
+  respectively).
+- A field-for-field transcription produces a **52.1% ground-only dimming**
+  (`1 − 0.478679`), more than double the 23% whole-image figure. That is
+  comfortably large enough, in magnitude, to produce a 23% whole-image gap
+  once blended with unaffected sky pixels — but the actual sky/ground blend
+  of the original scene's crop was **not independently measured** by this
+  experiment.
+- The 56% sky / 44% ground split below was solved from one equation in two
+  unknowns and remains **NOT independently confirmed**. This experiment does
+  not confirm it — it confirms only that a split of that required magnitude
+  (44% ground) is achievable, not that it is what the original scene's crop
+  actually had.
+- The original scene's crop composition
+  (`pt_transmission_reference.gd`'s actual camera framing) was **not
+  re-measured**.
+
 **State the evidential limit honestly.** The observed whole-image control
 ratio (Godot / Cycles) was **0.7712**. Solving for a shared sky contribution
 `S` and a Cycles-side ground contribution `G` from the two-equation system
@@ -1867,20 +1978,31 @@ will always fit. What it does show is that the hypothesis requires a
 sky/ground split that is plausible for the scene's camera framing, and it
 explains why the three channel ratios (0.7712 / 0.7724 / 0.7752) are nearly
 identical: a neutral-grey ground contributes the same fractional error to
-every channel.
+every channel. The confirming experiment above adds independent evidence that
+the 0.478679 ground-only factor itself is real and not a harness artefact; it
+does **not** add independent evidence for this particular 56%/44% split (see
+"What this experiment does NOT establish," above).
 
-**The test that would settle it.** Re-run the Task 8 comparison with the
-Godot ground authored at 0.767376 sRGB (or, equivalently, with the Blender
-Base Color set to 0.263273 linear) and check whether the gap closes. The
-original EXR reference and driver scripts were deleted (Task 8's report,
-section 4), so this requires rebuilding the harness; the scripts needed to do
-so are reproduced verbatim in
-`.superpowers/sdd/2026-08-19-transmission-rough-glass/task-8-report.md`.
+**A test that would still settle the split specifically.** Re-run the
+original Task 8 comparison with the Godot ground authored at 0.767376 sRGB
+(or, equivalently, with the Blender Base Color set to 0.263273 linear) and
+check whether the whole-image gap closes. The original EXR reference and
+driver scripts were deleted (Task 8's report, section 4), so this still
+requires rebuilding that harness; the scripts needed to do so are reproduced
+verbatim in
+`.superpowers/sdd/2026-08-19-transmission-rough-glass/task-8-report.md`. This
+re-run was **not** performed as part of confirming the hypothesis above — the
+confirming experiment used a new, independent furnace-test scene instead
+(built from `pt_sky_energy_gate.gd`'s geometry, not Task 8's), whose own
+driver scripts and full log are in
+`.superpowers/sdd/2026-08-21-environment-energy-fidelity/cycles-hypothesis-report.md`.
 
-**Where this points, if it holds.** This would make the ~23% gap a
-measurement artefact in the comparison setup — a colour-space mismatch
-between how the two scenes were authored — rather than an engine defect. That
-reading is consistent with §7.6: the gate shows the engine reproducing the
-analytic hemispherical irradiance to −1.6% at high radiance-map resolution,
-which is the outcome §7.6's verdict rule (§7.6, corrected) points at as well.
-No engine change is proposed here; the next step is the harness re-run above.
+**Where this leaves the roadmap.** The ~23% gap — carried since Phase E1 as
+this project's largest known fidelity gap — is confirmed as a
+comparison-harness colour-space error, not an engine defect (§7.4 amended
+accordingly). **No engine change is proposed or needed.** §7.6's own findings
+are unaffected by this and stand on their own: the engine reproduces analytic
+hemispherical irradiance to −1.6% at high radiance-map resolution, and its
+response is resolution-sensitive, reading +8.5% high at `RADIANCE_SIZE_256`
+on a deliberately sub-texel stimulus — a real, minor, separate aliasing item
+this confirmation does not touch and does not explain.
