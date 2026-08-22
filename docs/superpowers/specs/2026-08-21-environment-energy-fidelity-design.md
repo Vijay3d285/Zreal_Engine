@@ -189,41 +189,77 @@ prints per-probe numbers, accumulates `_failures`).
 It measures the one quantity Gate 1 computes and then divides away: **the sky
 as the renderer sees it, against the sky as authored.**
 
-Procedure, repeated at three peakedness levels:
+**Amended 2026-08-21, while writing the implementation plan.** This section
+originally specified a three-level *peakedness* sweep. It now specifies a
+*resolution* sweep, because `Sky.radiance_size` turns out to be settable
+(`scene/resources/sky.h:47`, `RADIANCE_SIZE_2048`) provided the sky is
+`PROCESS_MODE_QUALITY` (`sky.h:53`) rather than `REALTIME` — the realtime
+path force-clamps to 256 at `sky.cpp:593-595`. That was not known when this
+section was first written.
 
-1. Generate a panorama `Image` procedurally in GDScript, so its mean radiance
-   over the sphere is known in closed form rather than measured.
-2. Build a `PanoramaSkyMaterial` -> `Sky` -> `Environment`. **Not
-   `BG_COLOR`** — roadmap F3: `BG_COLOR` renders pure black to the path
-   tracer, because `env_sky_radiance()` reads `radiance_octmap`, which the
-   sky pass only populates for `BG_SKY` with a real `Sky` resource.
-3. Render sky-only, with no geometry, and accumulate.
-4. Assert the measured mean equals the analytic mean.
+The change matters because the two sweeps differ in kind. A peakedness sweep
+*infers* resolution loss from a trend. A resolution sweep *controls* for it
+directly: same panorama, same geometry, same integrator, only the texture
+size differs. Physics does not depend on a texture size, so any shift in the
+measured response is energy the radiance map lost — proof rather than
+inference, and self-contained, needing neither an analytic model nor another
+renderer.
 
-The three levels hold **total radiant energy constant** and vary only its
-angular concentration:
+Four probes:
 
-| Level | Panorama | Purpose |
-|---|---|---|
-| C | Constant radiance | Invariant to resolution. Isolates Mechanism A. |
-| B | Broad lobe, roughly 1 steradian | Intermediate point; makes the trend readable rather than binary. |
-| N | Narrow patch, under 0.01 steradian, same total energy | Maximally exposed to point subsampling. Isolates Mechanism B. |
+**Probe A — constant sky, sky-only, absolute.** The plane is hidden, so every
+camera ray misses and reaches the miss shader with `mis_ray_pdf ==
+RT_MIS_PDF_NONE`, giving MIS weight exactly 1. The pixel is therefore
+`authored_radiance * IBL_exposure_normalization` with no BSDF, no NEE and no
+integrator involved. A constant sky is invariant to resolution, so this probe
+is blind to Mechanism B by construction and reads **Mechanism A alone** — the
+only probe here whose result has a single possible cause.
 
-**Reading the result:**
+**Probe B — peaked sky, Lambertian plane, against an analytic integral.** A
+narrow bright band, one texel row of a 1024-tall panorama, so its angular
+width is `PI/1024` — far thinner than a 256px octmap texel. The plane's
+response is compared against an irradiance integral computed in GDScript from
+the **panorama image**, never from a render:
 
-- All three off by the same factor -> **Mechanism A**. The factor is
-  `IBL_exposure_normalization`; read it directly to confirm.
-- C clean, B slightly off, N badly off -> **Mechanism B**. The loss is
-  resolution-dependent.
-- All three clean -> both mechanisms are wrong, and the defect is in
-  Cycles-side setup: colour management, or `gen_panorama.py`'s own scaling.
-  This outcome is explicitly in scope. It would mean the 23% is a
-  measurement artefact rather than an engine defect — a legitimate and
-  valuable finding, not a failed phase.
+```
+E   = integral over upper hemisphere of L(w) cos(theta) dw
+L_o = albedo * E / PI
+```
 
-A fourth probe reads `IBL_exposure_normalization` directly through a new
-debug vis mode (**34** — modes 0-33 are allocated) so its value is observed
-rather than inferred, whichever way the sweep lands.
+The panorama is **mirrored about the equator** so the gate never has to assume
+whether the engine's lat-long `v = 0` is `+Y` or `-Y`. Assuming that would be
+precisely the kind of unverified transcription that produced F1. Mirrored, the
+upward hemisphere sees identical content under either convention, so the
+integral is correct either way and the probe measures energy rather than
+accidentally testing orientation.
+
+**Probe C — the same measurement at `radiance_size` 256 and 2048.** The
+decisive probe. Everything else is corroboration.
+
+**Probe D — `IBL_exposure_normalization` read directly off the GPU** through a
+new debug vis mode (**34** — modes 0-33 are allocated), so its value is
+observed rather than inferred. Inferring it from a brightness ratio would
+assume the rest of the sky path is correct, which is what the gate is testing.
+
+**Reading the result.** The rule is fixed here, before any measurement, and is
+encoded in the gate's own `_print_verdict()`:
+
+- Probe A off by more than tolerance **and** probe C flat -> **Mechanism A**. A
+  scalar dims the sky at every peakedness and resolution does not matter.
+  Probe D names the value.
+- Probe C shifts by more than tolerance -> **Mechanism B**, regardless of what
+  A says. Energy is being lost in the radiance map.
+- A clean, C flat, B clean -> **neither**. Both engine-side mechanisms are
+  clean and the 23% is a measurement artefact in the Cycles-side setup: colour
+  management, or `gen_panorama.py`'s own scaling. This outcome is explicitly
+  in scope. It would be a legitimate and valuable finding, not a failed phase,
+  and per §8.7 it means **no engine change is made**.
+- B off while A is clean and C is flat -> **inconclusive**, fitting no
+  modelled mechanism. Stop and widen the sweep; do not guess a fix.
+
+Fixing the rule in advance is deliberate. Roadmap §7.1 had to retract a
+circular calibration argument during the E1 fix wave, and a decision rule
+written after seeing the numbers is how that happens.
 
 ### 5.2 Task 2 — the fix
 
@@ -292,9 +328,10 @@ be re-derived from raw numbers rather than carried forward.
 
 ## 7. Testing
 
-**New:** `pt_sky_energy_gate.gd` — four probes (three peakedness levels plus
-the direct `IBL_exposure_normalization` read), headless, following the
-existing gates' interface.
+**New:** `pt_sky_energy_gate.gd` — four probes (A constant-sky absolute, B
+analytic irradiance, C the `radiance_size` 256-vs-2048 sweep, D the direct
+`IBL_exposure_normalization` read), headless, following the existing gates'
+interface.
 
 **Regression:** the full doctest suite (currently 1513/1513, 0 failed, 3
 skipped), all five existing GPU gates, and `pt_validation`.
@@ -307,18 +344,22 @@ the exact failure mode that let E1's Task 5/6 defects through a green
 
 ## 8. Acceptance
 
-1. `pt_sky_energy_gate` exists, runs headless, and its three-level sweep
-   yields an unambiguous reading of Mechanism A vs B vs neither.
-2. If a defect is found: it is fixed, and the gate's absolute assertions pass
-   at all three peakedness levels within 2%.
+1. `pt_sky_energy_gate` exists, runs headless, and its four probes yield an
+   unambiguous reading of Mechanism A vs B vs neither vs inconclusive, against
+   the decision rule fixed in §5.1.
+2. If a defect is found: it is fixed, probes A and B pass within 2%, and probe
+   C's resolution shift falls within 2%.
 3. `pt_energy_gate` Gate 1 still passes.
 4. doctest remains at 1513/1513, 0 failed.
 5. All five gates and `pt_validation` re-baselined, with old and new recorded.
 6. A Cycles comparison on the no-glass control scene reads within 5% rather
    than 23%.
-7. If Task 1 shows all three levels clean, acceptance is instead: the
-   measurement artefact is identified and documented, roadmap §7.4 is
-   corrected, and **no engine change is made**.
+7. If probes A, B and C are all clean, acceptance is instead: the measurement
+   artefact is identified and documented, roadmap §7.4 is corrected, and **no
+   engine change is made**.
+8. If the verdict is `inconclusive` (probe B off while A is clean and C is
+   flat), acceptance is to report and stop. No engine change is made on a
+   result that fits no modelled mechanism.
 
 ## 9. Out of scope
 
