@@ -1480,16 +1480,40 @@ gate purpose-built for this phase caught it.
 task's own measurement harness:** this engine's environment-lit diffuse
 response reads **~23% dimmer than Cycles under a matched HDRI**, reproduced
 on a scene with zero glass objects (§7.1's no-glass control). Root cause not
-chased at the time this paragraph was first written. **It has since been
-measured and localized by a dedicated four-probe gate — see §7.6.** That gate
-rules out a uniform exposure-scalar cause (probe D reads
-`IBL_exposure_normalization` at exactly 1.0) and rules out the cheap fix
-option — raising the radiance-map resolution or area-averaging its downsample
-— that this document's own follow-on E2a spec floated in §5.2 (probe C shows
-the response moving *further* from ground truth as resolution rises, the
-opposite of what an undersampling explanation predicts). The two candidates
-named in the previous version of this paragraph are superseded by that
-measurement; do not re-open them without accounting for §7.6's results.
+chased at the time this paragraph was first written. **A dedicated four-probe
+gate has since measured the engine side of it — see §7.6.** That gate
+eliminates a uniform exposure-scalar cause (probe A is bit-exact at 1.00000
+and probe D reads `IBL_exposure_normalization` at exactly 1.000000), and it
+demonstrates no energy loss at all at high radiance-map resolution (−0.05%
+against an analytic hemispherical-irradiance ground truth). **The ~23% gap
+versus Cycles is therefore still unexplained and fully open.**
+
+*(Erratum, corrected by the E2a fix wave. An earlier version of this
+paragraph declared the two candidates below superseded, and told readers not
+to re-open them, on the strength of a §7.6 result that was wrong — the gate's
+analytic ground truth omitted an sRGB albedo pre-encode. Both candidates are
+**restored as open**, and the octahedral-filtering one is now the better
+supported of the two: the corrected data shows the low-resolution radiance
+map reading 10.4% **high** on a sub-texel bright band, which is exactly the
+filtering-behaviour signature that candidate names — a gain rather than a
+loss, but the same mechanism.)*
+
+- **HDRI resolution/filtering loss during octahedral-map conversion.** A
+  small bright source averaged, or aliased, by a coarse box filter changes GI
+  system-wide. §7.6's corrected probe B shows this filtering path is not
+  energy-neutral at low resolution (+10.4% at `RADIANCE_SIZE_256` on a
+  one-texel-row stimulus), so the behaviour is real and measured; its sign
+  and magnitude under a real, broadband HDRI are not.
+- **Pre-existing environment-NEE energy behaviour already catalogued
+  elsewhere in this document.** Untouched by §7.6, which measures the
+  panorama→render chain end-to-end and cannot separate the NEE contribution
+  from the BSDF-strategy one.
+
+Whoever picks this up should start from the calibration numbers in §7.1 and
+the `gen_panorama.py` / `render_cycles_ref.py` scripts referenced there (kept
+in `task-8-report.md`, not the repo) as a ready-made repro — and should read
+§7.6's caveat about probe C's adversarial sub-texel stimulus before treating
+any of its numbers as a statement about a uniform gap under a real HDRI.
 
 **Parked backlog item, still open, untouched by this phase:** glTF **export**
 still writes `sheenColorFactor`, `specularColorFactor`, `attenuationColor`
@@ -1666,20 +1690,27 @@ transcribed into this roadmap in the first place — it exists only in the
 ledger, where it has already been corrected — so there was nothing here to
 fix.
 
-### 7.6 E2a - environment energy: measured verdict
+### 7.6 E2a - environment energy: what was measured
 
 **Follows up §7.4's ~23%-dimmer-than-Cycles open item.** `pt_sky_energy_gate.gd`
 runs four probes against a scene built directly from the source panorama
 image — never from another render — so nothing here can be faked by a global
-sky scale. Measured on `vijay_PTEngine_v12_PhaseE`:
+sky scale.
+
+**Read the erratum at the end of this section before citing any earlier
+version of it.** This section's first draft concluded MECHANISM B and
+reported roughly half the energy missing. That conclusion was **wrong**: the
+gate's analytic ground truth omitted the sRGB albedo pre-encode the RT
+material upload applies. The numbers below are the corrected measurement,
+taken on `vijay_PTEngine_v12_PhaseE` after the fix.
 
 | Probe | What it isolates | Result |
 |---|---|---|
-| A — constant sky, sky-only | Mechanism A: a scalar dimming the sky uniformly, independent of angular content | ratio **1.00000** |
-| B @ `Sky.RADIANCE_SIZE_256` | Peaked sky vs. an analytic irradiance integral computed from the panorama image | ratio **0.47263** (analytic L_o 0.31676) |
-| B @ `Sky.RADIANCE_SIZE_2048` | Same, at 8x the radiance-map linear resolution | ratio **0.42785** |
-| C — resolution shift (B moved between the two sizes above) | Mechanism B: whether the radiance map itself is losing energy | **9.475%** (tolerance 2%) |
-| D — `IBL_exposure_normalization`, read off the GPU via vis mode 34 | Names Mechanism A's scalar directly, rather than inferring it from a ratio | **1.000000** |
+| A — constant sky, sky-only | Mechanism A: a scalar dimming the sky uniformly, independent of angular content | ratio **1.00000** (bit-exact) |
+| B @ `Sky.RADIANCE_SIZE_256` | Peaked sky vs. an analytic irradiance integral computed from the panorama image | ratio **1.08484** — measured 0.34364 vs. analytic 0.31676 (**+8.5%**) |
+| B @ `Sky.RADIANCE_SIZE_2048` | Same, at 8x the radiance-map linear resolution | ratio **0.98354** — measured 0.31155 vs. analytic 0.31676 (**−1.6%**, inside the 2% tolerance) |
+| C — resolution shift (B moved between the two sizes above) | Whether the response depends on radiance-map resolution at all | **9.338%** (tolerance 2%) |
+| D — `IBL_exposure_normalization`, read off the GPU via vis mode 34 | Names Mechanism A's scalar directly, rather than inferring it from a ratio | **1.000000** (exact) |
 
 The realtime-clamp warning (`sky.cpp:593-595` force-clamping a `REALTIME`
 sky's radiance map to 256 and logging it) did not appear at either size —
@@ -1687,50 +1718,92 @@ sky's radiance map to 256 and logging it) did not appear at either size —
 took effect and probe C's comparison is not confounded by a silently-clamped
 second measurement.
 
-**Verdict rule (`_print_verdict()`, fixed before any measurement was
-taken):** `a_off = |A - 1| > TOLERANCE`, `res_sensitive = C > TOLERANCE`. `A`
-is clean and `C` exceeds tolerance, so the rule selects **MECHANISM B** — the
-radiance map itself is losing energy, not a uniform post-multiply scalar.
+**Finding 1 — `IBL_exposure_normalization` is eliminated as a cause.** Probe
+A reads 1.00000 bit-exact under a constant sky: the sky pass, the radiance
+octmap, the miss shader, MIS weighting and the accumulator are provably exact
+together with zero angular detail in the source. Probe D corroborates it
+directly — the one scalar Cycles has no counterpart for reads exactly
+1.000000. Neither a uniform post-multiply nor the exposure normalization can
+account for any part of the ~23% gap.
 
-**Finding 1 — the defect is localized, not merely present.** Probe A is
-bit-exact at 1.00000 under a constant sky: the sky pass, the radiance
-octmap, the miss shader, MIS weighting and the accumulator are all provably
-exact together, with zero angular detail in the source. Probe D corroborates
-this directly — `IBL_exposure_normalization` reads exactly 1.0, so the one
-scalar Cycles has no counterpart for is not the cause either. The moment the
-panorama gains angular detail (probe B's banded sky), the same chain loses
-roughly half the energy. The defect is specifically in how angular structure
-survives the path from source panorama to rendered response, not in any
-constant-factor stage.
+**Finding 2 — no energy loss is demonstrated anywhere in this measurement.**
+At `RADIANCE_SIZE_2048` the engine reproduces the analytic hemispherical
+irradiance to **−1.6%**, inside the gate's own 2% tolerance. There is no
+missing energy to attribute at that resolution. The engine-side "the radiance
+map loses energy" hypothesis is **not supported by this data**.
 
-**Finding 2 — the resolution sweep inverts naive expectation, and that
-inversion is load-bearing.** Raising `Sky.radiance_size` from 256 to 2048
-moved the response *further* from ground truth (0.42785, vs. 0.47263 at
-256), not closer. A simple undersampling account of a thin bright band —
-"the radiance map is too coarse to resolve it, so a bigger map should
-recover more of it" — predicts the opposite direction. It does not happen.
-This measurement **rules out** the cheap fix the E2a design spec's §5.2
-floated as an option ("generating the radiance map with a proper
-area-averaging downsample, or raising its resolution") and **strengthens the
-case** for that same spec's preferred fix — the path tracer sampling the
-panorama directly instead of borrowing the raster IBL radiance map, as
-Cycles does. This inversion was independently checked for harness artefacts
-(stale panorama or environment reuse between passes, missing settle time, an
-unreset accumulator, state leaking through `_verdict`) and none were found:
-each pass builds a fresh `Sky`, `Environment`, camera and plane, and
-`_render_accum` forces a genuine accumulate off-to-on edge on every call.
+**Finding 3 — the low-resolution response is HIGH, not low, and raising the
+resolution IMPROVED accuracy.** At `RADIANCE_SIZE_256` the response is
+**+8.5%** above ground truth. Going to `RADIANCE_SIZE_2048` moves it to
+−1.6% — from an 8.5% error to a 1.6% one. That is an aliasing **overshoot**
+on a deliberately sub-texel stimulus being resolved away by a finer map, the
+exact opposite of the "coarse map averages the band away, so it reads dim"
+account. Raising the radiance-map resolution therefore **helps**; the
+previous version of this section claimed this measurement ruled that option
+out, and it does not.
 
-**No root cause is asserted here, and no fix is proposed.** What is recorded
-above is what was measured and what it rules in and out; the mechanism
-behind why a higher-resolution radiance map loses *more* energy, and the
-implementation of the panorama-direct-sampling fix, are follow-up-plan work
-against spec §5.2, not this phase's.
+**Finding 4 — the verdict rule fired, and its label does not survive the
+corrected data.** `_print_verdict()`'s rule (`a_off = |A - 1| > TOLERANCE`,
+`res_sensitive = C > TOLERANCE`) selects on resolution sensitivity alone, so
+with C at 9.338% it printed **MECHANISM B — "energy is lost in the map."**
+The rule fired correctly on its own terms; the *label* is wrong for what was
+measured. C only shows the response *depends on* resolution. Its sign says
+the low-resolution map reads too BRIGHT, and the high-resolution one is
+accurate. "Lost energy" describes neither endpoint. Probe C's relative shift
+survives the albedo fix essentially unchanged (9.475% before, 9.338% after)
+because the albedo error cancelled in a ratio of two measured means — only
+its interpretation changes.
 
-**`pt_energy_gate` Gate 1 remains green and is not evidence against any of
-the above.** It is a RATIO test — `L_o` measured against `ALBEDO * l_sky`
-where `l_sky` is itself measured from the same render (`pt_energy_gate.gd`
-:206, :222) — so a uniform loss upstream of both measurements cancels
-exactly and the gate is structurally blind to it, exactly as its own header
-already says. Its green status covers integrator correctness given whatever
-radiance the renderer sees; it does not, and was never designed to, cover
-whether that radiance is right.
+**The ~23% gap versus Cycles remains UNEXPLAINED and open.** Nothing in this
+gate reproduces a ~23% uniform dimming. §7.4 carries the item, with both of
+its original candidates restored.
+
+**Caveat — probe C's stimulus is adversarial and licenses no claim about a
+real HDRI.** `_banded_panorama(1)` paints ONE texel row out of 1024, at
+radiance 200 against a 0.02 base; that single row carries ~97% of the
+hemispherical irradiance. Its angular width (PI/1024) is far below one
+256px-octmap texel (PI/256 at best), so whether a point sampler lands on it
+is close to a coin flip. This is a worst-case sub-texel aliasing probe,
+chosen to make a filtering difference visible at all. **It does not
+generalize**: a broadband HDRI has no such structure, and the +8.5%/−1.6%
+figures must not be read as predicting the sign or magnitude of any error
+under one, nor as explaining a uniform 23% gap.
+
+**Erratum — why the first conclusion was wrong.** The gate authored
+`mat.albedo_color = Color(0.5, 0.5, 0.5)` and its analytic model assumed the
+BRDF saw a linear reflectance of 0.5. The RT material upload
+(`render_raytracing.cpp:1540-1542`) reads `albedo` back and runs it through
+`srgb_to_linear()`, so the BRDF actually saw `srgb_to_linear(0.5) =
+0.214041` — 42.8% of the authored value. That single colour-space round trip
+accounts for the whole "roughly half the energy" reading: `0.214041 / 0.5 =
+0.428082` against a measured 0.42785 at `RADIANCE_SIZE_2048`, a 0.054%
+match. **The sibling gate documented this exact trap by name**
+(`pt_energy_gate.gd:562-568`, with the comment "This trap cost real debugging
+time once; do not 'simplify' it away") and pre-encoded with
+`.linear_to_srgb()`; this gate was written without that line. The fix wave
+added the pre-encode, and also zeroed `metallic_specular` — the gate had set
+`specular_mode = SPECULAR_DISABLED`, which is a **no-op on the path-tracing
+path** (`BaseMaterial3D` emits it only as a spatial-shader `render_mode`
+token), leaving a live F0 = 0.04 dielectric lobe the Lambertian analytic
+model does not account for. The lesson is procedural, not numeric: a gate
+whose ground truth is computed rather than measured must be validated against
+the engine's *upload* path, not just its integrator, before its verdict is
+recorded as a finding.
+
+**Observation for a future phase (no fix proposed).** The environment NEE CDF
+grid is hardcoded at `ENV_N_U 256` / `ENV_N_V 128`
+(`raytracing_env_sampling_inc.glsl:39-40`, and independently as `N_U 256` /
+`N_V 128` in `env_cdf_build.glsl:22-23`). Those constants do **not** scale
+with `Sky.radiance_size`, so the importance-sampling distribution stays at a
+fixed 256x128 resolution while the radiance map it samples can be eight times
+finer. Recorded as an observation only; whether it contributes to anything
+measured above has not been tested.
+
+**`pt_energy_gate` Gate 1 remains green and is not evidence about any of the
+above.** It is a RATIO test — `L_o` measured against `ALBEDO * l_sky` where
+`l_sky` is itself measured from the same render (`pt_energy_gate.gd`:206,
+:222) — so a uniform loss upstream of both measurements cancels exactly and
+the gate is structurally blind to it, exactly as its own header already says.
+Its green status covers integrator correctness given whatever radiance the
+renderer sees; it does not, and was never designed to, cover whether that
+radiance is right.

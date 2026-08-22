@@ -237,10 +237,20 @@ func _build_scene(p_panorama: ImageTexture, p_radiance_size: int) -> Environment
 	var plane_mesh := PlaneMesh.new()
 	plane_mesh.size = Vector2(200.0, 200.0)
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(ALBEDO, ALBEDO, ALBEDO)
+	# ALBEDO is the LINEAR reflectance the analytic answer is written in, but
+	# render_raytracing.cpp:1540-1542 runs albedo_color through srgb_to_linear()
+	# before it reaches the BRDF. Pre-encode so the shader ends up with exactly
+	# ALBEDO. Without this the plane reads srgb_to_linear(0.5) = 0.21404, which
+	# looks exactly like a ~57% energy loss and is really a colour-space round
+	# trip. See pt_energy_gate.gd:562-568.
+	mat.albedo_color = Color(ALBEDO, ALBEDO, ALBEDO).linear_to_srgb()
 	mat.metallic = 0.0
 	mat.roughness = 1.0
-	mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
+	# specular_mode is a NO-OP on the path-tracing path (it only emits a
+	# spatial-shader render_mode token). The live knob is metallic_specular,
+	# whose default 0.5 leaves an F0 = 0.04 dielectric lobe the Lambertian
+	# analytic model does not account for. See pt_energy_gate.gd:571-575.
+	mat.metallic_specular = 0.0
 	_plane = MeshInstance3D.new()
 	_plane.mesh = plane_mesh
 	_plane.material_override = mat
