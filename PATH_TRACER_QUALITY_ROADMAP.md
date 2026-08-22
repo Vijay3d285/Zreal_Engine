@@ -1807,3 +1807,80 @@ the gate is structurally blind to it, exactly as its own header already says.
 Its green status covers integrator correctness given whatever radiance the
 renderer sees; it does not, and was never designed to, cover whether that
 radiance is right.
+
+### 7.7 The 23% gap - leading hypothesis (UNTESTED)
+
+**This is a hypothesis, not a finding.** It has not been tested. Nothing below
+proposes an engine fix.
+
+E1 Task 8's Cycles comparison built its Blender scene by mirroring
+`pipeline_references/tests/pt_transmission_reference.gd`'s `_build_scene()`
+"field-for-field" (the phrase is that task's own report's). That includes
+copying literal RGB triples into both engines' material colours. But the two
+engines do not treat those triples the same way: `StandardMaterial3D`'s
+`albedo_color` is authored sRGB, and the RT material upload converts it to
+linear before the BRDF ever sees it —
+
+```cpp
+// render_raytracing.cpp:1538-1542
+// Colors declared with source_color in Godot shaders are stored in sRGB;
+// material_get_param returns the raw sRGB value, so we convert to linear here.
+Variant albedo_var = material_storage->material_get_param(p_material_rid, "albedo");
+if (albedo_var.get_type() == Variant::COLOR) {
+    Color c = ((Color)albedo_var).srgb_to_linear();
+```
+
+Blender's Principled BSDF `Base Color` is LINEAR — no such conversion happens
+on the Cycles side. Copying the same numeric triple into both `albedo_color`
+and `Base Color` therefore gives the two renderers DIFFERENT reflectances,
+not the same one.
+
+The reference scene's ground plane is authored `Color(0.55, 0.55, 0.55)`
+(`pt_transmission_reference.gd:118`, the `_add_box` call that builds the
+ground). Under the conversion above:
+
+| Side | Authored | BRDF sees (linear) |
+|---|---|---|
+| Godot (sRGB) | 0.55 | 0.263273 |
+| Blender (linear) | 0.55 | 0.55 |
+
+ground-only dimming ratio = 0.263273 / 0.55 = **0.478679**
+
+To make the two agree, the Godot side would need the ground authored at
+**0.767376 sRGB** — which decodes to linear 0.55, matching Blender's Base
+Color directly.
+
+**State the evidential limit honestly.** The observed whole-image control
+ratio (Godot / Cycles) was **0.7712**. Solving for a shared sky contribution
+`S` and a Cycles-side ground contribution `G` from the two-equation system
+
+```
+S + 0.478679*G = 0.181181
+S +          G = 0.234934
+```
+
+gives `S = 0.13182`, `G = 0.10311` — a 56% sky / 44% ground split — and
+reproduces 0.7712 exactly. **That exact reproduction is NOT independent
+evidence**: it is two unknowns solved from one equation (plus the definition
+`S + G = 0.234934`), and a system with as many free parameters as data points
+will always fit. What it does show is that the hypothesis requires a
+sky/ground split that is plausible for the scene's camera framing, and it
+explains why the three channel ratios (0.7712 / 0.7724 / 0.7752) are nearly
+identical: a neutral-grey ground contributes the same fractional error to
+every channel.
+
+**The test that would settle it.** Re-run the Task 8 comparison with the
+Godot ground authored at 0.767376 sRGB (or, equivalently, with the Blender
+Base Color set to 0.263273 linear) and check whether the gap closes. The
+original EXR reference and driver scripts were deleted (Task 8's report,
+section 4), so this requires rebuilding the harness; the scripts needed to do
+so are reproduced verbatim in
+`.superpowers/sdd/2026-08-19-transmission-rough-glass/task-8-report.md`.
+
+**Where this points, if it holds.** This would make the ~23% gap a
+measurement artefact in the comparison setup — a colour-space mismatch
+between how the two scenes were authored — rather than an engine defect. That
+reading is consistent with §7.6: the gate shows the engine reproducing the
+analytic hemispherical irradiance to −1.6% at high radiance-map resolution,
+which is the outcome §7.6's verdict rule (§7.6, corrected) points at as well.
+No engine change is proposed here; the next step is the harness re-run above.
