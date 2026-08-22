@@ -101,7 +101,7 @@ Expected: exit code 0. A GLSL syntax error surfaces here as a shader-compile fai
 grep -c "vis_mode == 34" servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl.gen.h
 ```
 
-Expected: a count of 2 or more (the raygen header embeds the include at more than one call site — `debug_visualize()` has both an HG0 form and an `RT_CUSTOM_HIT_GROUP` form). A count of 0 means the build did not regenerate the header; re-run Step 4 without `-j8` and read the output.
+Expected: a count of **1**. (Corrected 2026-08-21 during execution: this step originally predicted "2 or more", reasoning that `debug_visualize()` has both an HG0 and an `RT_CUSTOM_HIT_GROUP` call site. That is wrong — the two call sites *call* the function, they do not duplicate its body, so every vis mode including long-established ones such as 23 and 33 also greps to exactly 1. Verified against the built header.) A count of **0** means the build did not regenerate the header; re-run Step 4 without `-j8` and read the output.
 
 - [ ] **Step 6: Confirm no existing test regressed**
 
@@ -478,7 +478,7 @@ func _probe_b_at(p_radiance_size: int, p_label: String) -> float:
 		_failures.append("probe B [%s]: accumulator readback returned null" % p_label)
 		return -1.0
 	var s := _measure_crop(img, 0.25, 0.75)
-	var ratio := s["mean"] / maxf(analytic, 1e-9)
+	var ratio: float = s["mean"] / maxf(analytic, 1e-9)
 	print("  analytic L_o : %.5f  (from the panorama image)" % analytic)
 	print("  measured     : %.5f  (R %.5f  G %.5f  B %.5f)" % [s["mean"], s["r"], s["g"], s["b"]])
 	print("  ratio        : %.5f" % ratio)
@@ -492,7 +492,7 @@ In `_ready`, replace the single `await _probe_a()` line with:
 ```gdscript
 	await _probe_a()
 
-	var b256 := await _probe_b_at(Sky.RADIANCE_SIZE_256, "radiance 256")
+	var b256: float = await _probe_b_at(Sky.RADIANCE_SIZE_256, "radiance 256")
 	_verdict["b256"] = b256
 	if b256 > 0.0 and absf(b256 - 1.0) > TOLERANCE:
 		_failures.append("probe B (radiance 256): ratio %.5f vs 1.0 (limit %.0f%%)"
@@ -534,7 +534,7 @@ git commit -m "test(pt): E2a probe B - Lambertian response vs analytic irradianc
 In `_ready`, immediately after the probe B block added in Task 3, insert:
 
 ```gdscript
-	var b2048 := await _probe_b_at(Sky.RADIANCE_SIZE_2048, "radiance 2048")
+	var b2048: float = await _probe_b_at(Sky.RADIANCE_SIZE_2048, "radiance 2048")
 	_verdict["b2048"] = b2048
 	if b2048 > 0.0 and absf(b2048 - 1.0) > TOLERANCE:
 		_failures.append("probe B (radiance 2048): ratio %.5f vs 1.0 (limit %.0f%%)"
