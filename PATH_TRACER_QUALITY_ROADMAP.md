@@ -1290,9 +1290,11 @@ default** (see the Task 7 trap note below), exported via
 `GLTFDocument.append_from_scene` + `write_to_filesystem`, imported into Blender
 4.5 headless (`bpy.ops.import_scene.gltf`), read back from the Principled
 BSDF, and run through Cycles' own arbitration
-(`kernel/svm/closure.h:426-431`, transcribed in the driver script) to compute
+(`kernel/svm/closure.h:426-434` -- note the range: the driver script
+originally transcribed only `:426-431`, dropping the `if (ior < 1.0f) eta =
+1.0f / eta;` tail, which is defect F1) to compute
 `F0`/`eta`. Cross-checked a second way, independent of the Blender round trip:
-this engine's own `resolveDielectricF0` (`brdf_inc.glsl:443-448`) read back
+this engine's own `resolveDielectricF0` (`brdf_inc.glsl:477-493`) read back
 live via debug vis modes 30/31 on a `StandardMaterial3D` carrying the exact
 same four values.
 
@@ -1330,8 +1332,10 @@ GPU read is part of this fix wave's own verification pass, recorded in
 **`eta` did not match Cycles here at `83161b784f` — deliberately, per the
 design at the time.** [Historical, superseded by F3 above.]
 `resolveDielectricF0`'s eta re-derivation was gated on Godot's *native*
-`specular` parameter only (`brdf_inc.glsl:447`:
-`eta = (specular != 0.5f) ? ior_from_F0(luminance(F0)) : ior;`), not on
+`specular` parameter only -- the line then read
+`eta = (specular != 0.5f) ? ior_from_F0(luminance(F0)) : ior;` (no longer
+present at any line; see `3ce2f822a8` for the removal, and
+`brdf_inc.glsl:484-490` for what replaced it) -- and not on
 `specular_factor`/`specular_tint`. This fixture varies only `specular_factor`
 (the glTF-round-trippable knob) and leaves `metallic_specular` at its 0.5
 no-op point, so `eta` stayed pinned to the raw `ior` — matching the design

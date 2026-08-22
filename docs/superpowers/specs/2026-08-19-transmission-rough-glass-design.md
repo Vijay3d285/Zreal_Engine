@@ -62,10 +62,22 @@ names as the proper fix for the OIDN transparency defect.
 
 ### 3.2 F0 is resolved from IOR, with Godot's curve as a multiplier
 
+> **ERRATUM (2026-08-21) — READ BEFORE THIS SECTION.** The Cycles quote and the
+> pseudocode below are **wrong in three ways** and were shipped that way before
+> being caught by a whole-branch review. They are preserved verbatim as the
+> historical record of the defect; **do not implement from them.** The correct
+> arbitration is stated in "Corrected arbitration" at the end of this section,
+> and the authority is
+> `servers/rendering/renderer_rd/shaders/raytracing/brdf_inc.glsl`
+> (`resolveDielectricF0`), mirrored in
+> `tests/servers/rendering/test_pt_transmission.cpp` (`resolve_f0`).
+
 Phase D left F0 double-specified and handed the conflict to E. Cycles resolves
-exactly this conflict at `kernel/svm/closure.h:426-431`:
+exactly this conflict at `kernel/svm/closure.h:426-434`:
 
 ```c
+// !! ERRATUM F1: THIS QUOTE IS TRUNCATED. The real block has three more
+// !! lines -- see "Corrected arbitration" below for the full source.
 const float specular_ior_level = max(stack_load(stack, data.specular_ior_level), 0.0f);
 float eta = ior;
 float f0 = F0_from_ior(eta);
@@ -83,6 +95,7 @@ We adopt that structure with **Godot's** response curve rather than Blender's,
 so an existing tuned `specular` keeps behaving as it does today:
 
 ```
+// !! ERRATUM: DEFECTIVE. Carries F1, F2 and F3. Do not implement.
 f0_scalar = F0_from_ior(ior)                       // sqr((ior-1)/(ior+1))
 F0        = f0_scalar * specular_tint * specular_factor
 F0       *= 4.0 * specular * specular              // == 1.0 exactly at specular = 0.5
@@ -106,6 +119,78 @@ Blender's glTF importer independently confirms the other half of the mapping:
 (`pbrMetallicRoughness.py:409`), `specularColorFactor` → `specular_tint`
 (`:428`). Substituting into Cycles' formula collapses to glTF's own
 `F0 = F0_from_ior(ior) × specularColorFactor × specularFactor`.
+
+#### Corrected arbitration (2026-08-21)
+
+The full Cycles block, read from
+`intern/cycles/kernel/svm/closure.h:426-434` rather than transcribed:
+
+```c
+const float specular_ior_level = max(stack_load(stack, data.specular_ior_level), 0.0f);
+float eta = ior;
+float f0 = F0_from_ior(eta);
+if (specular_ior_level != 0.5f) {
+  f0 *= 2.0f * specular_ior_level;
+  eta = ior_from_F0(f0);
+  if (ior < 1.0f) {
+    eta = 1.0f / eta;          // <- F1: dropped from the quote above
+  }
+}
+...
+fresnel->f0 = f0 * specular_tint;  // closure.h:453 -- AFTER eta is fixed
+```
+
+Three defects, each independently shippable through a green suite because no
+test scene contained a transmissive material:
+
+**F1 - the dropped `ior < 1` flip.** `ior_from_F0` always returns a value
+`>= 1`, so for `ior < 1` (authorable: `material.cpp`'s ior hint is
+`"0,3,0.001,or_greater"`, and `KHR_materials_ior` permits it) the re-derived
+eta lands on the *wrong side of 1* - the surface refracts as if it were denser
+than its medium when the artist asked for less dense. Inverting the direction
+of refraction is not a subtle error.
+
+**F2 - eta derived from the tinted F0.** Cycles keeps the two completely
+separate: eta comes from the untinted *scalar* `f0` at `:429-431`, and
+`specular_tint` is multiplied in only at `:453`, where it can no longer reach
+eta. The spec's `ior_from_F0(luminance(F0))` reads the tinted vector, so a
+coloured tint drags the refractive index with it. Magnitude: at `ior 1.5`,
+`specular 1.0`, tint `(0.05, 0.9, 0.95)`, correct eta is `ior_from_F0(0.16) =
+2.333`, the defect gives `ior_from_F0(0.11566) = 2.031` - a 13% error in a
+quantity that is supposed to be a property of the *material*, not its colour.
+
+**F3 - the gate was too narrow.** Gating on `specular != 0.5` alone ignores
+`specular_factor`. This section's own next paragraph documents Blender's
+mapping `specular_ior_level = 0.5 * specularFactor`, under which a non-default
+`specular_factor` puts `specular_ior_level` off 0.5 exactly as much as a
+non-default `specular` does - so the spec refuted its own gate one paragraph
+later. Imported glTF glass overwhelmingly varies `specular_factor` and leaves
+`specular` at its default, so the common case got a correct F0 and a silently
+un-re-derived eta. Magnitude at `ior 1.33`, `specular_factor 0.6`: eta 1.246
+vs 1.33, moving the critical angle from 48.8 deg to 53.4 deg.
+
+The shipped form, gating on **either** knob and tinting **after**:
+
+```
+f0_scalar    = F0_from_ior(ior)
+f0_untinted  = f0_scalar * specular_factor
+f0_untinted *= 4.0 * specular * specular      // == 1.0 exactly at specular = 0.5
+eta          = ior
+if (specular != 0.5 || specular_factor != 1.0) {   // F3
+    eta = ior_from_F0(f0_untinted)                 // F2: untinted scalar
+    if (ior < 1.0) { eta = 1.0 / eta }             // F1
+}
+F0 = float3(f0_untinted) * specular_tint           // F2: tint applied last
+```
+
+Every default still collapses to `F0 = 0.04, eta = 1.5`, so the
+no-pixel-change guarantee for untouched materials survives the correction.
+
+**The process lesson, which outlived the bug.** All three defects entered as
+*transcription* errors in this document and were then faithfully implemented.
+Mirror discipline was enforced between C++ and GLSL - and both mirrored the
+same wrong spec. Quote external source files by reading them at implementation
+time; a quotation in a design doc is a claim about a file, not the file.
 
 ### 3.3 Back faces are visible only to transmissive continuation rays
 

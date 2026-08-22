@@ -278,9 +278,22 @@ TEST_CASE("[PathTracer][Transmission] F2: specular_tint must not leak into eta")
 	CHECK(f0_tinted.y == doctest::Approx(0.16f * 0.9f).epsilon(1e-6));
 	CHECK(f0_tinted.z == doctest::Approx(0.16f * 0.95f).epsilon(1e-6));
 	// ...but eta must be bit-identical to the untinted derivation, not pulled
-	// toward luminance(f0_tinted) (which would be far below 0.16).
+	// toward luminance(f0_tinted) (which is far below 0.16).
 	CHECK(eta_tinted == doctest::Approx(eta_white).epsilon(1e-6));
 	CHECK(eta_tinted == doctest::Approx(ior_from_f0(0.16f)).epsilon(1e-5));
+
+	// Spell the counterfactual out rather than asserting only against the
+	// correct value. Two of the four E1 escapes were assertions that were
+	// themselves correct but could not distinguish right from wrong, so pin
+	// the WRONG answer numerically and require the gap:
+	//   luminance(0.16 * (0.05, 0.9, 0.95)) = 0.16 * 0.72290 = 0.1156640
+	//   ior_from_f0(0.1156640)              = 2.030733
+	//   ior_from_f0(0.16)                   = 2.333333   <- required
+	// A 0.30 spread, ~13%. If someone reinstates the F2 defect, the equality
+	// above fails AND this inequality fails, so the failure is unambiguous.
+	const float eta_if_f2_regressed = ior_from_f0(luminance(f0_tinted));
+	CHECK(eta_if_f2_regressed == doctest::Approx(2.030733f).epsilon(1e-5));
+	CHECK(Math::abs(eta_tinted - eta_if_f2_regressed) > 0.25f);
 }
 
 TEST_CASE("[PathTracer][Transmission] F1: ior < 1 flips the re-derived eta") {
