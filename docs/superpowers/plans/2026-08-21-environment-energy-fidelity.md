@@ -507,7 +507,7 @@ bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tes
 
 Expected: probe A's number from Task 2 unchanged, plus a probe B ratio. **Again, a failure here is a result, not a bug to fix.** Record the ratio.
 
-Sanity check before trusting it: `analytic L_o` should be a positive number of order `0.01`-`0.1`. If it prints `0.00000`, the row sampling picked the wrong half — confirm `_banded_panorama` actually wrote bright rows by checking `pano_tex.get_image().get_pixel(0, int(PANO_H * 0.25))`.
+Sanity check before trusting it: `analytic L_o` should be **approximately 0.31676** for these constants. (Corrected 2026-08-21 during execution: this step originally said "order 0.01-0.1", which is wrong — the single `BAND_BRIGHT = 200` row dominates the integral. By hand: `200 * 2*PI * cos45 * sin45 * (PI/1024) = 1.9275`, plus the base `0.02 * PI = 0.0628`, giving `E = 1.9903` and `L_o = 0.5 * 1.9903 / PI = 0.31676`. Independently confirmed to full precision by re-implementing the discrete algorithm.) If it prints `0.00000`, the row sampling picked the wrong half — confirm `_banded_panorama` actually wrote bright rows by checking `pano_tex.get_image().get_pixel(0, int(PANO_H * 0.25))`.
 
 - [ ] **Step 6: Commit**
 
