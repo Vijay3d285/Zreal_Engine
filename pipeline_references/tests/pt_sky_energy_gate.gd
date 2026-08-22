@@ -177,6 +177,9 @@ func _ready() -> void:
 			_failures.append("probe C: response moved %.3f%% between radiance 256 and 2048 -- the radiance map is losing energy (Mechanism B)"
 					% (res_delta * 100.0))
 
+	await _probe_d()
+	_print_verdict()
+
 	print("\n=== RESULT ===")
 	if _failures.is_empty():
 		print("PASS - sky energy gate green.")
@@ -308,3 +311,69 @@ func _probe_b_at(p_radiance_size: int, p_label: String) -> float:
 	print("  measured     : %.5f  (R %.5f  G %.5f  B %.5f)" % [s["mean"], s["r"], s["g"], s["b"]])
 	print("  ratio        : %.5f" % ratio)
 	return ratio
+
+
+## PROBE D -- read IBL_exposure_normalization straight off the GPU.
+##
+## env_sky_radiance() multiplies sky radiance by this scalar
+## (raytracing_closest_hit_common_inc.glsl:306). Cycles has no equivalent. Vis
+## mode 34 reports it in the red channel at any pixel covering geometry, so the
+## value is OBSERVED rather than inferred from a brightness ratio -- inferring
+## it would assume the rest of the sky path is correct, which is what the gate
+## is testing.
+func _probe_d() -> void:
+	var env := _build_scene(_constant_panorama(), Sky.RADIANCE_SIZE_256)
+	_plane.visible = true
+	_look_down()
+	await get_tree().create_timer(2.0).timeout
+
+	env.set_pathtracing_debug_mode(34)
+	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), 4)
+	env.set_pathtracing_debug_mode(0)
+	if img == null:
+		_failures.append("probe D: accumulator readback returned null")
+		return
+	var s := _measure_crop(img, 0.4, 0.6)
+	print("\n=== PROBE D: IBL_exposure_normalization ===")
+	print("  value : %.6f" % s["r"])
+	_verdict["d_ibl"] = s["r"]
+	if absf(s["r"] - 1.0) > TOLERANCE:
+		_failures.append("probe D: IBL_exposure_normalization is %.6f, not 1.0 -- it scales sky radiance and Cycles has no counterpart (Mechanism A)"
+				% s["r"])
+
+
+## Reads the four numbers against a rule fixed BEFORE the measurement, so the
+## conclusion is read off rather than argued for afterwards.
+func _print_verdict() -> void:
+	var a: float = _verdict.get("a_ratio", -1.0)
+	var b256: float = _verdict.get("b256", -1.0)
+	var b2048: float = _verdict.get("b2048", -1.0)
+	var shift: float = _verdict.get("c_shift", -1.0)
+	var ibl: float = _verdict.get("d_ibl", -1.0)
+
+	print("\n=== VERDICT ===")
+	print("  A constant-sky ratio        : %.5f" % a)
+	print("  B ratio @ radiance 256      : %.5f" % b256)
+	print("  B ratio @ radiance 2048     : %.5f" % b2048)
+	print("  C resolution shift          : %.3f%%" % (shift * 100.0))
+	print("  D IBL_exposure_normalization: %.6f" % ibl)
+
+	var a_off := absf(a - 1.0) > TOLERANCE
+	var res_sensitive := shift > TOLERANCE
+
+	if a_off and not res_sensitive:
+		print("  -> MECHANISM A. A scalar dims the sky at every peakedness and the")
+		print("     response does not move with resolution. Probe D names the value.")
+	elif res_sensitive:
+		print("  -> MECHANISM B. The response moves with radiance-map resolution, so")
+		print("     energy is lost in the map. The fix is to stop borrowing the raster")
+		print("     IBL map and sample the panorama directly (spec 5.2).")
+	elif not a_off and not res_sensitive and absf(b256 - 1.0) <= TOLERANCE:
+		print("  -> NEITHER. Both engine-side mechanisms are clean, so the 23%% is a")
+		print("     measurement artefact in the Cycles-side setup (colour management,")
+		print("     or gen_panorama.py's own scaling). Spec 8.7: correct roadmap 7.4")
+		print("     and make NO engine change.")
+	else:
+		print("  -> INCONCLUSIVE. Probe B is off while A is clean and resolution does")
+		print("     not matter, which fits no modelled mechanism. Do not guess a fix;")
+		print("     widen the sweep before changing any engine code.")
