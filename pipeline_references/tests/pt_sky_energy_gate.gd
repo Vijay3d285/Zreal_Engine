@@ -85,10 +85,26 @@ func _build_scene(p_panorama: ImageTexture, p_radiance_size: int) -> Environment
 	var plane_mesh := PlaneMesh.new()
 	plane_mesh.size = Vector2(200.0, 200.0)
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(ALBEDO, ALBEDO, ALBEDO)
+	# ALBEDO is the LINEAR reflectance _analytic_outgoing_radiance() is written
+	# in, but render_raytracing.cpp:1540-1542 reads albedo_color back and runs it
+	# through srgb_to_linear() before it reaches the BRDF. Pre-encode so the
+	# shader ends up with exactly ALBEDO.
+	# Without this the plane reads srgb_to_linear(0.5) = 0.21404 -- 42.8% of the
+	# authored value, which looks exactly like a ~57% energy loss and is really
+	# just a colour-space round trip. pt_energy_gate.gd:562-568 documents the
+	# same trap; it cost this phase a wrong MECHANISM B verdict (roadmap 7.6).
+	# Do not "simplify" it away.
+	mat.albedo_color = Color(ALBEDO, ALBEDO, ALBEDO).linear_to_srgb()
 	mat.metallic = 0.0
 	mat.roughness = 1.0
-	mat.specular_mode = BaseMaterial3D.SPECULAR_DISABLED
+	# specular_mode is a NO-OP on the path-tracing path -- BaseMaterial3D only
+	# emits it as a spatial-shader `render_mode` token, which the RT material
+	# upload never reads. The live knob is metallic_specular (default 0.5), which
+	# gives a dielectric F0 = 0.16 * specular^2 = 0.04 lobe that the pure
+	# Lambertian analytic model above does not account for. Zero it so the
+	# directional-hemispherical reflectance is exactly ALBEDO.
+	# Matches pt_energy_gate.gd:571-575.
+	mat.metallic_specular = 0.0
 	_plane = MeshInstance3D.new()
 	_plane.mesh = plane_mesh
 	_plane.material_override = mat
@@ -357,6 +373,28 @@ func _print_verdict() -> void:
 	print("  B ratio @ radiance 2048     : %.5f" % b2048)
 	print("  C resolution shift          : %.3f%%" % (shift * 100.0))
 	print("  D IBL_exposure_normalization: %.6f" % ibl)
+
+	# A missing probe is NOT a passing probe. If either probe B returned -1.0
+	# (null accumulator readback) probe C is skipped entirely and "c_shift" is
+	# never set, so `shift` below defaults to -1.0 -- which reads as
+	# `res_sensitive == false` and would let this function name MECHANISM A or
+	# NEITHER off data that was never collected. Refuse to conclude instead.
+	if a < 0.0 or b256 < 0.0 or b2048 < 0.0 or shift < 0.0 or ibl < 0.0:
+		var missing: Array[String] = []
+		if not _verdict.has("a_ratio") or a < 0.0:
+			missing.append("A")
+		if not _verdict.has("b256") or b256 < 0.0:
+			missing.append("B@256")
+		if not _verdict.has("b2048") or b2048 < 0.0:
+			missing.append("B@2048")
+		if not _verdict.has("c_shift") or shift < 0.0:
+			missing.append("C")
+		if not _verdict.has("d_ibl") or ibl < 0.0:
+			missing.append("D")
+		print("  missing/invalid probes      : %s" % ", ".join(missing))
+		print("  -> INCOMPLETE. One or more probes did not report; no mechanism")
+		print("     can be named.")
+		return
 
 	var a_off := absf(a - 1.0) > TOLERANCE
 	var res_sensitive := shift > TOLERANCE
