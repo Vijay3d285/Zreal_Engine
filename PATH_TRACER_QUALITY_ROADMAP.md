@@ -1484,7 +1484,7 @@ chased at the time this paragraph was first written. **A dedicated four-probe
 gate has since measured the engine side of it — see §7.6.** That gate
 eliminates a uniform exposure-scalar cause (probe A is bit-exact at 1.00000
 and probe D reads `IBL_exposure_normalization` at exactly 1.000000), and it
-demonstrates no energy loss at all at high radiance-map resolution (−0.05%
+demonstrates no energy loss at all at high radiance-map resolution (−1.6%
 against an analytic hemispherical-irradiance ground truth). **The ~23% gap
 versus Cycles is therefore still unexplained and fully open.**
 
@@ -1494,14 +1494,14 @@ to re-open them, on the strength of a §7.6 result that was wrong — the gate's
 analytic ground truth omitted an sRGB albedo pre-encode. Both candidates are
 **restored as open**, and the octahedral-filtering one is now the better
 supported of the two: the corrected data shows the low-resolution radiance
-map reading 10.4% **high** on a sub-texel bright band, which is exactly the
+map reading 8.5% **high** on a sub-texel bright band, which is exactly the
 filtering-behaviour signature that candidate names — a gain rather than a
 loss, but the same mechanism.)*
 
 - **HDRI resolution/filtering loss during octahedral-map conversion.** A
   small bright source averaged, or aliased, by a coarse box filter changes GI
   system-wide. §7.6's corrected probe B shows this filtering path is not
-  energy-neutral at low resolution (+10.4% at `RADIANCE_SIZE_256` on a
+  energy-neutral at low resolution (+8.5% at `RADIANCE_SIZE_256` on a
   one-texel-row stimulus), so the behaviour is real and measured; its sign
   and magnitude under a real, broadband HDRI are not.
 - **Pre-existing environment-NEE energy behaviour already catalogued
