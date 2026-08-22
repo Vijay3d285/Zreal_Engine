@@ -656,6 +656,19 @@ void debug_visualize(
 				(dbg_ok && dbg_is_transmit && dbg_wrong_hemisphere) ? 1.0 : 0.0,
 				(dbg_ok && dbg_is_transmit) ? 1.0 : 0.0,
 				(dbg_ok && dbg_wrong_hemisphere) ? 1.0 : 0.0);
+	} else if (vis_mode == 34) {
+		// E2a probe D: the scalar this shader multiplies sky radiance by.
+		//
+		// env_sky_radiance() does `sky_color *= IBL_exposure_normalization`.
+		// Cycles has no equivalent scalar, so if this is not 1.0 it is a direct
+		// candidate for the ~23% environment dimming (roadmap 7.4).
+		//
+		// It is reported rather than inferred on purpose. Deriving it from a
+		// brightness ratio would assume the rest of the sky path is correct,
+		// which is exactly what the gate is testing -- the same circularity
+		// the E1 closeout had to retract from roadmap 7.1's calibration
+		// argument. Raw and unscaled, matching mode 23's convention.
+		ps.radiance = vec3(scene_data_block.data.IBL_exposure_normalization, 0.0, 0.0);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
