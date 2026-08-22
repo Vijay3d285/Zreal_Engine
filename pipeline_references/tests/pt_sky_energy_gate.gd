@@ -154,6 +154,29 @@ func _ready() -> void:
 		_failures.append("probe B (radiance 256): ratio %.5f vs 1.0 (limit %.0f%%)"
 				% [b256, TOLERANCE * 100.0])
 
+	var b2048: float = await _probe_b_at(Sky.RADIANCE_SIZE_2048, "radiance 2048")
+	_verdict["b2048"] = b2048
+	if b2048 > 0.0 and absf(b2048 - 1.0) > TOLERANCE:
+		_failures.append("probe B (radiance 2048): ratio %.5f vs 1.0 (limit %.0f%%)"
+				% [b2048, TOLERANCE * 100.0])
+
+	# PROBE C -- the resolution comparison itself.
+	#
+	# Same panorama, same geometry, same integrator; only Sky.radiance_size
+	# differs. Physics does not depend on a texture size, so ANY difference here
+	# is energy the radiance map lost. This is the one probe in the file that
+	# needs neither an analytic model nor another renderer to be conclusive.
+	if b256 > 0.0 and b2048 > 0.0:
+		var res_delta: float = absf(b2048 - b256) / maxf(b256, 1e-9)
+		print("\n=== PROBE C: resolution sensitivity ===")
+		print("  ratio at 256  : %.5f" % b256)
+		print("  ratio at 2048 : %.5f" % b2048)
+		print("  relative shift: %.3f%%" % (res_delta * 100.0))
+		_verdict["c_shift"] = res_delta
+		if res_delta > TOLERANCE:
+			_failures.append("probe C: response moved %.3f%% between radiance 256 and 2048 -- the radiance map is losing energy (Mechanism B)"
+					% (res_delta * 100.0))
+
 	print("\n=== RESULT ===")
 	if _failures.is_empty():
 		print("PASS - sky energy gate green.")
