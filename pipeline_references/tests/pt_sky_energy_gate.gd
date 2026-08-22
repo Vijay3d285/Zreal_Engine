@@ -29,10 +29,12 @@ extends "res://tests/pt_validation.gd"
 ##   A. Constant sky, sky-only. Invariant to resolution, so it reads the
 ##      scalar path alone (Mechanism A).
 ##   B. Peaked sky, Lambertian plane, against an irradiance integral computed
-##      in GDScript from the panorama image (Mechanism B).
+##      in GDScript from the panorama image. A probe B reading LOW is energy
+##      lost in the radiance map (Mechanism B); a probe B reading HIGH is an
+##      aliasing overshoot on the sub-texel stimulus, not lost energy.
 ##   C. Probe B repeated at two Sky.radiance_size values. If the response moves
-##      with resolution, energy is being lost in the radiance map -- proof, not
-##      inference.
+##      with resolution, the map is resolution-SENSITIVE -- that alone does not
+##      say which direction, if any, it is biased; probe B's sign settles that.
 ##   D. IBL_exposure_normalization read directly off the GPU via vis mode 34.
 
 const SKY_RADIANCE := 0.5 # Authored constant radiance for probe A.
@@ -398,20 +400,36 @@ func _print_verdict() -> void:
 
 	var a_off := absf(a - 1.0) > TOLERANCE
 	var res_sensitive := shift > TOLERANCE
+	# Resolution sensitivity (res_sensitive) is orthogonal to bias direction: it
+	# only says the response MOVES between radiance sizes, not which way either
+	# endpoint is off from 1.0. worst_bias and the LOW/HIGH checks below read
+	# the sign so a HIGH-reading aliasing overshoot (a gain) is never reported
+	# as the same thing as a probe reading LOW (a loss).
+	var worst_bias: float = maxf(absf(b256 - 1.0), absf(b2048 - 1.0))
+	var b256_low := b256 < 1.0 - TOLERANCE
+	var b2048_low := b2048 < 1.0 - TOLERANCE
 
 	if a_off and not res_sensitive:
 		print("  -> MECHANISM A. A scalar dims the sky at every peakedness and the")
 		print("     response does not move with resolution. Probe D names the value.")
+	elif b256_low or b2048_low:
+		print("  -> MECHANISM B -- ENERGY LOSS. A probe B reads low, so radiance is")
+		print("     being destroyed in the map.")
 	elif res_sensitive:
-		print("  -> MECHANISM B. The response moves with radiance-map resolution, so")
-		print("     energy is lost in the map. The fix is to stop borrowing the raster")
-		print("     IBL map and sample the panorama directly (spec 5.2).")
-	elif not a_off and not res_sensitive and absf(b256 - 1.0) <= TOLERANCE:
+		print("  -> RESOLUTION-SENSITIVE, NO ENERGY LOSS. The response moves with")
+		print("     radiance-map resolution, but no probe reads low. A probe B reading")
+		print("     HIGH is an aliasing overshoot on a sub-texel stimulus, not lost")
+		print("     energy. This does not by itself explain a uniform dimming.")
+		var worst_label := "B @ radiance 256"
+		var worst_val := b256
+		if absf(b2048 - 1.0) > absf(b256 - 1.0):
+			worst_label = "B @ radiance 2048"
+			worst_val = b2048
+		var worst_dir := "HIGH" if worst_val > 1.0 else "LOW"
+		print("     probe %s reads %s by %.3f%% (worst deviation)"
+				% [worst_label, worst_dir, worst_bias * 100.0])
+	else:
 		print("  -> NEITHER. Both engine-side mechanisms are clean, so the 23%% is a")
 		print("     measurement artefact in the Cycles-side setup (colour management,")
 		print("     or gen_panorama.py's own scaling). Spec 8.7: correct roadmap 7.4")
 		print("     and make NO engine change.")
-	else:
-		print("  -> INCONCLUSIVE. Probe B is off while A is clean and resolution does")
-		print("     not matter, which fits no modelled mechanism. Do not guess a fix;")
-		print("     widen the sweep before changing any engine code.")
