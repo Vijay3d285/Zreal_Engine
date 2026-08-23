@@ -249,4 +249,68 @@ TEST_CASE("[PathTracer][Anisotropy] positive and negative anisotropy swap the st
 	CHECK(nx < ny); // negative: y is
 }
 
+// The shipped HEIGHT-CORRELATED isotropic G2, copied verbatim from
+// brdf_inc.glsl:918-921 (Smith_G2_Height_Correlated_GGX_Lagarde). Its own doc
+// comment at brdf_inc.glsl:917 states the returned value is
+// "G2 / (4 * NdotL * NdotV)" -- USE_OPTIMIZED_G2 and USE_HEIGHT_CORRELATED_G2
+// (both on, brdf_inc.glsl:165 and :168) route Smith_G2 to exactly this
+// function and #define G2_DIVIDED_BY_DENOMINATOR 1 at :946 as a direct
+// consequence, so evalMicrofacet's isotropic branch performs NO further
+// division at its return statement (:1448-1449 pre-C1-fix numbering). This is
+// the reference the anisotropic G2, AS CONSUMED, must reduce to.
+static float smith_g2_height_correlated_ggx_lagarde(float p_alpha_squared, float p_ndotl, float p_ndotv) {
+	const float a = p_ndotv * Math::sqrt(p_alpha_squared + p_ndotl * (p_ndotl - p_alpha_squared * p_ndotl));
+	const float b = p_ndotl * Math::sqrt(p_alpha_squared + p_ndotv * (p_ndotv - p_alpha_squared * p_ndotv));
+	return 0.5f / (a + b);
+}
+
+// Plain (undivided) anisotropic G2, mirroring Smith_G2_Aniso verbatim
+// (brdf_inc.glsl:1019-1021).
+static float smith_g2_aniso(const Vector3 &p_v, const Vector3 &p_l, float p_ax, float p_ay) {
+	return 1.0f / (1.0f + smith_lambda_aniso(p_v, p_ax, p_ay) + smith_lambda_aniso(p_l, p_ax, p_ay));
+}
+
+TEST_CASE("[PathTracer][Anisotropy] microfacet G2, AS CONSUMED, reduces to the shipped isotropic G2/denominator convention") {
+	// C1 regression test (Task 3 review, Critical). Smith_G2_Aniso returns
+	// PLAIN G2 (1/(1+lambdaV+lambdaL)); the shipped isotropic path
+	// (Smith_G2_Height_Correlated_GGX_Lagarde, consumed via Smith_G2 under
+	// USE_OPTIMIZED_G2) returns G2 / (4*NdotL*NdotV) instead, and
+	// evalMicrofacet's return statement performs NO further division (its
+	// G2_DIVIDED_BY_DENOMINATOR branch). Before the fix, evalMicrofacet's
+	// anisotropic branch consumed Smith_G2_Aniso's PLAIN G2 directly, which is
+	// wrong by exactly the missing 4*NdotL*NdotV factor -- a geometry-dependent
+	// 0-4x brightness error on every anisotropic direct-lit surface. This test
+	// asserts the two conventions agree once that factor is applied, so this
+	// suite fails if the denominator convention ever desyncs again.
+	//
+	// Deliberately NOT (1.0, 1.0): there 4*NdotL*NdotV == 4 exactly, and a test
+	// that only checks normal incidence cannot distinguish "divided by the
+	// factor" from "not divided" well -- the whole point is to exercise it at
+	// non-trivial angles.
+	struct Case {
+		float ndotl;
+		float ndotv;
+	};
+	const Case cases[] = { { 0.35f, 0.7f }, { 0.5f, 0.5f } };
+
+	for (const Case &c : cases) {
+		float ax = 0.0f, ay = 0.0f;
+		aniso_alphas(0.4f, 0.0f, &ax, &ay); // anisotropy == 0 -> ax == ay == alpha, exactly
+		CHECK(ax == ay);
+		const float alpha = 0.4f * 0.4f;
+		const float alpha_sq = alpha * alpha;
+
+		const float sl = Math::sqrt(MAX(0.0f, 1.0f - c.ndotl * c.ndotl));
+		const float sv = Math::sqrt(MAX(0.0f, 1.0f - c.ndotv * c.ndotv));
+		const Vector3 l(sl * 0.6f, sl * 0.8f, c.ndotl);
+		const Vector3 v(sv * 0.6f, sv * 0.8f, c.ndotv);
+
+		const float g2_aniso_plain = smith_g2_aniso(v, l, ax, ay);
+		const float g2_aniso_divided = g2_aniso_plain / (4.0f * c.ndotl * c.ndotv);
+		const float g2_iso_divided = smith_g2_height_correlated_ggx_lagarde(alpha_sq, c.ndotl, c.ndotv);
+
+		CHECK(g2_aniso_divided == doctest::Approx(g2_iso_divided).epsilon(1e-4));
+	}
+}
+
 } // namespace TestPTAnisotropy

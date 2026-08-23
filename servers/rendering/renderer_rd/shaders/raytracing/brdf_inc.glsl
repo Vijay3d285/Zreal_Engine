@@ -1118,6 +1118,22 @@ float specularSampleWeightGGXVNDF(float alpha, float alphaSquared, float NdotL, 
 #endif
 }
 
+// I1 fix (Task 3 review, Important). Anisotropic partner of
+// specularSampleWeightGGXVNDF, computed the same way sampleGGXVNDFReflectionPdfAniso
+// is: Vaniso/Laniso are already rotated by -anisoPhi by the CALLER, into the
+// SAME frame the direction was drawn in by sampleSpecularHalfVector(Vaniso,
+// (ax,ay), u). Before this fix, every anisotropic-sampled direction was
+// weighted by the ISOTROPIC ratio (Smith_G2_Over_G1_Height_Correlated) even
+// though the direction itself came from the anisotropic VNDF -- a visible bias
+// that (combined with C1) made the BSDF-sampled and light-sampled estimators
+// of the same surface disagree, biasing the MIS partition rather than merely
+// approximating it.
+float specularSampleWeightGGXVNDFAniso(float3 Vaniso, float3 Laniso, float ax, float ay) {
+	float G1 = 1.0f / (1.0f + Smith_Lambda_Aniso(Vaniso, ax, ay));
+	float G2 = Smith_G2_Aniso(Vaniso, Laniso, ax, ay);
+	return G2 / G1;
+}
+
 // Weight for the reflection ray sampled from Beckmann distribution using Walter's method
 float specularSampleWeightBeckmannWalter(float alpha, float alphaSquared, float NdotL, float NdotV, float HdotL, float NdotH) {
 	return (HdotL * Smith_G2(alpha, alphaSquared, NdotL, NdotV)) / (NdotV * NdotH);
@@ -1142,11 +1158,11 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 //
 // E2b: ax/ay/anisoPhi come straight from BrdfData (prepareBRDFData). At
 // anisotropy == 0 (or no usable tangent) ax == ay == alpha and anisoPhi == 0,
-// so rotateAboutZ is the identity and this call reduces EXACTLY to the
-// pre-E2b isotropic one -- see brdf_inc.glsl Task 3 Step 2. No anisoActive
-// branch is needed here (unlike evalMicrofacet's D/G2): rotating V in and H
-// back at the default values is bit-identical, not merely numerically close.
-float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float ax, float ay, float anisoPhi, float2 u, OUT_PARAMETER(float3) weight) {
+// so rotateAboutZ is the identity and the SAMPLING half of this call reduces
+// EXACTLY to the pre-E2b isotropic one -- see brdf_inc.glsl Task 3 Step 2. The
+// WEIGHT half, below, DOES need an anisoActive branch (I1 fix, Task 3 review) --
+// see specularSampleWeightGGXVNDFAniso's doc comment.
+float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float ax, float ay, float anisoPhi, bool anisoActive, float2 u, OUT_PARAMETER(float3) weight) {
 	// Sample a microfacet normal (H) in local space
 	float3 Hlocal;
 	if (alpha == 0.0f) {
@@ -1181,18 +1197,20 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	// Calculate weight of the sample specific for selected sampling method
 	// (this is microfacet BRDF divided by PDF of sampling method - notice how most terms cancel out)
 	//
-	// KNOWN SCOPE BOUNDARY (Task 3): specularSampleWeight still uses the
-	// SCALAR isotropic G2/G1 ratio here even when anisoActive, because Task 2
-	// did not deliver an anisotropic G2/G1-ratio helper (only GGX_D_Aniso and
-	// Smith_G2_Aniso, both consumed directly by evalMicrofacet, not as a
-	// ratio) and the plan's Step 4 scopes the D/G2 replacement to
-	// evalMicrofacet only. This is a real, reported approximation for
-	// anisotropic materials -- not the invisible sampler/pdf desync this task
-	// exists to prevent (a wrong weight here directly scales rendered
-	// radiance, so it is visible, not mean-preserving) -- left for Task 4/5's
-	// Cycles-reference comparison to quantify and, if warranted, a follow-up
-	// task to close.
-	weight = ms * F * specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
+	// I1 fix (Task 3 review, Important): this used to call the SCALAR
+	// isotropic G2/G1 ratio unconditionally, even when Hlocal above was drawn
+	// from the ANISOTROPIC VNDF (ax != ay). Gated on anisoActive so the
+	// isotropic path (ax == ay == alpha, anisoPhi == 0) stays bit-identical to
+	// pre-E2b -- exactly the same shape as evalMicrofacet's D/G2 branch.
+	float weightRatio;
+	if (anisoActive) {
+		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
+		float3 Laniso = rotateAboutZ(Llocal, -anisoPhi);
+		weightRatio = specularSampleWeightGGXVNDFAniso(Vaniso, Laniso, ax, ay);
+	} else {
+		weightRatio = specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
+	}
+	weight = ms * F * weightRatio;
 
 	return Llocal;
 }
@@ -1258,8 +1276,10 @@ float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmissi
 // term, matching sampleSpecularMicrofacet's convention.
 // E2b: ax/ay/anisoPhi thread through to the half-vector sample exactly as in
 // sampleSpecularMicrofacet above -- same identity-at-default reasoning, no
-// anisoActive branch needed for the sampling step itself.
-bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float ax, float ay, float anisoPhi, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit) {
+// anisoActive branch needed for the SAMPLING step itself. The WEIGHT
+// computations below DO need one (I1 fix, Task 3 review) -- same reasoning as
+// sampleSpecularMicrofacet's own weight branch.
+bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float ax, float ay, float anisoPhi, bool anisoActive, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit) {
 	const float3 Nlocal = float3(0.0f, 0.0f, 1.0f);
 
 	float3 Hlocal;
@@ -1304,8 +1324,20 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		// and slightly dark at high roughness. Cycles has the same limitation.
 		// transmittance is per-channel (bsdf_microfacet.h:329), so a tinted
 		// dielectric's transmitted lobe carries colour, not just its reflection.
-		weight = transmittance / denom_t *
-				specularSampleWeight(alpha, alphaSquared, abs(NdotL), NdotV, HdotL, NdotH);
+		// I1 fix: anisoActive branch mirrors sampleSpecularMicrofacet's own
+		// weight fix. Laniso.z is negative here (transmitted, below-hemisphere
+		// local direction) but Smith_Lambda_Aniso only ever consumes V.z
+		// squared, so it naturally matches the abs(NdotL) the isotropic branch
+		// takes explicitly -- no extra sign-handling needed.
+		float weightRatioT;
+		if (anisoActive) {
+			float3 VanisoT = rotateAboutZ(Vlocal, -anisoPhi);
+			float3 LanisoT = rotateAboutZ(Llocal, -anisoPhi);
+			weightRatioT = specularSampleWeightGGXVNDFAniso(VanisoT, LanisoT, ax, ay);
+		} else {
+			weightRatioT = specularSampleWeight(alpha, alphaSquared, abs(NdotL), NdotV, HdotL, NdotH);
+		}
+		weight = transmittance / denom_t * weightRatioT;
 	} else {
 		Llocal = reflect(-Vlocal, Hlocal);
 		float HdotL = max(0.00001f, min(1.0f, dot(Hlocal, Llocal)));
@@ -1317,8 +1349,16 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 #else
 		float3 ms = float3(1.0f, 1.0f, 1.0f);
 #endif
-		weight = ms * (reflectance / pdf_reflect) *
-				specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
+		// I1 fix: same anisoActive branch as the transmit case above.
+		float weightRatioR;
+		if (anisoActive) {
+			float3 VanisoR = rotateAboutZ(Vlocal, -anisoPhi);
+			float3 LanisoR = rotateAboutZ(Llocal, -anisoPhi);
+			weightRatioR = specularSampleWeightGGXVNDFAniso(VanisoR, LanisoR, ax, ay);
+		} else {
+			weightRatioR = specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
+		}
+		weight = ms * (reflectance / pdf_reflect) * weightRatioR;
 	}
 
 	return true;
@@ -1351,8 +1391,10 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 // matching shade_and_bounce's own `transmissive_sample_ok = false` handling.
 // E2b: ax/ay/anisoPhi (from prepareBRDFData, same tangent-projection formula
 // every other consumer uses) pass straight through to sampleDielectricMicrofacet.
+// anisoActive (I1 fix, Task 3 review) passes through the same way, gating that
+// function's sample-weight computation.
 bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float alpha, float alphaSquared,
-		float3 specularF0, float eta, float transmissivness, bool thin_walled, float ax, float ay, float anisoPhi, float3 u3,
+		float3 specularF0, float eta, float transmissivness, bool thin_walled, float ax, float ay, float anisoPhi, bool anisoActive, float3 u3,
 		OUT_PARAMETER(float3) r_next_dir, OUT_PARAMETER(float3) r_weight, OUT_PARAMETER(bool) r_is_transmit,
 		OUT_PARAMETER(bool) r_wrong_hemisphere) {
 	float4 qRotationToZ = getRotationToZAxis(N);
@@ -1389,7 +1431,7 @@ bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float al
 	// and the validation mean all passed through this regression untouched
 	// -- only this gate's probe 6 caught it, because it was the only check
 	// exercising the transmissive lobe's rendered output directly.
-	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness, ax, ay, anisoPhi, u3, Llocal, r_weight, r_is_transmit)) {
+	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness, ax, ay, anisoPhi, anisoActive, u3, Llocal, r_weight, r_is_transmit)) {
 		return false;
 	}
 
@@ -1438,6 +1480,20 @@ float3 evalMicrofacet(const BrdfData data) {
 		float3 La = rotateAboutZ(Llocal, -data.anisoPhi);
 		D = GGX_D_Aniso(Ha, max(0.00001f, data.ax), max(0.00001f, data.ay));
 		G2 = Smith_G2_Aniso(Va, La, max(0.00001f, data.ax), max(0.00001f, data.ay));
+		// C1 fix (Task 3 review, Critical): Smith_G2_Aniso returns PLAIN G2, but
+		// this function's isotropic branch below returns G2 / (4*NdotL*NdotV) --
+		// see Smith_G2_Height_Correlated_GGX_Lagarde's own doc comment at :917
+		// ("returned value is G2 / (4 * NdotL * NdotV)") and the resulting
+		// #define G2_DIVIDED_BY_DENOMINATOR 1 at :946, which is why the return
+		// statement below performs NO further division. Left undivided, the
+		// anisotropic branch was up to 4x too bright at normal incidence and
+		// ~0.36x too dim at grazing (NdotL == NdotV == 0.3), and the BSDF-sampled
+		// estimator (specularSampleWeight, unaffected) would disagree with this
+		// evaluation -- a biased MIS partition, not merely an approximation.
+		// Clamped NdotL/NdotV mirror how the isotropic path protects itself.
+#if G2_DIVIDED_BY_DENOMINATOR
+		G2 /= 4.0f * max(0.00001f, data.NdotL) * max(0.00001f, data.NdotV);
+#endif
 	} else {
 		D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
 		G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
@@ -1891,7 +1947,7 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 
 	} else if (brdfType == SPECULAR_TYPE) {
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, materialLocal);
-		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, u, sampleWeight);
+		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, data.anisoActive, u, sampleWeight);
 	}
 
 	// Transform sampled direction Llocal back to V vector space.

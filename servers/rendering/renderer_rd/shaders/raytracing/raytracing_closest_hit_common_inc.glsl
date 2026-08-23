@@ -660,7 +660,7 @@ void debug_visualize(
 		bool dbg_wrong_hemisphere;
 		bool dbg_ok = sampleTransmissiveLobe(V, dbg_N, geometry_normal, dbg_alpha, dbg_alpha * dbg_alpha,
 				dbg_specularF0, dbg_mat.eta, dbg_mat.transmissivness, dbg_material.thickness == 0.0,
-				dbg_transData.ax, dbg_transData.ay, dbg_transData.anisoPhi, dbg_u3,
+				dbg_transData.ax, dbg_transData.ay, dbg_transData.anisoPhi, dbg_transData.anisoActive, dbg_u3,
 				dbg_next_dir, dbg_weight, dbg_is_transmit, dbg_wrong_hemisphere);
 		// Fix round 2 self-review: the thin-walled override this defect
 		// reorders around ONLY applies when isTransmit is true (`if
@@ -1208,7 +1208,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		bool wrongHemisphere;
 		if (sampleTransmissiveLobe(V, N, h.geometry_normal, alpha, alpha * alpha, specularF0,
 					brdf_mat.eta, brdf_mat.transmissivness, m.thickness == 0.0,
-					transData.ax, transData.ay, transData.anisoPhi, u3,
+					transData.ax, transData.ay, transData.anisoPhi, transData.anisoActive, u3,
 					next_dir, brdf_weight, isTransmit, wrongHemisphere)) {
 			transmissive_sample_ok = !wrongHemisphere;
 			took_transmissive_lobe = isTransmit;
