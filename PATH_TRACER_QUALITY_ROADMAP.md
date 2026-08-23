@@ -79,9 +79,10 @@ Ranked by impact on offline still quality.
 | 14 | **fp16 radiance/throughput payload** | `raytracing_inc.glsl:75-87` | fp32 throughout | Medium |
 | 15 | **Biased bump-map mirror recovery** | `brdf_inc.glsl:998-1009` | offset/position normals, no bias | Low-Med |
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
+| 17 | **Multi-scatter energy compensation over-shoot** — `evalEmsApprox`/`evalMultiScatterApproximation` over-corrects true single-scatter energy loss by roughly 3-8pp across the roughness/anisotropy range measured so far (E2b furnace: isotropic `anisotropy=0.0` control +5.95%, full sweep +3.4% to +8.1%; separate Cycles-comparison scene +6.52% raw, of which 5.85pp attributed to this bug). Pre-existing and anisotropy-orthogonal — reproduces with no anisotropic material involved at all, so it is not an E2b defect. Characterized in §7.8; **no fix is proposed here**, carried forward as-is for a future phase. | `brdf_inc.glsl:1156-1168` (`evalEmsApprox`/`evalMultiScatterApproximation`), call sites `:1215`, `:1375`, `raytracing_closest_hit_common_inc.glsl:1270` | approximation is engine-local; no Cycles line identified as its source or as exhibiting the same over-shoot | Low-Med |
 
 **Not gaps — verified correct, leave alone:**
-- BRDF library (VNDF GGX, height-correlated Smith G2, multi-scatter compensation) — Cycles-class.
+- BRDF library (VNDF GGX, height-correlated Smith G2) — Cycles-class. Multi-scatter compensation is present but **over-corrects** — see Gap #17 above; it is no longer an unqualified "leave alone."
 - `alpha = roughness²` (`brdf_inc.glsl:1046`) — matches Cycles/glTF convention exactly.
 - Rect-light area→solid-angle pdf conversion (`lights_inc.glsl:294-297`) — correct.
 - Wächter-Binder ray-origin offset (`raytracing_inc.glsl:182-197`) — correct.
@@ -796,7 +797,7 @@ GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_h
 
 **E2. Anisotropy, clearcoat, sheen** — anisotropy portion **COMPLETE (E2b)**, clearcoat/sheen **NOT STARTED**
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured within 0.67% of Cycles once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint and velvet: not met** — clearcoat and sheen lobes do not exist yet; carried to E2c/E2d (§7.8, spec §9) along with the two-way→N-way lobe-selection rewrite and anisotropy on the transmissive lobe.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint and velvet: not met** — clearcoat and sheen lobes do not exist yet; carried to E2c/E2d (§7.8, spec §9) along with the two-way→N-way lobe-selection rewrite and anisotropy on the transmissive lobe.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -2034,8 +2035,22 @@ half ay = alpha_ggx * aspect;
 
 The path tracer's `anisoAspect()` (`brdf_inc.glsl:994`) uses this exact
 formula. So Cycles parity AND raster/RT parity come from a single shared
-formula. Contrast E1, which had to *purchase* a deliberate divergence to ship
-correctly: the dielectric closure's Fresnel remap is intentionally NOT the
+formula — for the `ax`/`ay` MAPPING only. **The orientation channel does NOT
+share this parity.** The raster shader derives its highlight orientation from
+`ANISOTROPY_FLOW`, driven by the flowmap texture's RG channels
+(`ANISOTROPY_FLOW = anisotropy_tex.rg * 2.0 - 1.0;`,
+`scene/resources/material.cpp:1919-1920`) and has no `anisotropy_rotation`
+uniform at all — that parameter is listed explicitly among the ten
+path-tracer-only parameters with "no shader uniform to agree with"
+(`scene/resources/material.cpp:4104-4105`). The path tracer, by contrast,
+derives its orientation from `material.anisotropyRotation` added directly to
+the tangent's azimuth (`brdf_inc.glsl:1691`,
+`data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;`),
+with no flowmap involved. So the same material, with the same
+`anisotropy_rotation` and/or flowmap authored, orients its specular highlight
+differently in Forward+ than in the path tracer — a real, unaddressed
+divergence, distinct from the ax/ay mapping's genuine parity above. Contrast
+E1, which had to *purchase* a deliberate divergence to ship correctly: the dielectric closure's Fresnel remap is intentionally NOT the
 same function opaque materials use (`brdf_inc.glsl:1268-1272`'s own comment:
 *"routing everything through here would change the reflectance of every
 specular surface in every existing scene"*), a real, load-bearing difference
@@ -2057,7 +2072,7 @@ construction (`brdf_inc.glsl:988-993`).
 **`anisotropy_rotation` is RADIANS, not turns — the other real Cycles-API
 divergence, verified twice.** Cycles stores rotation as a 0-1 turn fraction
 and multiplies by `2*PI` internally; Godot's `anisotropy_rotation` is used
-directly as radians (`brdf_inc.glsl:1651`,
+directly as radians (`brdf_inc.glsl:1691`,
 `data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;` — no
 `2*PI` factor). This was already documented from Phase D
 (`PATH_TRACER_QUALITY_ROADMAP.md:985-987`) and Task 5's Cycles comparison
@@ -2069,7 +2084,7 @@ below).
 **`anisotropy == 0` takes the isotropic path unchanged — a deliberate user
 ruling, not an oversight.** `BrdfData.anisoActive` is `false` whenever
 `material.anisotropy == 0.0` or no usable tangent exists
-(`brdf_inc.glsl:1637-1641`), and every consumer is required to take the
+(`brdf_inc.glsl:1661-1667`), and every consumer is required to take the
 pre-existing isotropic branch in that case (`brdf_inc.glsl:349-353`'s own
 comment: *"the anisotropic form is strictly MORE accurate... and taking it
 unconditionally would silently shift every polished material and break the

@@ -1012,7 +1012,14 @@ float GGX_D_Aniso(float3 H, float ax, float ay) {
 
 // Anisotropic Smith lambda, the height-correlated partner of GGX_D_Aniso.
 float Smith_Lambda_Aniso(float3 V, float ax, float ay) {
-	float num = sqr(ax * V.x) + sqr(ay * V.y);
+	// Minor #4 hardening: clamp ax/ay the same way evalMicrofacet's own
+	// anisoActive branch already does at its call sites (max(0.00001f, ...)).
+	// Currently unreachable -- anisoAspect() keeps ax/ay bounded away from 0
+	// for every anisotropy in [-1,1] this engine can produce -- so this is
+	// hardening against a future/out-of-range caller, not a fix for a live bug.
+	float axc = max(0.00001f, ax);
+	float ayc = max(0.00001f, ay);
+	float num = sqr(axc * V.x) + sqr(ayc * V.y);
 	return (-1.0f + sqrt(1.0f + num / sqr(V.z))) * 0.5f;
 }
 
@@ -1071,8 +1078,12 @@ float sampleGGXVNDFReflectionPdf(float alpha, float alphaSquared, float NdotH, f
 // which is MEAN-PRESERVING, so no rendered image at any sample count reveals
 // it. Vis mode 35 exists to catch exactly this.
 float sampleGGXVNDFReflectionPdfAniso(float3 Vaniso, float3 Haniso, float ax, float ay, float VdotH) {
-	float G1 = 1.0f / (1.0f + Smith_Lambda_Aniso(Vaniso, ax, ay));
-	float D = GGX_D_Aniso(Haniso, ax, ay);
+	// Minor #4 hardening: same rationale as Smith_Lambda_Aniso's own clamp --
+	// GGX_D_Aniso divides by ax/ay directly and is otherwise unguarded here.
+	float axc = max(0.00001f, ax);
+	float ayc = max(0.00001f, ay);
+	float G1 = 1.0f / (1.0f + Smith_Lambda_Aniso(Vaniso, axc, ayc));
+	float D = GGX_D_Aniso(Haniso, axc, ayc);
 	return D * G1 * max(0.0f, VdotH) / max(0.00001f, Vaniso.z) / (4.0f * max(0.00001f, VdotH));
 }
 
@@ -1129,8 +1140,11 @@ float specularSampleWeightGGXVNDF(float alpha, float alphaSquared, float NdotL, 
 // of the same surface disagree, biasing the MIS partition rather than merely
 // approximating it.
 float specularSampleWeightGGXVNDFAniso(float3 Vaniso, float3 Laniso, float ax, float ay) {
-	float G1 = 1.0f / (1.0f + Smith_Lambda_Aniso(Vaniso, ax, ay));
-	float G2 = Smith_G2_Aniso(Vaniso, Laniso, ax, ay);
+	// Minor #4 hardening: same rationale as Smith_Lambda_Aniso's own clamp.
+	float axc = max(0.00001f, ax);
+	float ayc = max(0.00001f, ay);
+	float G1 = 1.0f / (1.0f + Smith_Lambda_Aniso(Vaniso, axc, ayc));
+	float G2 = Smith_G2_Aniso(Vaniso, Laniso, axc, ayc);
 	return G2 / G1;
 }
 
@@ -1168,12 +1182,21 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	if (alpha == 0.0f) {
 		// Fast path for zero roughness (perfect reflection), also prevents NaNs appearing due to divisions by zeroes
 		Hlocal = float3(0.0f, 0.0f, 1.0f);
-	} else {
+	} else if (anisoActive) {
 		// Rotate into the anisotropy frame, sample with the elliptical
 		// roughnesses, rotate the result back out.
 		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
 		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(ax, ay), u);
 		Hlocal = rotateAboutZ(Haniso, anisoPhi);
+	} else {
+		// Fix round (Minor #2): previously this branch always ran the
+		// rotate -> sample -> rotate-back path and relied on ax==ay==alpha
+		// and sin(-0)/cos(-0) algebra to reduce to the pre-E2b call. GLSL
+		// only guarantees 2^-11 absolute error on sin/cos, so that was
+		// bit-identity by algebra, not by construction. Calling the sampler
+		// directly with no rotation makes the isotropic path structurally
+		// identical to pre-E2b again.
+		Hlocal = sampleSpecularHalfVector(Vlocal, float2(alpha, alpha), u);
 	}
 
 	// Reflect view direction to obtain light vector
@@ -1287,10 +1310,14 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		// Fast path for zero roughness, and it also prevents the NaNs a
 		// division by zero would produce inside VNDF sampling.
 		Hlocal = float3(0.0f, 0.0f, 1.0f);
-	} else {
+	} else if (anisoActive) {
 		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
 		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(ax, ay), u.xy);
 		Hlocal = rotateAboutZ(Haniso, anisoPhi);
+	} else {
+		// Fix round (Minor #2): same structural fix as sampleSpecularMicrofacet
+		// above -- no rotation on the isotropic path, not an algebraic no-op.
+		Hlocal = sampleSpecularHalfVector(Vlocal, float2(alpha, alpha), u.xy);
 	}
 
 	float HdotV = dot(Hlocal, Vlocal);
@@ -1638,17 +1665,31 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 
 	float tangentLen = length(material.tangent);
 	if (material.anisotropy != 0.0f && tangentLen > 1e-6f) {
-		data.anisoActive = true;
-		float aspect = anisoAspect(material.anisotropy);
-		data.ax = data.alpha / aspect;
-		data.ay = data.alpha * aspect;
-
 		// Project the tangent into the local frame and take its azimuth there.
 		// getRotationToZAxis(N) sends N to +Z but leaves X arbitrary, so the
-		// azimuth must be measured, not assumed.
+		// azimuth must be measured, not assumed. Computed BEFORE deciding
+		// anisoActive (Minor #3 fix, below) because the activation guard now
+		// depends on it.
 		float4 qToZ = getRotationToZAxis(N);
 		float3 Tlocal = rotatePoint(qToZ, material.tangent / tangentLen);
-		data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;
+
+		// Minor #3 fix: tangentLen > 1e-6f only rules out a zero-length
+		// tangent. A unit-length tangent that is NORMAL-COLLINEAR (parallel to
+		// N) passes that guard but rotates to Tlocal.xy ~= (0,0) -- all of its
+		// length lands on Tlocal.z -- making atan(Tlocal.y, Tlocal.x) ==
+		// atan(0,0), which is undefined in GLSL and propagates NaN into
+		// anisoPhi and every specular sample on that surface. Guard on the
+		// LOCAL projected length instead, falling back to isotropic when it
+		// is degenerate. The original zero-length world-space guard above is
+		// kept as-is (it is still needed: it is what makes `tangentLen`, and
+		// therefore the normalize a few lines up, safe to divide by).
+		if (dot(Tlocal.xy, Tlocal.xy) > 1e-12f) {
+			data.anisoActive = true;
+			float aspect = anisoAspect(material.anisotropy);
+			data.ax = data.alpha / aspect;
+			data.ay = data.alpha * aspect;
+			data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;
+		}
 	}
 
 	// Pre-calculate some more BRDF terms
@@ -1936,9 +1977,16 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// and this reduces exactly to the pre-E2b call -- Vlocal/Nlocal are
 		// already in the local frame here, so unlike evalMicrofacet no extra
 		// world-to-local transform is needed.
-		float3 Vaniso = rotateAboutZ(Vlocal, -data.anisoPhi);
-		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(data.ax, data.ay), u);
-		float3 Hspecular = rotateAboutZ(Haniso, data.anisoPhi);
+		float3 Hspecular;
+		if (data.anisoActive) {
+			float3 Vaniso = rotateAboutZ(Vlocal, -data.anisoPhi);
+			float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(data.ax, data.ay), u);
+			Hspecular = rotateAboutZ(Haniso, data.anisoPhi);
+		} else {
+			// Fix round (Minor #2): same structural fix as sampleSpecularMicrofacet
+			// -- no rotation on the isotropic path.
+			Hspecular = sampleSpecularHalfVector(Vlocal, float2(data.alpha, data.alpha), u);
+		}
 
 		// Clamp HdotL to small value to prevent numerical instability. Assume that rays incident from below the hemisphere have been filtered
 		float VdotH = max(0.00001f, min(1.0f, dot(Vlocal, Hspecular)));

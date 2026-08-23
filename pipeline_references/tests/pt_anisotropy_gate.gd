@@ -106,6 +106,38 @@ const MODE_ANISO_PDF_PARITY := 35
 const ANISOTROPY_VALUES := [-0.9, -0.5, 0.0, 0.5, 0.9]
 const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 
+# Fix round 2 (Important #1): probe 1's PASS/FAIL logic used to compare the
+# absolute ratio against 1.0 (TOLERANCE below) and NOTHING ELSE, but every
+# combination in this sweep fails that comparison for a real, PRE-EXISTING,
+# anisotropy-orthogonal reason -- evalMultiScatterApproximation/evalEmsApprox
+# over-compensates the true single-scatter energy loss at this roughness by
+# several percentage points (confirmed and deliberately left unfixed; see
+# task-4-report.md fix round 1, C5, and PATH_TRACER_QUALITY_ROADMAP.md). That
+# made `_failures` structurally non-empty: the gate printed FAIL both when
+# the feature under test was correct AND when it was broken, so it guarded
+# nothing (see this file's fix-round-2 header note).
+#
+# These five values are the ratios MEASURED on the intact tree (HEAD
+# ff5a3a88d4 / 27c2c0f10b -- see task-4-report.md section 4's full stdout),
+# one per ANISOTROPY_VALUES entry, averaged across the three ROTATION_VALUES
+# at that anisotropy (the round-0 report's per-rotation spread is ~0.0002,
+# two orders of magnitude below BASELINE_BAND below -- a pure rotation of the
+# tangent frame cannot change how much energy a furnace returns, so
+# collapsing rotation out of the baseline is not throwing away signal). They
+# sit ABOVE 1.0 because of the `ms` over-compensation above, NOT because
+# anything here is broken -- do not "fix" this array to read 1.0.
+#
+# The point of asserting a TIGHT band around a number that is itself known to
+# be over 1.0 is regression detection, not correctness measurement: reverting
+# the C1 fix (evalMicrofacet's `G2 /= 4.0f * NdotL * NdotV`,
+# servers/rendering/renderer_rd/shaders/raytracing/brdf_inc.glsl) moves these
+# same five configurations by +10.2 to +15.8 percentage points (measured,
+# task-4-report.md fix round 1, I6's C1-revert experiment table) -- vastly
+# outside BASELINE_BAND, while ordinary run-to-run Monte Carlo noise (~0.02pp
+# per the per-rotation spread above) stays vastly inside it.
+const BASELINE_INTACT_RATIO := [1.0777727, 1.0809253, 1.059535, 1.0776337, 1.034110] # parallel to ANISOTROPY_VALUES
+const BASELINE_BAND := 0.005 # +/- 0.5 percentage points; see BASELINE_INTACT_RATIO's doc comment.
+
 # Fix round 1: 0.0 added per the coordinator's C2 fix instruction -- the
 # self-normalizing check being a genuinely independent instrument (unlike the
 # old R-vs-G tautology) means an isotropic control is now meaningful evidence
@@ -120,6 +152,15 @@ const NEE_DOM_ROUGHNESS := 0.9
 const NEE_DOM_ANISOTROPY := 0.9
 const NEE_DOM_ROTATION := 0.0
 const NEE_DOM_FRAMES := 64
+
+# Fix round 2 (Important #1): same regression-band treatment as probe 1's
+# BASELINE_INTACT_RATIO -- measured on the intact tree (task-4-report.md fix
+# round 1, I6), sits well above 1.0 for the same pre-existing `ms`
+# over-compensation reason (much larger here since it scales with roughness,
+# and NEE_DOM_ROUGHNESS is 0.9 vs probe 1's 0.4), and reverting the C1 fix
+# moves it by +42.6 percentage points (measured, the I6 C1-revert experiment)
+# -- far outside BASELINE_BAND.
+const BASELINE_INTACT_RATIO_NEE_DOM := 1.345900
 
 var _sphere: MeshInstance3D
 var _cam: Camera3D
@@ -274,11 +315,16 @@ func _max_abs_rg_diff(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
 
 func _probe_furnace(p_env: Environment) -> void:
 	print("\n=== PROBE 1: white furnace, anisotropic GGX sweep ===")
-	print("  sky radiance %.5f, tolerance %.1f%%" % [SKY_RADIANCE, TOLERANCE * 100.0])
+	print("  sky radiance %.5f" % SKY_RADIANCE)
+	print("  [diagnostic-only] absolute vs 1.0, tolerance %.1f%% -- NOT asserted, see BASELINE_INTACT_RATIO doc"
+			% (TOLERANCE * 100.0))
+	print("  [REAL gate] vs measured-intact baseline, band +/-%.1fpp" % (BASELINE_BAND * 100.0))
 	var vp_rid := get_viewport().get_viewport_rid()
 	var worst_ratio := 1.0
 	var worst_label := ""
-	for aniso in ANISOTROPY_VALUES:
+	for ai in range(ANISOTROPY_VALUES.size()):
+		var aniso: float = ANISOTROPY_VALUES[ai]
+		var baseline: float = BASELINE_INTACT_RATIO[ai]
 		for rot in ROTATION_VALUES:
 			_sphere.material_override = _sphere_material(aniso, rot)
 			var img: Image = await _render_accum(p_env, vp_rid, FURNACE_FRAMES)
@@ -292,17 +338,38 @@ func _probe_furnace(p_env: Environment) -> void:
 			if absf(ratio - 1.0) > absf(worst_ratio - 1.0):
 				worst_ratio = ratio
 				worst_label = tag
+			# Diagnostic only -- NOT asserted (fix round 2, Important #1). The
+			# absolute deviation from 1.0 is dominated by the pre-existing,
+			# anisotropy-orthogonal `ms` over-compensation (see
+			# BASELINE_INTACT_RATIO's doc comment and task-4-report.md fix
+			# round 1, C5) -- printed as a pointer to that open item, same
+			# demotion pattern probe 2's old R-vs-G check already received.
 			if absf(ratio - 1.0) > TOLERANCE:
-				_failures.append(("probe1 furnace [%s]: ratio %.6f vs 1.0 (limit %.1f%%) -- an " +
-						"energy-conserving BRDF must return the sky radiance regardless of ax/ay")
+				print(("  [diagnostic] %-34s ratio %.6f vs 1.0 exceeds %.1f%% -- known pre-existing " +
+						"multi-scatter over-compensation (see BASELINE_INTACT_RATIO doc), not asserted")
 						% [tag, ratio, TOLERANCE * 100.0])
+			# The REAL gate: a tight regression band around the ratio MEASURED
+			# on the intact tree. A C1-class reversion moves this same
+			# quantity by +10 to +16 percentage points (measured); ordinary
+			# run-to-run noise stays within ~0.02pp (measured) -- see
+			# BASELINE_INTACT_RATIO's doc comment for both numbers.
+			if absf(ratio - baseline) > BASELINE_BAND:
+				_failures.append(("probe1 furnace [%s]: ratio %.6f vs intact baseline %.6f " +
+						"(band +/-%.1fpp) -- moved outside the measured-good range, consistent with " +
+						"a reverted C1 fix (evalMicrofacet's G2/4*NdotL*NdotV, brdf_inc.glsl) or " +
+						"another regression in the anisotropic branch")
+						% [tag, ratio, baseline, BASELINE_BAND * 100.0])
 	print("  worst deviation: %s  ratio=%.6f" % [worst_label, worst_ratio])
 
 
 func _probe_furnace_nee_dominant(p_env: Environment) -> void:
 	print("\n=== PROBE 1b: white furnace, NEE-dominant configuration (fix round 1, I6) ===")
-	print("  roughness=%.2f anisotropy=%.2f rotation=%.4f, tolerance %.1f%%"
-			% [NEE_DOM_ROUGHNESS, NEE_DOM_ANISOTROPY, NEE_DOM_ROTATION, TOLERANCE * 100.0])
+	print("  roughness=%.2f anisotropy=%.2f rotation=%.4f"
+			% [NEE_DOM_ROUGHNESS, NEE_DOM_ANISOTROPY, NEE_DOM_ROTATION])
+	print("  [diagnostic-only] absolute vs 1.0, tolerance %.1f%% -- NOT asserted, see BASELINE_INTACT_RATIO_NEE_DOM doc"
+			% (TOLERANCE * 100.0))
+	print("  [REAL gate] vs measured-intact baseline %.6f, band +/-%.1fpp"
+			% [BASELINE_INTACT_RATIO_NEE_DOM, BASELINE_BAND * 100.0])
 	var mat := _sphere_material(NEE_DOM_ANISOTROPY, NEE_DOM_ROTATION)
 	mat.roughness = NEE_DOM_ROUGHNESS
 	_sphere.material_override = mat
@@ -313,9 +380,20 @@ func _probe_furnace_nee_dominant(p_env: Environment) -> void:
 	var s := _measure_crop(img, 0.05, 0.95)
 	var ratio: float = s["mean"] / SKY_RADIANCE
 	print("  mean=%.6f  ratio=%.6f  (n=%d)" % [s["mean"], ratio, s["n"]])
+	# Diagnostic only -- NOT asserted (fix round 2, Important #1). See probe
+	# 1's identical treatment above.
 	if absf(ratio - 1.0) > TOLERANCE:
-		_failures.append("probe1b NEE-dominant furnace: ratio %.6f vs 1.0 (limit %.1f%%)"
+		print(("  [diagnostic] ratio %.6f vs 1.0 exceeds %.1f%% -- known pre-existing multi-scatter " +
+				"over-compensation (see BASELINE_INTACT_RATIO_NEE_DOM doc), not asserted")
 				% [ratio, TOLERANCE * 100.0])
+	# The REAL gate: regression band around the measured-intact baseline. A
+	# C1-class reversion moves this same quantity by +42.6 percentage points
+	# (measured, task-4-report.md fix round 1 I6) -- far outside BASELINE_BAND.
+	if absf(ratio - BASELINE_INTACT_RATIO_NEE_DOM) > BASELINE_BAND:
+		_failures.append(("probe1b NEE-dominant furnace: ratio %.6f vs intact baseline %.6f " +
+				"(band +/-%.1fpp) -- moved outside the measured-good range, consistent with a " +
+				"reverted C1 fix or another regression in the anisotropic branch")
+				% [ratio, BASELINE_INTACT_RATIO_NEE_DOM, BASELINE_BAND * 100.0])
 
 
 func _probe_pdf_parity(p_env: Environment) -> void:

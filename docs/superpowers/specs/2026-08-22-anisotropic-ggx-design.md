@@ -313,6 +313,51 @@ discrepancy.
    stretched along the expected axis and rotating correctly with
    `anisotropy_rotation`.
 
+**Amended during execution (2026-08-22, fix-wave closeout).** Items 2, 3, and
+6 above stand unmodified as originally written, but none is met literally.
+What actually happened, per task and fix-round:
+
+- **Item 3 (pdf/sampler parity within 1e-4) — superseded, not met, by
+  design.** Task 4's original construction (compare the sampler's realized
+  pdf `R` against `combinedPdf`'s report `G` for the same direction) was
+  found in fix round 1 to be a **tautology**: both sides resolve to the
+  identical expression from identical inputs, so a genuinely wrong pdf
+  formula would still read `R == G` and pass. It was replaced with a real,
+  independent instrument — self-normalized importance sampling,
+  `E[1/combinedPdf(L)]` over real sampler draws compared against the upper
+  hemisphere's exact solid-angle measure `2*PI`, tolerance 3% — which cannot
+  be gamed by evaluating the same formula twice. That instrument **passes**
+  at every anisotropy value tested, including the `0.0` control (worst case
+  0.53% off `2*PI`). Item 3 as literally written (a 1e-4 bound on the old
+  tautological comparison) is retired, not satisfied; see roadmap §7.8 and
+  `.superpowers/sdd/2026-08-22-anisotropic-ggx/task-4-report.md` fix round 1,
+  C2.
+- **Item 2 (furnace within 2%) — measurably fails, root-caused, not fixed.**
+  Every swept `anisotropy`/`anisotropy_rotation` combination misses the 2%
+  bar, including the isotropic `anisotropy=0.0` control (+5.95%), which
+  proves the excess is not an anisotropy defect: the anisotropic branch is
+  not even reached at `anisotropy=0`. Root cause: a pre-existing,
+  anisotropy-orthogonal over-correction in
+  `evalMultiScatterApproximation`/`evalEmsApprox` (confirmed by forcing
+  `ms=1.0` and watching the ratio drop from 1.0595 to 0.9657). Per the
+  coordinator's explicit instruction this bug is diagnosed and left unfixed
+  — see roadmap §7.8's open item and gap-table entry #17. The GPU gate
+  (`pt_anisotropy_gate.gd`) does not assert this absolute bound as a
+  pass/fail condition for exactly this reason; it instead asserts a tight
+  regression band around the ratios measured on the intact tree, which is
+  what actually guards the anisotropic-GGX feature this spec covers.
+- **Item 6 (Cycles within 5%) — measurably fails, root-caused, not fixed.**
+  The raw comparison reads **+6.52%**, missing the 5% bar. A targeted
+  attribution experiment (same forced-`ms=1.0` technique) found 5.85 of the
+  6.52 percentage points (90%) attributable to the same pre-existing
+  multi-scatter over-correction as item 2; with that isolated, the residual
+  gap is 0.67%, comfortably inside 5%. No fix is proposed, matching item 2.
+  See roadmap §7.8, Task 5's closeout.
+
+None of the three items is rewritten above — this block records what was
+actually measured and why, alongside the original unmodified acceptance
+criteria.
+
 ## 9. Out of scope
 
 - Clearcoat, sheen, the N-way lobe rewrite (E2c/E2d).
