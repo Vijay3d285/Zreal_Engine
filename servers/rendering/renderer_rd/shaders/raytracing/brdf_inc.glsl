@@ -292,6 +292,18 @@ struct MaterialProperties {
 	// resolved_eta / its interior-hit flip.
 	float eta;
 	float opacity;
+
+	// E2b anisotropy. `anisotropy` is SIGNED [-1,1] (see anisoAspect).
+	// `anisotropyRotation` is RADIANS, NOT turns -- Godot's property hint is
+	// "0,6.2831853,0.001,radians_as_degrees" (scene/resources/material.cpp:3811)
+	// and render_raytracing.cpp uploads it unmodified. Cycles stores turns and
+	// multiplies by 2*PI (closure.h:316); doing that here would be a 6.28x error.
+	float anisotropy;
+	float anisotropyRotation;
+	// World-space surface tangent. Zero-length means "no usable tangent", which
+	// forces the isotropic fallback -- Cycles gates the same way on
+	// stack_valid(data.tangent_offset) (closure.h:309).
+	float3 tangent;
 };
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
@@ -324,6 +336,22 @@ struct BrdfData {
 	// True when V/L is backfacing wrt. shading normal N
 	bool Vbackfacing;
 	bool Lbackfacing;
+
+	// E2b. ax/ay are the elliptical roughnesses; anisoPhi is the azimuth, in the
+	// local (N -> +Z) frame, of the axis ax runs along. Consumers rotate about Z
+	// by -anisoPhi before evaluating and by +anisoPhi after sampling. Storing ONE
+	// angle here, computed once in prepareBRDFData, is what stops the sampler and
+	// the pdf deriving the frame differently -- that desync is mean-preserving
+	// and no rendered image can catch it (spec section 4.4).
+	float ax;
+	float ay;
+	float anisoPhi;
+	// True only when anisotropy is actually in play. When false EVERY consumer
+	// must take the existing isotropic path unchanged -- the anisotropic form is
+	// strictly MORE accurate (see Task 3 Step 4), and taking it unconditionally
+	// would silently shift every polished material and break the no-pixel-change
+	// guarantee.
+	bool anisoActive;
 };
 
 // -------------------------------------------------------------------------
@@ -947,6 +975,52 @@ float GGX_D(float alphaSquared, float NdotH) {
 }
 
 // -------------------------------------------------------------------------
+//    Anisotropic GGX (roadmap E2b)
+//
+// The aspect/ax/ay mapping below is shared VERBATIM with two independent
+// sources, verified by reading both:
+//   Blender Cycles      intern/cycles/kernel/svm/closure.h:311-313
+//   this engine's raster shaders/scene_forward_lights_inc.glsl:272-274
+// Adopting it therefore buys Cycles parity AND raster/RT parity from one
+// formula. Unlike E1's Fresnel split, no divergence is purchased here.
+// -------------------------------------------------------------------------
+
+// SIGNED anisotropy, matching Godot's raster. Cycles saturatefs to [0,1] and
+// carries the other orientation in its rotation, which is NOT equivalent: at
+// anisotropy = -0.5 this gives an axis ratio of 1.450, Cycles' |a| = 0.5 plus
+// 90 degrees gives 1.818. Different eccentricity, not a different orientation.
+// Nothing is lost -- KHR_materials_anisotropy has no sign, so every glTF or
+// Blender-imported material lands in a >= 0 where the two agree exactly.
+float anisoAspect(float anisotropy) {
+	// Exactly 1.0 at anisotropy 0, which is what makes ax == ay == alpha and
+	// keeps untouched materials bit-identical to pre-E2b.
+	return sqrt(1.0f - anisotropy * 0.9f);
+}
+
+float3 rotateAboutZ(float3 v, float phi) {
+	float s = sin(phi);
+	float c = cos(phi);
+	return float3(c * v.x - s * v.y, s * v.x + c * v.y, v.z);
+}
+
+// Anisotropic GGX NDF. H must already be in the anisotropy-aligned frame
+// (z along N, x along the rotated tangent).
+float GGX_D_Aniso(float3 H, float ax, float ay) {
+	float d = sqr(H.x / ax) + sqr(H.y / ay) + sqr(H.z);
+	return 1.0f / (PI * ax * ay * sqr(d));
+}
+
+// Anisotropic Smith lambda, the height-correlated partner of GGX_D_Aniso.
+float Smith_Lambda_Aniso(float3 V, float ax, float ay) {
+	float num = sqr(ax * V.x) + sqr(ay * V.y);
+	return (-1.0f + sqrt(1.0f + num / sqr(V.z))) * 0.5f;
+}
+
+float Smith_G2_Aniso(float3 V, float3 L, float ax, float ay) {
+	return 1.0f / (1.0f + Smith_Lambda_Aniso(V, ax, ay) + Smith_Lambda_Aniso(L, ax, ay));
+}
+
+// -------------------------------------------------------------------------
 //    Microfacet model
 // -------------------------------------------------------------------------
 
@@ -1424,6 +1498,31 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	data.roughness = material.roughness;
 	data.alpha = material.roughness * material.roughness;
 	data.alphaSquared = data.alpha * data.alpha;
+
+	// E2b: elliptical roughness and the anisotropy azimuth.
+	//
+	// Defaults are the exact isotropic values, so a material with anisotropy 0
+	// or no usable tangent is bit-identical to pre-E2b: anisoAspect(0) is
+	// exactly 1.0, so ax == ay == alpha.
+	data.ax = data.alpha;
+	data.ay = data.alpha;
+	data.anisoPhi = 0.0f;
+	data.anisoActive = false;
+
+	float tangentLen = length(material.tangent);
+	if (material.anisotropy != 0.0f && tangentLen > 1e-6f) {
+		data.anisoActive = true;
+		float aspect = anisoAspect(material.anisotropy);
+		data.ax = data.alpha / aspect;
+		data.ay = data.alpha * aspect;
+
+		// Project the tangent into the local frame and take its azimuth there.
+		// getRotationToZAxis(N) sends N to +Z but leaves X arbitrary, so the
+		// azimuth must be measured, not assumed.
+		float4 qToZ = getRotationToZAxis(N);
+		float3 Tlocal = rotatePoint(qToZ, material.tangent / tangentLen);
+		data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;
+	}
 
 	// Pre-calculate some more BRDF terms
 	data.F = evalFresnel(data.specularF0, shadowedF90(data.specularF0), data.LdotH);
