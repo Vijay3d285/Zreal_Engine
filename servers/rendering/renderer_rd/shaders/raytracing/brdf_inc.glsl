@@ -1062,6 +1062,20 @@ float sampleGGXVNDFReflectionPdf(float alpha, float alphaSquared, float NdotH, f
 	return (GGX_D(max(0.00001f, alphaSquared), NdotH) * Smith_G1_GGX(alpha, NdotV, alphaSquared, NdotV * NdotV)) / (4.0f * NdotV);
 }
 
+// Anisotropic partner of sampleGGXVNDFReflectionPdf. MUST stay in lockstep with
+// the sampler: V, L and H are rotated by -anisoPhi by the CALLER, so this
+// function sees them already in the anisotropy frame.
+//
+// A pdf that disagrees with the sampler is the B2 defect class -- two
+// strategies estimating different integrands, which MIS cannot repair and
+// which is MEAN-PRESERVING, so no rendered image at any sample count reveals
+// it. Vis mode 35 exists to catch exactly this.
+float sampleGGXVNDFReflectionPdfAniso(float3 Vaniso, float3 Haniso, float ax, float ay, float VdotH) {
+	float G1 = 1.0f / (1.0f + Smith_Lambda_Aniso(Vaniso, ax, ay));
+	float D = GGX_D_Aniso(Haniso, ax, ay);
+	return D * G1 * max(0.0f, VdotH) / max(0.00001f, Vaniso.z) / (4.0f * max(0.00001f, VdotH));
+}
+
 // "Walter's trick" is an adjustment of alpha value for Walter's sampling to reduce maximal weight of sample to about 4
 // Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al., page 8
 float waltersTrick(float alpha, float NdotV) {
@@ -1125,15 +1139,25 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 
 // Samples a reflection ray from the rough surface using selected microfacet distribution and sampling method
 // Resulting weight includes multiplication by cosine (NdotL) term
-float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
+//
+// E2b: ax/ay/anisoPhi come straight from BrdfData (prepareBRDFData). At
+// anisotropy == 0 (or no usable tangent) ax == ay == alpha and anisoPhi == 0,
+// so rotateAboutZ is the identity and this call reduces EXACTLY to the
+// pre-E2b isotropic one -- see brdf_inc.glsl Task 3 Step 2. No anisoActive
+// branch is needed here (unlike evalMicrofacet's D/G2): rotating V in and H
+// back at the default values is bit-identical, not merely numerically close.
+float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float ax, float ay, float anisoPhi, float2 u, OUT_PARAMETER(float3) weight) {
 	// Sample a microfacet normal (H) in local space
 	float3 Hlocal;
 	if (alpha == 0.0f) {
 		// Fast path for zero roughness (perfect reflection), also prevents NaNs appearing due to divisions by zeroes
 		Hlocal = float3(0.0f, 0.0f, 1.0f);
 	} else {
-		// For non-zero roughness, this calls VNDF sampling for GG-X distribution or Walter's sampling for Beckmann distribution
-		Hlocal = sampleSpecularHalfVector(Vlocal, float2(alpha, alpha), u);
+		// Rotate into the anisotropy frame, sample with the elliptical
+		// roughnesses, rotate the result back out.
+		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
+		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(ax, ay), u);
+		Hlocal = rotateAboutZ(Haniso, anisoPhi);
 	}
 
 	// Reflect view direction to obtain light vector
@@ -1156,6 +1180,18 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 
 	// Calculate weight of the sample specific for selected sampling method
 	// (this is microfacet BRDF divided by PDF of sampling method - notice how most terms cancel out)
+	//
+	// KNOWN SCOPE BOUNDARY (Task 3): specularSampleWeight still uses the
+	// SCALAR isotropic G2/G1 ratio here even when anisoActive, because Task 2
+	// did not deliver an anisotropic G2/G1-ratio helper (only GGX_D_Aniso and
+	// Smith_G2_Aniso, both consumed directly by evalMicrofacet, not as a
+	// ratio) and the plan's Step 4 scopes the D/G2 replacement to
+	// evalMicrofacet only. This is a real, reported approximation for
+	// anisotropic materials -- not the invisible sampler/pdf desync this task
+	// exists to prevent (a wrong weight here directly scales rendered
+	// radiance, so it is visible, not mean-preserving) -- left for Task 4/5's
+	// Cycles-reference comparison to quantify and, if warranted, a follow-up
+	// task to close.
 	weight = ms * F * specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
 
 	return Llocal;
@@ -1220,7 +1256,10 @@ float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmissi
 // Returns false when no usable direction was produced (TIR with no reflective
 // energy, or a degenerate half-vector). Resulting weight includes the cosine
 // term, matching sampleSpecularMicrofacet's convention.
-bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit) {
+// E2b: ax/ay/anisoPhi thread through to the half-vector sample exactly as in
+// sampleSpecularMicrofacet above -- same identity-at-default reasoning, no
+// anisoActive branch needed for the sampling step itself.
+bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float ax, float ay, float anisoPhi, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit) {
 	const float3 Nlocal = float3(0.0f, 0.0f, 1.0f);
 
 	float3 Hlocal;
@@ -1229,7 +1268,9 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		// division by zero would produce inside VNDF sampling.
 		Hlocal = float3(0.0f, 0.0f, 1.0f);
 	} else {
-		Hlocal = sampleSpecularHalfVector(Vlocal, float2(alpha, alpha), u.xy);
+		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
+		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(ax, ay), u.xy);
+		Hlocal = rotateAboutZ(Haniso, anisoPhi);
 	}
 
 	float HdotV = dot(Hlocal, Vlocal);
@@ -1308,8 +1349,10 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 // have. Does NOT report false through the boolean return for a
 // wrong-hemisphere sample -- the caller decides how to treat r_wrong_hemisphere,
 // matching shade_and_bounce's own `transmissive_sample_ok = false` handling.
+// E2b: ax/ay/anisoPhi (from prepareBRDFData, same tangent-projection formula
+// every other consumer uses) pass straight through to sampleDielectricMicrofacet.
 bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float alpha, float alphaSquared,
-		float3 specularF0, float eta, float transmissivness, bool thin_walled, float3 u3,
+		float3 specularF0, float eta, float transmissivness, bool thin_walled, float ax, float ay, float anisoPhi, float3 u3,
 		OUT_PARAMETER(float3) r_next_dir, OUT_PARAMETER(float3) r_weight, OUT_PARAMETER(bool) r_is_transmit,
 		OUT_PARAMETER(bool) r_wrong_hemisphere) {
 	float4 qRotationToZ = getRotationToZAxis(N);
@@ -1346,7 +1389,7 @@ bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float al
 	// and the validation mean all passed through this regression untouched
 	// -- only this gate's probe 6 caught it, because it was the only check
 	// exercising the transmissive lobe's rendered output directly.
-	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness, u3, Llocal, r_weight, r_is_transmit)) {
+	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness, ax, ay, anisoPhi, u3, Llocal, r_weight, r_is_transmit)) {
 		return false;
 	}
 
@@ -1368,9 +1411,37 @@ bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float al
 }
 
 // Evaluates microfacet specular BRDF
+//
+// E2b, Task 3 Step 4. The anisotropic branch below deviates from the plan's
+// literal snippet, which rotates data.H/V/L by -data.anisoPhi directly. That
+// is only correct if data.H/V/L are already expressed in the LOCAL frame
+// (N -> +Z) that anisoPhi was measured in (prepareBRDFData derives anisoPhi
+// from rotatePoint(getRotationToZAxis(N), tangent)). evalMicrofacet's only
+// real caller is evalCombinedBRDFSeparate, invoked with WORLD-SPACE N/L/V from
+// raytracing_lights_inc.glsl (analytic NEE), raytracing_emissive_inc.glsl
+// (emissive NEE) and the env-NEE site in raytracing_closest_hit_common_inc.glsl
+// -- so data.H/V/L here are world-space vectors, and rotateAboutZ'ing them
+// directly would spin around the WORLD Z axis, unrelated to the surface's
+// local tangent frame: the anisotropy axis would come out wrong for every
+// normal not already aligned with world Z. Transforming through
+// getRotationToZAxis(data.N) first (the SAME rotation prepareBRDFData applied
+// to the tangent) is what makes Ha/Va/La comparable to anisoPhi at all.
 float3 evalMicrofacet(const BrdfData data) {
-	float D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
-	float G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
+	float D, G2;
+	if (data.anisoActive) {
+		float4 qToZ = getRotationToZAxis(data.N);
+		float3 Hlocal = rotatePoint(qToZ, data.H);
+		float3 Vlocal = rotatePoint(qToZ, data.V);
+		float3 Llocal = rotatePoint(qToZ, data.L);
+		float3 Ha = rotateAboutZ(Hlocal, -data.anisoPhi);
+		float3 Va = rotateAboutZ(Vlocal, -data.anisoPhi);
+		float3 La = rotateAboutZ(Llocal, -data.anisoPhi);
+		D = GGX_D_Aniso(Ha, max(0.00001f, data.ax), max(0.00001f, data.ay));
+		G2 = Smith_G2_Aniso(Va, La, max(0.00001f, data.ax), max(0.00001f, data.ay));
+	} else {
+		D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
+		G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
+	}
 	//float3 F = evalFresnel(data.specularF0, shadowedF90(data.specularF0), data.VdotH); //< Unused, F is precomputed already
 
 #if G2_DIVIDED_BY_DENOMINATOR
@@ -1643,7 +1714,21 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float4 qRotationToZ = getRotationToZAxis(N);
 	float3 Llocal = rotatePoint(qRotationToZ, L);
 	float3 Vlocal = rotatePoint(qRotationToZ, V);
-	const BrdfData data = prepareBRDFData(float3(0.0f, 0.0f, 1.0f), Llocal, Vlocal, material);
+	// E2b: prepareBRDFData derives anisoPhi from rotatePoint(getRotationToZAxis(N),
+	// material.tangent) -- with N == (0,0,1) below (the local placeholder every
+	// call site in this function already uses), that rotation is the identity,
+	// so an UNROTATED material.tangent would be read as if it were already in
+	// this local frame. material.tangent is WORLD-space (h.tangent), so it must
+	// be rotated by the SAME qRotationToZ applied to L/V just above, or anisoPhi
+	// comes out measuring the wrong axis entirely -- consistently wrong between
+	// this function and evalIndirectCombinedBRDF's identical pattern (both would
+	// derive the same incorrect anisoPhi from the same unrotated tangent), so it
+	// would NOT show up as a sampler/pdf MIS desync, but the indirect specular
+	// highlight's orientation would disagree with the direct-light NEE one
+	// (evalMicrofacet correctly rotates by the REAL N, not this dummy one).
+	MaterialProperties materialLocal = material;
+	materialLocal.tangent = rotatePoint(qRotationToZ, material.tangent);
+	const BrdfData data = prepareBRDFData(float3(0.0f, 0.0f, 1.0f), Llocal, Vlocal, materialLocal);
 
 	// V ~= -L (near-mirror-degenerate incident/outgoing pair) leaves no stable
 	// half-vector to normalize. clampShadingNormal only REDUCES backfacing V,
@@ -1685,9 +1770,28 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// conservative, minimal fix; an optimization to also skip the unused
 	// quaternion/prepareBRDFData work in this regime is deferred, not part of
 	// this fix.
-	float specularContribution = (material.roughness < RT_MIS_DELTA_ROUGHNESS)
-			? 0.0f
-			: specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH);
+	// E2b: route through the anisotropic pdf ONLY when data.anisoActive, exactly
+	// mirroring evalMicrofacet's D/G2 branch below (Task 3 Step 4) and for the
+	// identical reason -- GGX_D_Aniso is NOT bit-identical to GGX_D even when
+	// ax == ay == alpha (Task 1's float32-cancellation finding at NdotH == 1
+	// applies here too, since sampleGGXVNDFReflectionPdfAniso calls
+	// GGX_D_Aniso internally). Taking the anisotropic pdf unconditionally would
+	// shift combinedPdf's MIS weights on every existing scene, exactly the
+	// bit-identity break the user's ruling forbids. Rotating Vlocal/Llocal/
+	// Hlocal by -data.anisoPhi here MUST match the rotation sampleSpecular
+	// applies when it actually draws the direction -- that agreement is the
+	// entire point of this task.
+	float specularContribution;
+	if (material.roughness < RT_MIS_DELTA_ROUGHNESS) {
+		specularContribution = 0.0f;
+	} else if (data.anisoActive) {
+		float3 Vaniso = rotateAboutZ(Vlocal, -data.anisoPhi);
+		float3 Haniso = rotateAboutZ(Hlocal, -data.anisoPhi);
+		float VdotH = max(0.00001f, dot(Vlocal, Hlocal));
+		specularContribution = sampleGGXVNDFReflectionPdfAniso(Vaniso, Haniso, data.ax, data.ay, VdotH);
+	} else {
+		specularContribution = specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH);
+	}
 
 	// Roadmap E1: when the surface transmits, the dielectric closure only
 	// REFLECTS with probability pdf_reflect, so the density it assigns to an
@@ -1748,19 +1852,37 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	float3 Vlocal = rotatePoint(qRotationToZ, V);
 	const float3 Nlocal = float3(0.0f, 0.0f, 1.0f);
 
+	// E2b: prepareBRDFData derives anisoPhi via rotatePoint(getRotationToZAxis(N),
+	// material.tangent); with N == Nlocal == (0,0,1) below, that inner rotation
+	// is the identity, so passing the raw WORLD-space material.tangent straight
+	// through would be read as already-local, i.e. the wrong axis. Rotate the
+	// tangent by the SAME qRotationToZ applied to V/L above first, so it lands
+	// in the identical local frame -- matching evalMicrofacet's world-to-local
+	// transform (which uses the real shadingNormal directly instead).
+	MaterialProperties materialLocal = material;
+	materialLocal.tangent = rotatePoint(qRotationToZ, material.tangent);
+
 	float3 rayDirectionLocal = float3(0.0f, 0.0f, 0.0f);
 
 	if (brdfType == DIFFUSE_TYPE) {
 		// Sample diffuse ray using cosine-weighted hemisphere sampling
 		rayDirectionLocal = sampleHemisphere(u);
-		const BrdfData data = prepareBRDFData(Nlocal, rayDirectionLocal, Vlocal, material);
+		const BrdfData data = prepareBRDFData(Nlocal, rayDirectionLocal, Vlocal, materialLocal);
 
 		// Function 'diffuseTerm' is predivided by PDF of sampling the cosine weighted hemisphere
 		sampleWeight = data.diffuseReflectance * diffuseTerm(data);
 
 #if COMBINE_BRDFS_WITH_FRESNEL
 		// Sample a half-vector of specular BRDF. Note that we're reusing random variable 'u' here, but correctly it should be an new independent random number
-		float3 Hspecular = sampleSpecularHalfVector(Vlocal, float2(data.alpha, data.alpha), u);
+		// E2b: rotate into the anisotropy frame, sample with ax/ay, rotate back.
+		// At anisotropy == 0 (or no usable tangent) data.anisoPhi is 0 and
+		// data.ax == data.ay == data.alpha, so both rotations are the identity
+		// and this reduces exactly to the pre-E2b call -- Vlocal/Nlocal are
+		// already in the local frame here, so unlike evalMicrofacet no extra
+		// world-to-local transform is needed.
+		float3 Vaniso = rotateAboutZ(Vlocal, -data.anisoPhi);
+		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(data.ax, data.ay), u);
+		float3 Hspecular = rotateAboutZ(Haniso, data.anisoPhi);
 
 		// Clamp HdotL to small value to prevent numerical instability. Assume that rays incident from below the hemisphere have been filtered
 		float VdotH = max(0.00001f, min(1.0f, dot(Vlocal, Hspecular)));
@@ -1768,8 +1890,8 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 #endif
 
 	} else if (brdfType == SPECULAR_TYPE) {
-		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, material);
-		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, u, sampleWeight);
+		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, materialLocal);
+		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, u, sampleWeight);
 	}
 
 	// Transform sampled direction Llocal back to V vector space.

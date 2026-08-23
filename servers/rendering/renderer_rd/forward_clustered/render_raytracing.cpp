@@ -1802,7 +1802,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// here would silently return nothing.
 	Variant anisotropy_var = material_storage->material_get_param(p_material_rid, "anisotropy_ratio");
 	if (anisotropy_var.get_type() == Variant::FLOAT) {
-		mat.anisotropy = anisotropy_var;
+		// E2b: clamp to [-1, 1], mirroring where E1 clamped attenuation_color.
+		// anisoAspect (brdf_inc.glsl) computes sqrt(1 - anisotropy * 0.9); above
+		// anisotropy == 1.111 that radicand goes negative and yields NaN.
+		mat.anisotropy = CLAMP((float)anisotropy_var, -1.0f, 1.0f);
 	}
 
 	Variant emission_var = material_storage->material_get_param(p_material_rid, "emission");

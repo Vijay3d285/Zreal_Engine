@@ -456,6 +456,13 @@ void debug_visualize(
 		dbg_mat.transmissivness = 0.0;
 		dbg_mat.eta = 1.5; // Unused while transmissivness is 0.0; see MaterialProperties.eta.
 		dbg_mat.opacity = 1.0;
+		// E2b Task 3 Step 5. Uninitialized struct fields are undefined in GLSL --
+		// this vis mode calls evalIndirectCombinedBRDF below, which DOES consume
+		// anisotropy through prepareBRDFData, so leaving these unset here would
+		// read garbage.
+		dbg_mat.anisotropy = dbg_material.anisotropy;
+		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
+		dbg_mat.tangent = world_tangent;
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -558,6 +565,13 @@ void debug_visualize(
 		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
 		dbg_mat.eta = dbg_eta_32;
 		dbg_mat.opacity = 1.0;
+		// E2b Task 3 Step 5. Not consumed by combinedPdfLobeProbability /
+		// samplerLobeProbability below, but a MaterialProperties field left
+		// unset is undefined in GLSL regardless of whether this call site
+		// happens to read it.
+		dbg_mat.anisotropy = dbg_material.anisotropy;
+		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
+		dbg_mat.tangent = world_tangent;
 
 		float pSpec = combinedPdfLobeProbability(dbg_mat);
 		float brdfProbability = samplerLobeProbability(dbg_mat);
@@ -596,6 +610,11 @@ void debug_visualize(
 		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
 		dbg_mat.eta = dbg_eta_33;
 		dbg_mat.opacity = 1.0;
+		// E2b Task 3 Step 5. Consumed below via prepareBRDFData (dbg_transData)
+		// to derive ax/ay/anisoPhi for sampleTransmissiveLobe's aniso sampling.
+		dbg_mat.anisotropy = dbg_material.anisotropy;
+		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
+		dbg_mat.tangent = world_tangent;
 
 		vec3 dbg_specularF0 = baseColorToSpecularF0(dbg_mat.baseColor, dbg_mat.metalness, dbg_mat.dielectricF0);
 		float dbg_alpha = dbg_mat.roughness * dbg_mat.roughness;
@@ -624,6 +643,12 @@ void debug_visualize(
 		// otherwise dead.
 		vec3 dbg_N = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
 
+		// E2b: ax/ay/anisoPhi for THIS hit's dbg_N, via prepareBRDFData -- the
+		// same tangent-projection formula every other consumer uses, so this
+		// detector cannot silently derive the anisotropy frame a different way
+		// than production does. L is unused for these three fields.
+		BrdfData dbg_transData = prepareBRDFData(dbg_N, V, V, dbg_mat);
+
 		RNGState dbg_rng = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
 		vec2 dbg_u_xy = rng_2d(dbg_rng, RT_PRNG_SURFACE_BSDF);
 		float dbg_u_z = rng_1d(dbg_rng, RT_PRNG_TRANSMIT);
@@ -634,7 +659,8 @@ void debug_visualize(
 		bool dbg_is_transmit;
 		bool dbg_wrong_hemisphere;
 		bool dbg_ok = sampleTransmissiveLobe(V, dbg_N, geometry_normal, dbg_alpha, dbg_alpha * dbg_alpha,
-				dbg_specularF0, dbg_mat.eta, dbg_mat.transmissivness, dbg_material.thickness == 0.0, dbg_u3,
+				dbg_specularF0, dbg_mat.eta, dbg_mat.transmissivness, dbg_material.thickness == 0.0,
+				dbg_transData.ax, dbg_transData.ay, dbg_transData.anisoPhi, dbg_u3,
 				dbg_next_dir, dbg_weight, dbg_is_transmit, dbg_wrong_hemisphere);
 		// Fix round 2 self-review: the thin-walled override this defect
 		// reorders around ONLY applies when isTransmit is true (`if
@@ -917,6 +943,15 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// case is physically correct, not merely defensive.
 	brdf_mat.eta = h.is_front_face ? resolved_eta : ((resolved_eta > 0.0) ? (1.0 / resolved_eta) : resolved_eta);
 	brdf_mat.opacity = 1.0;
+	// E2b Task 3 Step 5. The production path -- consumed by prepareBRDFData
+	// (evalIndirectCombinedBRDF's specular sample, combinedPdf, evalCombinedBRDFSeparate)
+	// everywhere brdf_mat flows below. MaterialResult m does not carry
+	// anisotropy (Phase D never forwarded it there), so read it straight from
+	// the MaterialData binding, same as debug_visualize's dbg_material param.
+	MaterialData raw_mat = materials[h.geometry_idx];
+	brdf_mat.anisotropy = raw_mat.anisotropy;
+	brdf_mat.anisotropyRotation = raw_mat.anisotropy_rotation; // already RADIANS
+	brdf_mat.tangent = h.tangent;
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
 	// Fix round 1, I2: the transmission weight used to be applied to THIS
@@ -1159,6 +1194,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	if (brdfType == SPECULAR_TYPE && brdf_mat.transmissivness > 0.0) {
 		float alpha = brdf_mat.roughness * brdf_mat.roughness;
 		float3 u3 = float3(u, rng_1d(rng, RT_PRNG_TRANSMIT));
+		// E2b: ax/ay/anisoPhi for THIS hit's N, via prepareBRDFData -- the same
+		// tangent-projection formula every other consumer uses (V is a dummy L,
+		// unused for these three fields).
+		BrdfData transData = prepareBRDFData(N, V, V, brdf_mat);
 		// Fix round 2: calls sampleTransmissiveLobe (brdf_inc.glsl), which
 		// encapsulates sampling, the hemisphere-consistency guard, and the
 		// thin-walled override IN THE ORDER fix round 1's I1 established --
@@ -1168,7 +1207,8 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		bool isTransmit;
 		bool wrongHemisphere;
 		if (sampleTransmissiveLobe(V, N, h.geometry_normal, alpha, alpha * alpha, specularF0,
-					brdf_mat.eta, brdf_mat.transmissivness, m.thickness == 0.0, u3,
+					brdf_mat.eta, brdf_mat.transmissivness, m.thickness == 0.0,
+					transData.ax, transData.ay, transData.anisoPhi, u3,
 					next_dir, brdf_weight, isTransmit, wrongHemisphere)) {
 			transmissive_sample_ok = !wrongHemisphere;
 			took_transmissive_lobe = isTransmit;
