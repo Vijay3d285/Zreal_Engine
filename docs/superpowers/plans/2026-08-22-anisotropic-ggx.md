@@ -16,7 +16,7 @@
 - **After touching any `.glsl`, run a full scons build** so `.glsl.gen.h` regenerates. Never hand-edit a `.gen.h`.
 - **`anisotropy` stays SIGNED.** Feed the raw value into `aspect = sqrt(1 - anisotropy * 0.9)`. Do NOT saturate it. (Spec §3.2.)
 - **`anisotropy_rotation` is RADIANS. Do NOT multiply by 2π.** Cycles stores turns and multiplies; Godot does not. (Spec §3.3.)
-- At `anisotropy == 0` the output must be **bit-identical** to the current build. `aspect` is exactly `1.0` there.
+- At `anisotropy == 0` the output must be **bit-identical** to the current build. `aspect` is exactly `1.0` there, AND every consumer must take the EXISTING isotropic code path via `data.anisoActive`, not the anisotropic one. The anisotropic form is strictly more accurate (the shipped `GGX_D` cancels in float32 at `NdotH == 1`), so routing everything through it would silently improve — and therefore change — every polished material. Ruled during execution: bit-identity governs.
 - Debug vis modes 0-34 are allocated. **35 is the next free.** A new GLSL vis mode REQUIRES a matching `RTDebugMode` enumerator in `scene/resources/environment.h` before `RT_DEBUG_MAX`, plus its inspector hint entry in `environment.cpp` — E2a found mode 34 had been added to GLSL only, leaving `RT_DEBUG_MAX` aliasing a live mode.
 - Verify every claim about Cycles or this codebase by **reading the file at implementation time**. Line numbers in this plan may have shifted.
 - Doctest baseline before this plan: **1513 passed, 0 failed, 3 skipped.**
@@ -141,7 +141,11 @@ TEST_CASE("[PathTracer][Anisotropy] anisotropic D reduces to the shipped isotrop
 	// using Hz = NdotH and Hx^2+Hy^2 = 1-NdotH^2. Asserted numerically across
 	// roughness and angle rather than trusted.
 	const float roughnesses[] = { 0.05f, 0.2f, 0.5f, 0.9f };
-	const float ndoths[] = { 0.15f, 0.5f, 0.8f, 1.0f };
+	// 0.999 not 1.0 on purpose -- see the cancellation test below. At exactly
+	// NdotH = 1 the SHIPPED isotropic reference loses ~0.27% to float32
+	// cancellation at small alpha, so comparing against it there measures the
+	// reference's precision, not this formula's correctness.
+	const float ndoths[] = { 0.15f, 0.5f, 0.8f, 0.999f };
 
 	for (float r : roughnesses) {
 		float ax = 0.0f, ay = 0.0f;
@@ -158,6 +162,44 @@ TEST_CASE("[PathTracer][Anisotropy] anisotropic D reduces to the shipped isotrop
 			CHECK(ggx_d_aniso(h, ax, ay) == doctest::Approx(ggx_d_iso(alpha_sq, ndoth)).epsilon(1e-5));
 		}
 	}
+}
+
+TEST_CASE("[PathTracer][Anisotropy] the shipped isotropic D loses precision at NdotH = 1") {
+	// Recorded, not worked around. Found by this suite during E2b implementation.
+	//
+	// GGX_D computes b = (alphaSquared - 1) * NdotH^2 + 1. At NdotH == 1 that is
+	// alphaSquared - 1 + 1: subtract 1 from a number near 1, then add it back.
+	// In float32 the low bits are gone. At roughness 0.05 (alphaSquared 6.25e-6)
+	// the result carries ~0.27% error; the anisotropic form, which never forms
+	// that difference, is the ACCURATE one.
+	//
+	// This matters more than a corner case sounds: NdotH near 1 at low roughness
+	// is exactly where a sharp specular highlight lives.
+	//
+	// It is ALSO why prepareBRDFData branches to the isotropic path at
+	// anisotropy == 0 rather than routing everything through the anisotropic
+	// form. Taking the more accurate path unconditionally would silently shift
+	// every polished material and break the no-pixel-change guarantee. The
+	// engine keeps its existing behaviour where anisotropy is off; the accuracy
+	// improvement applies only where anisotropy is actually used.
+	const float alpha = 0.05f * 0.05f;
+	const float alpha_sq = alpha * alpha;
+	float ax = 0.0f, ay = 0.0f;
+	aniso_alphas(0.05f, 0.0f, &ax, &ay);
+
+	const Vector3 h_normal(0.0f, 0.0f, 1.0f);
+	const float d_aniso = ggx_d_aniso(h_normal, ax, ay);
+	const float d_iso = ggx_d_iso(alpha_sq, 1.0f);
+
+	// At NdotH == 1 the true value is exactly 1/(PI*alphaSquared).
+	const float exact = 1.0f / (float(Math::PI) * alpha_sq);
+	CHECK(d_aniso == doctest::Approx(exact).epsilon(1e-5));
+
+	// The shipped reference is measurably off there -- pinned so that if someone
+	// ever makes GGX_D numerically stable, this test fails and tells them the
+	// branch in prepareBRDFData can be revisited.
+	CHECK(d_iso != doctest::Approx(exact).epsilon(1e-4));
+	CHECK(Math::abs(d_iso - exact) / exact > 0.002f);
 }
 
 TEST_CASE("[PathTracer][Anisotropy] SIGNED convention, with the Cycles alternative pinned") {
@@ -332,6 +374,12 @@ Append to the END of the struct:
 	float ax;
 	float ay;
 	float anisoPhi;
+	// True only when anisotropy is actually in play. When false EVERY consumer
+	// must take the existing isotropic path unchanged -- the anisotropic form is
+	// strictly MORE accurate (see Task 3 Step 4), and taking it unconditionally
+	// would silently shift every polished material and break the no-pixel-change
+	// guarantee.
+	bool anisoActive;
 ```
 
 - [ ] **Step 5: Compute them in `prepareBRDFData`**
@@ -347,9 +395,11 @@ Find the alpha block (`grep -n "data.alphaSquared = data.alpha" brdf_inc.glsl`) 
 	data.ax = data.alpha;
 	data.ay = data.alpha;
 	data.anisoPhi = 0.0f;
+	data.anisoActive = false;
 
 	float tangentLen = length(material.tangent);
 	if (material.anisotropy != 0.0f && tangentLen > 1e-6f) {
+		data.anisoActive = true;
 		float aspect = anisoAspect(material.anisotropy);
 		data.ax = data.alpha / aspect;
 		data.ay = data.alpha * aspect;
@@ -449,9 +499,39 @@ float sampleGGXVNDFReflectionPdfAniso(float3 Vaniso, float3 Haniso, float ax, fl
 
 Then route every specular-pdf call site found in Step 1 through it, rotating its inputs by `-data.anisoPhi` first.
 
-- [ ] **Step 4: Use the anisotropic D and G2 in the BRDF evaluation**
+- [ ] **Step 4: Use the anisotropic D and G2 in the BRDF evaluation — BEHIND A BRANCH**
 
-Find the evaluation (`grep -n "Microfacet_D(max(0.00001f, data.alphaSquared)" brdf_inc.glsl`). Replace the isotropic `D`/`G2` pair with the anisotropic ones, rotating `V`, `L` and `H` into the anisotropy frame first. Guard `ax` and `ay` independently with `max(0.00001f, ...)` — at `roughness = 0` both go to zero and `D` is singular.
+Find the evaluation (`grep -n "Microfacet_D(max(0.00001f, data.alphaSquared)" brdf_inc.glsl`).
+
+**The isotropic path must be kept and taken whenever anisotropy is off.** Do NOT route everything through the anisotropic form:
+
+```glsl
+	float D, G2;
+	if (data.anisoActive) {
+		float3 Ha = rotateAboutZ(data.H, -data.anisoPhi);
+		float3 Va = rotateAboutZ(data.V, -data.anisoPhi);
+		float3 La = rotateAboutZ(data.L, -data.anisoPhi);
+		D = GGX_D_Aniso(Ha, max(0.00001f, data.ax), max(0.00001f, data.ay));
+		G2 = Smith_G2_Aniso(Va, La, max(0.00001f, data.ax), max(0.00001f, data.ay));
+	} else {
+		D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
+		G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
+	}
+```
+
+**Why the branch is load-bearing, not a micro-optimisation.** The anisotropic
+form is strictly MORE accurate than the shipped isotropic one: `GGX_D`'s
+`b = (alphaSquared - 1) * NdotH^2 + 1` catastrophically cancels in float32 at
+`NdotH == 1`, carrying ~0.27% error at roughness 0.05 — and `NdotH` near 1 at
+low roughness is where a sharp highlight lives. Taking the better path
+unconditionally would silently change every polished material in every existing
+scene and break the no-pixel-change guarantee (spec §4.6, acceptance §8.1).
+The branch keeps today's behaviour exactly where anisotropy is off. Task 1's
+`the shipped isotropic D loses precision at NdotH = 1` test records the
+underlying numerics.
+
+Guard `ax` and `ay` independently with `max(0.00001f, ...)` — at `roughness = 0`
+both go to zero and `D` is singular.
 
 - [ ] **Step 5: Populate the new MaterialProperties fields**
 

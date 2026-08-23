@@ -189,8 +189,28 @@ D = 1 / (PI * a^2 * ( (Hx^2 + Hy^2)/a^2 + Hz^2 )^2 )
 using `Hz = NdotH` and `Hx^2 + Hy^2 = 1 - NdotH^2`. Likewise §4.3 reduces to
 `Smith_G2_Height_Correlated`.
 
-**This identity is asserted numerically in doctest at several roughness and
-NdotH values, not assumed.** E1's "no pixel changes" claim was only credible
+**Amended during execution (2026-08-22).** The identity holds algebraically but
+NOT in float32 at `NdotH == 1`. The shipped `GGX_D` forms
+`b = (alphaSquared - 1) * NdotH^2 + 1`, which at `NdotH == 1` subtracts 1 from a
+number near 1 and adds it back — catastrophic cancellation. At roughness 0.05
+the shipped value carries **0.27% error**; the anisotropic form, which never
+forms that difference, is the accurate one.
+
+That is not an obscure corner: `NdotH` near 1 at low roughness is where a sharp
+specular highlight lives. So the anisotropic path is a real, if small, accuracy
+improvement — and taking it unconditionally would change every polished material
+in every existing scene.
+
+**Ruling: bit-identity governs.** `BrdfData.anisoActive` gates the anisotropic
+path; at `anisotropy == 0` every consumer takes the existing isotropic code
+unchanged. The accuracy improvement applies only where anisotropy is in use. A
+doctest case records the cancellation and pins the shipped reference's error, so
+that if `GGX_D` is ever made numerically stable the test fails and tells the
+reader this branch can be revisited.
+
+**The identity is asserted numerically in doctest at several roughness and
+NdotH values, not assumed** — at `NdotH` values away from the cancellation
+corner. E1's "no pixel changes" claim was only credible
 because it was arithmetic; the same standard applies here.
 
 ## 5. Error handling and degenerate inputs
