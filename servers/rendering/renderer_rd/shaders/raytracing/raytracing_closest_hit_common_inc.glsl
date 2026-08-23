@@ -695,6 +695,103 @@ void debug_visualize(
 		// the E1 closeout had to retract from roadmap 7.1's calibration
 		// argument. Raw and unscaled, matching mode 23's convention.
 		ps.radiance = vec3(scene_data_block.data.IBL_exposure_normalization, 0.0, 0.0);
+	} else if (vis_mode == 35) {
+		// E2b pdf/sampler parity. R = the density the SAMPLER actually realises,
+		// G = what sampleGGXVNDFReflectionPdfAniso reports for the same
+		// direction. They must agree.
+		//
+		// This calls the SAME functions the integrator calls, not re-inlined
+		// copies -- a second copy here would validate the probe's own arithmetic
+		// rather than the shipped code. Same reason vis mode 32 exists (E1).
+		//
+		// R (dbg_sampler_pdf): sampleSpecularMicrofacet is the ACTUAL specular
+		// sampler shade_and_bounce dispatches to (via evalIndirectCombinedBRDF's
+		// SPECULAR_TYPE branch, brdf_inc.glsl's `sampleSpecular` macro). Calling
+		// it here with a real RNG draw produces a real local-space Llocal. Its
+		// half-vector is recovered from reflection symmetry -- Llocal ==
+		// reflect(-Vlocal, Hlocal) implies Hlocal == normalize(Vlocal + Llocal)
+		// for whatever Hlocal the sampler actually drew -- then fed into
+		// sampleGGXVNDFReflectionPdfAniso, the SAME low-level pdf primitive G
+		// below calls. This is "the density the sampler realises" because H
+		// comes from the geometry of what the shipped sampler returned, not
+		// from re-running its RNG a second time.
+		//
+		// G (dbg_reported_pdf): combinedPdf -- the SAME function shade_and_bounce
+		// calls at its mis_ray_pdf assignment -- evaluated at the WORLD-space
+		// direction the sampler just realised. The gate's probe-2 material is
+		// fully metallic (diffuseLum == 0, so combinedPdfLobeProbability returns
+		// exactly 1.0) and non-transmissive (transmitScale == 1.0 exactly), so
+		// combinedPdf's diffuse+specular mixture collapses bit-exactly onto its
+		// own internal sampleGGXVNDFReflectionPdfAniso call -- but reached
+		// through combinedPdf's INDEPENDENTLY-coded world-to-local rotation
+		// (brdf_inc.glsl:1770-1787), not R's. A rotation-convention desync
+		// between the SAMPLING side and the REPORTING side -- exactly Task 3's
+		// two frame fixes (evalMicrofacet's world-to-local transform and
+		// pre-rotating the tangent before prepareBRDFData) -- would show up
+		// here as R != G, but ONLY at a shading normal not aligned with world
+		// Z: getRotationToZAxis((0,0,1)) is the identity and would hide it
+		// completely. The gate must therefore sample a sphere (or a tilted
+		// plane), never a Z-facing quad.
+		MaterialProperties dbg_mat;
+		dbg_mat.baseColor = albedo;
+		dbg_mat.metalness = metalness;
+		dbg_mat.roughness = roughness;
+		vec3 dbg_f0_35;
+		float dbg_eta_35;
+		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
+				dbg_material.specular_tint, dbg_f0_35, dbg_eta_35);
+		dbg_mat.dielectricF0 = dbg_f0_35;
+		dbg_mat.emissive = vec3(0.0);
+		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
+		dbg_mat.eta = dbg_eta_35;
+		dbg_mat.opacity = 1.0;
+		dbg_mat.anisotropy = dbg_material.anisotropy;
+		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
+		dbg_mat.tangent = world_tangent;
+
+		// Same clamped shading normal shade_and_bounce actually bounces from
+		// (mirrors vis mode 33's dbg_N) -- on a sphere this is well away from
+		// world Z almost everywhere, which is what makes this probe able to
+		// see the two frame fixes at all.
+		vec3 dbg_N35 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+
+		// ax/ay/anisoPhi for THIS hit's dbg_N35, via prepareBRDFData -- the same
+		// tangent-projection formula every other consumer uses (L is unused for
+		// these three fields; mirrors mode 33's dbg_transData).
+		BrdfData dbg_data35 = prepareBRDFData(dbg_N35, V, V, dbg_mat);
+
+		float4 dbg_qToZ35 = getRotationToZAxis(dbg_N35);
+		vec3 dbg_Vlocal35 = rotatePoint(dbg_qToZ35, V);
+
+		float dbg_alpha35 = dbg_mat.roughness * dbg_mat.roughness;
+		vec3 dbg_specularF0_35 = baseColorToSpecularF0(dbg_mat.baseColor, dbg_mat.metalness, dbg_mat.dielectricF0);
+
+		RNGState dbg_rng35 = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
+		vec2 dbg_u35 = rng_2d(dbg_rng35, RT_PRNG_SURFACE_BSDF);
+
+		vec3 dbg_weight35;
+		vec3 dbg_Llocal35 = sampleSpecularMicrofacet(dbg_Vlocal35, dbg_alpha35, dbg_alpha35 * dbg_alpha35,
+				dbg_specularF0_35, dbg_data35.ax, dbg_data35.ay, dbg_data35.anisoPhi, dbg_data35.anisoActive,
+				dbg_u35, dbg_weight35);
+
+		// Reflection symmetry recovers the half-vector the sampler drew without
+		// re-deriving it any other way: Llocal == reflect(-Vlocal, Hlocal) for
+		// ANY Hlocal implies Hlocal == normalize(Vlocal + Llocal).
+		vec3 dbg_Hlocal35 = normalize(dbg_Vlocal35 + dbg_Llocal35);
+		vec3 dbg_Vaniso35 = rotateAboutZ(dbg_Vlocal35, -dbg_data35.anisoPhi);
+		vec3 dbg_Haniso35 = rotateAboutZ(dbg_Hlocal35, -dbg_data35.anisoPhi);
+		// Matches combinedPdf's own VdotH clamp (brdf_inc.glsl:1846) so R and G
+		// are not compared under two different clamp conventions.
+		float dbg_VdotH35 = max(0.00001, dot(dbg_Vlocal35, dbg_Hlocal35));
+
+		float dbg_sampler_pdf = sampleGGXVNDFReflectionPdfAniso(dbg_Vaniso35, dbg_Haniso35,
+				dbg_data35.ax, dbg_data35.ay, dbg_VdotH35);
+
+		vec3 dbg_dir35 = normalize(rotatePoint(invertRotation(dbg_qToZ35), dbg_Llocal35));
+		float dbg_reported_pdf = combinedPdf(dbg_N35, dbg_dir35, V, dbg_mat);
+
+		// Raw and unscaled, matching mode 23's convention.
+		ps.radiance = vec3(dbg_sampler_pdf, dbg_reported_pdf, 0.0);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

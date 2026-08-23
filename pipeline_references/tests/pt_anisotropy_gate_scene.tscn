@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://tests/pt_anisotropy_gate.gd" id="1_anisogate"]
+
+[node name="PTAnisotropyGate" type="Node"]
+script = ExtResource("1_anisogate")
