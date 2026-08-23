@@ -794,9 +794,9 @@ Add transmission, IOR, clearcoat (+roughness), sheen (+tint), anisotropy (+rotat
 GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_hit_common:474`). Handle front/back faces, IOR sides, total internal reflection. Wire `max_transmission_bounce` from B3.
 *Accept:* a glass vase refracts correctly; rough glass blurs plausibly; retire the "glass vanishing" workaround **for content that adopts transmission** (see the corrected OIDN claim above and the full closeout in §6).
 
-**E2. Anisotropy, clearcoat, sheen**
+**E2. Anisotropy, clearcoat, sheen** — anisotropy portion **COMPLETE (E2b)**, clearcoat/sheen **NOT STARTED**
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured within 0.67% of Cycles once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint and velvet: not met** — clearcoat and sheen lobes do not exist yet; carried to E2c/E2d (§7.8, spec §9) along with the two-way→N-way lobe-selection rewrite and anisotropy on the transmissive lobe.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -2006,3 +2006,226 @@ hemispherical irradiance to −1.6% at high radiance-map resolution, and its
 response is resolution-sensitive, reading +8.5% high at `RADIANCE_SIZE_256`
 on a deliberately sub-texel stimulus — a real, minor, separate aliasing item
 this confirmation does not touch and does not explain.
+
+### 7.8 E2b - anisotropic GGX
+
+**Status: landed and measured.** Real anisotropic GGX (elliptical `ax`/`ay`
+roughness, azimuth-aware `D`/`G2`/VNDF sampling/pdf) now threads through
+`sampleGGXVNDF`'s existing `alpha2D` parameter, replacing the isotropic
+`(alpha, alpha)` pair E2's original framing (§4) flagged as the entry point.
+Full task-by-task record:
+`.superpowers/sdd/2026-08-22-anisotropic-ggx/task-{1..5}-report.md`.
+
+**The `ax`/`ay` mapping is shared verbatim with two independent sources —
+parity was free here, unlike an earlier phase.** Both read and confirmed
+line-for-line:
+
+```
+Blender Cycles          intern/cycles/kernel/svm/closure.h:311-313
+this engine's raster     servers/rendering/renderer_rd/shaders/scene_forward_lights_inc.glsl:272-274
+```
+
+```glsl
+// scene_forward_lights_inc.glsl:272-274, confirmed byte-for-byte during Task 5
+half aspect = sqrt(half(1.0) - anisotropy * half(0.9));
+half ax = alpha_ggx / aspect;
+half ay = alpha_ggx * aspect;
+```
+
+The path tracer's `anisoAspect()` (`brdf_inc.glsl:994`) uses this exact
+formula. So Cycles parity AND raster/RT parity come from a single shared
+formula. Contrast E1, which had to *purchase* a deliberate divergence to ship
+correctly: the dielectric closure's Fresnel remap is intentionally NOT the
+same function opaque materials use (`brdf_inc.glsl:1268-1272`'s own comment:
+*"routing everything through here would change the reflectance of every
+specular surface in every existing scene"*), a real, load-bearing difference
+between this engine's opaque and transmissive Fresnel paths that Cycles does
+not have. E2b needed no equivalent trade — parity was free here.
+
+**Signed, not saturated — a deliberate, documented divergence from Cycles'
+internal representation, with no material-authoring cost.** `anisotropy` here
+is SIGNED `[-1,1]`, matching this engine's own raster convention.
+Cycles instead `saturatefs`-clamps to `[0,1]` and carries the other
+orientation in its rotation channel — **not equivalent**: at
+`anisotropy=-0.5`, Godot's convention gives an axis ratio of 1.450 vs Cycles'
+`|a|=0.5` + 90° gives 1.818 (different eccentricity, not just a different
+orientation). Nothing is lost in practice: `KHR_materials_anisotropy` (glTF)
+has no sign concept, so every glTF- or Blender-imported material lands in
+`anisotropy >= 0`, exactly where the two conventions agree exactly by
+construction (`brdf_inc.glsl:988-993`).
+
+**`anisotropy_rotation` is RADIANS, not turns — the other real Cycles-API
+divergence, verified twice.** Cycles stores rotation as a 0-1 turn fraction
+and multiplies by `2*PI` internally; Godot's `anisotropy_rotation` is used
+directly as radians (`brdf_inc.glsl:1651`,
+`data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;` — no
+`2*PI` factor). This was already documented from Phase D
+(`PATH_TRACER_QUALITY_ROADMAP.md:985-987`) and Task 5's Cycles comparison
+independently re-confirmed it empirically, not just by citation: converting
+Godot's `PI/2` radians to Blender's `0.25` turn reproduced a ~90° highlight
+rotation in BOTH engines (89.6°→0.3° in Godot, 89.8°→−0.3° in Cycles — see
+below).
+
+**`anisotropy == 0` takes the isotropic path unchanged — a deliberate user
+ruling, not an oversight.** `BrdfData.anisoActive` is `false` whenever
+`material.anisotropy == 0.0` or no usable tangent exists
+(`brdf_inc.glsl:1637-1641`), and every consumer is required to take the
+pre-existing isotropic branch in that case (`brdf_inc.glsl:349-353`'s own
+comment: *"the anisotropic form is strictly MORE accurate... and taking it
+unconditionally would silently shift every polished material and break the
+no-pixel-change guarantee"*). `anisoAspect(0) == 1.0` exactly, so
+`ax == ay == alpha` bit-for-bit at anisotropy 0 — this is why the reduction
+identity doctest (Task 1) and the furnace/pdf-parity `0.0` controls (Task 4)
+are meaningful checks, not tautologies: correct pre-E2b behavior is required
+to reproduce exactly at that one value, and does.
+
+**Verification results, carried forward from Tasks 1-4 and re-confirmed by
+Task 5's own regression run:**
+
+- **doctest**: 1521 passed / 0 failed / 3 skipped, unchanged across every task
+  from Task 1's baseline through Task 5's final restore.
+- **CPU-mirror reduction identities** (Task 1): `ggx_d_aniso` reduces to the
+  shipped `GGX_D` and `smith_lambda_aniso` reduces to the shipped
+  `Smith_G_Lambda_GGX` at `anisotropy=0`, exactly, in real arithmetic. One
+  real finding along the way: the *shipped* isotropic `GGX_D` loses ~0.27%
+  precision at `NdotH=1`, small roughness, via float32 catastrophic
+  cancellation in `(alphaSquared-1)*NdotH²+1` — a pre-existing shipped-code
+  artifact, not an E2b defect, now pinned as a permanent regression guard
+  (`test_pt_anisotropy.cpp`, "the shipped isotropic D loses precision at
+  NdotH = 1").
+- **pdf/sampler self-normalizing parity** (Task 4, fix round 1): the ORIGINAL
+  construction (compare the sampler's realized pdf `R` against `combinedPdf`'s
+  report `G` for the same direction) was found to be a **tautology** — both
+  sides resolve to the identical expression through identical inputs, so a
+  genuinely wrong pdf formula would still read `R==G`. Replaced with a real
+  instrument: draw real samples from the production sampler, accumulate
+  `E[1/combinedPdf(L)]`, and compare against the upper hemisphere's exact
+  solid-angle measure `2*PI` — a check that cannot be gamed by evaluating the
+  same formula twice. **Result: PASSES at every anisotropy value tested,
+  including a fresh `0.0` control (ratio 1.001145/1.001152)**, worst case
+  0.53% off `2*PI` at `anisotropy=0.9`. No evidence of a sampler/pdf desync in
+  the anisotropic branch. (This supersedes the original spec's §8 acceptance
+  item 3, "pdf/sampler parity probe agrees within 1e-4" — that construction
+  could not have failed even if the formula were wrong, so its 1e-4 pass was
+  not meaningful evidence; the self-normalizing instrument is the real check
+  and is the one that matters.)
+- **C1-revert experiment** (Task 4, fix round 1, I6): Task 3's C1 fix (a
+  missing `1/(4·NdotL·NdotV)` factor inside `evalMicrofacet`'s
+  `anisoActive` branch) was temporarily reverted, measured, and restored.
+  Furnace probe 1 (`roughness=0.4`) shifted **+10.2 to +15.8 percentage
+  points** across the anisotropy sweep; a second, NEE-dominant probe 1b
+  (`roughness=0.9, anisotropy=0.9`, built specifically because the a priori
+  MIS-weight estimate predicted probe 1 alone might not catch a reverted C1)
+  shifted **+42.6 points**. Both probes are therefore confirmed, by direct
+  experiment rather than assertion, to actually guard the fix they exist to
+  guard — satisfying the project's standing "gates must be falsifiable"
+  discipline.
+- **Furnace sweep** (Task 4): FAILS as an absolute check, **+3.4% to +8.1%**
+  over 1.0 across the full anisotropy/rotation sweep, including the isotropic
+  `anisotropy=0.0` control at +5.95%. See the separate open item below — this
+  is NOT an anisotropy defect.
+
+**The Cycles comparison (Task 5), with its mandatory positive control.**
+Scene: metallic sphere, `roughness=0.4`, `anisotropy=0.6` (`>0`, the range
+where the two engines' conventions agree exactly), `anisotropy_rotation` `0`
+and `PI/2`, under a spatially uniform-radiance world. Colour-space handling
+followed the E2a-lesson hard requirement exactly: Godot's
+`albedo_color=Color(0.8,0.8,0.8)` (sRGB, as an artist would type it) decodes
+via the engine's own `Color::srgb_to_linear()` — printed live by the harness,
+not assumed — to `0.60382730`; Blender's `Base Color` was set to that decoded
+number, **not** to `0.8`.
+
+```
+                Godot mean   Cycles mean   ratio      % off
+rotation=0      0.625747     0.587438      1.065214   +6.52%
+rotation=PI/2   0.625796     0.587503      1.065179   +6.52%
+```
+
+**Positive control**: a second Blender arm with the RAW, un-decoded `0.8`
+Base Color measured `0.783586` against the reconciled arm's `0.587438` — ratio
+`1.333904`, against a naive `v/srgb_to_linear(v)` prediction of `1.324882`
+(0.68% apart, attributed to Cycles' own `F0`-dependent multi-scatter
+compensation term, which makes this specular scene's response mildly
+nonlinear in base colour, unlike E2a's pure-Lambertian control). The control
+clearly reproduces the ~33% brightness swing the colour-space trap predicts,
+in the correct direction.
+
+**Rotation check**: intensity-weighted principal-axis angle (image moments)
+of each render's brightness distribution. Within each engine, the axis
+rotates by the expected ~90° between the two settings (Godot: 89.59°→0.27°;
+Cycles: 89.79°→−0.30°) — **the highlight rotates the same way in both
+engines**. The two engines' absolute axis angles also agree with each other
+to within half a degree at each setting, which is more than the check
+requires and was not independently guaranteed by anything in this task (it
+depends on both engines' UV-sphere tangent generators sharing a convention,
+which was not separately verified).
+
+**As measured, the raw comparison MISSES the spec's 5% acceptance bar
+(§8.6): +6.52%.** This is reported as a plain finding, not adjusted or hidden.
+A targeted attribution experiment — reusing Task 4's own forced-`ms=1.0`
+technique (temporary shader edit, rebuilt, measured, reverted, rebuilt again;
+`git diff` confirmed empty before and after) — found that **5.85 of the 6.52
+percentage points (90%) are attributable to the pre-existing,
+anisotropy-orthogonal `evalMultiScatterApproximation` over-compensation bug**
+(below). With that known bug's contribution isolated, the residual gap is
+**0.67%**, comfortably inside the 5% bar. Full numbers, scripts, and the
+diagnostic rebuild log are in
+`.superpowers/sdd/2026-08-22-anisotropic-ggx/task-5-report.md`. **No fix is
+proposed here** — the diagnostic edit was reverted immediately after
+measurement and the production binary was rebuilt and independently
+re-verified (doctest 1521/0/3 unchanged; `pt_anisotropy_gate_scene.tscn`'s
+`anisotropy=0.00` control reproduced Task 4's committed `1.059537` to 6
+decimal places) before this closeout was written.
+
+**Open item — pre-existing, NOT caused or fixed by E2b, anisotropy-orthogonal.**
+`evalMultiScatterApproximation`/`evalEmsApprox` over-compensates
+single-scattering energy loss by roughly 3-8 percentage points across the
+roughness/anisotropy range exercised here. It reads high on the isotropic
+`anisotropy=0.0` furnace control too (+5.95%), which is the direct proof it
+is not an anisotropy defect — the anisotropic branch of the code this bug
+lives near is not even reached at `anisotropy=0`. Task 4 confirmed the
+mechanism directly by forcing `ms=1.0` at all three reachable call sites
+(`brdf_inc.glsl:1192`, `:1348`, `raytracing_closest_hit_common_inc.glsl:1270`)
+and watching the furnace ratio drop from 1.0595 to 0.9657 (a true
+single-scatter energy deficit of ~3.4%, over-corrected to +5.95% by the `ms`
+term). Task 5's Cycles-comparison scene (different `F0`, different geometry)
+reproduced the same signature: gap collapses from +6.52% to +0.67% when `ms`
+is forced off. **This item is carried forward, unfixed, exactly as Task 4 left
+it.** E2b does not claim to have caused it and does not claim to have fixed
+it — it is recorded here as a separate, pre-existing engine defect that
+happens to be visible in both this feature's own furnace gate and its Cycles
+comparison, because both exercise the same underlying rough-conductor code
+path anisotropic GGX also uses. No fix is proposed for it in this closeout.
+
+**Phase table.** E2's anisotropy line (§4, "E2. Anisotropy, clearcoat, sheen")
+is now **complete for the anisotropic-GGX portion**: `sampleGGXVNDF` threads
+real per-material `ax`/`ay` through the whole reflective specular path
+(distribution, height-correlated Smith G2, VNDF sampling, and pdf), matching
+Cycles' and this engine's own raster's shared formula, verified by doctest,
+a GPU furnace/pdf-parity gate, and the Cycles comparison above. **What
+remains under the original E2 heading, per spec §9, is explicitly out of
+scope for this phase and carried to its named successors:**
+
+- **Clearcoat** and **sheen** lobes — not started (E2c/E2d).
+- **The two-way → N-way lobe-selection rewrite** — still two-way; adding
+  clearcoat/sheen as real third/fourth lobes requires this first (E2c).
+- **Anisotropy on the transmissive lobe, as a real, evaluated feature — still
+  out of scope, but not for the reason a quick read suggests.** Cycles
+  applies `alpha_x`/`alpha_y` to its glass closure too
+  (`closure.h:450-451`); the spec (§9) scoped this phase to the reflective
+  lobe only. Reading `sampleDielectricMicrofacet` (`brdf_inc.glsl:1277-1339`)
+  during this closeout found the SAMPLER already threads `ax`/`ay`/`anisoPhi`
+  through both its shared half-vector draw and BOTH branches' importance
+  weight (`weightRatioR` reflect, `weightRatioT` transmit) — a deliberate
+  side effect of Task 3's "I1" weight-consistency fix, not a new claim of
+  transmissive-anisotropy support. It does not make anisotropic glass a real
+  feature: there is no BRDF **evaluation** or **pdf** for a transmitted
+  direction anywhere in this file, anisotropic or not —
+  `evalCombinedBRDFSeparate` returns zero whenever `data.Lbackfacing`
+  (`brdf_inc.glsl:1886-1888`, true for every transmitted direction) and
+  `combinedPdf` returns `0.0` whenever `NdotL <= 0`
+  (`brdf_inc.glsl:1746-1749`, same condition) — so NEE/MIS can never combine
+  a strategy against a refracted direction at all, matching the pre-existing,
+  already-documented "NEE through refractive lobes is unimplemented" gap
+  (E1 closeout). Genuine anisotropic glass needs that eval/pdf machinery
+  built first; remains an E2c/E2d item (spec §9).
