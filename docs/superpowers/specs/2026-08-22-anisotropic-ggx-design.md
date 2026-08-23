@@ -1,6 +1,6 @@
 # Anisotropic GGX (E2b) — Design
 
-**Branch:** `vijay_PTEngine_v12_PhaseE`
+**Branch:** `vijay_PTEngine_v13_PhaseE2`
 **Status:** design, awaiting review
 **Predecessor:** `2026-08-21-environment-energy-fidelity-design.md` (E2a)
 **Successors:** E2c (N-way lobe rewrite + clearcoat), E2d (sheen)
