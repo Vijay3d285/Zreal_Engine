@@ -512,7 +512,17 @@ Find the evaluation (`grep -n "Microfacet_D(max(0.00001f, data.alphaSquared)" br
 		float3 Va = rotateAboutZ(data.V, -data.anisoPhi);
 		float3 La = rotateAboutZ(data.L, -data.anisoPhi);
 		D = GGX_D_Aniso(Ha, max(0.00001f, data.ax), max(0.00001f, data.ay));
+		// CORRECTED DURING EXECUTION. Smith_G2 is NOT plain G2 here: with
+		// USE_OPTIMIZED_G2 (:165) and GGX it resolves to the Lagarde form, which
+		// returns G2/(4*NdotL*NdotV) and sets G2_DIVIDED_BY_DENOMINATOR (:946),
+		// which is why evalMicrofacet's return at :1448 does NO division.
+		// Smith_G2_Aniso returns PLAIN G2, so it must be given the same
+		// convention or the anisotropic branch is wrong by 4*NdotL*NdotV --
+		// a geometry-dependent 0-4x error, not a constant.
 		G2 = Smith_G2_Aniso(Va, La, max(0.00001f, data.ax), max(0.00001f, data.ay));
+#if G2_DIVIDED_BY_DENOMINATOR
+		G2 /= 4.0f * max(0.00001f, data.NdotL) * max(0.00001f, data.NdotV);
+#endif
 	} else {
 		D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
 		G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
