@@ -82,6 +82,17 @@ static float ggx_d_iso(float p_alpha_squared, float p_ndoth) {
 	return p_alpha_squared / (Math::PI * b * b);
 }
 
+// The shipped ISOTROPIC Smith terms, copied from brdf_inc.glsl:805-807 and
+// :810-812, so the reduction below is checked against the real thing.
+static float smith_g_a(float p_alpha, float p_ndots) {
+	return p_ndots / (MAX(0.00001f, p_alpha) * Math::sqrt(1.0f - MIN(0.99999f, p_ndots * p_ndots)));
+}
+
+static float smith_lambda_iso(float p_alpha, float p_ndots) {
+	const float a = smith_g_a(p_alpha, p_ndots);
+	return (-1.0f + Math::sqrt(1.0f + (1.0f / (a * a)))) * 0.5f;
+}
+
 TEST_CASE("[PathTracer][Anisotropy] aspect is exactly 1 at anisotropy 0") {
 	// This exactness is the whole no-pixel-change guarantee. sqrt(1.0) must be
 	// bit-exact, not approximately 1.
@@ -120,6 +131,55 @@ TEST_CASE("[PathTracer][Anisotropy] anisotropic D reduces to the shipped isotrop
 			CHECK(ggx_d_aniso(h, ax, ay) == doctest::Approx(ggx_d_iso(alpha_sq, ndoth)).epsilon(1e-5));
 		}
 	}
+}
+
+TEST_CASE("[PathTracer][Anisotropy] anisotropic Smith lambda reduces to the shipped isotropic one") {
+	// At ax == ay the anisotropic numerator (ax^2*Vx^2 + ay^2*Vy^2)/Vz^2 becomes
+	// alpha^2*(1-NdotV^2)/NdotV^2, which is exactly 1/a^2 from Smith_G_a. So the
+	// two forms must agree. Asserted numerically rather than trusted.
+	//
+	// NdotV stays away from 1.0 deliberately: the ISOTROPIC form clamps with
+	// min(0.99999, NdotS*NdotS), which the anisotropic form has no counterpart
+	// for, so exactly 1.0 compares the reference's clamp rather than this
+	// formula. Same reason the D reduction test uses 0.999 -- see the
+	// cancellation test below.
+	const float roughnesses[] = { 0.1f, 0.3f, 0.6f, 0.9f };
+	const float ndotvs[] = { 0.2f, 0.5f, 0.8f, 0.95f };
+
+	for (float r : roughnesses) {
+		float ax = 0.0f, ay = 0.0f;
+		aniso_alphas(r, 0.0f, &ax, &ay);
+		const float alpha = r * r;
+
+		for (float ndotv : ndotvs) {
+			const float s = Math::sqrt(MAX(0.0f, 1.0f - ndotv * ndotv));
+			const Vector3 v(s * 0.6f, s * 0.8f, ndotv);
+
+			CHECK(smith_lambda_aniso(v, ax, ay) == doctest::Approx(smith_lambda_iso(alpha, ndotv)).epsilon(1e-4));
+		}
+	}
+}
+
+TEST_CASE("[PathTracer][Anisotropy] Smith lambda actually responds to the anisotropy axes") {
+	// Guards against a reduction test that would pass on a lambda that ignored
+	// ax/ay entirely. With ax != ay, a view along x must be shadowed differently
+	// from a view along y -- if these were equal, smith_lambda_aniso could be
+	// returning the isotropic answer regardless of its arguments and the test
+	// above would still be green.
+	float ax = 0.0f, ay = 0.0f;
+	aniso_alphas(0.4f, 0.8f, &ax, &ay); // strongly anisotropic
+	CHECK(ax != ay);
+
+	const float s = Math::sqrt(1.0f - 0.5f * 0.5f);
+	const Vector3 v_along_x(s, 0.0f, 0.5f);
+	const Vector3 v_along_y(0.0f, s, 0.5f);
+
+	const float lx = smith_lambda_aniso(v_along_x, ax, ay);
+	const float ly = smith_lambda_aniso(v_along_y, ax, ay);
+
+	CHECK(lx > 0.0f);
+	CHECK(ly > 0.0f);
+	CHECK(Math::abs(lx - ly) > 0.05f);
 }
 
 TEST_CASE("[PathTracer][Anisotropy] the shipped isotropic D loses precision at NdotH = 1") {
