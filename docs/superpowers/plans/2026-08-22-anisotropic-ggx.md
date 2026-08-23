@@ -256,7 +256,7 @@ If the reduction test FAILS, the anisotropic `D` in Step 3 is wrong; fix the for
 bin/godot.windows.editor.x86_64.console.exe --headless --test
 ```
 
-Expected: `1517 passed | 0 failed | 3 skipped` (1513 + the 4 new cases).
+Expected: `1520 passed | 0 failed | 3 skipped` (1513 baseline + 5 cases from Step 3 and 2 added in the Lambda-coverage fix round).
 
 - [ ] **Step 6: Commit**
 
@@ -432,7 +432,7 @@ bin/godot.windows.editor.x86_64.console.exe --headless --test
 bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_energy_gate_scene.tscn
 ```
 
-Expected: `1517 passed | 0 failed | 3 skipped`, and `PASS - all energy gates green.`
+Expected: `1520 passed | 0 failed | 3 skipped`, and `PASS - all energy gates green.`
 
 - [ ] **Step 8: Commit**
 
@@ -665,7 +665,7 @@ bin/godot.windows.editor.x86_64.console.exe --headless --test
 bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_energy_gate_scene.tscn
 ```
 
-Expected: `1517 passed | 0 failed | 3 skipped`, and `PASS - all energy gates green.`
+Expected: `1520 passed | 0 failed | 3 skipped`, and `PASS - all energy gates green.`
 
 - [ ] **Step 6: Commit**
 
