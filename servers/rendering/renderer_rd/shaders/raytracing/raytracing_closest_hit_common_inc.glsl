@@ -696,9 +696,18 @@ void debug_visualize(
 		// argument. Raw and unscaled, matching mode 23's convention.
 		ps.radiance = vec3(scene_data_block.data.IBL_exposure_normalization, 0.0, 0.0);
 	} else if (vis_mode == 35) {
-		// E2b pdf/sampler parity. R = the density the SAMPLER actually realises,
-		// G = what sampleGGXVNDFReflectionPdfAniso reports for the same
-		// direction. They must agree.
+		// E2b pdf/sampler parity. Fix round 1 (C2, CRITICAL): the original R-vs-G
+		// single-sample comparison described below is a TAUTOLOGY -- traced
+		// symbolically, R and G resolve to the identical expression with the
+		// identical inputs, so a genuinely wrong pdf formula (a missing factor,
+		// wrong G1, swapped ax/ay) would still read R == G and pass. See the
+		// comment further down (at dbg_valid35) for the full trace and for the
+		// REAL instrument this mode now also computes in its B channel.
+		//
+		// R = the density the SAMPLER actually realises, G = what
+		// sampleGGXVNDFReflectionPdfAniso reports for the same direction, both
+		// now hemisphere-guarded to match production's own early-out --
+		// retained as a confirmation diagnostic, not as the probe's real signal.
 		//
 		// This calls the SAME functions the integrator calls, not re-inlined
 		// copies -- a second copy here would validate the probe's own arithmetic
@@ -788,10 +797,59 @@ void debug_visualize(
 				dbg_data35.ax, dbg_data35.ay, dbg_VdotH35);
 
 		vec3 dbg_dir35 = normalize(rotatePoint(invertRotation(dbg_qToZ35), dbg_Llocal35));
-		float dbg_reported_pdf = combinedPdf(dbg_N35, dbg_dir35, V, dbg_mat);
 
-		// Raw and unscaled, matching mode 23's convention.
-		ps.radiance = vec3(dbg_sampler_pdf, dbg_reported_pdf, 0.0);
+		// Fix round 1, C2 (CRITICAL): the ORIGINAL construction here compared
+		// dbg_sampler_pdf against combinedPdf(dbg_N35, dbg_dir35, V, dbg_mat) with
+		// no hemisphere check. Traced symbolically, both resolve to the SAME
+		// expression: prepareBRDFData(Nlocal=(0,0,1), ...) inside combinedPdf
+		// makes getRotationToZAxis((0,0,1)) the identity, so combinedPdf
+		// recomputes the identical anisoPhi/ax/ay and calls the identical
+		// sampleGGXVNDFReflectionPdfAniso -- so R == G by construction for ANY
+		// correct OR incorrect pdf formula; the probe could never fail on the
+		// defect class it exists to catch. The non-zero diffs fix round 0
+		// measured were an artifact of combinedPdf's OWN
+		// `if (dot(N,L) <= 0.0) return 0.0;` early-out (brdf_inc.glsl:1745-1749)
+		// firing on samples this harness fed it with no matching guard --
+		// production never calls combinedPdf that way (evalIndirectCombinedBRDF
+		// rejects below-hemisphere directions before shade_and_bounce ever
+		// reaches the mis_ray_pdf assignment), so that zero was not a desync, it
+		// was this probe asking a question production never asks. Guarding both
+		// sides to the SAME hemisphere condition production itself enforces
+		// collapses R and G back to agreement (fix round 1 measured ~1e-6 across
+		// every combination, pure fp32 round-trip noise) -- which is itself
+		// confirmation of the tautology, not a passing test: two genuinely
+		// independent implementations do not collapse that tightly by
+		// coincidence.
+		bool dbg_valid35 = dot(dbg_N35, dbg_dir35) > 0.0;
+		float dbg_reported_pdf = dbg_valid35 ? combinedPdf(dbg_N35, dbg_dir35, V, dbg_mat) : 0.0;
+		float dbg_sampler_pdf_guarded = dbg_valid35 ? dbg_sampler_pdf : 0.0;
+
+		// Fix round 1, C2 item 3: the REAL instrument. R vs G above cannot
+		// detect a wrong pdf FORMULA because they are the same formula evaluated
+		// twice -- guarding only proves the tautology, it does not fix it. This
+		// is the actual independent check: self-normalized importance sampling.
+		// Draw L ~ p_true (whatever density sampleSpecularMicrofacet ACTUALLY
+		// realises -- its closed form is never needed) and accumulate 1/G(L)
+		// with G = combinedPdf, the SAME reporting function production uses for
+		// mis_ray_pdf. If G == p_true everywhere on p_true's support,
+		// E[1/G(L)] = integral over that support of p_true(L)/G(L) dL =
+		// integral of 1 dL = the support's solid-angle measure -- 2*PI for the
+		// upper hemisphere, independent of the LOBE SHAPE of p_true or G, so it
+		// cannot be gamed by two copies of the same (right or wrong) formula the
+		// way R/G above could. A wrong G (a missing factor, swapped ax/ay, a
+		// wrong G1) shifts the accumulated mean away from 2*PI. The gate
+		// accumulates this over many frames via the standard accumulation
+		// buffer and averages again over every pixel on the sphere; both are
+		// real draws from the real sampler.
+		float dbg_self_norm35 = (dbg_valid35 && dbg_reported_pdf > 0.0) ? (1.0 / dbg_reported_pdf) : 0.0;
+
+		// R = old-style sampler-reconstructed pdf, now hemisphere-guarded (fix
+		// round 1's confirmation diagnostic -- expect R == G to fp32 noise). G =
+		// combinedPdf's report, now hemisphere-guarded to match. B = the real
+		// instrument's per-sample contribution, 1/G(L) or 0 -- the gate
+		// accumulates and averages B against 2*PI. Raw and unscaled, matching
+		// mode 23's convention.
+		ps.radiance = vec3(dbg_sampler_pdf_guarded, dbg_reported_pdf, dbg_self_norm35);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

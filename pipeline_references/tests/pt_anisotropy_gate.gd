@@ -24,38 +24,102 @@ extends "res://tests/pt_validation.gd"
 ## is undisturbed), but it is not, by itself, evidence about the anisotropic
 ## branch.
 ##
-## PROBE 2 -- pdf/sampler parity (vis mode 35).
+## PROBE 1b -- white furnace, NEE-dominant configuration (fix round 1, I6).
 ##
-## Per-pixel comparison of the density sampleSpecularMicrofacet actually
-## realises (R) against what combinedPdf -- the SAME function shade_and_bounce
-## calls for mis_ray_pdf -- reports for that exact direction (G). A desync
-## here is the B2 defect class: two MIS strategies estimating different
-## integrands, which no rendered mean can ever reveal (mean-preserving by
-## construction). Task 3 needed two frame fixes for this (a world-to-local
-## transform in evalMicrofacet, and pre-rotating the tangent before
-## prepareBRDFData) that are load-bearing ONLY when the shading normal is not
-## already world Z -- getRotationToZAxis((0,0,1)) is the identity and hides
-## both. Run ONLY at non-zero anisotropy (anisotropy 0 leaves anisoPhi == 0
-## and anisoActive == false, so the frame-rotation code this probe exists to
-## guard never executes) and across a sphere, which presents a whole cone of
-## normals away from Z at once. See raytracing_closest_hit_common_inc.glsl's
-## vis_mode == 35 block for the full construction.
+## Probe 1's roughness=0.4 configuration under a uniform sky gives env-NEE
+## (which is what exercises evalMicrofacet's anisotropic branch -- the C1 fix
+## lives there) a MIS weight of roughly 0.4% of the pixel mean: env_pdf for a
+## uniform sky is ~1/(4*PI) ~ 0.08 while bsdf_pdf for this lobe is ~1.2 (see
+## probe 2's own G readouts), so the power heuristic gives env-NEE a weight of
+## ~0.0044. A 4x error confined to evalMicrofacet's anisotropic branch would
+## move probe 1's mean by roughly 1.3% -- INSIDE its own 2% tolerance. Probe 1
+## alone would pass with the C1 fix reverted; it is not, on its own, a working
+## guard on that fix (see task-4-report.md fix round 1, I6). This probe uses
+## a higher roughness and the SAME anisotropy the feature under test cares
+## about specifically so the specular lobe is broad enough that env-NEE
+## carries real weight, while still keeping the sky perfectly UNIFORM so the
+## "output == sky radiance" closed form still holds exactly -- unlike a
+## point/spot light, which would break that identity.
+##
+## PROBE 2 -- pdf/sampler self-normalization (vis mode 35).
+##
+## Fix round 1 (C2, CRITICAL): the original construction compared the density
+## sampleSpecularMicrofacet actually realises (R) against what combinedPdf --
+## the SAME function shade_and_bounce calls for mis_ray_pdf -- reports for
+## that exact direction (G). Traced symbolically, R and G resolve to the
+## IDENTICAL expression with the identical inputs (combinedPdf's own
+## prepareBRDFData call uses the local placeholder normal (0,0,1), making
+## getRotationToZAxis the identity there, so it recomputes the same phi/ax/ay
+## and calls the same sampleGGXVNDFReflectionPdfAniso R already called) --  a
+## genuinely wrong pdf formula would still read R == G and PASS. It cannot
+## detect the B2 defect class (two MIS strategies estimating different
+## integrands, mean-preserving, invisible to any rendered image) it exists to
+## catch. Kept below ONLY as a hemisphere-guard confirmation diagnostic
+## (expected to collapse to ~1e-6 once both sides share production's own
+## `dot(N,L) <= 0` early-out) -- it does not gate pass/fail.
+##
+## The REAL instrument is self-normalized importance sampling: draw L with
+## the REAL sampler (sampleSpecularMicrofacet) and accumulate 1/combinedPdf(L)
+## over many real samples. If combinedPdf's reported density equals the
+## density the sampler actually realises everywhere on its support, that
+## expectation equals the support's solid-angle measure -- 2*PI for the upper
+## hemisphere -- independent of the LOBE SHAPE of either side, so it cannot be
+## gamed by evaluating the same formula twice the way R/G above could. Task 3
+## needed two frame fixes here (a world-to-local transform in evalMicrofacet,
+## and pre-rotating the tangent before prepareBRDFData) that are load-bearing
+## ONLY when the shading normal is not already world Z -- run across a
+## sphere, which presents a whole cone of normals away from Z at once, and at
+## non-zero anisotropy (anisotropy 0 leaves anisoPhi == 0 and
+## anisoActive == false, so the frame-rotation code this probe exists to
+## guard never executes; kept as a control the same way probe 1 keeps one).
+## See raytracing_closest_hit_common_inc.glsl's vis_mode == 35 block for the
+## full construction.
 
 const SKY_RADIANCE := 1.0
 const TOLERANCE := 0.02 # furnace, 2% per the brief.
-const PDF_TOLERANCE := 1e-4 # per-pixel |R - G|, per the brief.
+# Fix round 1: the old exact per-pixel |R - G| check is kept only as an
+# UNASSERTED confirmation diagnostic (see the header comment) -- it no longer
+# gates pass/fail, so this constant is documentation, not a live bound.
+const PDF_TOLERANCE_DIAGNOSTIC_ONLY := 1e-4
+# Fix round 1 (C2 item 3): tolerance for the REAL instrument,
+# E[1/combinedPdf(L)] vs 2*PI. Chosen a priori from the expected Monte Carlo
+# noise floor, BEFORE looking at whether any anisotropic case passes or
+# fails: combinedPdf's reported values in this scene run ~0.9-1.5 (see fix
+# round 0's R/G printouts), so 1/combinedPdf is a modest, low-variance
+# quantity, and PDF_FRAMES samples across every pixel of a fully-sphere-
+# filled 256x256 crop give an effective sample count in the millions --
+# standard-error-of-the-mean at that count is orders of magnitude below 1%
+# for a quantity in this range. 3% leaves comfortable margin for unexpected
+# tail behaviour near the crop's more grazing edges while staying far below
+# the >=10-30% shift a genuine missing-factor or swapped-axis pdf bug would
+# produce.
+const TOL_SELFNORM := 0.03
 const FURNACE_FRAMES := 32
-const PDF_FRAMES := 4
+# Fix round 1: bumped from 4. The old value was sized for an EXACT per-sample
+# comparison (any single valid sample either matched or it didn't); the new
+# self-normalizing check is a Monte Carlo mean and needs real sample count to
+# converge, even though spatial averaging over the whole sphere crop already
+# supplies most of that.
+const PDF_FRAMES := 64
 const MODE_ANISO_PDF_PARITY := 35
 
 const ANISOTROPY_VALUES := [-0.9, -0.5, 0.0, 0.5, 0.9]
 const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 
-# Non-zero only, and deliberately NOT the full ANISOTROPY_VALUES sweep --
-# every value here must exercise the anisotropic branch (anisotropy 0 would
-# prove nothing about it, see the header comment above).
-const PDF_PARITY_ANISOTROPY_VALUES := [-0.9, -0.5, 0.5, 0.9]
+# Fix round 1: 0.0 added per the coordinator's C2 fix instruction -- the
+# self-normalizing check being a genuinely independent instrument (unlike the
+# old R-vs-G tautology) means an isotropic control is now meaningful evidence
+# again: correct pre-E2b code must ALSO read 2*PI here.
+const PDF_PARITY_ANISOTROPY_VALUES := [-0.9, -0.5, 0.0, 0.5, 0.9]
 const PDF_PARITY_ROTATION_VALUES := [0.0, PI / 4.0]
+
+# Probe 1b (I6): a configuration where env-NEE -- and therefore
+# evalMicrofacet's anisotropic branch -- carries real MIS weight. See the
+# header comment.
+const NEE_DOM_ROUGHNESS := 0.9
+const NEE_DOM_ANISOTROPY := 0.9
+const NEE_DOM_ROTATION := 0.0
+const NEE_DOM_FRAMES := 64
 
 var _sphere: MeshInstance3D
 var _cam: Camera3D
@@ -235,9 +299,30 @@ func _probe_furnace(p_env: Environment) -> void:
 	print("  worst deviation: %s  ratio=%.6f" % [worst_label, worst_ratio])
 
 
+func _probe_furnace_nee_dominant(p_env: Environment) -> void:
+	print("\n=== PROBE 1b: white furnace, NEE-dominant configuration (fix round 1, I6) ===")
+	print("  roughness=%.2f anisotropy=%.2f rotation=%.4f, tolerance %.1f%%"
+			% [NEE_DOM_ROUGHNESS, NEE_DOM_ANISOTROPY, NEE_DOM_ROTATION, TOLERANCE * 100.0])
+	var mat := _sphere_material(NEE_DOM_ANISOTROPY, NEE_DOM_ROTATION)
+	mat.roughness = NEE_DOM_ROUGHNESS
+	_sphere.material_override = mat
+	var img: Image = await _render_accum(p_env, get_viewport().get_viewport_rid(), NEE_DOM_FRAMES)
+	if img == null:
+		_failures.append("probe1b NEE-dominant furnace: accumulator readback returned null")
+		return
+	var s := _measure_crop(img, 0.05, 0.95)
+	var ratio: float = s["mean"] / SKY_RADIANCE
+	print("  mean=%.6f  ratio=%.6f  (n=%d)" % [s["mean"], ratio, s["n"]])
+	if absf(ratio - 1.0) > TOLERANCE:
+		_failures.append("probe1b NEE-dominant furnace: ratio %.6f vs 1.0 (limit %.1f%%)"
+				% [ratio, TOLERANCE * 100.0])
+
+
 func _probe_pdf_parity(p_env: Environment) -> void:
-	print("\n=== PROBE 2: anisotropic pdf/sampler parity (vis mode %d) ===" % MODE_ANISO_PDF_PARITY)
-	print("  per-pixel |R - G| < %.6f across the sphere" % PDF_TOLERANCE)
+	print("\n=== PROBE 2: anisotropic pdf/sampler self-normalization (vis mode %d) ===" % MODE_ANISO_PDF_PARITY)
+	print("  diagnostic-only: old per-pixel |R - G| tautology check, NOT asserted (fix round 1, C2)")
+	print("  REAL instrument: E[1/combinedPdf(L)] over real sampler draws vs 2*PI=%.6f, tolerance %.1f%%"
+			% [TAU, TOL_SELFNORM * 100.0])
 	var vp_rid := get_viewport().get_viewport_rid()
 	p_env.set_pathtracing_debug_mode(MODE_ANISO_PDF_PARITY)
 	for aniso in PDF_PARITY_ANISOTROPY_VALUES:
@@ -248,13 +333,27 @@ func _probe_pdf_parity(p_env: Environment) -> void:
 			if img == null:
 				_failures.append("probe2 pdf parity [%s]: accumulator readback returned null" % tag)
 				continue
-			var stats := _max_abs_rg_diff(img, 0.05, 0.95)
-			print("  %-34s n=%d  max|R-G|=%.8f  at (%d,%d)  R=%.6f G=%.6f"
-					% [tag, stats["n"], stats["max_diff"], stats["x"], stats["y"], stats["r"], stats["g"]])
-			if stats["max_diff"] > PDF_TOLERANCE:
-				_failures.append(("probe2 pdf parity [%s]: max|R-G| %.8f at pixel (%d,%d) " +
-						"(R=%.6f G=%.6f) exceeds %.6f -- the sampler and the pdf report have desynced")
-						% [tag, stats["max_diff"], stats["x"], stats["y"], stats["r"], stats["g"], PDF_TOLERANCE])
+
+			# Diagnostic only -- NOT asserted. Confirms the hemisphere guard
+			# collapsed the old tautological R-vs-G comparison (fix round 1,
+			# C2 items 1-2), it does not test the pdf formula.
+			var diag := _max_abs_rg_diff(img, 0.05, 0.95)
+			print("  %-34s [diagnostic] max|R-G|=%.8f  at (%d,%d)  R=%.6f G=%.6f"
+					% [tag, diag["max_diff"], diag["x"], diag["y"], diag["r"], diag["g"]])
+
+			# The real instrument: mean of the B channel (1/combinedPdf(L) per
+			# valid sample, 0 otherwise) over the crop, via the SAME
+			# _measure_crop helper probe 1 uses.
+			var s := _measure_crop(img, 0.05, 0.95)
+			var self_norm: float = s["b"]
+			var ratio: float = self_norm / TAU
+			print("  %-34s [self-norm] E[1/G]=%.6f  ratio vs 2*PI=%.6f  (n=%d)"
+					% [tag, self_norm, ratio, s["n"]])
+			if absf(ratio - 1.0) > TOL_SELFNORM:
+				_failures.append(("probe2 self-norm pdf parity [%s]: E[1/combinedPdf(L)] %.6f vs " +
+						"2*PI=%.6f, ratio %.6f exceeds %.1f%% tolerance -- the reported pdf does not " +
+						"describe the density the sampler actually realises")
+						% [tag, self_norm, TAU, ratio, TOL_SELFNORM * 100.0])
 	# Clear the debug mode afterwards per the brief -- leaving it set would
 	# make every subsequent render in this process emit pdf-parity channels
 	# instead of colour.
@@ -277,6 +376,7 @@ func _ready() -> void:
 	await get_tree().create_timer(2.0).timeout
 
 	await _probe_furnace(env)
+	await _probe_furnace_nee_dominant(env)
 	await _probe_pdf_parity(env)
 
 	print("\n=== RESULT ===")
