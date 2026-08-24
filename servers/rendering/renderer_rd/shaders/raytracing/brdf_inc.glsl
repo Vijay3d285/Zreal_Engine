@@ -1721,6 +1721,68 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 #endif
 }
 
+// N-way lobe registry (E2c). Nothing calls these yet -- see brdf_inc.glsl's
+// callers in raytracing_closest_hit_common_inc.glsl and this file's own
+// combinedPdf below, which still use combinedPdfLobeProbability /
+// samplerLobeProbability directly until the switchover task.
+#define LOBE_SPECULAR 0
+#define LOBE_DIFFUSE 1
+#define LOBE_COUNT 2
+
+// THE single lobe-selection probability. Replaces combinedPdfLobeProbability
+// and samplerLobeProbability, which were deliberately duplicated so that a
+// divergence between the sampler's value and combinedPdf's stayed
+// representable -- see the comment those functions carried, and the historical
+// defect it cites (pSpec 0.0476 against the sampler's 0.0909).
+//
+// That duplication is retired for the reason it was created. The detector it
+// existed to enable compared the two values side by side, which is a
+// comparison of two evaluations of ONE formula -- E2b's final review
+// established that exact construction is a tautology that cannot fail, and
+// replaced it with a self-normalizing instrument that draws from the real
+// sampler and checks E[1/pdf] against the domain's measure. That instrument
+// catches a pdf wrong by a factor k as a reading of 1/k whether or not a
+// second copy of this formula exists.
+//
+// So unifying now makes the desync structurally IMPOSSIBLE and still
+// DETECTABLE. Do not restore the duplication on the strength of the old
+// comment.
+float lobeWeight(MaterialProperties material) {
+	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
+	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
+	float specularLum = luminance(specularF0);
+	float diffuseLum = luminance(diffuseReflectance);
+
+	if (diffuseLum < 0.0001f) {
+		return 1.0f;
+	} else if (specularLum < 0.0001f) {
+		return 0.0f;
+	}
+	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
+}
+
+// CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
+// which today's `u < brdfProbability` picks SPECULAR_TYPE.
+int selectLobe(float u, float weights[LOBE_COUNT]) {
+	float acc = 0.0f;
+	for (int i = 0; i < LOBE_COUNT - 1; i++) {
+		acc += weights[i];
+		if (u < acc) {
+			return i;
+		}
+	}
+	return LOBE_COUNT - 1;
+}
+
+// Sum in registry order: specular term first, then diffuse.
+float combineLobePdf(float weights[LOBE_COUNT], float pdfs[LOBE_COUNT]) {
+	float acc = 0.0f;
+	for (int i = 0; i < LOBE_COUNT; i++) {
+		acc += weights[i] * pdfs[i];
+	}
+	return acc;
+}
+
 // combinedPdf's own lobe-selection probability (pSpec), extracted to its own
 // function (fix round 2) so a debug vis mode can call the EXACT code
 // combinedPdf uses instead of re-inlining a copy that could silently drift
