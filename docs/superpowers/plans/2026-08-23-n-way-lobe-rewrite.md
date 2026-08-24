@@ -16,7 +16,7 @@
 - **This phase ships NO feature.** Any rendered difference is a bug, not an improvement. If a gate number moves, investigate — never rationalise it.
 - **SPECULAR IS LOBE INDEX 0.** Registry order is contract. A diffuse-first registry inverts every pixel's lobe choice while leaving the image statistically identical and every gate green.
 - **One `rng_1d(rng, RT_PRNG_LOBE)` call, consumed once.** No second draw, no remap, no rescale into a sub-interval.
-- **Summation order is preserved**: specular term first, then diffuse, matching `pSpec * specularContribution * transmitScale + (1.0f - pSpec) * pdfDiffuse`.
+- **Summation order is preserved**: specular term first, then diffuse, matching `pSpec * specularContribution * transmitScale + (1.0f - pSpec) * pdfDiffuse`. **One reassociation is accepted and must be recorded, not hidden:** C parses `a * b * c` as `(a * b) * c`, so folding `transmitScale` into the specular pdf entry yields `pSpec * (spec * transmit)` instead — 1 ULP apart, relative difference `1.06e-7`, two orders below `mean_luma`'s ~1e-5 floor. Ruled during execution: the clean uniform sum is worth one ULP on one term. Task 1 pins it.
 - `transmitScale` belongs to the **specular lobe's pdf**, not to the combination. It multiplies only the specular term today and must continue to.
 - Verify every claim about this codebase by **reading the file at implementation time**. Line numbers here may have shifted.
 - Doctest baseline: **1521 passed, 0 failed, 3 skipped.**
@@ -167,8 +167,41 @@ TEST_CASE("[PathTracer][LobeRegistry] combine_pdf reduces to the two-term form")
 	const float weights[LOBE_COUNT] = { p_spec, 1.0f - p_spec };
 	const float pdfs[LOBE_COUNT] = { spec_contribution * transmit_scale, pdf_diffuse };
 
-	const float expected = p_spec * spec_contribution * transmit_scale + (1.0f - p_spec) * pdf_diffuse;
+	// NOTE the grouping. C parses `a * b * c` as `(a * b) * c`, so the shader
+	// computes (p_spec * spec_contribution) * transmit_scale. The registry folds
+	// transmit_scale into the specular pdf ENTRY, computing
+	// p_spec * (spec_contribution * transmit_scale). Those differ by 1 ULP in
+	// float32 -- the next test records it. `expected` uses the REGISTRY's
+	// grouping, so this test verifies the registry's own arithmetic rather than
+	// loosening an epsilon to tolerate a difference that should be pinned.
+	const float expected = p_spec * (spec_contribution * transmit_scale) + (1.0f - p_spec) * pdf_diffuse;
 	CHECK(combine_pdf(weights, pdfs, LOBE_COUNT) == doctest::Approx(expected).epsilon(1e-9));
+}
+
+TEST_CASE("[PathTracer][LobeRegistry] the registry reassociates the specular term by 1 ULP") {
+	// Recorded, not hidden. Found by the test above before any shader was
+	// touched, and ruled during execution: a clean uniform sum is worth one ULP
+	// on one term.
+	//
+	//   shader today: (p_spec * spec) * transmit   -- C's left-to-right grouping
+	//   registry:      p_spec * (spec * transmit)  -- transmit folded into the pdf
+	//
+	// Mathematically equal, 1 ULP apart in float32. Relative difference 1.06e-7,
+	// two orders of magnitude BELOW mean_luma's ~1e-5 run-to-run floor on an
+	// identical binary, so no gate in this project can resolve it.
+	const float p_spec = 0.42f;
+	const float spec_contribution = 3.75f;
+	const float transmit_scale = 0.61f;
+
+	const float shader_grouping = (p_spec * spec_contribution) * transmit_scale;
+	const float registry_grouping = p_spec * (spec_contribution * transmit_scale);
+
+	// They genuinely differ -- if this ever passes as equal, the compiler has
+	// reassociated and the pinned magnitudes below stop meaning anything.
+	CHECK(shader_grouping != registry_grouping);
+	const float rel = Math::abs(shader_grouping - registry_grouping) / shader_grouping;
+	CHECK(rel < 2e-7f);
+	CHECK(rel > 1e-8f);
 }
 
 TEST_CASE("[PathTracer][LobeRegistry] lobe_weight preserves the degenerate branches") {
@@ -197,7 +230,7 @@ bin/godot.windows.editor.x86_64.console.exe --headless --test --test-case="*Lobe
 bin/godot.windows.editor.x86_64.console.exe --headless --test
 ```
 
-Expected: 5 new cases pass; full suite 1526 passed, 0 failed, 3 skipped. Report ACTUAL numbers. If a CHECK fails, fix the mirror, never the assertion.
+Expected: 6 new cases pass; full suite 1527 passed, 0 failed, 3 skipped. Report ACTUAL numbers. If a CHECK fails, fix the mirror, never the assertion.
 
 - [ ] **Step 4: Commit**
 
@@ -264,7 +297,7 @@ bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tes
 bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_anisotropy_gate_scene.tscn
 ```
 
-GPU gates need a real Vulkan device — no `--headless` on those two. Expected: doctest 1526/0/3; `pt_energy_gate` "PASS - all energy gates green."; `pt_anisotropy_gate` "PASS - anisotropic GGX gate green." Report actual numbers.
+GPU gates need a real Vulkan device — no `--headless` on those two. Expected: doctest 1527/0/3; `pt_energy_gate` "PASS - all energy gates green."; `pt_anisotropy_gate` "PASS - anisotropic GGX gate green." Report actual numbers.
 
 - [ ] **Step 4: Commit**
 
@@ -337,7 +370,7 @@ bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tes
 bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_sky_energy_gate_scene.tscn
 ```
 
-Expected: doctest 1526/0/3; `pt_energy_gate` PASS; `pt_anisotropy_gate` PASS within its ±0.5pp bands; `pt_sky_energy_gate` exits 1 as always with probe A 1.00000 and probe B@2048 ~0.98355.
+Expected: doctest 1527/0/3; `pt_energy_gate` PASS; `pt_anisotropy_gate` PASS within its ±0.5pp bands; `pt_sky_energy_gate` exits 1 as always with probe A 1.00000 and probe B@2048 ~0.98355.
 
 `pt_anisotropy_gate` is the tightest instrument in the suite and the most likely to notice a real change. **If any number moves, investigate — do not rationalise it.** This phase changes no behaviour, so a moved number means the refactor is wrong.
 

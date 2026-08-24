@@ -92,7 +92,26 @@ today's code already does so; the implementer must check rather than assume.
 two-term expression, changing the last bits. At N=2 the sum must produce the
 same operations in the same order as the code it replaces.
 
-This is why §5 does not claim the gates prove bit-identity: they cannot.
+**Amended during execution (2026-08-23).** One reassociation is unavoidable
+and is accepted. C parses `a * b * c` as `(a * b) * c`, so the shader computes
+`(pSpec * specularContribution) * transmitScale`. The registry folds
+`transmitScale` into the specular lobe's pdf entry, computing
+`pSpec * (specularContribution * transmitScale)`. Mathematically equal, **1 ULP
+apart in float32** — relative difference `1.06e-7`.
+
+Found by Task 1's own test before any shader was touched.
+
+**Ruling: accept it.** Contorting the registry to preserve one grouping would
+make it something other than a uniform sum, which is precisely what E2d and
+E2e are meant to build on, and every future lobe would reintroduce the same
+question. The difference is two orders of magnitude below `mean_luma`'s ~1e-5
+run-to-run floor on an identical binary, so no instrument in this project can
+resolve it.
+
+**The claim is therefore weakened, not the code**: this phase is identical to
+today except for one documented reassociation on the specular term. A doctest
+case pins the 1-ULP gap so it is a recorded fact rather than a puzzle for
+whoever next compares the two expressions.
 
 ## 4. Design
 
