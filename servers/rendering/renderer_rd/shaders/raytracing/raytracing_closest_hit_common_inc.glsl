@@ -552,13 +552,18 @@ void debug_visualize(
 		// itself against; that is what makes it able to fail.
 		//
 		// This mode is kept, not deleted, so debug tooling built against
-		// MODE_PDF_PARITY (pipeline_references/tests/pt_transmission_gate.gd)
-		// keeps a live, non-tautological signal rather than reading undefined
-		// values: it now reports lobeWeight's single value directly, in all
-		// three channels, so a consumer checking "pSpec" or "brdfProbability"
-		// against an analytic reference is still testing the real formula,
-		// and the ratio channel is honestly 1.0 by construction -- documented
-		// here as exactly that, not implied to still be an agreement check.
+		// MODE_PDF_PARITY (pipeline_references/tests/pt_transmission_gate.gd,
+		// probe 9) keeps a live, non-tautological signal rather than reading
+		// undefined values: it reports lobeWeight's single real value in the
+		// r channel ONLY, so a consumer checking it against an analytic
+		// reference is still testing the real formula. g and b are 0.0 --
+		// fix round 1 found that repeating the value into g/b and hard-coding
+		// b to 1.0 (an earlier draft of this fix) left probe 9's "ratio"
+		// assertion comparing a compile-time constant to 1.0: unfalsifiable
+		// by ANY input, worse than the tautology this fix set out to retire,
+		// since it needed zero formula evaluations, not two. Do not restore
+		// that pattern; see probe 9's own header comment for the corrected
+		// assertion set (one real analytic check, not three).
 		MaterialProperties dbg_mat;
 		dbg_mat.baseColor = albedo;
 		dbg_mat.metalness = metalness;
@@ -580,7 +585,7 @@ void debug_visualize(
 		dbg_mat.tangent = world_tangent;
 
 		float pSpec = lobeWeight(dbg_mat);
-		ps.radiance = vec3(pSpec, pSpec, 1.0);
+		ps.radiance = vec3(pSpec, 0.0, 0.0);
 	} else if (vis_mode == 33) {
 		// Fix round 2, detector 2: hemisphere-guard firing rate. Accumulates
 		// float(wrongNg || wrongN) across many samples via the standard

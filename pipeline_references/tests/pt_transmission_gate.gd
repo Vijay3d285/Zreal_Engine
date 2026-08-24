@@ -240,21 +240,41 @@ const P8_TOLERANCE := 0.005 # 0.5%.
 const P8_FLOOR := 1e-6 # I2.
 
 # ---------------------------------------------------------------------------
-# Probe 9: pdf parity (fix round 2, detector 1 -- Task 5/6 defect a).
+# Probe 9: pdf value check (fix round 2 detector 1 -- Task 5/6 defect a).
+# RETIRED as a two-function agreement check by E2c (Task 3); see below.
 #
-# Vis mode 32 reads combinedPdfLobeProbability(dbg_mat) and
+# Vis mode 32 originally read combinedPdfLobeProbability(dbg_mat) and
 # samplerLobeProbability(dbg_mat) (brdf_inc.glsl) DIRECTLY -- the exact
-# production functions combinedPdf and shade_and_bounce respectively call,
-# not a re-inlined copy -- and emits vec3(pSpec, brdfProbability, ratio).
+# production functions combinedPdf and shade_and_bounce respectively called
+# -- and emitted vec3(pSpec, brdfProbability, ratio). That side-by-side
+# comparison is what originally exposed Task 5/6 defect a (a pdf-only desync
+# between combinedPdf and the sampler, mean-preserving by construction -- see
+# WHY THIS below).
+#
+# E2c (Task 3) deleted both functions: combinedPdf and shade_and_bounce's
+# sampler now both call ONE registry function, lobeWeight. A pdf-only desync
+# between "combinedPdf's view" and "the sampler's view" is therefore
+# structurally impossible, not merely re-synced by hand -- there is only one
+# call site left to be wrong, and if it is wrong, every consumer reads the
+# same wrong value, so no side-by-side ratio can ever observe a disagreement
+# again. Comparing two evaluations of one formula is a tautology (ratio ==
+# 1.0 always, by construction, regardless of correctness) -- vis mode 32 now
+# reports lobeWeight's one real value as vec3(pSpec, 0.0, 0.0) rather than
+# fabricate a second reading to compare it against. Probe 9 below keeps only
+# the analytic assertion on that value (assertion 2 in the old numbering).
+# The live detector for "is the pdf VALUE correct" (as opposed to "do two
+# call sites of it agree") is vis mode 35's self-normalizing E[1/pdf]
+# instrument -- see pt_anisotropy_gate.gd, Probe 2.
 #
 # WHY THIS, AND NOT A RENDERED MEAN (see also probe 8's header comment and
 # the fix-round-1 addendum in task-7-report.md): MIS is unbiased for ANY set
 # of weights satisfying sum(w) == 1 pointwise, and combinedPdf appears ONLY
 # inside such weights (raytracing_closest_hit_common_inc.glsl's env-NEE and
 # mis_ray_pdf sites, raytracing_emissive_inc.glsl's emissive NEE) -- never as
-# an estimator divisor. A pdf-only desync between the two functions is
-# therefore MEAN-PRESERVING BY CONSTRUCTION: no rendered probe, at any
-# roughness or transmission, can ever detect it. This is the only way.
+# an estimator divisor. A pdf-only desync between combinedPdf and the sampler
+# was therefore MEAN-PRESERVING BY CONSTRUCTION: no rendered probe, at any
+# roughness or transmission, could ever have detected it. Reading the value
+# directly, as this probe still does, remains the only way to check it.
 # ---------------------------------------------------------------------------
 const MODE_PDF_PARITY := 32
 const TOL_PDF_PARITY_RATIO := 1e-4
@@ -1224,15 +1244,25 @@ func _p7_glass_material(p_tint_srgb: Color) -> StandardMaterial3D:
 ##   earlier draft of this comment blamed "Monte Carlo noise"; that was wrong
 ##   -- the effect is deterministic and small, not variance.
 ##
-## The ACTUAL fix: two vis modes that read the relevant quantities directly
-## instead of through a rendered mean -- RT_DEBUG_PDF_PARITY (mode 32, probe
-## 9) reads combinedPdfLobeProbability and samplerLobeProbability (brdf_inc.glsl)
-## side by side, the same two-numbers comparison that originally exposed
-## defect a; RT_DEBUG_GUARD_FIRING_RATE (mode 33, probe 10) accumulates the
-## guard's raw rejection rate directly, before any weight is ever applied. See
-## probes 9 and 10 below -- both catch their respective defect, verified by
-## reintroducing each (task-7-report.md's fix-round-2 addendum has the
-## verbatim failure messages).
+## The ACTUAL fix (fix round 2): two vis modes that read the relevant
+## quantities directly instead of through a rendered mean --
+## RT_DEBUG_PDF_PARITY (mode 32, probe 9) originally read
+## combinedPdfLobeProbability and samplerLobeProbability (brdf_inc.glsl) side
+## by side, the same two-numbers comparison that originally exposed defect a;
+## RT_DEBUG_GUARD_FIRING_RATE (mode 33, probe 10) accumulates the guard's raw
+## rejection rate directly, before any weight is ever applied. See probe 10
+## below -- it still catches its defect this way, verified by reintroducing
+## it (task-7-report.md's fix-round-2 addendum has the verbatim failure
+## message).
+##
+## E2c (Task 3) retired mode 32's two-function comparison: combinedPdf and
+## shade_and_bounce's sampler now both call ONE registry function
+## (lobeWeight, brdf_inc.glsl), so the desync this probe watched for is
+## structurally impossible, not merely re-synced by hand. Probe 9 below now
+## keeps only its analytic check on lobeWeight's actual value; the live
+## detector for defect-a-shaped bugs (a pdf VALUE wrong, not two call sites
+## disagreeing) is vis mode 35's self-normalizing E[1/pdf] instrument, see
+## pt_anisotropy_gate.gd Probe 2.
 ##
 ## What THIS probe (8) demonstrably provides, independent of the above: it is
 ## the only real render in this gate exercising combinedPdf's non-degenerate
@@ -1302,41 +1332,31 @@ func _probe9_pdf_parity() -> void:
 	(s["env"] as Environment).set_pathtracing_debug_mode(MODE_PDF_PARITY)
 	var img: Image = await _render_accum(s["env"], get_viewport().get_viewport_rid(), 1)
 	var px: Color = img.get_pixel(img.get_width() / 2, img.get_height() / 2)
+	# g and b are 0.0 by construction (E2c, Task 3) -- see this file's probe 9
+	# header comment and RT_DEBUG_PDF_PARITY's own comment
+	# (raytracing_closest_hit_common_inc.glsl) for why the r-only reading
+	# replaces the old three-channel vec3(pSpec, brdfProbability, ratio).
 	var pSpec: float = px.r
-	var brdfProbability: float = px.g
-	var ratio: float = px.b
-	print("  pSpec=%.6f  brdfProbability=%.6f  ratio=%.6f  (expected pSpec %.6f)"
-			% [pSpec, brdfProbability, ratio, P9_EXPECTED_PSPEC])
+	print("  pSpec=%.6f  (expected %.6f)" % [pSpec, P9_EXPECTED_PSPEC])
 	(s["env"] as Environment).set_pathtracing_debug_mode(0)
 
-	# Primary detector assertion: the two functions must agree exactly.
-	_checks += 1
-	var ratio_delta: float = absf(ratio - 1.0)
-	if ratio_delta > TOL_PDF_PARITY_RATIO:
-		_failures.append(("probe9 pdf parity: ratio %.6f (pSpec %.6f, brdfProbability %.6f) vs "
-				+ "expected 1.0, delta %.6f exceeds %.6f")
-				% [ratio, pSpec, brdfProbability, ratio_delta, TOL_PDF_PARITY_RATIO])
-	else:
-		print("  ok    probe9 pdf parity ratio: %.6f" % ratio)
-
-	# Secondary assertions: both functions individually match the analytic
-	# prediction, not just each other -- catches the case where both are
-	# wrong in the SAME way (ratio would still read 1.0).
+	# The two-function agreement check this probe used to run (ratio vs 1.0,
+	# and a duplicate reading of the same value under a second name) is
+	# retired: combinedPdf and the sampler now share one call site
+	# (lobeWeight), so that agreement is structurally guaranteed, not merely
+	# re-verified here, and a ratio of one formula against itself is a
+	# tautology that cannot fail regardless of correctness -- keeping it would
+	# have been strictly worse than the vis-mode-35 tautology this project
+	# already caught in review, since this one needed zero formula
+	# evaluations, not two. The one check that remains is analytic: does
+	# lobeWeight itself compute the value the material's inputs predict.
 	_checks += 1
 	var pspec_delta: float = absf(pSpec - P9_EXPECTED_PSPEC)
 	if pspec_delta > TOL_PDF_PARITY_RATIO:
-		_failures.append(("probe9 pdf parity: combinedPdfLobeProbability %.6f vs analytic %.6f, "
+		_failures.append(("probe9 pdf value: lobeWeight %.6f vs analytic %.6f, "
 				+ "delta %.6f exceeds %.6f") % [pSpec, P9_EXPECTED_PSPEC, pspec_delta, TOL_PDF_PARITY_RATIO])
 	else:
-		print("  ok    probe9 combinedPdfLobeProbability: %.6f" % pSpec)
-
-	_checks += 1
-	var brdfprob_delta: float = absf(brdfProbability - P9_EXPECTED_PSPEC)
-	if brdfprob_delta > TOL_PDF_PARITY_RATIO:
-		_failures.append(("probe9 pdf parity: samplerLobeProbability %.6f vs analytic %.6f, "
-				+ "delta %.6f exceeds %.6f") % [brdfProbability, P9_EXPECTED_PSPEC, brdfprob_delta, TOL_PDF_PARITY_RATIO])
-	else:
-		print("  ok    probe9 samplerLobeProbability: %.6f" % brdfProbability)
+		print("  ok    probe9 lobeWeight: %.6f" % pSpec)
 
 
 ## Finding a NON-ZERO CORRECT-CODE rate for THIS PROBE's specific fixture
