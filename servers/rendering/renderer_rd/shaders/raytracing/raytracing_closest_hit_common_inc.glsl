@@ -527,31 +527,38 @@ void debug_visualize(
 				dbg_material.specular_tint, dbg_f0, dbg_eta);
 		ps.radiance = (vis_mode == 30) ? dbg_f0 : vec3(dbg_eta);
 	} else if (vis_mode == 32) {
-		// Fix round 2, detector 1: pdf parity. combinedPdf's own
-		// lobe-selection probability (pSpec) against shade_and_bounce's own
-		// (brdfProbability), calling the ACTUAL production functions each
-		// site calls -- combinedPdfLobeProbability / samplerLobeProbability
-		// (brdf_inc.glsl) -- not a re-inlined copy.
+		// Fix round 2, detector 1: pdf parity -- RETIRED as a two-function
+		// comparison by E2c (Task 3). combinedPdfLobeProbability and
+		// samplerLobeProbability, the deliberately-duplicated pair this mode
+		// used to compare side by side, are deleted: combinedPdf and
+		// shade_and_bounce's sampler now both call the SAME registry function,
+		// lobeWeight (brdf_inc.glsl). A pdf-only desync between "combinedPdf's
+		// view" and "the sampler's view" of the lobe-selection probability is
+		// therefore no longer a possible outcome of any code path -- there is
+		// only one call site left to be wrong, and if it is, both consumers
+		// are wrong THE SAME WAY, which a same-formula-side-by-side ratio can
+		// never detect regardless of how many call sites feed it (a ratio of
+		// two evaluations of one formula is 1.0 by construction, a tautology,
+		// not a comparison). Reporting a synthetic 1.0 here would be exactly
+		// that: a probe that cannot fail.
 		//
-		// Why a rendered mean cannot do this job (Task 5/6 defect a): MIS is
-		// unbiased for ANY set of weights satisfying sum(w) == 1 pointwise,
-		// and combinedPdf appears ONLY inside such weights
-		// (raytracing_closest_hit_common_inc.glsl's env-NEE and mis_ray_pdf
-		// sites, raytracing_emissive_inc.glsl's emissive NEE) -- never as an
-		// estimator divisor. The BSDF ray's actual f/p comes from the
-		// sampler's own realised weight, not from combinedPdf. A pdf-only
-		// desync between combinedPdfLobeProbability and samplerLobeProbability
-		// is therefore MEAN-PRESERVING BY CONSTRUCTION: fix round 1's Probe 8
-		// measured a 0.000006 delta under a reintroduced desync, across three
-		// scene configurations, and that was the CORRECT answer (zero), not a
-		// weak signal. This vis mode reads the two probabilities directly,
-		// the same comparison that originally exposed the historical defect
-		// as two numbers side by side (0.0909 sampler vs 0.0476 combinedPdf).
+		// The live detector for "is this formula's VALUE correct" (as opposed
+		// to "do two call sites of it agree") is RT_DEBUG_ANISO_PDF_PARITY
+		// (vis mode 35, pt_anisotropy_gate) -- E2b's self-normalizing
+		// instrument. It draws real directions from the real sampler and
+		// checks the empirical mean of 1/pdf against the domain's known
+		// measure, so a pdf wrong by a factor k reads back as 1/k on an
+		// instrument that has no second copy of the formula to agree with
+		// itself against; that is what makes it able to fail.
 		//
-		// Emits vec3(pSpec, brdfProbability, ratio). Correct code: ratio ==
-		// 1.0 exactly, for any material -- both functions consume the same
-		// baseColorToSpecularF0/baseColorToDiffuseReflectance with the same
-		// inputs, just from two independently-maintained call sites.
+		// This mode is kept, not deleted, so debug tooling built against
+		// MODE_PDF_PARITY (pipeline_references/tests/pt_transmission_gate.gd)
+		// keeps a live, non-tautological signal rather than reading undefined
+		// values: it now reports lobeWeight's single value directly, in all
+		// three channels, so a consumer checking "pSpec" or "brdfProbability"
+		// against an analytic reference is still testing the real formula,
+		// and the ratio channel is honestly 1.0 by construction -- documented
+		// here as exactly that, not implied to still be an agreement check.
 		MaterialProperties dbg_mat;
 		dbg_mat.baseColor = albedo;
 		dbg_mat.metalness = metalness;
@@ -565,18 +572,15 @@ void debug_visualize(
 		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
 		dbg_mat.eta = dbg_eta_32;
 		dbg_mat.opacity = 1.0;
-		// E2b Task 3 Step 5. Not consumed by combinedPdfLobeProbability /
-		// samplerLobeProbability below, but a MaterialProperties field left
-		// unset is undefined in GLSL regardless of whether this call site
-		// happens to read it.
+		// E2b Task 3 Step 5. Not consumed by lobeWeight below, but a
+		// MaterialProperties field left unset is undefined in GLSL regardless
+		// of whether this call site happens to read it.
 		dbg_mat.anisotropy = dbg_material.anisotropy;
 		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
 		dbg_mat.tangent = world_tangent;
 
-		float pSpec = combinedPdfLobeProbability(dbg_mat);
-		float brdfProbability = samplerLobeProbability(dbg_mat);
-		float ratio = (brdfProbability > 0.0) ? (pSpec / brdfProbability) : ((pSpec == 0.0) ? 1.0 : 0.0);
-		ps.radiance = vec3(pSpec, brdfProbability, ratio);
+		float pSpec = lobeWeight(dbg_mat);
+		ps.radiance = vec3(pSpec, pSpec, 1.0);
 	} else if (vis_mode == 33) {
 		// Fix round 2, detector 2: hemisphere-guard firing rate. Accumulates
 		// float(wrongNg || wrongN) across many samples via the standard
@@ -728,7 +732,7 @@ void debug_visualize(
 		// G (dbg_reported_pdf): combinedPdf -- the SAME function shade_and_bounce
 		// calls at its mis_ray_pdf assignment -- evaluated at the WORLD-space
 		// direction the sampler just realised. The gate's probe-2 material is
-		// fully metallic (diffuseLum == 0, so combinedPdfLobeProbability returns
+		// fully metallic (diffuseLum == 0, so lobeWeight returns
 		// exactly 1.0) and non-transmissive (transmitScale == 1.0 exactly), so
 		// combinedPdf's diffuse+specular mixture collapses bit-exactly onto its
 		// own internal sampleGGXVNDFReflectionPdfAniso call -- but reached
@@ -1324,18 +1328,25 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	} else if (specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
-		// Fix round 2: calls samplerLobeProbability (brdf_inc.glsl) rather than
-		// re-inlining the clamp(...) formula here -- see that function's doc
-		// comment for why it is a separate function from combinedPdf's own
-		// combinedPdfLobeProbability rather than a shared call, and
-		// RT_DEBUG_PDF_PARITY for the detector this pair makes possible.
-		float brdfProbability = samplerLobeProbability(brdf_mat);
-		if (rng_1d(rng, RT_PRNG_LOBE) < brdfProbability) {
+		// E2c: routed through the N-way lobe registry (brdf_inc.glsl) --
+		// lobeWeight computes the same clamp(...) formula the old
+		// samplerLobeProbability/combinedPdfLobeProbability pair duplicated,
+		// and selectLobe replaces the direct `u < brdfProbability` compare.
+		// Exactly ONE rng_1d(rng, RT_PRNG_LOBE) draw, consumed once, below.
+		// LOBE_SPECULAR == 0 is picked on `u < weights[0]` -- the identical
+		// condition the old `<` compare used, so this is a routing change,
+		// not a behaviour change. See RT_DEBUG_PDF_PARITY (vis mode 32) for
+		// why the duplication this replaces is retired, not restored.
+		float weights[LOBE_COUNT];
+		weights[LOBE_SPECULAR] = lobeWeight(brdf_mat);
+		weights[LOBE_DIFFUSE] = 1.0 - weights[LOBE_SPECULAR];
+		int lobe = selectLobe(rng_1d(rng, RT_PRNG_LOBE), weights);
+		if (lobe == LOBE_SPECULAR) {
 			brdfType = SPECULAR_TYPE;
-			ps.throughput /= brdfProbability;
+			ps.throughput /= weights[LOBE_SPECULAR];
 		} else {
 			brdfType = DIFFUSE_TYPE;
-			ps.throughput /= (1.0 - brdfProbability);
+			ps.throughput /= weights[LOBE_DIFFUSE];
 		}
 	}
 

@@ -1721,10 +1721,12 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 #endif
 }
 
-// N-way lobe registry (E2c). Nothing calls these yet -- see brdf_inc.glsl's
-// callers in raytracing_closest_hit_common_inc.glsl and this file's own
-// combinedPdf below, which still use combinedPdfLobeProbability /
-// samplerLobeProbability directly until the switchover task.
+// N-way lobe registry (E2c). Task 3 routes both consumers through it:
+// shade_and_bounce's sampler (raytracing_closest_hit_common_inc.glsl) via
+// lobeWeight/selectLobe, and this file's own combinedPdf below via
+// lobeWeight/combineLobePdf. combinedPdfLobeProbability and
+// samplerLobeProbability, the deliberately-duplicated pair this registry
+// replaces, are deleted -- see lobeWeight's doc comment for why.
 #define LOBE_SPECULAR 0
 #define LOBE_DIFFUSE 1
 #define LOBE_COUNT 2
@@ -1783,57 +1785,6 @@ float combineLobePdf(float weights[LOBE_COUNT], float pdfs[LOBE_COUNT]) {
 	return acc;
 }
 
-// combinedPdf's own lobe-selection probability (pSpec), extracted to its own
-// function (fix round 2) so a debug vis mode can call the EXACT code
-// combinedPdf uses instead of re-inlining a copy that could silently drift
-// from it. See samplerLobeProbability below for its sibling: the two are
-// INTENTIONALLY separate functions rather than one shared helper, computing
-// the identical formula from the identical inputs -- that is what makes a
-// future divergence between them representable and catchable at all, the
-// same failure mode Task 5/6's original combinedPdf desync was (pSpec here
-// measured 0.0476 against the sampler's 0.0909 on a representative
-// transmissive material before that fix). Fully unifying them into one
-// function would make such a divergence structurally impossible to
-// reintroduce, which sounds better until you need a regression test for
-// exactly that class of bug -- see fix round 2's pdf-parity detector
-// (RT_DEBUG_PDF_PARITY, raytracing_closest_hit_common_inc.glsl).
-float combinedPdfLobeProbability(MaterialProperties material) {
-	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
-	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
-	float specularLum = luminance(specularF0);
-	float diffuseLum = luminance(diffuseReflectance);
-
-	if (diffuseLum < 0.0001f) {
-		return 1.0f;
-	} else if (specularLum < 0.0001f) {
-		return 0.0f;
-	}
-	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
-}
-
-// The SAMPLER's own lobe-selection probability (brdfProbability) -- what
-// shade_and_bounce's BRDF-importance-sampling block (raytracing_closest_hit_
-// common_inc.glsl) actually uses to pick a lobe and scale throughput.
-// Deliberately a SEPARATE function from combinedPdfLobeProbability above, not
-// a shared call from both sites, even though the formula is currently
-// identical -- see that function's doc comment for why. shade_and_bounce
-// calls this one; combinedPdf calls the other. A future edit to either site
-// without the other is exactly the historical failure mode this pair exists
-// to make representable.
-float samplerLobeProbability(MaterialProperties material) {
-	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
-	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
-	float specularLum = luminance(specularF0);
-	float diffuseLum = luminance(diffuseReflectance);
-
-	if (diffuseLum < 0.0001f) {
-		return 1.0f;
-	} else if (specularLum < 0.0001f) {
-		return 0.0f;
-	}
-	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
-}
-
 // PDF that the combined diffuse+specular sampler in evalIndirectCombinedBRDF
 // would assign to an arbitrary direction L.
 //
@@ -1856,14 +1807,18 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// transmissivness) as shade_and_bounce's own lobe-selection diffuseLum
 	// (raytracing_closest_hit_common_inc.glsl) and prepareBRDFData's
 	// data.diffuseReflectance below -- one function, one set of inputs, so
-	// pSpec here and brdfProbability there cannot desync. Before this fix,
-	// this line called the 2-arg (pre-I2) form directly, independent of
+	// pSpec here and shade_and_bounce's own weight cannot desync. Before that
+	// fix, this line called the 2-arg (pre-I2) form directly, independent of
 	// prepareBRDFData's, and pSpec was measured desynced from the sampler's
 	// brdfProbability by roughly 2x on a representative transmissive material
 	// (albedo 0.8, metalness 0, transmission 0.5: sampler 0.0909, this
 	// function 0.0476) -- live on every transmissive surface, through
 	// mis_ray_pdf, env NEE and emissive NEE.
-	float pSpec = combinedPdfLobeProbability(material);
+	//
+	// E2c: this now calls lobeWeight, the SAME registry function
+	// shade_and_bounce's sampler calls -- the desync above is structurally
+	// impossible to reintroduce, not merely re-synced by hand a second time.
+	float pSpec = lobeWeight(material);
 
 	// Diffuse lobe: cosine-weighted hemisphere.
 	float pdfDiffuse = diffusePdf(NdotL);
@@ -1976,7 +1931,23 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 				reflectance_unused, transmittance_unused, cos_theta_t_unused);
 	}
 
-	return pSpec * specularContribution * transmitScale + (1.0f - pSpec) * pdfDiffuse;
+	// E2c: routed through the registry's combineLobePdf. transmitScale is
+	// folded into the specular lobe's pdf entry so the multiplication happens
+	// in the same place it did before (pSpec * (specularContribution *
+	// transmitScale)) rather than being reassociated to
+	// (pSpec * specularContribution) * transmitScale -- the two differ by up
+	// to 1 ULP (relative 1.06e-7), two orders below the ~1e-5 measurement
+	// floor, and Task 1's dedicated test pins that specific reassociation as
+	// the one accepted exception to bit-identical summation order.
+	float weights[LOBE_COUNT];
+	weights[LOBE_SPECULAR] = pSpec;
+	weights[LOBE_DIFFUSE] = 1.0f - pSpec;
+
+	float pdfs[LOBE_COUNT];
+	pdfs[LOBE_SPECULAR] = specularContribution * transmitScale;
+	pdfs[LOBE_DIFFUSE] = pdfDiffuse;
+
+	return combineLobePdf(weights, pdfs);
 }
 
 // Version that returns diffuse and specular separately.
