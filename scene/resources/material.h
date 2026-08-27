@@ -473,6 +473,8 @@ private:
 		StringName rim_tint;
 		StringName clearcoat;
 		StringName clearcoat_roughness;
+		StringName clearcoat_ior;
+		StringName clearcoat_tint;
 		StringName anisotropy;
 		StringName transmission;
 		StringName ior;
@@ -558,6 +560,8 @@ private:
 	float rim_tint = 0.0f;
 	float clearcoat = 0.0f;
 	float clearcoat_roughness = 0.0f;
+	float clearcoat_ior = 1.5f;
+	Color clearcoat_tint = Color(1, 1, 1);
 	float anisotropy = 0.0f;
 
 	// Path-tracer-only material parameters (glTF material extensions).
@@ -707,6 +711,12 @@ public:
 
 	void set_clearcoat_roughness(float p_clearcoat_roughness);
 	float get_clearcoat_roughness() const;
+
+	void set_clearcoat_ior(float p_clearcoat_ior);
+	float get_clearcoat_ior() const;
+
+	void set_clearcoat_tint(const Color &p_clearcoat_tint);
+	Color get_clearcoat_tint() const;
 
 	void set_anisotropy(float p_anisotropy);
 	float get_anisotropy() const;

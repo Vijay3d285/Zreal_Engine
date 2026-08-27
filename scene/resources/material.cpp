@@ -573,10 +573,11 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->clearcoat_roughness = "clearcoat_roughness";
 	shader_names->anisotropy = "anisotropy_ratio";
 
-	// Parameter names equal property names for all ten. Verified collision-free
-	// against the generated forward+ shader: grepping `uniform <type> <name>` in
-	// this file returns zero matches for every one. A collision would route the
-	// value into the forward+ UBO and change rendering.
+	// Parameter names equal property names for all twelve. Verified
+	// collision-free against the generated forward+ shader: grepping
+	// `uniform <type> <name>` in this file returns zero matches for every one.
+	// A collision would route the value into the forward+ UBO and change
+	// rendering.
 	shader_names->transmission = "transmission";
 	shader_names->ior = "ior";
 	shader_names->thickness = "thickness";
@@ -587,6 +588,8 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->sheen_color = "sheen_color";
 	shader_names->sheen_roughness = "sheen_roughness";
 	shader_names->anisotropy_rotation = "anisotropy_rotation";
+	shader_names->clearcoat_ior = "clearcoat_ior";
+	shader_names->clearcoat_tint = "clearcoat_tint";
 
 	shader_names->heightmap_scale = "heightmap_scale";
 	shader_names->subsurface_scattering_strength = "subsurface_scattering_strength";
@@ -2280,6 +2283,31 @@ float BaseMaterial3D::get_clearcoat_roughness() const {
 	return clearcoat_roughness;
 }
 
+// clearcoat_ior / clearcoat_tint have no forward+ shader uniform (they are
+// path-tracer-only, like transmission/ior/etc. above), so they are NOT
+// feature-gated and are published unconditionally via _material_set_param,
+// which queues into pending_params when _get_material() isn't valid yet
+// (e.g. during construction) and flushes once the RID is created --
+// see _check_material_rid(). Calling RS::material_set_param() directly here
+// would skip that queueing and silently drop the value.
+void BaseMaterial3D::set_clearcoat_ior(float p_clearcoat_ior) {
+	clearcoat_ior = p_clearcoat_ior;
+	_material_set_param(shader_names->clearcoat_ior, p_clearcoat_ior);
+}
+
+float BaseMaterial3D::get_clearcoat_ior() const {
+	return clearcoat_ior;
+}
+
+void BaseMaterial3D::set_clearcoat_tint(const Color &p_clearcoat_tint) {
+	clearcoat_tint = p_clearcoat_tint;
+	_material_set_param(shader_names->clearcoat_tint, p_clearcoat_tint);
+}
+
+Color BaseMaterial3D::get_clearcoat_tint() const {
+	return clearcoat_tint;
+}
+
 void BaseMaterial3D::set_anisotropy(float p_anisotropy) {
 	anisotropy = p_anisotropy;
 	_material_set_param(shader_names->anisotropy, features[FEATURE_ANISOTROPY] ? p_anisotropy : 0.0f);
@@ -3517,6 +3545,11 @@ void BaseMaterial3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_clearcoat_roughness", "clearcoat_roughness"), &BaseMaterial3D::set_clearcoat_roughness);
 	ClassDB::bind_method(D_METHOD("get_clearcoat_roughness"), &BaseMaterial3D::get_clearcoat_roughness);
 
+	ClassDB::bind_method(D_METHOD("set_clearcoat_ior", "clearcoat_ior"), &BaseMaterial3D::set_clearcoat_ior);
+	ClassDB::bind_method(D_METHOD("get_clearcoat_ior"), &BaseMaterial3D::get_clearcoat_ior);
+	ClassDB::bind_method(D_METHOD("set_clearcoat_tint", "clearcoat_tint"), &BaseMaterial3D::set_clearcoat_tint);
+	ClassDB::bind_method(D_METHOD("get_clearcoat_tint"), &BaseMaterial3D::get_clearcoat_tint);
+
 	ClassDB::bind_method(D_METHOD("set_anisotropy", "anisotropy"), &BaseMaterial3D::set_anisotropy);
 	ClassDB::bind_method(D_METHOD("get_anisotropy"), &BaseMaterial3D::get_anisotropy);
 
@@ -3803,6 +3836,11 @@ void BaseMaterial3D::_bind_methods() {
 	ADD_PROPERTYI(PropertyInfo(Variant::BOOL, "clearcoat_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_feature", "get_feature", FEATURE_CLEARCOAT);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "clearcoat", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_clearcoat", "get_clearcoat");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "clearcoat_roughness", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_clearcoat_roughness", "get_clearcoat_roughness");
+	// clearcoat_ior / clearcoat_tint are path-tracer-only (no forward+ shader
+	// uniform) and, unlike clearcoat / clearcoat_roughness above, are NOT
+	// feature-gated -- see the comment above set_clearcoat_ior().
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "clearcoat_ior", PROPERTY_HINT_RANGE, "1,3,0.01"), "set_clearcoat_ior", "get_clearcoat_ior");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "clearcoat_tint"), "set_clearcoat_tint", "get_clearcoat_tint");
 	ADD_PROPERTYI(PropertyInfo(Variant::OBJECT, "clearcoat_texture", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_texture", "get_texture", TEXTURE_CLEARCOAT);
 
 	ADD_GROUP("Anisotropy", "anisotropy_");
@@ -4100,15 +4138,16 @@ BaseMaterial3D::BaseMaterial3D(bool p_orm) :
 	orm = p_orm;
 	// Initialize to the same values as the shader.
 	//
-	// The ten path-tracer-only parameters (transmission, ior, thickness,
+	// The twelve path-tracer-only parameters (transmission, ior, thickness,
 	// attenuation_distance/color, specular_factor/tint, sheen_color/roughness,
-	// anisotropy_rotation) are DELIBERATELY absent from this list. They have no
-	// shader uniform to agree with, so there is nothing to initialise them "to
-	// the same values as". Their in-class member initialisers
-	// (scene/resources/material.h) hold the defaults, and the path tracer's
-	// per-material default fill (render_raytracing.cpp) covers the case where
-	// the parameter was never pushed into the map. Adding them here would put a
-	// third copy of every default in play with nothing keeping the three in step.
+	// anisotropy_rotation, clearcoat_ior, clearcoat_tint) are DELIBERATELY
+	// absent from this list. They have no shader uniform to agree with, so
+	// there is nothing to initialise them "to the same values as". Their
+	// in-class member initialisers (scene/resources/material.h) hold the
+	// defaults, and the path tracer's per-material default fill
+	// (render_raytracing.cpp) covers the case where the parameter was never
+	// pushed into the map. Adding them here would put a third copy of every
+	// default in play with nothing keeping the three in step.
 	//
 	// clearcoat / clearcoat_roughness / anisotropy below are a different case:
 	// they DO have shader uniforms, so they are initialised, but their published

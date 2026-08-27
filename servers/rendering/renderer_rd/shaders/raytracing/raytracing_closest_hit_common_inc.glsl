@@ -859,6 +859,16 @@ void debug_visualize(
 		// accumulates and averages B against 2*PI. Raw and unscaled, matching
 		// mode 23's convention.
 		ps.radiance = vec3(dbg_sampler_pdf_guarded, dbg_reported_pdf, dbg_self_norm35);
+	} else if (vis_mode == 36) {
+		// E2d arrival gate: r = clearcoat, g = clearcoat_roughness,
+		// b = (clearcoat_ior - 1.0) so the 1.5 default reads 0.5 rather than
+		// saturating. Tint gets its own mode -- packing five numbers into
+		// three channels is how a field silently reads as its neighbour.
+		ps.radiance = vec3(dbg_material.clearcoat, dbg_material.clearcoat_roughness,
+				dbg_material.clearcoat_ior - 1.0);
+	} else if (vis_mode == 37) {
+		// E2d arrival gate: the tint, straight through.
+		ps.radiance = dbg_material.clearcoat_tint;
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

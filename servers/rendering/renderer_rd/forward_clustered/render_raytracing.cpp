@@ -1476,6 +1476,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.clearcoat = 0.0f;
 	mat.clearcoat_roughness = 0.0f;
 	mat.anisotropy = 0.0f;
+	mat.clearcoat_ior = 1.5f;
+	mat.clearcoat_tint[0] = 1.0f;
+	mat.clearcoat_tint[1] = 1.0f;
+	mat.clearcoat_tint[2] = 1.0f;
 	mat._pad0 = 0.0f;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
@@ -1795,6 +1799,25 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	Variant clearcoat_roughness_var = material_storage->material_get_param(p_material_rid, "clearcoat_roughness");
 	if (clearcoat_roughness_var.get_type() == Variant::FLOAT) {
 		mat.clearcoat_roughness = clearcoat_roughness_var;
+	}
+
+	Variant clearcoat_ior_var = material_storage->material_get_param(p_material_rid, "clearcoat_ior");
+	if (clearcoat_ior_var.get_type() == Variant::FLOAT) {
+		// Cycles: fmaxf(coat_ior, 1.0f) -- svm/closure.h:149.
+		mat.clearcoat_ior = MAX((float)clearcoat_ior_var, 1.0f);
+	}
+
+	Variant clearcoat_tint_var = material_storage->material_get_param(p_material_rid, "clearcoat_tint");
+	if (clearcoat_tint_var.get_type() == Variant::COLOR) {
+		// sRGB-decoded like every other colour factor here -- albedo_color
+		// (:1542), attenuation_color (:1745), specular_tint (:1766). Cycles'
+		// coat_tint socket is already linear, so a Cycles-comparison material
+		// must author this with .linear_to_srgb() to land on the same value.
+		Color c = ((Color)clearcoat_tint_var).srgb_to_linear();
+		// Cycles: max(coat_tint, zero) -- svm/closure.h:150.
+		mat.clearcoat_tint[0] = MAX(c.r, 0.0f);
+		mat.clearcoat_tint[1] = MAX(c.g, 0.0f);
+		mat.clearcoat_tint[2] = MAX(c.b, 0.0f);
 	}
 
 	// BaseMaterial3D's anisotropy parameter is named "anisotropy_ratio", not

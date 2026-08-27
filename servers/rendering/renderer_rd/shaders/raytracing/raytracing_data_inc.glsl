@@ -118,7 +118,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 176 bytes)
+// MATERIAL DATA (matches C++ layout, 192 bytes)
 // ============================================================================
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -156,5 +156,7 @@ struct MaterialData {
 	float clearcoat;
 	float clearcoat_roughness;
 	float anisotropy;
+	float clearcoat_ior; // E2d. Was _pad0.
+	vec3 clearcoat_tint; // E2d. std430 aligns this to offset 176.
 	float _pad0;
 };

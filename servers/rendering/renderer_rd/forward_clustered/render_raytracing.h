@@ -102,7 +102,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 176 bytes).
+// Must match GLSL MaterialData (std430, 192 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -134,15 +134,24 @@ struct alignas(16) RT_MaterialData {
 	float clearcoat;
 	float clearcoat_roughness;
 	float anisotropy;
+	// E2d: coat IOR. Takes the slot the old _pad0 occupied, so the struct
+	// stays 176 bytes up to here. Cycles clamps this with fmaxf(., 1.0f)
+	// (svm/closure.h:149); the upload does the same.
+	float clearcoat_ior;
+	// E2d: coat tint, Beer's-law absorption through the coat. A vec3 aligns
+	// to 16 in std430, so it starts at 176 and the struct grows to 192.
+	float clearcoat_tint[3];
 	float _pad0;
 };
-static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 192, "RT_MaterialData must be 192 bytes for std430");
 // A vec3 aligns to 16 bytes in std430, so reordering members around one shifts
 // the GPU's view of every subsequent field WITHOUT changing sizeof. The size
-// assert alone passes on a broken layout; these three are what catch it.
+// assert alone passes on a broken layout; these four are what catch it.
 static_assert(offsetof(RT_MaterialData, attenuation_color) == 112, "attenuation_color must be 16-byte aligned for std430 vec3");
 static_assert(offsetof(RT_MaterialData, specular_tint) == 128, "specular_tint must be 16-byte aligned for std430 vec3");
 static_assert(offsetof(RT_MaterialData, sheen_color) == 144, "sheen_color must be 16-byte aligned for std430 vec3");
+static_assert(offsetof(RT_MaterialData, clearcoat_tint) == 176, "clearcoat_tint must be 16-byte aligned for std430 vec3");
+static_assert(offsetof(RT_MaterialData, clearcoat_ior) == 172, "clearcoat_ior must occupy the slot the old _pad0 held");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
