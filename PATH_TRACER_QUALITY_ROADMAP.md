@@ -2252,7 +2252,7 @@ scope for this phase and carried to its named successors:**
 `DIFFUSE_TYPE`/`SPECULAR_TYPE` selection is replaced by a registry — a
 `LOBE_COUNT`-sized weight array, a CDF walk (`selectLobe`), and a
 per-lobe weighted pdf sum (`combineLobePdf`) — all in
-`brdf_inc.glsl:1732-1786`. `LOBE_COUNT` is **2**. Nothing renders
+`brdf_inc.glsl:1730-1786`. `LOBE_COUNT` is **2**. Nothing renders
 differently, and that is the whole acceptance criterion. Full task-by-task
 record: `.superpowers/sdd/2026-08-23-n-way-lobe-rewrite/task-{1..4}-report.md`.
 
@@ -2304,18 +2304,34 @@ builds, so a **same-binary control** was run — the N=2 build gated twice — t
 establish what run-to-run noise looks like before attributing anything to the
 third lobe:
 
-| metric | N=3 | N=2 run A | N=2 run B | treatment delta | control delta |
+| metric | N=3 | N=2 run A | N=2 run B | treatment delta (N=3 vs A) | control delta (A vs B) |
 |---|---|---|---|---|---|
-| energy, bumpy normal-mapped mean | 1.42073 | 1.42098 | 1.42006 | 2.5e-4 | **9.2e-4** |
+| energy, bumpy normal-mapped mean | 1.42073 | 1.42098 | 1.42006 | 2.5e-4 | 9.2e-4 |
 | energy, smooth mirror mean | 1.48897 | 1.48915 | 1.48906 | 1.8e-4 | 9.0e-5 |
 | energy, rough metal mean | 1.70837 | 1.70831 | 1.70822 | 6.0e-5 | 9.0e-5 |
 | aniso, probe 1b NEE-dominant mean | 1.345898 | 1.345912 | 1.345915 | 1.4e-5 | 3.0e-6 |
 | aniso, worst furnace deviation | 1.080978 | 1.080981 | 1.080982 | 3.0e-6 | 1.0e-6 |
 
-The N=3-vs-N=2 differences sit inside the same-binary band; on `bumpy` the
-control spread is nearly **4x larger** than the treatment spread. Verdict: the
-third lobe changed nothing these instruments can resolve. No normalisation bug
-was hiding at N=2.
+**Read the table honestly: it does not show treatment uniformly below control.**
+Control exceeds treatment on two rows (bumpy by 3.7x, rough metal marginally);
+treatment exceeds control on three (smooth mirror 2.0x, probe 1b 4.7x, worst
+furnace 3.0x). Recomputing treatment against run B instead of run A flips which
+rows fall on which side without moving the picture. One control delta per metric
+is a **one-sample** estimate of the noise, so it establishes an order of
+magnitude and not a band, and no arrangement of these numbers supports a claim
+that every treatment delta sits inside a measured band.
+
+What the table does support: **treatment and control deltas occupy the same
+range on every row** — both span ~1e-6 to ~1e-3, and neither column is
+consistently the larger. That is what an inert third lobe looks like when both
+columns are measuring the same GPU non-determinism, and it is what the mechanism
+argument below independently predicts (weight 0.0, pdf 0.0, trailing position,
+`acc + 0.0f` bit-exact — the N=3 build *should* be bit-identical, which means the
+entire table is measuring run-to-run noise on both sides). A real normalisation
+bug at N=2 would not hide inside 1e-3 on a furnace ratio; it would move the
+selection split. **Verdict: the third lobe changed nothing these instruments can
+resolve, and no normalisation bug was hiding at N=2 — but the evidence is
+agreement in magnitude plus the mechanism, not a measured band.**
 
 One mechanism is worth carrying forward, because it is why the test was inert
 rather than merely lucky. `selectLobe`'s loop runs to `LOBE_COUNT - 1` and
@@ -2353,15 +2369,29 @@ reviewer tracing three properties through the shipped diff:
 **The one documented exception.** C parses `a * b * c` as `(a * b) * c`, so the
 old code computed `(pSpec * specularContribution) * transmitScale`. The
 registry folds `transmitScale` into the specular pdf entry, computing
-`pSpec * (specularContribution * transmitScale)`. Mathematically equal, **1 ULP
-apart in float32** — relative difference `1.06e-7`. Found by the phase's own
-doctest before any shader was touched.
+`pSpec * (specularContribution * transmitScale)`. **1 ULP apart in float32** at
+the inputs the doctest pins — a measurement at one triple, not a bound, since
+`(a*b)*c` vs `a*(b*c)` can differ by ~2 ULP in general. Two relative figures get
+quoted and they measure different quantities: `6.2e-8` is the gap on the
+**specular term** (what the test computes), `1.06e-7` the gap on the **full
+combined expression** with those constants. Found by the phase's own doctest
+before any shader was touched.
+
+"Mathematically equal" holds on every reachable input but is not unconditional:
+at `pSpec == 0.0f` the old form yielded `0.0` for any finite
+`specularContribution`, while the new form evaluates
+`specularContribution * transmitScale` first. Nothing reachable produces a
+non-finite value there — `specularPdf`'s `alphaSquared`, `NdotV` and `LdotH` are
+all floored at `1e-5`, bounding the contribution — but a future lobe with an
+unfloored pdf would turn that corner into a `NaN`. Recorded by the E2c final
+review; no reachable input was found.
 
 It was accepted rather than engineered around: contorting the registry to
 preserve one grouping would make it something other than a uniform sum, which
 is precisely what E2d and E2e build on, and every future lobe would reintroduce
-the question. At `1.06e-7` it is two orders of magnitude below the `mean_luma`
-floor, so no instrument in this project can resolve it. **The claim was
+the question. At `6.2e-8` on the term and `1.06e-7` combined, both sit orders of
+magnitude below the `mean_luma` floor, so no instrument in this project can
+resolve either. **The claim was
 weakened rather than the code**: this phase is identical to today except for
 one documented reassociation on the specular term. A doctest case pins the gap
 — both that the two groupings differ at all (a tripwire against the compiler
@@ -2370,7 +2400,7 @@ is a recorded fact rather than a puzzle for whoever next compares the two
 expressions.
 
 **Verification summary.** doctest **1527 passed / 0 failed / 3 skipped**
-(2,066,549 assertions); `pt_energy_gate` PASS; `pt_anisotropy_gate` PASS within
+(2,066,552 assertions); `pt_energy_gate` PASS; `pt_anisotropy_gate` PASS within
 its +/-0.5pp measured-intact bands; `pt_transmission_gate` exit 0 with 44
 checks.
 
@@ -2395,8 +2425,20 @@ checks.
   `min(weights)` instead of `weights[i]`, and the orientation test failed at
   `p_spec = 0.73` and **only** there — the previous 0.37-only version would
   have passed that bug silently. Break reverted, suite green. This mattered
-  more than a routine coverage gap because that suite is the **only** safety
-  net for lobe order, which no rendered image can see.
+  more than a routine coverage gap because it is the only automated pin on the
+  CDF's *orientation*, which no rendered image can see.
+- **Lobe ORDER in the shader has no automated instrument at all, and the
+  closeout above should not be read as saying otherwise.** The doctest case
+  named "specular is index 0" checks the *test file's own* `#define`s against
+  literals in the same translation unit; nothing links them to
+  `brdf_inc.glsl`. Invert the shader's `LOBE_SPECULAR`/`LOBE_DIFFUSE` and all
+  six cases still pass. A CPU mirror cannot see the shader, and a rendered
+  image cannot see an inverted registry — the picture stays statistically
+  identical and every GPU gate passes. **Structural review is the only
+  instrument**, which is why design §6.3 names it. The case is kept because it
+  pins the mirror the other five cases are built on; its comment now says so
+  rather than claiming the property it is named for. Raised by the E2c final
+  review; recorded rather than papered over.
 - **Non-default `SPECULAR_BRDF` / `MICROFACET_DISTRIBUTION` configurations no
   longer compile** (inherited from E2b, unchanged here).
 

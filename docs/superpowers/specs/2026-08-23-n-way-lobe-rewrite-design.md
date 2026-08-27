@@ -96,8 +96,11 @@ same operations in the same order as the code it replaces.
 and is accepted. C parses `a * b * c` as `(a * b) * c`, so the shader computes
 `(pSpec * specularContribution) * transmitScale`. The registry folds
 `transmitScale` into the specular lobe's pdf entry, computing
-`pSpec * (specularContribution * transmitScale)`. Mathematically equal, **1 ULP
-apart in float32** — relative difference `1.06e-7`.
+`pSpec * (specularContribution * transmitScale)`. **1 ULP apart in float32** at
+the inputs the doctest pins — `6.2e-8` relative on the specular term, `1.06e-7`
+on the full combined expression there. A measurement at one triple, not a bound.
+Mathematically equal on every reachable input; see roadmap §7.9 for the
+`pSpec == 0.0` × non-finite corner the phrase does not cover.
 
 Found by Task 1's own test before any shader was touched.
 

@@ -1932,13 +1932,32 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	}
 
 	// E2c: routed through the registry's combineLobePdf. transmitScale is
-	// folded into the specular lobe's pdf entry so the multiplication happens
-	// in the same place it did before (pSpec * (specularContribution *
-	// transmitScale)) rather than being reassociated to
-	// (pSpec * specularContribution) * transmitScale -- the two differ by up
-	// to 1 ULP (relative 1.06e-7), two orders below the ~1e-5 measurement
-	// floor, and Task 1's dedicated test pins that specific reassociation as
-	// the one accepted exception to bit-identical summation order.
+	// folded into the specular lobe's pdf entry, and THAT REASSOCIATES THE
+	// SPECULAR TERM. Read the direction carefully -- it is the phase's only
+	// accepted deviation from bit-identity, so getting it backwards defeats
+	// the record:
+	//
+	//   before:  return pSpec * specularContribution * transmitScale + ...
+	//            which C/GLSL parse as (pSpec * specularContribution) * transmitScale
+	//   now:     pdfs[LOBE_SPECULAR] = specularContribution * transmitScale
+	//            then combineLobePdf multiplies, giving
+	//            pSpec * (specularContribution * transmitScale)
+	//
+	// Mathematically equal, 1 ULP apart in float32 at the inputs Task 1's
+	// test pins (relative 6.2e-8 on this term; 1.06e-7 on the full combined
+	// expression there) -- both orders of magnitude below the ~1e-5
+	// measurement floor. Accepted deliberately rather than engineered around:
+	// contorting the registry to preserve one grouping would make it
+	// something other than a uniform sum, which is what E2d/E2e build on.
+	// See roadmap 7.9 and test_pt_lobe_registry.cpp's dedicated case.
+	//
+	// One caveat the phrase "mathematically equal" does not cover: at
+	// pSpec == 0.0f the old form yielded 0.0 for any finite
+	// specularContribution, whereas the new form evaluates
+	// specularContribution * transmitScale FIRST. No reachable input produces
+	// a non-finite value there (specularPdf's alphaSquared, NdotV and LdotH
+	// are all floored at 1e-5, bounding the contribution), but a future lobe
+	// with an unfloored pdf would turn that corner into a NaN.
 	float weights[LOBE_COUNT];
 	weights[LOBE_SPECULAR] = pSpec;
 	weights[LOBE_DIFFUSE] = 1.0f - pSpec;

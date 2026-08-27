@@ -84,10 +84,20 @@ static float combine_pdf(const float *p_weights, const float *p_pdfs, int p_n) {
 }
 
 TEST_CASE("[PathTracer][LobeRegistry] specular is index 0") {
-	// Not cosmetic. A diffuse-first registry makes `u < cdf[0]` select DIFFUSE
-	// exactly where today's `u < brdfProbability` selects SPECULAR, inverting
-	// every pixel's lobe choice. The image stays statistically identical, so no
-	// gate can see it. This is the phase's likeliest silent failure.
+	// READ THIS BEFORE TRUSTING THIS CASE. It checks the THREE #defines at the
+	// top of THIS FILE against literals, in the same translation unit. Nothing
+	// links them to brdf_inc.glsl. **It cannot detect a GLSL-side divergence.**
+	// Invert `#define LOBE_SPECULAR` / `LOBE_DIFFUSE` in the shader and every
+	// pixel's lobe choice flips while all six cases here still pass.
+	//
+	// It is kept because it pins the mirror the other five cases are built on:
+	// if someone edits the mirror's constants to "fix" a failure, this fails
+	// first and names why. That is its whole job. The property it is named for
+	// -- that the SHADER puts specular at index 0 -- has no automated
+	// instrument at all: no rendered image can see an inverted registry (the
+	// picture stays statistically identical and every GPU gate passes), and a
+	// CPU mirror cannot see the shader. Structural review is the only
+	// instrument, which is why design 6.3 names it explicitly.
 	CHECK(LOBE_SPECULAR == 0);
 	CHECK(LOBE_DIFFUSE == 1);
 	CHECK(LOBE_COUNT == 2);
@@ -101,16 +111,21 @@ TEST_CASE("[PathTracer][LobeRegistry] CDF orientation matches the two-way compar
 	// p_spec = 0.37, i.e. specular as the minority lobe. A hypothetical
 	// select_lobe keying off min/max weight, or special-casing a dominant
 	// first lobe, is only distinguishable from positional order when the
-	// split is examined from both sides. This suite is the only safety net
-	// for lobe order -- no rendered image can see it -- so the sweep is not
-	// redundancy.
+	// split is examined from both sides. This is the only automated pin on
+	// the CDF's ORIENTATION -- no rendered image can see it -- so the sweep is
+	// not redundancy. (It pins the orientation of the mirror below, which is
+	// textually identical to the GLSL; the shader's own lobe ORDER is covered
+	// only by structural review, see the first case in this file.)
 	const float p_specs[] = { 0.37f, 0.5f, 0.73f };
 	for (float p_spec : p_specs) {
 		CAPTURE(p_spec);
 		const float weights[LOBE_COUNT] = { p_spec, 1.0f - p_spec };
 
-		const float us[] = { 0.0f, 0.1f, p_spec - 0.00001f, p_spec + 0.00001f,
-			0.5f, 0.9f, 0.999f };
+		// p_spec itself is included deliberately: without it, mutating
+		// select_lobe's `u < acc` to `u <= acc` passes every case. Measure-zero
+		// at runtime, but this is the only pin on the predicate.
+		const float us[] = { 0.0f, 0.1f, p_spec - 0.00001f, p_spec,
+			p_spec + 0.00001f, 0.5f, 0.9f, 0.999f };
 		for (float u : us) {
 			CAPTURE(u);
 			const int expected = (u < p_spec) ? LOBE_SPECULAR : LOBE_DIFFUSE;
@@ -164,6 +179,15 @@ TEST_CASE("[PathTracer][LobeRegistry] combine_pdf reduces to the two-term form")
 	// float32 -- the next test records it. `expected` uses the REGISTRY's
 	// grouping, so this test verifies the registry's own arithmetic rather than
 	// loosening an epsilon to tolerate a difference that should be pinned.
+	//
+	// Consequence, stated plainly: this case does NOT verify reduction to the
+	// pre-E2c two-term expression -- the next case is what measures the gap
+	// between them. And note that SUMMATION ORDER cannot be pinned here at
+	// all: IEEE-754 addition is commutative bit-exactly, so reversing
+	// combine_pdf's loop at N == 2 returns an identical float. Order only
+	// becomes observable at N >= 3, where associativity, not commutativity, is
+	// what bites. Until then the roadmap's summation-order property rests on
+	// structural review, not on this file.
 	const float expected = p_spec * (spec_contribution * transmit_scale) + (1.0f - p_spec) * pdf_diffuse;
 	CHECK(combine_pdf(weights, pdfs, LOBE_COUNT) == doctest::Approx(expected).epsilon(1e-9));
 }
@@ -176,9 +200,14 @@ TEST_CASE("[PathTracer][LobeRegistry] the registry reassociates the specular ter
 	//   shader today: (p_spec * spec) * transmit   -- C's left-to-right grouping
 	//   registry:      p_spec * (spec * transmit)  -- transmit folded into the pdf
 	//
-	// Mathematically equal, 1 ULP apart in float32. Relative difference 1.06e-7,
-	// two orders of magnitude BELOW mean_luma's ~1e-5 run-to-run floor on an
-	// identical binary, so no gate in this project can resolve it.
+	// Mathematically equal, 1 ULP apart in float32 AT THESE INPUTS -- this is a
+	// measurement at one triple, not a bound; (a*b)*c vs a*(b*c) can differ by
+	// ~2 ULP in general. Two relative figures get quoted and they measure
+	// different things: 6.2e-8 is the gap on the SPECULAR TERM (what `rel`
+	// below computes), 1.06e-7 is the gap on the FULL combined expression with
+	// these constants. Both are orders of magnitude BELOW mean_luma's ~1e-5
+	// run-to-run floor on an identical binary, so no gate in this project can
+	// resolve either.
 	const float p_spec = 0.42f;
 	const float spec_contribution = 3.75f;
 	const float transmit_scale = 0.61f;
