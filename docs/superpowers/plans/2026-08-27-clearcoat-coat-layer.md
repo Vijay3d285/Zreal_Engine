@@ -268,7 +268,7 @@ Then:
 bin/godot.windows.editor.x86_64.console.exe --headless --test --test-case="*CoatAlbedo*"
 ```
 
-Expected: 7 test cases, all passing.
+Expected: 6 test cases, all passing.
 
 **If the midpoint case fails**, the mirror is not endpoint-aligned — fix the mirror, do not loosen the epsilon. That case is the entire reason this task exists.
 
@@ -290,7 +290,7 @@ Do not skip this. "The test covers this" is an assumption until the test has bee
 bin/godot.windows.editor.x86_64.console.exe --headless --test
 ```
 
-Expected: 1534 passed / 0 failed / 3 skipped (1527 + 7 new).
+Expected: 1533 passed / 0 failed / 3 skipped (1527 + 6 new). Task 2 adds the seventh, taking later tasks to 1534.
 
 - [ ] **Step 6: Commit**
 
