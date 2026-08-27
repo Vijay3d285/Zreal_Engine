@@ -105,6 +105,11 @@ V mul(const M &m, const V &v) {
 // BRDF types
 #define DIFFUSE_TYPE 1
 #define SPECULAR_TYPE 2
+// E2d. The coat layer's own GGX lobe. Numerically distinct from LOBE_COAT (2):
+// these BRDF-type tags and the lobe-registry indices are separate namespaces and
+// only ever meet through the sampler's `if (lobe == LOBE_COAT) brdfType =
+// COAT_TYPE` mapping (raytracing_closest_hit_common_inc.glsl).
+#define COAT_TYPE 3
 
 // PIs
 #ifndef PI
@@ -304,6 +309,18 @@ struct MaterialProperties {
 	// forces the isotropic fallback -- Cycles gates the same way on
 	// stack_valid(data.tangent_offset) (closure.h:309).
 	float3 tangent;
+
+	// E2d coat. coatWeight 0 disables the layer entirely -- it is the ONLY field
+	// that says so. clearcoat/clearcoat_roughness are feature-gated and forced to
+	// 0 when FEATURE_CLEARCOAT is off (scene/resources/material.cpp:2270,2277),
+	// but clearcoat_ior and clearcoat_tint are published unconditionally
+	// (:2294,:2304), so a material with the clearcoat feature disabled still
+	// carries a perfectly valid ior of 1.5 and a white tint. Never gate the coat
+	// on those two.
+	float coatWeight;
+	float coatRoughness;
+	float coatIor;
+	float3 coatTint;
 };
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
@@ -1729,7 +1746,11 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 // replaces, are deleted -- see lobeWeight's doc comment for why.
 #define LOBE_SPECULAR 0
 #define LOBE_DIFFUSE 1
-#define LOBE_COUNT 2
+// E2d. APPENDS -- it does not displace specular from index 0, which E2c made a
+// contract. The coat is physically outermost, but layering happens through the
+// throughput scale, not through registry position.
+#define LOBE_COAT 2
+#define LOBE_COUNT 3
 
 // ---------------------------------------------------------------------------
 // SELECTION WEIGHT vs THROUGHPUT SCALE (E2d).
@@ -1881,8 +1902,79 @@ float coatAlbedoEstimate(float coatRoughness, float cosNI, float ior) {
 	return mix(f0, 1.0f, s);
 }
 
+// Selection probability mass for the coat, BEFORE normalisation against the
+// base lobes. Cycles sets a closure's sample_weight from its estimated albedo
+// (bsdf_microfacet.h:1021), so sampling effort tracks how much light the coat
+// actually returns.
+//
+// Below CLOSURE_WEIGHT_CUTOFF (1e-5, svm/types.h:576) Cycles skips the coat
+// entirely; returning 0 here does the same. That EXACT ZERO is load-bearing for
+// the phase invariant: at clearcoat == 0 the caller's baseShare is 1.0f - 0.0f
+// == exactly 1.0f, and multiplying by exactly 1.0f is the IEEE identity, so the
+// three-lobe arithmetic reduces to E2c's two-lobe arithmetic bit-for-bit.
+//
+// THE CLAMP IS NOT COSMETIC. The sampler divides throughput by the selected
+// lobe's weight, so an unclamped mass is an unbounded variance source: a coat
+// just above the cutoff with a typical estimate near 0.04 yields ~4e-7, and
+// dividing by that is a 2.5-million-fold spike -- fireflies on any faintly
+// coated material. Symmetrically, a mass near 1 drives baseShare toward 0 and
+// does the same to the specular and diffuse divisors.
+//
+// lobeWeight (above) already ends in clamp(..., 0.01f, 0.99f) for exactly this
+// reason. Mirror it rather than inventing a different bound. Cycles does not
+// clamp its sample_weight, but Cycles carries variance machinery this
+// integrator does not; matching its noise profile is not the goal, matching
+// its IMAGE is, and an unbounded divisor changes the image through noise.
+float coatLobeWeight(MaterialProperties material, float cosNI) {
+	if (material.coatWeight <= 0.00001f) {
+		return 0.0f;
+	}
+	float mass = material.coatWeight * coatAlbedoEstimate(material.coatRoughness, cosNI, material.coatIor);
+	return clamp(mass, 0.01f, 0.99f);
+}
+
+// Isotropic VNDF reflection pdf of the coat lobe, at alpha = coatRoughness^2.
+//
+// PDF CONVENTION -- read before editing. This file carries TWO conventions and
+// E2b shipped a Critical defect from confusing them (see evalMicrofacet's C1
+// note): G2_DIVIDED_BY_DENOMINATOR (:946) governs the BRDF *value* returned by
+// evalMicrofacet, NOT any pdf. Every pdf here is raw. Specifically, this
+// mirrors combinedPdf's ISOTROPIC branch verbatim --
+// `specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH)` -- and
+// specularPdf resolves (:242) to sampleGGXVNDFReflectionPdf (:1066), which
+// returns GGX_D * Smith_G1_GGX / (4 * NdotV) and performs no G2 division at
+// all. Do not substitute a Smith_G2* form.
+//
+// The near-delta cutoff is the same instrument RT_MIS_DELTA_ROUGHNESS provides
+// for the base specular lobe, keyed on the COAT's own roughness: a mirror coat
+// has no meaningful continuous density, and specularPdf's alphaSquared floor
+// would otherwise turn a Dirac delta into a finite ~3e4 spike that a
+// diffuse-drawn direction could land inside. shade_and_bounce stores
+// RT_MIS_PDF_NONE for a coat sample in exactly this regime, so the two agree.
+float coatPdf(float coatRoughness, float NdotH, float NdotV, float LdotH) {
+	if (coatRoughness < RT_MIS_DELTA_ROUGHNESS) {
+		return 0.0f;
+	}
+	float alpha = coatRoughness * coatRoughness;
+	return specularPdf(alpha, alpha * alpha, NdotH, NdotV, LdotH);
+}
+
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
 // which today's `u < brdfProbability` picks SPECULAR_TYPE.
+//
+// E2d: LOBE_COUNT is now 3 and the trailing `return LOBE_COUNT - 1` returns the
+// COAT. On an uncoated material weights[LOBE_COAT] is 0.0 and the sampler
+// divides throughput by the selected weight -- so it LOOKS like this needs a
+// zero-division guard. It does not, and adding one would hide the real
+// invariant: with coatMass == 0 the caller's baseShare is exactly 1.0f, so the
+// two base weights are fl(pSpec) and fl(1.0f - pSpec), which sum to exactly
+// 1.0f for every float32 pSpec; and rng_1d bottoms out in
+// sb_uint_to_float_excl (sobol_burley_inc.glsl:89-91, dividing by 4294967808.0
+// rather than 2^32 precisely so the result stays strictly below 1.0), so
+// `u < acc` is always true on the second iteration. The residue window is
+// empty. test_pt_lobe_registry.cpp's "select_lobe never returns a zero-weight
+// lobe" case pins this against the REAL lobe_weight, including u ==
+// 0.99999994f, the largest float32 below 1.0.
 int selectLobe(float u, float weights[LOBE_COUNT]) {
 	float acc = 0.0f;
 	for (int i = 0; i < LOBE_COUNT - 1; i++) {
@@ -1894,7 +1986,14 @@ int selectLobe(float u, float weights[LOBE_COUNT]) {
 	return LOBE_COUNT - 1;
 }
 
-// Sum in registry order: specular term first, then diffuse.
+// Sum in REGISTRY ORDER: specular term first, then diffuse, then coat (E2d).
+//
+// At N == 2 that order was unfalsifiable -- IEEE addition is commutative
+// bit-exactly, so reversing this loop was a provable no-op. At N == 3 the
+// question becomes ASSOCIATIVITY, which is NOT an IEEE identity: (a+b)+c and
+// a+(b+c) can differ by an ulp. The ascending `i` loop below is what fixes the
+// grouping to ((spec + diffuse) + coat) for every caller, so the answer cannot
+// depend on which consumer built the array.
 float combineLobePdf(float weights[LOBE_COUNT], float pdfs[LOBE_COUNT]) {
 	float acc = 0.0f;
 	for (int i = 0; i < LOBE_COUNT; i++) {
@@ -2076,13 +2175,35 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// a non-finite value there (specularPdf's alphaSquared, NdotV and LdotH
 	// are all floored at 1e-5, bounding the contribution), but a future lobe
 	// with an unfloored pdf would turn that corner into a NaN.
+	//
+	// E2d: the split below MUST stay identical to shade_and_bounce's
+	// (raytracing_closest_hit_common_inc.glsl) -- that is the invariant this
+	// function's header comment already names, now with three terms instead of
+	// two. cosNI is dot(N, V) unclamped, the SAME expression the sampler feeds
+	// coatLobeWeight; using data.NdotV (floored at 1e-5 and capped at 1) here
+	// would silently desync the two on backfacing V.
+	float cosNI = dot(N, V);
+	float coatMass = coatLobeWeight(material, cosNI);
+	// At coatMass == 0 this is exactly 1.0f, so weights[LOBE_SPECULAR] is
+	// 1.0f * pSpec == pSpec and weights[LOBE_DIFFUSE] is 1.0f * (1.0f - pSpec)
+	// == 1.0f - pSpec -- the IEEE identity, bit-identical to the E2c form this
+	// replaces. The coat term then contributes weights[LOBE_COAT] * coatPdfValue
+	// == 0.0f * finite == 0.0f, and acc + 0.0f is exact for the non-negative acc
+	// combineLobePdf accumulates. coatPdf is finite by construction (specularPdf
+	// floors alphaSquared, NdotH and NdotV), which is what keeps that 0.0f from
+	// being a NaN -- the corner the transmitScale note above flags for "a future
+	// lobe with an unfloored pdf".
+	float baseShare = 1.0f - coatMass;
+
 	float weights[LOBE_COUNT];
-	weights[LOBE_SPECULAR] = pSpec;
-	weights[LOBE_DIFFUSE] = 1.0f - pSpec;
+	weights[LOBE_SPECULAR] = baseShare * pSpec;
+	weights[LOBE_DIFFUSE] = baseShare * (1.0f - pSpec);
+	weights[LOBE_COAT] = coatMass;
 
 	float pdfs[LOBE_COUNT];
 	pdfs[LOBE_SPECULAR] = specularContribution * transmitScale;
 	pdfs[LOBE_DIFFUSE] = pdfDiffuse;
+	pdfs[LOBE_COAT] = coatPdf(material.coatRoughness, NdotH, NdotV, LdotH);
 
 	return combineLobePdf(weights, pdfs);
 }
@@ -2165,6 +2286,41 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 
 	} else if (brdfType == SPECULAR_TYPE) {
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, materialLocal);
+		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, data.anisoActive, u, sampleWeight);
+	} else if (brdfType == COAT_TYPE) {
+		// E2d. The coat is an isotropic GGX with alpha = sqr(coat_roughness) and a
+		// dielectric F0 from coat_ior. Cycles forces alpha_x == alpha_y ==
+		// sqr(coat_roughness) (svm/closure.h:165) -- NOT this engine's raster
+		// mix(0.001, 0.1, r) remap; see the E2d spec section 3.2 for why the
+		// raster and the path tracer deliberately disagree here.
+		//
+		// Reuses the EXISTING isotropic specular path rather than writing a second
+		// one, by handing it a MaterialProperties describing the coat alone:
+		//   - roughness  -> the coat's, so prepareBRDFData's alpha/alphaSquared
+		//                   (:1653-1654) are the coat's.
+		//   - metalness  -> 0 and baseColor -> black, so
+		//                   baseColorToSpecularF0(black, 0, F0) returns exactly the
+		//                   coat F0 and nothing underneath the coat leaks into this
+		//                   lobe. There is no diffuse under a coat lobe.
+		//   - transmissivness -> 0. The coat never transmits; leaving the base's
+		//                   value here would make a glass base drag its dielectric
+		//                   split into the coat.
+		//   - anisotropy -> 0, which is what forces prepareBRDFData's anisoActive
+		//                   false and ax == ay == alpha (:1667). Cycles gives the
+		//                   coat no anisotropy to match, so passing the base's
+		//                   would stretch a highlight that should be round.
+		MaterialProperties coatMat = materialLocal;
+		coatMat.roughness = material.coatRoughness;
+		coatMat.metalness = 0.0f;
+		coatMat.transmissivness = 0.0f;
+		coatMat.baseColor = float3(0.0f, 0.0f, 0.0f);
+		// q = (ior-1)/(ior+1); F0 SQUARES q. coatAlbedoEstimate builds the same q
+		// and takes its square ROOT for the LUT's z axis -- opposite directions
+		// from one quantity, and swapping them type-checks. Keep them apart.
+		float q = (material.coatIor - 1.0f) / (material.coatIor + 1.0f);
+		coatMat.dielectricF0 = float3(q * q, q * q, q * q);
+		coatMat.anisotropy = 0.0f;
+		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, coatMat);
 		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, data.anisoActive, u, sampleWeight);
 	}
 

@@ -463,6 +463,15 @@ void debug_visualize(
 		dbg_mat.anisotropy = dbg_material.anisotropy;
 		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
 		dbg_mat.tangent = world_tangent;
+		// E2d Task 5, same rule as the E2b note above: uninitialized struct fields
+		// are undefined in GLSL. evalIndirectCombinedBRDF below is only ever called
+		// here with SPECULAR_TYPE/DIFFUSE_TYPE, so the coat is not read -- set them
+		// anyway, and with production's clamps, so this probe never diverges from
+		// shade_and_bounce for a reason that has nothing to do with what it measures.
+		dbg_mat.coatWeight = max(dbg_material.clearcoat, 0.0);
+		dbg_mat.coatRoughness = clamp(dbg_material.clearcoat_roughness, 0.0, 1.0);
+		dbg_mat.coatIor = max(dbg_material.clearcoat_ior, 1.0);
+		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -583,6 +592,12 @@ void debug_visualize(
 		dbg_mat.anisotropy = dbg_material.anisotropy;
 		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
 		dbg_mat.tangent = world_tangent;
+		// E2d Task 5. Not consumed by lobeWeight below (the coat has its own
+		// coatLobeWeight), but undefined-if-unset applies here too.
+		dbg_mat.coatWeight = max(dbg_material.clearcoat, 0.0);
+		dbg_mat.coatRoughness = clamp(dbg_material.clearcoat_roughness, 0.0, 1.0);
+		dbg_mat.coatIor = max(dbg_material.clearcoat_ior, 1.0);
+		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 
 		float pSpec = lobeWeight(dbg_mat);
 		ps.radiance = vec3(pSpec, 0.0, 0.0);
@@ -624,6 +639,12 @@ void debug_visualize(
 		dbg_mat.anisotropy = dbg_material.anisotropy;
 		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
 		dbg_mat.tangent = world_tangent;
+		// E2d Task 5. sampleTransmissiveLobe below never touches the coat, but
+		// undefined-if-unset applies here too.
+		dbg_mat.coatWeight = max(dbg_material.clearcoat, 0.0);
+		dbg_mat.coatRoughness = clamp(dbg_material.clearcoat_roughness, 0.0, 1.0);
+		dbg_mat.coatIor = max(dbg_material.clearcoat_ior, 1.0);
+		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 
 		vec3 dbg_specularF0 = baseColorToSpecularF0(dbg_mat.baseColor, dbg_mat.metalness, dbg_mat.dielectricF0);
 		float dbg_alpha = dbg_mat.roughness * dbg_mat.roughness;
@@ -766,6 +787,15 @@ void debug_visualize(
 		dbg_mat.anisotropy = dbg_material.anisotropy;
 		dbg_mat.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
 		dbg_mat.tangent = world_tangent;
+		// E2d Task 5. LOAD-BEARING here, not merely hygienic: this probe calls
+		// combinedPdf below, and combinedPdf now reads coatWeight/coatRoughness/
+		// coatIor through coatLobeWeight and coatPdf. Left unset these are
+		// undefined, and pt_anisotropy_gate's E[1/pdf] reading -- which must stay
+		// at 2*PI -- would drift on garbage that has nothing to do with anisotropy.
+		dbg_mat.coatWeight = max(dbg_material.clearcoat, 0.0);
+		dbg_mat.coatRoughness = clamp(dbg_material.clearcoat_roughness, 0.0, 1.0);
+		dbg_mat.coatIor = max(dbg_material.clearcoat_ior, 1.0);
+		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 
 		// Same clamped shading normal shade_and_bounce actually bounces from
 		// (mirrors vis mode 33's dbg_N) -- on a sphere this is well away from
@@ -1147,6 +1177,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.anisotropy = raw_mat.anisotropy;
 	brdf_mat.anisotropyRotation = raw_mat.anisotropy_rotation; // already RADIANS
 	brdf_mat.tangent = h.tangent;
+	// E2d coat. Read from raw_mat for the same reason anisotropy is: MaterialResult
+	// carries no clearcoat fields, so the MaterialData binding is the only source.
+	//
+	// Cycles' clamps, svm/closure.h:148-150, all four reproduced. coatWeight is the
+	// ONLY gate: clearcoat and clearcoat_roughness are feature-gated to 0 when
+	// FEATURE_CLEARCOAT is off (scene/resources/material.cpp:2270,2277) while
+	// clearcoat_ior and clearcoat_tint are published unconditionally (:2294,:2304),
+	// so a material with the feature disabled still arrives here carrying a valid
+	// ior of 1.5 and a white tint. Gating on either of those would switch the coat
+	// on for every uncoated material in the scene.
+	brdf_mat.coatWeight = max(raw_mat.clearcoat, 0.0);
+	brdf_mat.coatRoughness = clamp(raw_mat.clearcoat_roughness, 0.0, 1.0);
+	brdf_mat.coatIor = max(raw_mat.clearcoat_ior, 1.0);
+	brdf_mat.coatTint = max(raw_mat.clearcoat_tint, vec3(0.0));
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
 	// Fix round 1, I2: the transmission weight used to be applied to THIS
@@ -1358,10 +1402,41 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	float specularLum = luminance(specularF0);
 	float diffuseLum = luminance(diffuseReflectance);
 
+	// E2d. cosNI is the UNCLAMPED dot(N, V), and combinedPdf computes the very
+	// same expression from the same N and V -- the two splits have to agree
+	// direction by direction or MIS partitions one integrand while the estimator
+	// evaluates another (the B2 defect class).
+	float cosNI = dot(N, V);
+	float coatMass = coatLobeWeight(brdf_mat, cosNI);
+
 	int brdfType;
-	if (diffuseLum < 0.0001) {
+	bool tookCoatLobe = false;
+	// DEVIATION FROM THE TASK 5 BRIEF, deliberate. The brief replaces only the
+	// weights block, which lives in the `else` of this three-way branch -- but the
+	// first two arms return WITHOUT drawing a lobe or dividing throughput, so a
+	// coat placed only in the `else` would be silently inert on exactly the
+	// materials E2d exists for: `diffuseLum < 0.0001` is a pure metal, and
+	// metal-plus-coat IS car paint, the phase's own stated acceptance target
+	// (E2d spec, section 5 point 4 and section 7 point 4). Gating both fast paths
+	// on `coatMass <= 0.0` keeps them
+	// available to uncoated materials and routes coated ones through the general
+	// selection instead.
+	//
+	// This preserves the phase invariant exactly. coatLobeWeight returns literal
+	// 0.0f below the 1e-5 cutoff and otherwise clamps to [0.01, 0.99], so
+	// `coatMass <= 0.0` is true for precisely the uncoated case; at clearcoat == 0
+	// each condition reduces to the identical expression it replaced, evaluated in
+	// the identical order, and the identical arm is taken.
+	//
+	// The general path handles both degenerate cases correctly on its own:
+	// lobeWeight returns exactly 1.0 when diffuseLum is negligible and exactly 0.0
+	// when specularLum is, so one base weight becomes exactly 0 -- and selectLobe
+	// can never RETURN that index, because a zero increment leaves `acc` where the
+	// previous iteration already failed `u < acc`. The surviving divisor is
+	// baseShare >= 0.01, never zero.
+	if (coatMass <= 0.0 && diffuseLum < 0.0001) {
 		brdfType = SPECULAR_TYPE;
-	} else if (specularLum < 0.0001) {
+	} else if (coatMass <= 0.0 && specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
 		// E2c: routed through the N-way lobe registry (brdf_inc.glsl) --
@@ -1373,16 +1448,62 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// condition the old `<` compare used, so this is a routing change,
 		// not a behaviour change. See RT_DEBUG_PDF_PARITY (vis mode 32) for
 		// why the duplication this replaces is retired, not restored.
+		//
+		// E2d: the coat takes coatMass of the selection mass; the base lobes split
+		// what is left, in their existing proportion. Specular stays at index 0.
+		// At coatMass == 0 baseShare is exactly 1.0f and multiplying by exactly
+		// 1.0f is the IEEE identity, so both base weights are bit-identical to the
+		// E2c form, and weights[LOBE_COAT] == 0.0 is unreachable by selectLobe.
+		float baseShare = 1.0 - coatMass;
+		float pSpec = lobeWeight(brdf_mat);
+
 		float weights[LOBE_COUNT];
-		weights[LOBE_SPECULAR] = lobeWeight(brdf_mat);
-		weights[LOBE_DIFFUSE] = 1.0 - weights[LOBE_SPECULAR];
+		weights[LOBE_SPECULAR] = baseShare * pSpec;
+		weights[LOBE_DIFFUSE] = baseShare * (1.0 - pSpec);
+		weights[LOBE_COAT] = coatMass;
+
+		// STILL exactly one draw, consumed once, unremapped and unrescaled. A
+		// second draw or a remap here shifts every subsequent sample in the path --
+		// statistically valid, bitwise different everywhere, and invisible to every
+		// gate.
 		int lobe = selectLobe(rng_1d(rng, RT_PRNG_LOBE), weights);
-		if (lobe == LOBE_SPECULAR) {
+		if (lobe == LOBE_COAT) {
+			brdfType = COAT_TYPE;
+			tookCoatLobe = true;
+			ps.throughput /= weights[LOBE_COAT];
+		} else if (lobe == LOBE_SPECULAR) {
 			brdfType = SPECULAR_TYPE;
 			ps.throughput /= weights[LOBE_SPECULAR];
 		} else {
 			brdfType = DIFFUSE_TYPE;
 			ps.throughput /= weights[LOBE_DIFFUSE];
+		}
+	}
+
+	// E2d: the layering half. Without it the coat is ADDITIVE -- a lobe that
+	// returns light the base still returns in full -- which is the wrong render,
+	// which is why the lobe and this block land in one commit.
+	if (!tookCoatLobe && brdf_mat.coatWeight > 0.00001) {
+		// closure_layering_weight(a, w) = w * saturate(1 - max(a/w))
+		// (bsdf_util.h:440). The coat's albedo is coatWeight*w*estimate, so the w
+		// cancels and the whole thing reduces to this one line.
+		//
+		// THIS IS A THROUGHPUT FACTOR, NOT A SELECTION PROBABILITY. It must not be
+		// folded into weights[] above -- see the selection-vs-throughput block at
+		// the top of brdf_inc.glsl's registry section. Folding it in and
+		// renormalising would still integrate to the right mean (MIS is unbiased
+		// for ANY weights summing to 1 pointwise), so the error would be
+		// mean-preserving and invisible to every rendered gate this project has.
+		ps.throughput *= clamp(1.0 - coatMass, 0.0, 1.0);
+
+		// Beer's law through the coat. Cycles applies this OUTSIDE the coat lobe's
+		// own reflective_caustics branch (svm/closure.h:155 vs :178), so it is a
+		// separate step and must not be fused with the attenuation above.
+		if (brdf_mat.coatTint != vec3(1.0, 1.0, 1.0)) {
+			float cosNT = sqrt(1.0 - (1.0 / (brdf_mat.coatIor * brdf_mat.coatIor)) * (1.0 - cosNI * cosNI));
+			float opticalDepth = 1.0 / max(cosNT, 0.00001);
+			ps.throughput *= mix(vec3(1.0, 1.0, 1.0),
+					pow(brdf_mat.coatTint, vec3(opticalDepth)), brdf_mat.coatWeight);
 		}
 	}
 
@@ -1604,8 +1725,16 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	//     it outright and must take full weight -- sky seen through glass is
 	//     paid once, in full. This is the same rule as the near-delta case, not
 	//     a new exception.
+	//
+	//   - near-delta COAT (E2d). The same rule as near-delta specular, keyed on
+	//     the coat's OWN roughness: coatPdf (brdf_inc.glsl) returns 0.0 below
+	//     RT_MIS_DELTA_ROUGHNESS for exactly this reason, so without this clause a
+	//     mirror coat would report a mixture pdf built only from the base lobes --
+	//     a density that does not describe how the direction was actually drawn.
+	//     Unreachable while clearcoat is 0, since brdfType is never COAT_TYPE then.
 	if (took_transmissive_lobe || recovered_sample || dot(N, V) <= 0.0 ||
-			(brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)) {
+			(brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS) ||
+			(brdfType == COAT_TYPE && brdf_mat.coatRoughness < RT_MIS_DELTA_ROUGHNESS)) {
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
 	} else {
 		float bsdf_pdf = combinedPdf(N, next_dir, V, brdf_mat);
