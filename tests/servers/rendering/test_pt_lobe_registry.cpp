@@ -233,28 +233,50 @@ TEST_CASE("[PathTracer][LobeRegistry] lobe_weight preserves the degenerate branc
 	CHECK(lobe_weight(0.001f, 1000.0f) == doctest::Approx(0.01f).epsilon(1e-6));
 }
 
-TEST_CASE("[PathTracer][LobeRegistry] the two-lobe weights sum to exactly 1.0f") {
-	// LOAD-BEARING, and not obvious. E2d appends the coat at index 2, and
-	// select_lobe falls through to `return LOBE_COUNT - 1` -- the coat -- for
-	// any u at or above the running weight sum. On a material with no coat that
-	// lobe has weight 0, and the sampler divides throughput by it.
+TEST_CASE("[PathTracer][LobeRegistry] select_lobe never returns a zero-weight lobe") {
+	// LOAD-BEARING for E2d. Task 5 appends the coat at index 2, and on an
+	// uncoated material its weight is 0. select_lobe falls through to
+	// `return p_n - 1` -- the coat -- for any u at or above the running weight
+	// sum, and the sampler divides throughput by the selected lobe's weight.
+	// If that fallback were reachable with a zero-weight lobe last, the render
+	// would grow NaNs at a rate no mean-based gate would attribute correctly.
 	//
-	// That fallback is unreachable ONLY because fl(p) + fl(1-p) is exactly 1.0f
-	// for every float32 p, so the residue window is empty and u < 1.0f always
-	// holds (rng_1d bottoms out in sb_uint_to_float_excl, so u lies in [0,1)
-	// strictly). For p >= 0.5 that is Sterbenz's lemma; below it the rounding
-	// error is at most a half-ulp of 1.0 and rounds back to 1.0.
+	// An earlier version of this case asserted `p + (1.0f - p) == 1.0f` over a
+	// list of p values. That is true for EVERY float32 p as a consequence of
+	// IEEE-754 rounding, so it could not fail, and it never called the real
+	// weight function -- the same defect class the case was written to close.
 	//
-	// Pin it, because it is the reason no zero-division guard is needed. If a
-	// later change computes the diffuse weight some other way -- say
-	// 1.0f - clamp(p, ...) against a differently-clamped p -- this fails and
-	// says why, instead of the render growing NaNs at a 1-in-10-million rate
-	// that no mean-based gate would attribute correctly.
-	const float ps[] = { 0.01f, 0.0700001f, 0.37f, 0.5f, 0.6180339f, 0.73f, 0.99f };
-	for (float p : ps) {
-		CAPTURE(p);
-		const float weights[LOBE_COUNT] = { p, 1.0f - p };
-		CHECK(weights[0] + weights[1] == 1.0f);
+	// This version calls the REAL lobe_weight, builds the pair exactly as the
+	// sampler does (w1 = 1 - w0), appends the zero third entry Task 5 appends,
+	// and asserts on select_lobe's OUTPUT. It fails if lobe_weight's clamp
+	// bounds change, if the diffuse weight is ever computed some other way, or
+	// if select_lobe's accumulation changes -- any of which can make index 2
+	// reachable.
+	const float lums[][2] = {
+		{ 0.04f, 0.5f }, { 0.5f, 0.04f }, { 1.0f, 1.0f },
+		{ 0.9f, 0.1f }, { 0.001f, 0.999f }, { 0.37f, 0.63f },
+		{ 2.5f, 0.125f }, { 0.125f, 2.5f },
+	};
+	// 0.99999994f is the largest float32 strictly below 1.0. rng_1d returns
+	// [0,1) (sb_uint_to_float_excl, sobol_burley_inc.glsl:118), so that is the
+	// worst case the sampler can actually hand select_lobe.
+	const float us[] = { 0.0f, 0.5f, 0.9f, 0.999f, 0.999999f, 0.99999994f };
+
+	for (const float *lum : lums) {
+		CAPTURE(lum[0]);
+		CAPTURE(lum[1]);
+		const float w0 = lobe_weight(lum[0], lum[1]);
+		const float weights3[3] = { w0, 1.0f - w0, 0.0f };
+
+		for (float u : us) {
+			CAPTURE(u);
+			const int selected = select_lobe(u, weights3, 3);
+			// The real assertion: whatever lobe comes back must have weight the
+			// sampler can divide by.
+			CHECK(weights3[selected] > 0.0f);
+			// And with a zero third entry it must specifically never be index 2.
+			CHECK(selected != 2);
+		}
 	}
 }
 
