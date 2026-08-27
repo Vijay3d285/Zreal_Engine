@@ -869,6 +869,27 @@ void debug_visualize(
 	} else if (vis_mode == 37) {
 		// E2d arrival gate: the tint, straight through.
 		ps.radiance = dbg_material.clearcoat_tint;
+	} else if (vis_mode == 38) {
+		// E2d: coatAlbedoEstimate evaluated on the GPU, so the gate can compare
+		// it against test_pt_coat_albedo.cpp's CPU mirror. A transcription slip
+		// between the two -- a swapped F0/z, a half-texel index -- produces a
+		// plausible render and no failing test WITHOUT this readout, because
+		// the estimate only ever appears multiplied into an attenuation.
+		//
+		// r = estimate at this hit's cos(N,V); g = estimate forced to cosNI 1.0
+		// (normal incidence, must approach F0); b = forced to cosNI 0.0
+		// (grazing, must approach 1).
+		//
+		// Uses the NdotV parameter (dot(final_normal, V), floor-clamped to
+		// 0.0001 by the caller) rather than a bare `dot(N, V)`: this function has
+		// no `N` in scope -- that identifier is a local of shade_and_bounce(),
+		// a different function below -- NdotV is the already-computed equivalent
+		// quantity other debug modes in this function already use (see vis
+		// modes 11/17 above, DLSSRR_computeSpecularAlbedo's NdotV argument).
+		ps.radiance = vec3(
+				coatAlbedoEstimate(dbg_material.clearcoat_roughness, NdotV, dbg_material.clearcoat_ior),
+				coatAlbedoEstimate(dbg_material.clearcoat_roughness, 1.0, dbg_material.clearcoat_ior),
+				coatAlbedoEstimate(dbg_material.clearcoat_roughness, 0.0, dbg_material.clearcoat_ior));
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

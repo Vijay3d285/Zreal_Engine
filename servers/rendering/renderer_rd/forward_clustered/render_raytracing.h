@@ -489,6 +489,16 @@ class RenderRaytracing {
 	RID emissive_fallback_buffer;
 	RID _get_emissive_fallback_buffer();
 
+	// E2d: directional-albedo LUT for the clearcoat layer (GGX_COAT_ALBEDO_TABLE,
+	// ggx_coat_albedo_table.h). Fixed content, uploaded once and reused every
+	// frame -- unlike env_dist_fallback_buffer/emissive_fallback_buffer above,
+	// this is not a stand-in for a disabled feature; it is bound at set 0
+	// binding 38 unconditionally. Read in brdf_inc.glsl (coatLutRead1D/2D/3D,
+	// coatAlbedoEstimate). No non-debug consumer yet -- Task 5 wires it into
+	// shading; today only vis mode 38 reads it back.
+	RID coat_albedo_buffer;
+	RID _get_coat_albedo_buffer();
+
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
 		uint32_t mm_validator = 0; // High 32 bits of MM RID id at last access.

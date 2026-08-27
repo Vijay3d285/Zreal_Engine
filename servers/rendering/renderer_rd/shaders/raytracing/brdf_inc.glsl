@@ -1788,6 +1788,99 @@ float lobeWeight(MaterialProperties material) {
 	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
 }
 
+// ---------------------------------------------------------------------------
+// E2d: coat directional-albedo LUT (GGX_COAT_ALBEDO_TABLE, Task 1's C++ header).
+//
+// The SSBO is declared HERE, inside brdf_inc.glsl, rather than hoisted up into
+// scene_raytracing_raygen.glsl the way GeometryBuffer/MaterialBuffer/MotionTransforms
+// are. Those three are hoisted because several different _inc.glsl files consume
+// them; this table has exactly one consumer -- the functions immediately below --
+// so it follows the raytracing_env_sampling_inc.glsl / raytracing_emissive_inc.glsl
+// convention of a feature-local SSBO declared in the file that reads it.
+//
+// This ALSO happens to be load-bearing for correctness, not just consistency:
+// brdf_inc.glsl (guarded by BRDF_HLSLI, so each stage still only sees it once) is
+// textually #include'd by BOTH the miss and closest_hit stage blocks of
+// scene_raytracing_raygen.glsl. A declaration placed only in the closest_hit
+// stage's own block, after its brdf_inc.glsl include, would leave `coat_albedo_table`
+// undeclared when the miss stage's copy of this same function body is compiled --
+// even though nothing in the miss stage ever calls coatAlbedoEstimate. Declaring it
+// here means the declaration is pasted into both stages together with the
+// functions that use it, and both compile.
+layout(set = 0, binding = 38, std430) readonly buffer CoatAlbedoTable {
+	float data[];
+}
+coat_albedo_table;
+
+// Cycles' lookup_table_read* (intern/cycles/kernel/util/lookup_table.h:14-71),
+// transcribed. ENDPOINT-ALIGNED: [0,1] maps onto [0, size-1] and lerps between
+// integer entries.
+//
+// DO NOT replace this with a hardware-filtered 3D texture. Hardware filtering
+// is half-texel-centered; it would compile, render plausibly, and be wrong by
+// half a texel at every lookup -- a small, uniform, entirely silent energy
+// error. test_pt_coat_albedo.cpp's midpoint cases exist to catch exactly that,
+// and they only guard the CPU mirror; this function is on its honour.
+float coatLutRead1D(int base, float x, int size) {
+	x = clamp(x, 0.0f, 1.0f) * float(size - 1);
+	int index = min(int(x), size - 1);
+	int nindex = min(index + 1, size - 1);
+	float t = x - float(index);
+	float data0 = coat_albedo_table.data[base + index];
+	if (t == 0.0f) {
+		return data0;
+	}
+	return (1.0f - t) * data0 + t * coat_albedo_table.data[base + nindex];
+}
+
+float coatLutRead2D(int base, float x, float y, int xsize, int ysize) {
+	y = clamp(y, 0.0f, 1.0f) * float(ysize - 1);
+	int index = min(int(y), ysize - 1);
+	int nindex = min(index + 1, ysize - 1);
+	float t = y - float(index);
+	float data0 = coatLutRead1D(base + xsize * index, x, xsize);
+	if (t == 0.0f) {
+		return data0;
+	}
+	return (1.0f - t) * data0 + t * coatLutRead1D(base + xsize * nindex, x, xsize);
+}
+
+#define GGX_COAT_TABLE_DIM 16
+
+float coatLutRead3D(float x, float y, float z) {
+	const int d = GGX_COAT_TABLE_DIM;
+	z = clamp(z, 0.0f, 1.0f) * float(d - 1);
+	int index = min(int(z), d - 1);
+	int nindex = min(index + 1, d - 1);
+	float t = z - float(index);
+	float data0 = coatLutRead2D(d * d * index, x, y, d, d);
+	if (t == 0.0f) {
+		return data0;
+	}
+	float data1 = coatLutRead2D(d * d * nindex, x, y, d, d);
+	return (1.0f - t) * data0 + t * data1;
+}
+
+// Directional albedo of the coat, following bsdf_microfacet_estimate_albedo's
+// dielectric branch (bsdf_microfacet.h:556-579) -- reflection only, since the
+// coat is neither a glass closure nor DIELECTRIC_TINT.
+//
+// Writing q = (ior-1)/(ior+1): F0 SQUARES q, z takes its square ROOT. Opposite
+// directions from the same quantity. Swapping them type-checks.
+//
+// cosNI is deliberately NOT clamped here. Cycles does not clamp it either
+// (bsdf_microfacet.h:504); the clamp inside coatLutRead3D absorbs a negative
+// onto the cosNI = 0 row. Adding a clamp of our own would diverge.
+float coatAlbedoEstimate(float coatRoughness, float cosNI, float ior) {
+	float alpha = coatRoughness * coatRoughness;
+	float rough = sqrt(sqrt(alpha * alpha)); // sqrt(sqrt(ax*ay)); ax == ay for the coat.
+	float q = (ior - 1.0f) / (ior + 1.0f);
+	float f0 = q * q;
+	float z = sqrt(abs(q));
+	float s = coatLutRead3D(rough, cosNI, z);
+	return mix(f0, 1.0f, s);
+}
+
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
 // which today's `u < brdfProbability` picks SPECULAR_TYPE.
 int selectLobe(float u, float weights[LOBE_COUNT]) {

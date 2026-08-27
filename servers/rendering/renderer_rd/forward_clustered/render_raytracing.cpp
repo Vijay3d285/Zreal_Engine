@@ -33,6 +33,7 @@
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
+#include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
@@ -85,6 +86,11 @@ RenderRaytracing::~RenderRaytracing() {
 		emissive_fallback_buffer = RID();
 	}
 
+	if (coat_albedo_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(coat_albedo_buffer);
+		coat_albedo_buffer = RID();
+	}
+
 	emissive_lights.free_resources();
 
 	if (bindless_block) {
@@ -124,6 +130,26 @@ RID RenderRaytracing::_get_emissive_fallback_buffer() {
 	const uint8_t zeros[16] = {};
 	emissive_fallback_buffer = RD::get_singleton()->storage_buffer_create(sizeof(zeros), Span<uint8_t>(zeros, sizeof(zeros)));
 	return emissive_fallback_buffer;
+}
+
+// E2d: directional-albedo LUT for the clearcoat layer. Unlike the two fallback
+// buffers above, this is not a stand-in for a disabled feature -- it is the
+// real, only content ever bound at binding 38 -- but it shares their
+// create-once-and-cache shape (mirrors GGX_COAT_ALBEDO_TABLE from Task 1's
+// ggx_coat_albedo_table.h verbatim; nothing computes or mutates it after
+// upload).
+RID RenderRaytracing::_get_coat_albedo_buffer() {
+	if (coat_albedo_buffer.is_valid()) {
+		return coat_albedo_buffer;
+	}
+	Vector<uint8_t> bytes;
+	bytes.resize(sizeof(GGX_COAT_ALBEDO_TABLE));
+	memcpy(bytes.ptrw(), GGX_COAT_ALBEDO_TABLE, sizeof(GGX_COAT_ALBEDO_TABLE));
+	coat_albedo_buffer = RD::get_singleton()->storage_buffer_create(bytes.size(), bytes);
+	if (coat_albedo_buffer.is_valid()) {
+		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT Coat Albedo Table");
+	}
+	return coat_albedo_buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -4074,6 +4100,18 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			u.append_id((emissive_ready && slot.is_valid()) ? slot : _get_emissive_fallback_buffer());
 			uniforms.push_back(u);
 		}
+	}
+
+	// Binding 38: E2d coat directional-albedo LUT (GGX_COAT_ALBEDO_TABLE).
+	// Always bound -- unlike 31/34-37 above, there is no disabled-feature
+	// fallback path here; _get_coat_albedo_buffer() lazily uploads the fixed
+	// table once and caches the RID for every frame after.
+	{
+		RD::Uniform u;
+		u.binding = 38;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(_get_coat_albedo_buffer());
+		uniforms.push_back(u);
 	}
 
 	// Use the pipeline-side shader so UniformSetFormat matches at bind time.
