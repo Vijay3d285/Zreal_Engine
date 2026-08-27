@@ -21,6 +21,7 @@ Copied verbatim from the spec (`docs/superpowers/specs/2026-08-27-clearcoat-coat
 - **Cycles clamps:** `coat_weight` skipped below `CLOSURE_WEIGHT_CUTOFF` = `1e-5f` (`svm/types.h:576`); `coat_roughness` via `saturatef`; `coat_ior` via `fmaxf(·, 1.0f)`; `coat_tint` via `max(·, 0)` (`closure.h:148-150`).
 - **Tint is applied outside the coat-lobe branch** (`closure.h:155` vs `:178`). Two separate steps; do not fuse them into one branch.
 - **The near-delta specular guard (`RT_MIS_DELTA_ROUGHNESS`) and the `VplusL` degenerate check in `combinedPdf` must survive verbatim** and must not be folded into the registry.
+- **Every lobe's selection weight is clamped to `[0.01, 0.99]` when that lobe is active.** The sampler divides throughput by the selected weight, so an unclamped weight is an unbounded variance source. `lobeWeight` already does this; `coatLobeWeight` must match it.
 - **sRGB:** every colour factor is sRGB-decoded on upload — `albedo_color` (`render_raytracing.cpp:1542`), `attenuation_color` (`:1745`), `specular_tint` (`:1766`). `clearcoat_tint` follows the same path. Any Cycles-comparison material must author colours with `.linear_to_srgb()`.
 - **Gap #17 applies to the coat.** The multi-scatter term over-corrects by 3-8pp. Do not attempt to fix it; report raw and adjusted figures side by side.
 - **NEVER touch, stage, revert, checkout over, or stash these six files** — they are the user's uncommitted work: `pipeline_references/compositor_effect.gd`, `image_glb_creation.gd`, `render.gd`, `structure.gd`, `video_glb_creation.gd`, `custom_shape.gd`. Use `git add` with **explicit paths only**, never `-A` or `.`.
@@ -308,7 +309,7 @@ git commit -m "test(pt): E2d coat albedo LUT and its endpoint-aligned indexing"
 
 **Interfaces:**
 - Consumes: the existing `LOBE_SPECULAR`/`LOBE_DIFFUSE`/`LOBE_COUNT`, `lobeWeight`, `selectLobe`, `combineLobePdf`.
-- Produces: `float combineLobePdfScaled(float weights[LOBE_COUNT], float pdfs[LOBE_COUNT])` — unchanged semantics, added for symmetry is **not** wanted; instead this task produces **`LOBE_THROUGHPUT_IDENTITY`** and the convention documented below. No signature changes.
+- Produces: no new function and **no new constant** — only the documented convention below, plus a doctest that pins the fact the convention rests on. No signature changes. An earlier draft of this plan introduced a `LOBE_THROUGHPUT_IDENTITY 1.0f` that nothing would have referenced: dead code the reviewer would rightly flag, mandated by the plan. Removed.
 
 **What this task actually does.** It introduces the *concept* and its documentation without changing any arithmetic, exactly as E2c's Task 2 added the registry with no consumers. `LOBE_COUNT` stays 2. Nothing renders differently.
 
@@ -342,7 +343,6 @@ In `brdf_inc.glsl`, immediately after the `#define LOBE_COUNT 2` block, insert:
 //
 // So: weights[] stays the selection array. Throughput scales are applied to
 // ps.throughput at the call site, never mixed into weights[].
-#define LOBE_THROUGHPUT_IDENTITY 1.0f
 // ---------------------------------------------------------------------------
 ```
 
@@ -351,25 +351,29 @@ In `brdf_inc.glsl`, immediately after the `#define LOBE_COUNT 2` block, insert:
 Append to `tests/servers/rendering/test_pt_lobe_registry.cpp`, inside the existing namespace, before the closing brace:
 
 ```cpp
-TEST_CASE("[PathTracer][LobeRegistry] a unit throughput scale changes nothing") {
-	// E2d introduces per-lobe throughput scales distinct from selection
-	// weights. At N == 2 every scale is 1.0, so this pins the reduction: the
-	// scaled combination must equal the unscaled one bit-for-bit, or E2d has
-	// already changed the render before it has added a lobe.
-	const float p_spec = 0.42f;
-	const float weights[LOBE_COUNT] = { p_spec, 1.0f - p_spec };
-	const float pdfs[LOBE_COUNT] = { 2.2875f, 0.28f };
-	const float throughput[LOBE_COUNT] = { 1.0f, 1.0f };
-
-	const float unscaled = combine_pdf(weights, pdfs, LOBE_COUNT);
-
-	float scaled = 0.0f;
-	for (int i = 0; i < LOBE_COUNT; i++) {
-		scaled += weights[i] * pdfs[i] * throughput[i];
+TEST_CASE("[PathTracer][LobeRegistry] the two-lobe weights sum to exactly 1.0f") {
+	// LOAD-BEARING, and not obvious. E2d appends the coat at index 2, and
+	// select_lobe falls through to `return LOBE_COUNT - 1` -- the coat -- for
+	// any u at or above the running weight sum. On a material with no coat that
+	// lobe has weight 0, and the sampler divides throughput by it.
+	//
+	// That fallback is unreachable ONLY because fl(p) + fl(1-p) is exactly 1.0f
+	// for every float32 p, so the residue window is empty and u < 1.0f always
+	// holds (rng_1d bottoms out in sb_uint_to_float_excl, so u lies in [0,1)
+	// strictly). For p >= 0.5 that is Sterbenz's lemma; below it the rounding
+	// error is at most a half-ulp of 1.0 and rounds back to 1.0.
+	//
+	// Pin it, because it is the reason no zero-division guard is needed. If a
+	// later change computes the diffuse weight some other way -- say
+	// 1.0f - clamp(p, ...) against a differently-clamped p -- this fails and
+	// says why, instead of the render growing NaNs at a 1-in-10-million rate
+	// that no mean-based gate would attribute correctly.
+	const float ps[] = { 0.01f, 0.0700001f, 0.37f, 0.5f, 0.6180339f, 0.73f, 0.99f };
+	for (float p : ps) {
+		CAPTURE(p);
+		const float weights[LOBE_COUNT] = { p, 1.0f - p };
+		CHECK(weights[0] + weights[1] == 1.0f);
 	}
-	// Bit-exact, not Approx: multiplying by exactly 1.0f is the identity in
-	// IEEE-754, so any difference here means the loop is not what it looks like.
-	CHECK(scaled == unscaled);
 }
 ```
 
@@ -381,6 +385,10 @@ bin/godot.windows.editor.x86_64.console.exe --headless --test --test-case="*Lobe
 ```
 
 Expected: 7 cases (6 existing + 1 new), all passing.
+
+**Do not weaken the new case to `doctest::Approx`.** Bit-exactness is the
+property being asserted; a tolerance would pass on precisely the drift the
+case exists to catch.
 
 - [ ] **Step 4: Verify nothing renders differently**
 
@@ -761,8 +769,8 @@ git commit -m "feat(pt): E2d coat albedo LUT on the GPU with endpoint-aligned re
 - Modify: `servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl` (sampler, throughput)
 
 **Interfaces:**
-- Consumes: `coatAlbedoEstimate` (Task 4), `LOBE_THROUGHPUT_IDENTITY` and the convention (Task 2), `material.clearcoat_ior` / `clearcoat_tint` (Task 3).
-- Produces: `LOBE_COAT = 2`, `LOBE_COUNT = 3`; `float coatLobeWeight(MaterialProperties material)`; `float3 evalCoat(...)`; `float coatPdf(...)`.
+- Consumes: `coatAlbedoEstimate` (Task 4), the selection-vs-throughput convention (Task 2), `material.clearcoat_ior` / `clearcoat_tint` (Task 3).
+- Produces: `LOBE_COAT = 2`, `LOBE_COUNT = 3`; `float coatLobeWeight(MaterialProperties material, float cosNI)`; `float3 evalCoat(...)`; `float coatPdf(...)`.
 
 **These land in one commit on purpose.** A coat lobe without attenuation is an additive coat — the wrong render. Attenuation without the lobe loses energy with nothing to receive it. Every intermediate state is a wrong render, so there is no honest place to split. This mirrors E2c's Task 3, which switched both registry consumers together for the same reason.
 
@@ -808,12 +816,26 @@ Add the coat's selection weight:
 // actually returns.
 //
 // Below CLOSURE_WEIGHT_CUTOFF (1e-5, svm/types.h:576) Cycles skips the coat
-// entirely; returning 0 here does the same, and selectLobe will never pick it.
+// entirely; returning 0 here does the same.
+//
+// THE CLAMP IS NOT COSMETIC. The sampler divides throughput by the selected
+// lobe's weight, so an unclamped mass is an unbounded variance source: a coat
+// just above the cutoff with a typical estimate near 0.04 yields ~4e-7, and
+// dividing by that is a 2.5-million-fold spike -- fireflies on any faintly
+// coated material. Symmetrically, a mass near 1 drives baseShare toward 0 and
+// does the same to the specular and diffuse divisors.
+//
+// lobeWeight (above) already ends in clamp(..., 0.01f, 0.99f) for exactly this
+// reason. Mirror it rather than inventing a different bound. Cycles does not
+// clamp its sample_weight, but Cycles carries variance machinery this
+// integrator does not; matching its noise profile is not the goal, matching
+// its IMAGE is, and an unbounded divisor changes the image through noise.
 float coatLobeWeight(MaterialProperties material, float cosNI) {
 	if (material.coatWeight <= 0.00001f) {
 		return 0.0f;
 	}
-	return material.coatWeight * coatAlbedoEstimate(material.coatRoughness, cosNI, material.coatIor);
+	float mass = material.coatWeight * coatAlbedoEstimate(material.coatRoughness, cosNI, material.coatIor);
+	return clamp(mass, 0.01f, 0.99f);
 }
 ```
 
@@ -868,7 +890,8 @@ Immediately **after** the selection block, and only when the chosen lobe is a ba
 			// the w cancels and the whole thing reduces to this one line.
 			//
 			// THIS IS A THROUGHPUT FACTOR, NOT A SELECTION PROBABILITY. It must
-			// not be folded into weights[] above -- see LOBE_THROUGHPUT_IDENTITY.
+			// not be folded into weights[] above -- see the selection-vs-throughput
+			// block at the top of brdf_inc.glsl's registry section.
 			ps.throughput *= clamp(1.0 - coatMass, 0.0, 1.0);
 
 			// Beer's law through the coat. Cycles applies this OUTSIDE the coat
@@ -951,7 +974,11 @@ Expected: doctest 1534/0/3, and **all three gates still PASS** — every existin
 E2c's three-lobe proof was inert by construction. This is the first real N=3, so confirm by reading the code and report in writing:
 
 1. **Summation order.** At N=2 order was unfalsifiable (IEEE addition is commutative bit-exactly). At N=3 it is *associativity*. Confirm `combineLobePdf` still accumulates specular, then diffuse, then coat, in registry order.
-2. **The trailing fallback.** `selectLobe` falls through to `return LOBE_COUNT - 1`, which now returns **coat**. Confirm that is correct: the fallback absorbs the weight-sum rounding residue, and coat is a real lobe that can receive it. Confirm `weights[LOBE_COAT] > 0` whenever that path is reachable — if `coatMass` is 0 the residue would land on a zero-weight lobe and divide by zero.
+2. **The trailing fallback.** `selectLobe` falls through to `return LOBE_COUNT - 1`, which now returns **coat**. On an uncoated material `weights[LOBE_COAT]` is 0, and the sampler would divide throughput by it.
+
+   **That path is unreachable, and Task 2's doctest is what pins why** — do **not** add a guard for it. With `coatMass == 0`, `baseShare` is exactly `1.0f`, so the base weights are `fl(pSpec)` and `fl(1.0f - pSpec)`, which sum to exactly `1.0f` for every float32 `pSpec` (Sterbenz above 0.5; a half-ulp that rounds back below it — verified over 10M samples). `rng_1d` bottoms out in `sb_uint_to_float_excl` (`sobol_burley_inc.glsl:118`), so `u` lies in `[0,1)` strictly and `u < 1.0f` always holds. The residue window is empty.
+
+   Confirm both halves by reading the code — the exact sum, and the exclusive upper bound on `u`. If either stops holding, Task 2's doctest fails first and names the reason. Report what you found; do not assume this note is still true.
 
 - [ ] **Step 9: Commit**
 
