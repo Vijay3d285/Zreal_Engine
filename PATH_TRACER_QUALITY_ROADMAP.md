@@ -797,7 +797,7 @@ GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_h
 
 **E2. Anisotropy, clearcoat, sheen** — anisotropy portion **COMPLETE (E2b)**, clearcoat/sheen **NOT STARTED**
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint and velvet: not met** — clearcoat and sheen lobes do not exist yet; carried to E2c/E2d (§7.8, spec §9) along with the two-way→N-way lobe-selection rewrite and anisotropy on the transmissive lobe.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint and velvet: not met** — clearcoat and sheen lobes do not exist yet; carried to E2d/E2e (§7.8, spec §9). The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9); anisotropy on the transmissive lobe remains.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -2221,9 +2221,10 @@ a GPU furnace/pdf-parity gate, and the Cycles comparison above. **What
 remains under the original E2 heading, per spec §9, is explicitly out of
 scope for this phase and carried to its named successors:**
 
-- **Clearcoat** and **sheen** lobes — not started (E2c/E2d).
+- **Clearcoat** and **sheen** lobes — not started (E2d/E2e).
 - **The two-way → N-way lobe-selection rewrite** — still two-way; adding
   clearcoat/sheen as real third/fourth lobes requires this first (E2c).
+  **Landed after this closeout was written — see §7.9.**
 - **Anisotropy on the transmissive lobe, as a real, evaluated feature — still
   out of scope, but not for the reason a quick read suggests.** Cycles
   applies `alpha_x`/`alpha_y` to its glass closure too
@@ -2243,4 +2244,162 @@ scope for this phase and carried to its named successors:**
   a strategy against a refracted direction at all, matching the pre-existing,
   already-documented "NEE through refractive lobes is unimplemented" gap
   (E1 closeout). Genuine anisotropic glass needs that eval/pdf machinery
-  built first; remains an E2c/E2d item (spec §9).
+  built first; remains an E2d/E2e item (spec §9).
+
+### 7.9 E2c - N-way lobe rewrite
+
+**Status: landed. Ships no feature, by design.** The hardcoded two-way
+`DIFFUSE_TYPE`/`SPECULAR_TYPE` selection is replaced by a registry — a
+`LOBE_COUNT`-sized weight array, a CDF walk (`selectLobe`), and a
+per-lobe weighted pdf sum (`combineLobePdf`) — all in
+`brdf_inc.glsl:1732-1786`. `LOBE_COUNT` is **2**. Nothing renders
+differently, and that is the whole acceptance criterion. Full task-by-task
+record: `.superpowers/sdd/2026-08-23-n-way-lobe-rewrite/task-{1..4}-report.md`.
+
+What it bought: clearcoat (E2d) and sheen (E2e) each add a lobe, and each
+would otherwise have had to invent the selection and combination machinery
+*while* also getting its own BRDF right. Those two risks are now separated,
+and the machinery half was validated against a configuration whose correct
+answer is already known — today's image.
+
+**The two duplicated lobe-probability functions are unified.**
+`combinedPdfLobeProbability` and `samplerLobeProbability` computed the
+identical formula from identical inputs, deliberately, so that a desync
+between the sampler's split and `combinedPdf`'s stayed representable. Both
+are deleted; `lobeWeight` is the single source.
+
+The old comment's reasoning no longer holds. The detector it named compared
+the two values side by side — a comparison of two evaluations of *one*
+formula. E2b's final review established that construction is a tautology in
+vis mode 35 and cannot fail, and replaced it with a self-normalizing
+instrument: draw from the real sampler, accumulate `1/pdf`, compare the mean
+to the domain's measure. A pdf wrong by factor `k` reads `1/k` whether or not
+a second copy of the formula exists. Unification therefore makes the desync
+structurally **impossible** while leaving it **detectable**. `lobeWeight`
+carries this in a comment so the duplication is not restored on the strength
+of the old one.
+
+**Two constraints future lobe work must honour.** Both are invisible to every
+gate this project has, which is why they are recorded here rather than left
+in the code:
+
+1. **Specular is lobe index 0.** A CDF draw selects lobe 0 when `u < cdf[0]`.
+   A diffuse-first registry would select *diffuse* on exactly the inputs where
+   today's code selects *specular*, inverting every pixel's lobe choice. The
+   image stays statistically identical, so every gate still passes and the
+   output is bitwise unrecognisable. Registry order is contract, not detail.
+2. **One RNG draw, on `RT_PRNG_LOBE`, consumed once.** A selection that draws
+   a second value, remaps `u`, or rescales it into a sub-interval shifts every
+   subsequent sample in the path — again a statistically valid render that is
+   bitwise different everywhere, and again invisible to every gate.
+
+**Step 1 result — a zero-weight third lobe is inert.** `LOBE_COUNT` was
+temporarily raised to 3 with a third entry of weight `0.0` and pdf `0.0` added
+at both consumer sites, rebuilt, and gated; then reverted to 2, rebuilt, and
+gated again. **Neither `selectLobe` nor `combineLobePdf` was touched to do
+it** — that is acceptance criterion 4, met as worded.
+
+Both gates PASS at N=3 and at N=2. The measured figures differ between the two
+builds, so a **same-binary control** was run — the N=2 build gated twice — to
+establish what run-to-run noise looks like before attributing anything to the
+third lobe:
+
+| metric | N=3 | N=2 run A | N=2 run B | treatment delta | control delta |
+|---|---|---|---|---|---|
+| energy, bumpy normal-mapped mean | 1.42073 | 1.42098 | 1.42006 | 2.5e-4 | **9.2e-4** |
+| energy, smooth mirror mean | 1.48897 | 1.48915 | 1.48906 | 1.8e-4 | 9.0e-5 |
+| energy, rough metal mean | 1.70837 | 1.70831 | 1.70822 | 6.0e-5 | 9.0e-5 |
+| aniso, probe 1b NEE-dominant mean | 1.345898 | 1.345912 | 1.345915 | 1.4e-5 | 3.0e-6 |
+| aniso, worst furnace deviation | 1.080978 | 1.080981 | 1.080982 | 3.0e-6 | 1.0e-6 |
+
+The N=3-vs-N=2 differences sit inside the same-binary band; on `bumpy` the
+control spread is nearly **4x larger** than the treatment spread. Verdict: the
+third lobe changed nothing these instruments can resolve. No normalisation bug
+was hiding at N=2.
+
+One mechanism is worth carrying forward, because it is why the test was inert
+rather than merely lucky. `selectLobe`'s loop runs to `LOBE_COUNT - 1` and
+falls through to `return LOBE_COUNT - 1`, so the last lobe absorbs the float
+rounding residue of the weight sum — the standard CDF-walk idiom, and correct
+when the last lobe is real. With a *trailing zero-weight* lobe, the handful of
+draws in that residue window (at most ~1 ULP of 1.0) returned index 2, which
+the sampler's `else` branch mapped onto the diffuse path with the same
+throughput divisor they would have taken at N=2. Identical behaviour, not an
+accident. **E2d and E2e add real lobes, so the fallback is correct for them;
+the note is that a zero-weight lobe must not be placed last.**
+
+**Bit-identity was verified structurally, not by pixels.** This is the phase's
+central claim and the gates cannot carry it. `pt_validation`'s `mean_luma` has
+a documented ~1e-5 run-to-run floor on an *identical binary*, from GPU float
+non-associativity in the accumulation reduction — the control column above
+measures that floor directly. A gate matching to five decimal places proves
+the refactor did not change behaviour meaningfully. **It does not prove
+bit-identity, and nothing in this closeout claims it does.** The evidence is a
+reviewer tracing three properties through the shipped diff:
+
+- **Lobe order.** `LOBE_SPECULAR` is 0; at `LOBE_COUNT == 2` the CDF loop runs
+  once and `acc = 0.0f + weights[0]`, which is bit-exact under IEEE-754, so
+  `selectLobe` returns specular on precisely `u < weights[0]` — the identical
+  predicate to the old `rng_1d(...) < brdfProbability`. NaN behaviour is
+  preserved too (a NaN weight compares false, giving diffuse, as before).
+- **RNG draw.** Exactly one `rng_1d(rng, RT_PRNG_LOBE)` in the whole raytracing
+  tree, passed straight into `selectLobe` with no remap, rescale, clamp, or
+  second draw. `lobeWeight` is evaluated in a prior statement exactly as
+  `samplerLobeProbability` was, so the RNG advances at the same point and every
+  downstream draw sees identical state.
+- **Summation order.** `combineLobePdf` seeds `acc = 0.0f` and accumulates
+  specular then diffuse, matching the expression it replaces.
+
+**The one documented exception.** C parses `a * b * c` as `(a * b) * c`, so the
+old code computed `(pSpec * specularContribution) * transmitScale`. The
+registry folds `transmitScale` into the specular pdf entry, computing
+`pSpec * (specularContribution * transmitScale)`. Mathematically equal, **1 ULP
+apart in float32** — relative difference `1.06e-7`. Found by the phase's own
+doctest before any shader was touched.
+
+It was accepted rather than engineered around: contorting the registry to
+preserve one grouping would make it something other than a uniform sum, which
+is precisely what E2d and E2e build on, and every future lobe would reintroduce
+the question. At `1.06e-7` it is two orders of magnitude below the `mean_luma`
+floor, so no instrument in this project can resolve it. **The claim was
+weakened rather than the code**: this phase is identical to today except for
+one documented reassociation on the specular term. A doctest case pins the gap
+— both that the two groupings differ at all (a tripwire against the compiler
+contracting them) and that the magnitude stays in `1e-8 < rel < 2e-7` — so it
+is a recorded fact rather than a puzzle for whoever next compares the two
+expressions.
+
+**Verification summary.** doctest **1527 passed / 0 failed / 3 skipped**
+(2,066,534 assertions); `pt_energy_gate` PASS; `pt_anisotropy_gate` PASS within
+its +/-0.5pp measured-intact bands; `pt_transmission_gate` exit 0 with 44
+checks.
+
+**Open items carried out of E2c.**
+
+- **`pt_transmission_gate` probe 6 is bimodal.** It has been observed at ~4.069
+  (three times, including this phase) and ~5.04 (many times, across E2b), on
+  binaries that differ in ways that cannot reach it — this phase's fix round
+  has zero diff in `brdf_inc.glsl` while probe 6 exercises the real non-debug
+  TIR path. E2b saw 4.069235 identical to six decimal places across two
+  separate launches, then ~5.04 six times on the *same unchanged binary*, which
+  is inconsistent with a deterministic regression. Flaky, not caused by this
+  refactor, not chased here.
+- **Lobe-order test coverage.** Both order tests exercise only `p_spec = 0.37`,
+  i.e. `< 0.5`. A hypothetical `selectLobe` picking by min/max weight rather
+  than positional order would coincidentally agree at that value and pass both.
+  A single `p_spec > 0.5` case closes it. This matters more than a routine gap
+  because that suite is the **only** safety net for lobe order, which no
+  rendered image can see.
+- **Non-default `SPECULAR_BRDF` / `MICROFACET_DISTRIBUTION` configurations no
+  longer compile** (inherited from E2b, unchanged here).
+
+**Phase table.** Under section 4's "E2. Anisotropy, clearcoat, sheen":
+anisotropic GGX is complete (section 7.8), and **the two-way to N-way
+lobe-selection rewrite is now complete**. What remains under that heading is
+**clearcoat (E2d)** and **sheen (E2e)** — neither started — plus anisotropy on
+the transmissive lobe, which still needs the refracted-direction eval/pdf
+machinery described at the end of section 7.8. Cycles'
+`closure_layering_weight` attenuation semantics
+(`intern/cycles/kernel/svm/closure.h:141` sheen, `:174` coat) arrive with the
+first real layer in E2d; this phase deliberately changed no layering
+semantics, only selection and combination.
