@@ -96,13 +96,26 @@ TEST_CASE("[PathTracer][LobeRegistry] specular is index 0") {
 TEST_CASE("[PathTracer][LobeRegistry] CDF orientation matches the two-way comparison") {
 	// Today: `if (rng < brdfProbability) SPECULAR else DIFFUSE`.
 	// The CDF must agree at every u, including both boundaries.
-	const float p_spec = 0.37f;
-	const float weights[LOBE_COUNT] = { p_spec, 1.0f - p_spec };
+	//
+	// Swept over BOTH regimes deliberately. An earlier revision tested only
+	// p_spec = 0.37, i.e. specular as the minority lobe. A hypothetical
+	// select_lobe keying off min/max weight, or special-casing a dominant
+	// first lobe, is only distinguishable from positional order when the
+	// split is examined from both sides. This suite is the only safety net
+	// for lobe order -- no rendered image can see it -- so the sweep is not
+	// redundancy.
+	const float p_specs[] = { 0.37f, 0.5f, 0.73f };
+	for (float p_spec : p_specs) {
+		CAPTURE(p_spec);
+		const float weights[LOBE_COUNT] = { p_spec, 1.0f - p_spec };
 
-	const float us[] = { 0.0f, 0.1f, 0.36999f, 0.37001f, 0.5f, 0.9f, 0.999f };
-	for (float u : us) {
-		const int expected = (u < p_spec) ? LOBE_SPECULAR : LOBE_DIFFUSE;
-		CHECK(select_lobe(u, weights, LOBE_COUNT) == expected);
+		const float us[] = { 0.0f, 0.1f, p_spec - 0.00001f, p_spec + 0.00001f,
+			0.5f, 0.9f, 0.999f };
+		for (float u : us) {
+			CAPTURE(u);
+			const int expected = (u < p_spec) ? LOBE_SPECULAR : LOBE_DIFFUSE;
+			CHECK(select_lobe(u, weights, LOBE_COUNT) == expected);
+		}
 	}
 }
 
@@ -110,18 +123,26 @@ TEST_CASE("[PathTracer][LobeRegistry] the inverted registry is measurably differ
 	// Guards the guard: if select_lobe ever became order-insensitive, the test
 	// above would pass on a broken implementation. Pin that a diffuse-first
 	// ordering genuinely disagrees, so the property being tested is real.
-	const float p_spec = 0.37f;
-	const float correct[LOBE_COUNT] = { p_spec, 1.0f - p_spec };
-	const float inverted[LOBE_COUNT] = { 1.0f - p_spec, p_spec };
+	//
+	// Both regimes again, for the reason given above. p_spec = 0.5 is
+	// deliberately NOT swept here: at an even split the inverted registry is
+	// the same array, so zero disagreements is the correct answer and the
+	// test would be asserting against a genuinely orientation-free input.
+	const float p_specs[] = { 0.37f, 0.73f };
+	for (float p_spec : p_specs) {
+		CAPTURE(p_spec);
+		const float correct[LOBE_COUNT] = { p_spec, 1.0f - p_spec };
+		const float inverted[LOBE_COUNT] = { 1.0f - p_spec, p_spec };
 
-	int disagreements = 0;
-	for (int i = 0; i < 100; i++) {
-		const float u = (float(i) + 0.5f) / 100.0f;
-		if (select_lobe(u, correct, LOBE_COUNT) != select_lobe(u, inverted, LOBE_COUNT)) {
-			disagreements++;
+		int disagreements = 0;
+		for (int i = 0; i < 100; i++) {
+			const float u = (float(i) + 0.5f) / 100.0f;
+			if (select_lobe(u, correct, LOBE_COUNT) != select_lobe(u, inverted, LOBE_COUNT)) {
+				disagreements++;
+			}
 		}
+		CHECK(disagreements > 20);
 	}
-	CHECK(disagreements > 20);
 }
 
 TEST_CASE("[PathTracer][LobeRegistry] combine_pdf reduces to the two-term form") {

@@ -2370,7 +2370,7 @@ is a recorded fact rather than a puzzle for whoever next compares the two
 expressions.
 
 **Verification summary.** doctest **1527 passed / 0 failed / 3 skipped**
-(2,066,534 assertions); `pt_energy_gate` PASS; `pt_anisotropy_gate` PASS within
+(2,066,549 assertions); `pt_energy_gate` PASS; `pt_anisotropy_gate` PASS within
 its +/-0.5pp measured-intact bands; `pt_transmission_gate` exit 0 with 44
 checks.
 
@@ -2384,12 +2384,19 @@ checks.
   separate launches, then ~5.04 six times on the *same unchanged binary*, which
   is inconsistent with a deterministic regression. Flaky, not caused by this
   refactor, not chased here.
-- **Lobe-order test coverage.** Both order tests exercise only `p_spec = 0.37`,
-  i.e. `< 0.5`. A hypothetical `selectLobe` picking by min/max weight rather
-  than positional order would coincidentally agree at that value and pass both.
-  A single `p_spec > 0.5` case closes it. This matters more than a routine gap
-  because that suite is the **only** safety net for lobe order, which no
-  rendered image can see.
+- ~~**Lobe-order test coverage.**~~ **Closed before the phase ended.** Both
+  order tests had exercised only `p_spec = 0.37`, i.e. `< 0.5`, so a
+  `selectLobe` keying off min/max weight rather than positional order would
+  coincidentally agree there and pass both. Now swept over `{0.37, 0.5, 0.73}`
+  (orientation) and `{0.37, 0.73}` (inverted-registry; `0.5` is excluded
+  because at an even split the inverted array is the same array, making zero
+  disagreements the correct answer). The guard was then **proven by breaking
+  the thing it guards**: `select_lobe` was temporarily rewritten to accumulate
+  `min(weights)` instead of `weights[i]`, and the orientation test failed at
+  `p_spec = 0.73` and **only** there — the previous 0.37-only version would
+  have passed that bug silently. Break reverted, suite green. This mattered
+  more than a routine coverage gap because that suite is the **only** safety
+  net for lobe order, which no rendered image can see.
 - **Non-default `SPECULAR_BRDF` / `MICROFACET_DISTRIBUTION` configurations no
   longer compile** (inherited from E2b, unchanged here).
 
