@@ -233,4 +233,29 @@ TEST_CASE("[PathTracer][LobeRegistry] lobe_weight preserves the degenerate branc
 	CHECK(lobe_weight(0.001f, 1000.0f) == doctest::Approx(0.01f).epsilon(1e-6));
 }
 
+TEST_CASE("[PathTracer][LobeRegistry] the two-lobe weights sum to exactly 1.0f") {
+	// LOAD-BEARING, and not obvious. E2d appends the coat at index 2, and
+	// select_lobe falls through to `return LOBE_COUNT - 1` -- the coat -- for
+	// any u at or above the running weight sum. On a material with no coat that
+	// lobe has weight 0, and the sampler divides throughput by it.
+	//
+	// That fallback is unreachable ONLY because fl(p) + fl(1-p) is exactly 1.0f
+	// for every float32 p, so the residue window is empty and u < 1.0f always
+	// holds (rng_1d bottoms out in sb_uint_to_float_excl, so u lies in [0,1)
+	// strictly). For p >= 0.5 that is Sterbenz's lemma; below it the rounding
+	// error is at most a half-ulp of 1.0 and rounds back to 1.0.
+	//
+	// Pin it, because it is the reason no zero-division guard is needed. If a
+	// later change computes the diffuse weight some other way -- say
+	// 1.0f - clamp(p, ...) against a differently-clamped p -- this fails and
+	// says why, instead of the render growing NaNs at a 1-in-10-million rate
+	// that no mean-based gate would attribute correctly.
+	const float ps[] = { 0.01f, 0.0700001f, 0.37f, 0.5f, 0.6180339f, 0.73f, 0.99f };
+	for (float p : ps) {
+		CAPTURE(p);
+		const float weights[LOBE_COUNT] = { p, 1.0f - p };
+		CHECK(weights[0] + weights[1] == 1.0f);
+	}
+}
+
 } // namespace TestPTLobeRegistry

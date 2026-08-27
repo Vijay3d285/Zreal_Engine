@@ -1731,6 +1731,31 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 #define LOBE_DIFFUSE 1
 #define LOBE_COUNT 2
 
+// ---------------------------------------------------------------------------
+// SELECTION WEIGHT vs THROUGHPUT SCALE (E2d).
+//
+// Cycles gives every closure two independent numbers, and conflating them is
+// the defect this separation exists to prevent:
+//
+//   weight        -- radiometric throughput. What the closure multiplies into
+//                    the path, and what a LAYER withdraws from everything
+//                    beneath it (closure_layering_weight, bsdf_util.h:440).
+//   sample_weight -- selection probability. Which lobe the RNG picks.
+//
+// Through E2c these were the same array, and that was CORRECT at N == 2: the
+// two lobes' weights summed to 1 and no layer existed to withdraw anything.
+//
+// Coat (E2d) breaks that. Its attenuation of the base is a throughput factor,
+// NOT a selection probability. Folding it into the selection weights and
+// renormalising would still integrate to the right mean -- MIS is unbiased for
+// ANY weights summing to 1 pointwise -- so the error would be MEAN-PRESERVING
+// and invisible to every rendered gate this project has. That exact shape
+// already cost a Phase E1 defect.
+//
+// So: weights[] stays the selection array. Throughput scales are applied to
+// ps.throughput at the call site, never mixed into weights[].
+// ---------------------------------------------------------------------------
+
 // THE single lobe-selection probability. Replaces combinedPdfLobeProbability
 // and samplerLobeProbability, which were deliberately duplicated so that a
 // divergence between the sampler's value and combinedPdf's stayed
