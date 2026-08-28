@@ -989,6 +989,226 @@ git commit -m "feat(pt): E2d the coat lobe and its layering attenuation"
 
 ---
 
+---
+
+## Task 5b: Close the coat's energy gap — real multi-scatter compensation and exact dielectric Fresnel
+
+**Files:**
+- Create: `servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h`
+- Modify: `tests/servers/rendering/test_pt_coat_albedo.cpp`
+- Modify: `servers/rendering/renderer_rd/shaders/raytracing/brdf_inc.glsl`
+- Modify: `servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp`
+- Modify: `servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl`
+
+**Interfaces:**
+- Consumes: Task 4's `coatLutRead1D` / `coatLutRead2D` (already written and reviewed), `coatMaterial()`, `evalCoat`, `coatAlbedoEstimate`.
+- Produces: `GGX_E_TABLE[1024]`, `GGX_EAVG_TABLE[32]`; GLSL `float coatEnergyScale(float coatRoughness, float cosNI, float ior)`.
+
+**Why this task exists.** Task 5's review found the coat withdraws more energy than its lobe returns. The withdrawal, `saturate(1 − coat_weight · estimate)`, uses Cycles' **average Fresnel** as an albedo. That is only legitimate because Cycles' coat is fully energy-compensated — `bsdf_microfacet_setup_fresnel_dielectric` calls `microfacet_ggx_preserve_energy` (`bsdf_microfacet.h:1024`). This engine's `evalMultiScatterApproximation` is `1 + F0·Ems`, which at the coat's `F0 = 0.04` is **≈1.002** and recovers almost none of the GGX single-scattering deficit. Measured payout/withdrawal at the default `clearcoat_roughness = 0.5`: **0.911** at normal incidence, **0.736** at `cosNI = 0.3`. A coated white sphere darkens toward its silhouette with no physical source.
+
+The design spec §3.5 asserted the two terms were equivalent. **They are not**, and that erratum belongs in the spec as part of this task.
+
+**Scope discipline.** This fixes the **coat only**. Gap #17 — the *base* specular's multi-scatter over-compensation — stays untouched and out of scope, and is now cleanly separated from this.
+
+### The math, read from Cycles
+
+`microfacet_ggx_preserve_energy` (`intern/cycles/kernel/closure/bsdf_microfacet.h:432-485`):
+
+```
+mu    = dot(wi, N)
+rough = sqrt(sqrt(alpha_x * alpha_y))
+E     = lookup_table_read_2D(ggx_E, rough, mu, 32, 32)
+E_avg = lookup_table_read(ggx_Eavg, rough, 32)
+
+missing_factor = (1 - E) / E
+energy_scale   = 1 + missing_factor            // == 1/E
+
+if Fss != 1:
+    Fms       = Fss * E_avg / (1 - Fss * (1 - E_avg))
+    darkening = (1 + Fms * missing_factor) / energy_scale
+    weight       *= darkening
+    sample_weight *= average(darkening)
+```
+
+The BSDF value is multiplied by `energy_scale`, and the weight by `darkening`. Their product is the whole story:
+
+```
+energy_scale * darkening = (1/E) * (E + Fms*(1-E)) = 1 + Fms * (1 - E) / E
+```
+
+so the single multiplier the coat's BRDF needs is:
+
+```
+coatEnergyScale = 1 + Fms * (1 - E) / E,   Fms = Fss * E_avg / (1 - Fss * (1 - E_avg))
+```
+
+with `Fss = fresnel_dielectric_Fss(ior)` (`bsdf_util.h:131-137`), which for `eta >= 1` is `(eta - 1) / (4.08567 + 1.00071 * eta)`. At `ior = 1.5` that is `0.089487`.
+
+**Derive this yourself from the Cycles source before implementing it** — if your algebra disagrees with the line above, trust your algebra and tell me.
+
+### Exact dielectric Fresnel for the coat
+
+The second half. `shadowedF90(F0) = min(1, F0 / 0.04)` (`brdf_inc.glsl:690-696`) caps the coat's grazing reflectance below 1 for every `clearcoat_ior < 1.5`. At ior 1.1 the coat's Fresnel can never exceed 5.67% at any angle, while the withdrawal table — built from *exact* dielectric Fresnel — reads 0.110 at grazing. `clearcoat_ior`'s inspector range is `"1,3,0.01"`, so this is an ordinary artist setting.
+
+Cycles' coat uses `fresnel_type = DIELECTRIC`, i.e. exact `fresnel_dielectric_cos`, not Schlick. **Use this engine's exact dielectric Fresnel for the coat** — E1 landed that machinery; find it and use it. If it cannot be called from the coat's eval and sample paths, fall back to Schlick with `F90 = 1.0` for the coat and say why in your report.
+
+**The sampler and the evaluator must change together.** They currently agree with each other, so this is a pure energy loss and not an MIS desync. Changing one without the other would *create* a desync — a strictly worse bug.
+
+- [ ] **Step 1: Extract the two tables**
+
+```bash
+python - <<'PYEOF'
+import io, re
+src = r"C:\Users\aiadmin\Desktop\blender_build\blender\intern\cycles\scene\shader.tables"
+s = io.open(src, encoding="utf-8", errors="replace").read()
+out = ['/**************************************************************************/',
+       '/*  ggx_energy_tables.h                                                   */',
+       '/**************************************************************************/',
+       '', '#pragma once', '',
+       '// GGX directional albedo E(rough, mu) and its average E_avg(rough), used for',
+       '// multiple-scattering energy compensation.',
+       '//',
+       '// COPIED VERBATIM from Blender Cycles, intern/cycles/scene/shader.tables:',
+       '//   table_ggx_E[1024]  (32x32, indexed [x = rough][y = mu])',
+       '//   table_ggx_Eavg[32] (indexed [rough])',
+       '// Consumed by coatEnergyScale; see microfacet_ggx_preserve_energy',
+       '// (intern/cycles/kernel/closure/bsdf_microfacet.h:432-485).',
+       '//',
+       '// COAT ONLY. The base specular lobe still uses evalMultiScatterApproximation',
+       '// and roadmap Gap #17 still applies to it -- deliberately out of scope here.',
+       '']
+for name, count in (("ggx_E", 1024), ("ggx_Eavg", 32)):
+    m = re.search(r"static const float table_%s\[%d\] = \{(.*?)\};" % (name, count), s, re.S)
+    assert m, name
+    vals = re.findall(r"(-?[0-9.]+(?:e[-+]?\d+)?)f", m.group(1))
+    assert len(vals) == count, (name, len(vals))
+    out.append('inline constexpr float GGX_%s_TABLE[%d] = {' % (name.upper().replace("GGX_",""), count))
+    for i in range(0, count, 8):
+        out.append('\t' + ' '.join(f'{v}f,' for v in vals[i:i+8]))
+    out.append('};')
+    out.append('')
+    print(name, len(vals), "first", vals[0], "last", vals[-1])
+out.insert(len(out), 'inline constexpr int GGX_E_DIM = 32;')
+io.open("servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h", "w",
+        encoding="utf-8", newline="\n").write("\n".join(out) + "\n")
+print("wrote header")
+PYEOF
+```
+
+The generated names are `GGX_E_TABLE[1024]`, `GGX_EAVG_TABLE[32]`, `GGX_E_DIM = 32`. If the script's name-mangling produces something different, fix the script rather than renaming by hand, and report what you changed.
+
+- [ ] **Step 2: CPU mirror and doctest**
+
+Add to `tests/servers/rendering/test_pt_coat_albedo.cpp`, inside the existing namespace. `coat_lut_read_1d` and `coat_lut_read_2d` already exist there — reuse them, do not write second copies.
+
+```cpp
+static float coat_fss_from_ior(float p_ior) {
+	// fresnel_dielectric_Fss, bsdf_util.h:131-137. eta >= 1 branch only:
+	// coat_ior is clamped to >= 1 on upload, so the eta < 1 polynomial is
+	// unreachable here. Do not port it "for completeness" -- an unreachable
+	// branch is an untested branch.
+	return (p_ior - 1.0f) / (4.08567f + 1.00071f * p_ior);
+}
+
+static float coat_energy_scale(float p_coat_roughness, float p_cos_ni, float p_ior) {
+	const float alpha = p_coat_roughness * p_coat_roughness;
+	const float rough = Math::sqrt(Math::sqrt(alpha * alpha));
+	const float E = coat_lut_read_2d(GGX_E_TABLE, rough, p_cos_ni, GGX_E_DIM, GGX_E_DIM);
+	const float e_avg = coat_lut_read_1d(GGX_EAVG_TABLE, rough, GGX_E_DIM);
+	const float fss = coat_fss_from_ior(p_ior);
+	const float fms = fss * e_avg / (1.0f - fss * (1.0f - e_avg));
+	return 1.0f + fms * (1.0f - E) / E;
+}
+
+TEST_CASE("[PathTracer][CoatAlbedo] Fss matches Cycles' dielectric fit") {
+	// bsdf_util.h:136, (eta-1)/(4.08567 + 1.00071*eta).
+	CHECK(coat_fss_from_ior(1.5f) == doctest::Approx(0.089487f).epsilon(1e-4));
+	CHECK(coat_fss_from_ior(1.0f) == doctest::Approx(0.0f).epsilon(1e-6));
+	CHECK(coat_fss_from_ior(1.5f) < coat_fss_from_ior(2.0f));
+}
+
+TEST_CASE("[PathTracer][CoatAlbedo] energy compensation exceeds 1 and grows with roughness") {
+	// The whole point: a rough lobe loses more single-scattering energy, so it
+	// needs a larger multiplier back. A stub returning 1.0 fails this.
+	const float smooth = coat_energy_scale(0.05f, 0.8f, 1.5f);
+	const float rough = coat_energy_scale(0.80f, 0.8f, 1.5f);
+	CHECK(smooth >= 1.0f);
+	CHECK(rough > smooth);
+	// Pin the counterfactual: the old evalMultiScatterApproximation at the
+	// coat's F0 = 0.04 is ~1.002 and CANNOT reach this.
+	CHECK(rough > 1.01f);
+}
+
+TEST_CASE("[PathTracer][CoatAlbedo] compensation closes the withdrawal/payout gap") {
+	// The defect this task exists to fix, stated as a test. The coat withdraws
+	// coat_albedo_estimate from the base; its lobe must return the same energy
+	// once compensated. Uncompensated, this ratio was measured at 0.911 at
+	// normal incidence and 0.736 at cos_ni = 0.3 for roughness 0.5.
+	//
+	// This is a NECESSARY condition, not the full proof -- the real payout also
+	// carries the Fresnel and the VNDF weight, which only the GPU gate can
+	// measure. It fails loudly if the compensation is omitted or inverted.
+	for (float rough : { 0.2f, 0.5f, 0.8f }) {
+		for (float mu : { 1.0f, 0.7f, 0.3f }) {
+			CAPTURE(rough);
+			CAPTURE(mu);
+			CHECK(coat_energy_scale(rough, mu, 1.5f) >= 1.0f);
+		}
+	}
+	// Directionally: the compensation must be larger exactly where the measured
+	// gap was worse -- rougher, and further from normal incidence.
+	CHECK(coat_energy_scale(0.5f, 0.3f, 1.5f) > coat_energy_scale(0.5f, 1.0f, 1.5f));
+}
+```
+
+- [ ] **Step 3: Run the new tests and prove they can fail**
+
+```bash
+python -m SCons platform=windows target=editor tests=yes -j8
+bin/godot.windows.editor.x86_64.console.exe --headless --test --test-case="*CoatAlbedo*"
+```
+
+Then temporarily make `coat_energy_scale` `return 1.0f;`, rebuild, and confirm the second and third cases FAIL. Record the values. Revert, rebuild, confirm green. Do not skip this.
+
+- [ ] **Step 4: Upload the tables and write the GLSL**
+
+Append both tables to the existing coat SSBO rather than adding new bindings — this mirrors Cycles, which keeps one `lookup_table` and indexes it by offset. Define the offsets as named constants shared by C++ and GLSL, and state in your report how you guaranteed they agree.
+
+Write `coatEnergyScale(coatRoughness, cosNI, ior)` in `brdf_inc.glsl`, transcribing the CPU mirror. Reuse Task 4's `coatLutRead1D` / `coatLutRead2D`.
+
+- [ ] **Step 5: Apply it, and switch the coat to exact dielectric Fresnel**
+
+Multiply the coat's BRDF by `coatEnergyScale` in **both** `evalCoat` and the `COAT_TYPE` sampler arm, replacing the `coatMultiScatter` / `evalMultiScatterApproximation` use on the coat path only. Switch the coat's Fresnel from `shadowedF90` to exact dielectric Fresnel in both places.
+
+**Both changes must land in the eval and the sampler together.** They agree today; changing one alone creates an MIS desync, which is worse than the energy loss being fixed.
+
+- [ ] **Step 6: Fix vis mode 32's false reading**
+
+`raytracing_closest_hit_common_inc.glsl:591` emits `lobeWeight(dbg_mat)`, but the sampler's actual `weights[LOBE_SPECULAR]` is now `baseShare * pSpec`. They coincide only when `baseShare == 1`. Scale it by `baseShare` so it reports what its name says. **This must land before Task 6 captures any baseline through that probe.**
+
+- [ ] **Step 7: Verify**
+
+```bash
+python -m SCons platform=windows target=editor tests=yes -j8
+bin/godot.windows.editor.x86_64.console.exe --headless --test
+bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_energy_gate_scene.tscn
+bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_anisotropy_gate_scene.tscn
+bin/godot.windows.editor.x86_64.console.exe --path pipeline_references res://tests/pt_transmission_gate_scene.tscn
+```
+
+All three gates must PASS **unchanged** — every gate scene has `clearcoat = 0`, so this task is a no-op there. `pt_transmission_gate`'s probe 9 reads through vis mode 32; if Step 6 moved it, that is expected and must be re-derived from material facts, not copied from the shader.
+
+- [ ] **Step 8: Record the spec erratum**
+
+Add to `docs/superpowers/specs/2026-08-27-clearcoat-coat-layer-design.md` §3.5 that its claim of equivalence between `evalMultiScatterApproximation` and `microfacet_ggx_preserve_energy` was **wrong**, with the measured 0.911 / 0.736 figures and what replaced it. Do not quietly amend the section — mark it as an erratum, the way E1's spec §3.2 was.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h tests/servers/rendering/test_pt_coat_albedo.cpp servers/rendering/renderer_rd/shaders/raytracing/brdf_inc.glsl servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl docs/superpowers/specs/2026-08-27-clearcoat-coat-layer-design.md
+git commit -m "fix(pt): E2d real multi-scatter compensation and exact Fresnel for the coat"
+```
+
 ## Task 6: The gate, and proving it can fail
 
 **Files:**
