@@ -1209,84 +1209,90 @@ git add servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h tests/serve
 git commit -m "fix(pt): E2d real multi-scatter compensation and exact Fresnel for the coat"
 ```
 
-## Task 6: The gate, and proving it can fail
+## Task 6: The gate — the first execution of any coat code
 
 **Files:**
 - Create: `pipeline_references/tests/pt_coat_gate.gd`, `pipeline_references/tests/pt_coat_gate_scene.tscn`
+- Modify: `servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl` (one new vis mode)
 
 **Interfaces:**
-- Consumes: vis modes 36, 37, 38 (Tasks 3-4); the coat lobe (Task 5).
+- Consumes: vis modes 36/37 (Task 3), 38 (Task 4), 32 (fixed in Task 5b); the coat lobe, `evalCoat`, `coatLayerAlbedo`, `coatEnergyScale`, `coatDarkening`.
 - Produces: a gate script exiting 0 on pass, 1 on fail.
 
-**Model it on `pipeline_references/tests/pt_anisotropy_gate.gd`.** Read that file first — it carries the measured-baseline pattern this gate must follow, and the sRGB pre-encode this gate must not "simplify" away.
+**Read this first.** **Nothing in Tasks 3, 4, 5 or 5b has ever executed with a coat present.** Every existing gate scene has `clearcoat = 0`, so every line that runs when a coat exists has compiled and never run. This task is the first execution. Treat every probe as a discovery, not a confirmation.
 
-**The verdict rule, fixed before measuring.** Baselines are recorded as measured-intact constants with a ±0.5pp band. An absolute comparison against 1.0 would exit non-zero regardless, because Gap #17 already lifts these surfaces above it — a gate that cannot *newly* fail is not an instrument. That is E2b's Important #1, and repeating it here would waste the phase.
+**Model the script on `pipeline_references/tests/pt_anisotropy_gate.gd`.** Read it first — it carries the measured-baseline pattern and the sRGB pre-encode this gate must not "simplify" away.
 
-- [ ] **Step 1: Build the scene**
+**The verdict rule, fixed before measuring.** Baselines are measured-intact constants with a tight band. An absolute comparison against 1.0 would exit non-zero regardless, because Gap #17 already lifts these surfaces — a gate that cannot *newly* fail is not an instrument. That was E2b's Important #1; repeating it wastes the phase.
 
-Copy `pt_anisotropy_gate_scene.tscn` and repoint its script. In `_build_scene`, note these three, each of which has silently broken a sibling gate:
+**Scene-building traps, each of which has silently broken a sibling gate:**
 
 ```gdscript
 sky.process_mode = Sky.PROCESS_MODE_QUALITY   # REALTIME force-clamps to 256 (sky.cpp:593-595)
 env.background_mode = Environment.BG_SKY      # BG_COLOR renders pure black to the PT
-mat.albedo_color = Color(ALBEDO, ALBEDO, ALBEDO).linear_to_srgb()  # :1542 decodes it back
-mat.clearcoat_tint = Color(1, 1, 1).linear_to_srgb()               # :1766-style decode; DO NOT simplify away
+mat.albedo_color = Color(A, A, A).linear_to_srgb()      # render_raytracing.cpp:1542 decodes it back
+mat.clearcoat_tint = Color(1, 1, 1).linear_to_srgb()    # same path at :1766; DO NOT simplify away
+mat.clearcoat_enabled = true                  # else set_clearcoat publishes 0.0 (material.cpp:2270)
 ```
 
-- [ ] **Step 2: Probe 1 — arrival**
+- [ ] **Step 1: Probe A — GPU/CPU parity on the energy tables**
 
-Render vis modes 36 and 37 and assert the authored values arrive:
+The GLSL transcriptions of `coatGgxE`, `coatEnergyScale` and `coatDarkening` have **no** automated test — doctest cannot execute GLSL. A transposed LUT axis, a swapped `RT_COAT_SSBO_E_OFFSET`/`_EAVG_OFFSET`, or a `32`↔`16` dimension slip all compile and return plausible numbers in `[0,1]`.
 
-```gdscript
-# clearcoat 0.8, clearcoat_roughness 0.25, clearcoat_ior 1.5 -> b reads 0.5.
-_check("coat arrival r", px36.r, 0.8, 1e-3)
-_check("coat arrival g", px36.g, 0.25, 1e-3)
-_check("coat arrival b (ior-1)", px36.b, 0.5, 1e-3)
-```
+Add a vis mode emitting `vec3(coatGgxE(...), coatEnergyScale(...), coatDarkening(...))` at the hit's material, following the pattern already at `raytracing_closest_hit_common_inc.glsl:945-947` for `coatAlbedoEstimate`. Assert against CPU-mirror values:
 
-- [ ] **Step 3: Probe 2 — the albedo estimate matches the CPU mirror**
+| `(coat_roughness, cosNI, ior)` | E | energy scale | darkening |
+|---|---|---|---|
+| `(0.5, 1.0, 1.5)` | 0.915284 | 1.007385 | 0.922042 |
+| `(0.8, 1.0, 1.5)` | 0.555225 | 1.044910 | 0.580160 |
 
-Render vis mode 38. Its g channel is the estimate at normal incidence and its b channel at grazing. Assert against values computed from Task 1's mirror at the same inputs — **compute them by running the doctest mirror, not by copying a number out of the shader**, or the check is comparing the implementation to itself:
+- [ ] **Step 2: Probe B — the white furnace, the only real balance instrument**
 
-```gdscript
-# From test_pt_coat_albedo.cpp at coatRoughness 0.25, ior 1.5.
-const P2_NORMAL_INCIDENCE := 0.04    # approaches F0
-_check("estimate at normal incidence", px38.g, P2_NORMAL_INCIDENCE, 0.02)
-_check_gt("estimate at grazing", px38.b, 0.5)
-_check_gt("grazing exceeds normal", px38.b, px38.g)
-```
+The doctests assert an algebraic identity; they cannot see the shader applying `coatDarkening` in the wrong place, twice, or omitting `coatEnergyScale` from one of the two paths. **Only a rendered furnace can.**
 
-- [ ] **Step 4: Probe 3 — the white furnace, which is the real instrument**
+A coated white Lambertian under a constant-radiance-1 environment must read 1.0. Sweep `clearcoat ∈ {0, 0.25, 0.5, 1.0}` × `clearcoat_roughness ∈ {0.05, 0.5, 0.9}` × `clearcoat_ior ∈ {1.1, 1.5, 2.0}`.
 
-A white furnace with a coated white diffuse base under a uniform sky. **Coat plus attenuated base must not exceed 1.** This is the assertion an additive coat fails, so it is the probe that distinguishes a layer from a lobe.
+**The shape that matters is flatness**: energy the coat takes is energy the base loses, so the mean must not climb or fall with `clearcoat`. Record measured-intact baselines ±0.5pp; report absolute-vs-1.0 as an unasserted diagnostic labelled Gap #17's pedestal.
 
-Sweep `clearcoat` over `{0.0, 0.25, 0.5, 0.75, 1.0}` at `clearcoat_roughness = 0.3`. Record each measured mean as a named baseline constant with a ±0.5pp band. Report the absolute-vs-1.0 figure as an **unasserted diagnostic**, labelled as Gap #17's known pedestal.
+This is also the only instrument that can falsify the `A_ss = E · estimate` inference the whole 5b derivation rests on.
 
-The shape that matters: **the sweep must be flat.** At `clearcoat = 0` and `clearcoat = 1` the furnace mean should agree within the band, because energy the coat takes is energy the base loses. A mean that climbs with `clearcoat` is an additive coat.
+- [ ] **Step 3: Probe C — put a coat on a pure metal**
 
-- [ ] **Step 5: Probe 4 — three-lobe pdf self-normalization**
+`raytracing_closest_hit_common_inc.glsl`'s lobe-weight block has a three-way branch whose first arm is `diffuseLum < 0.0001`. That arm is a **distinct code path**, it is what car paint takes, and one deviation in Task 5 is the only thing keeping the coat alive on it. Assert the coat is visibly present on a metallic base.
 
-Extend E2b's instrument to three lobes: draw from the real sampler, accumulate `1/combinedPdf(L)`, and compare the mean against the domain measure `2π = 6.283185`, tolerance 3%. A pdf wrong by factor `k` reads exactly `1/k`.
+- [ ] **Step 4: Probe D — three live lobes in the pdf**
 
-Run it at `clearcoat` ∈ `{0.0, 0.5, 1.0}`. **The `clearcoat = 0` case must match E2b's existing readings**, since the coat contributes nothing there.
+Point E2b's self-normalising instrument (vis mode 35) at a **coated** material: draw from the real sampler, accumulate `1/combinedPdf(L)`, compare the mean to `2π = 6.283185`, tolerance 3%. A pdf wrong by factor `k` reads exactly `1/k`.
 
-- [ ] **Step 6: PROVE THE GATE CAN FAIL**
+That probe has only ever run at `coatMass == 0`, where the third term is `0.0f * finite`. Run it at `clearcoat ∈ {0.0, 0.5, 1.0}`; the `0.0` case must still match E2b's readings.
 
-Do not skip this and do not report the gate as working without it.
+- [ ] **Step 5: Probe E — exact dielectric Fresnel, where it actually differs**
 
-Temporarily revert the attenuation in `raytracing_closest_hit_common_inc.glsl` Step 4 — make the coat additive by deleting the `ps.throughput *= clamp(1.0 - coatMass, 0.0, 1.0);` line. Rebuild. Run the gate.
+Task 5b switched the coat from Schlick-with-`shadowedF90` to exact dielectric Fresnel. At `ior = 1.5` the two agree (`shadowedF90` clamps to exactly 1.0); at `ior = 1.1` they differ by ~2×, because Schlick capped the coat at 5.67% while exact Fresnel reaches 0.110 at grazing.
 
-**Expected: probe 3's sweep is no longer flat and the gate exits 1.** Record the observed numbers at `clearcoat = 0` and `clearcoat = 1` both with and without the line.
+Measure the coat's directional reflectance against `cosNI` at `clearcoat_ior ∈ {1.1, 1.5, 2.0}` and compare to analytic `fresnel_dielectric_cos`. **A gate that only tests ior 1.5 cannot fail on the bug this change fixed.**
 
-Then restore the line, rebuild, and confirm the gate returns to its baselines.
+- [ ] **Step 6: Probe F — vis mode 32 with a coat present**
 
-If the gate passes with the line deleted, **the gate is not an instrument** — fix the gate before continuing, and say so plainly rather than proceeding.
+Task 5b fixed vis mode 32 to report `(1 − coatLobeWeight) · lobeWeight`, and it has never been read with a coat. Check it against a CPU-computed `(1 − clamp(cw·estimate·darkening, 0.01, 0.99)) · lobeWeight`. **This must pass before any baseline is captured through that probe.**
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Probe G — `clearcoat_ior = 1.0` is inert**
+
+At exactly 1.0 the albedo table's first z-slice is all zeros, so the coat should be fully inert — but `evalCoat` is still *called* from every NEE site whenever `coatWeight > 1e-5`, so it is a live path. Assert `clearcoat = 1.0, clearcoat_ior = 1.0` renders identically to `clearcoat = 0`.
+
+- [ ] **Step 8: PROVE THE GATE CAN FAIL**
+
+Not optional, and not satisfied by any of the above passing.
+
+Delete the `* coatDarkening(...)` factor at `brdf_inc.glsl:2081`, rebuild, run the gate. **Expected: probe B goes red** — that factor is exactly what balances withdrawal against payout. Record the observed numbers with and without it. Then restore, rebuild, confirm the gate returns to baseline.
+
+If the gate passes with that factor deleted, **the gate is not an instrument** — fix the gate and say so plainly rather than proceeding.
+
+- [ ] **Step 9: Commit**
 
 ```bash
-git add pipeline_references/tests/pt_coat_gate.gd pipeline_references/tests/pt_coat_gate_scene.tscn
-git commit -m "test(pt): E2d coat energy-conservation gate, proven by breaking it"
+git add pipeline_references/tests/pt_coat_gate.gd pipeline_references/tests/pt_coat_gate_scene.tscn servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl
+git commit -m "test(pt): E2d coat gate - first execution of the coat, proven by breaking it"
 ```
 
 ---
