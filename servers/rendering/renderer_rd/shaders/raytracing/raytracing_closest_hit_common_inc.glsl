@@ -599,8 +599,33 @@ void debug_visualize(
 		dbg_mat.coatIor = max(dbg_material.clearcoat_ior, 1.0);
 		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 
+		// E2d Task 5b. This used to emit the bare lobeWeight(dbg_mat), but since
+		// E2d the sampler's actual weights[LOBE_SPECULAR] is `baseShare * pSpec`
+		// (raytracing_closest_hit_common_inc.glsl, the three-lobe selection
+		// block) -- the two coincide only when baseShare == 1, i.e. only on an
+		// uncoated material. Reporting the unscaled value would have made this
+		// probe say something other than what its name claims for exactly the
+		// materials E2d exists for, and Task 6 is about to capture a baseline
+		// through it.
+		//
+		// Reconstructed from the SAME two functions the sampler calls, in the
+		// same order, on the same unclamped dot(N, V) -- not re-derived. At
+		// clearcoat == 0 coatLobeWeight returns literal 0.0, baseShare is
+		// exactly 1.0f, and `1.0f * pSpec == pSpec` is the IEEE multiplicative
+		// identity, so every existing reading of this mode (pt_transmission_gate
+		// probe 9, whose material is a StandardMaterial3D with the default
+		// clearcoat of 0) is bit-unchanged.
+		// There is no `N` in this function's scope -- debug_visualize receives
+		// final_normal and geometry_normal, and shade_and_bounce's N is the
+		// CLAMPED shading normal. Rebuild it with the same call and the same
+		// threshold vis mode 22 already uses eleven lines above, so cosNI here
+		// is the same expression the sampler feeds coatLobeWeight, not the
+		// floored NdotV parameter (which is max(dot(m.normal, V), 0.0001) --
+		// a different, pre-clamp normal).
+		vec3 N_clamped32 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
 		float pSpec = lobeWeight(dbg_mat);
-		ps.radiance = vec3(pSpec, 0.0, 0.0);
+		float dbgBaseShare32 = 1.0 - coatLobeWeight(dbg_mat, dot(N_clamped32, V));
+		ps.radiance = vec3(dbgBaseShare32 * pSpec, 0.0, 0.0);
 	} else if (vis_mode == 33) {
 		// Fix round 2, detector 2: hemisphere-guard firing rate. Accumulates
 		// float(wrongNg || wrongN) across many samples via the standard
@@ -1352,13 +1377,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 #if MICROFACET_DISTRIBUTION == GGX
 					float ms_alpha = brdf_mat.roughness * brdf_mat.roughness;
 					f_spec *= evalMultiScatterApproximation(ms_alpha, NdotV, specularF0);
-					// E2d fix round 1: the coat is sampled through the same
-					// sampleSpecularMicrofacet, so it carries the same `ms` on the
-					// BSDF side and needs the same compensation here. Built from the
-					// COAT's alpha and F0, not the base's -- coatMultiScatter does
-					// that from the shared coatMaterial. No-op at coatWeight 0
-					// because f_coat is already vec3(0) there.
-					f_coat *= coatMultiScatter(brdf_mat, NdotV);
+					// E2d Task 5b: NO coat factor here any more. The coat's
+					// compensation is coatEnergyScale (real Cycles
+					// preserve_energy, not the 1 + F0*Ems approximation, which at
+					// the coat's F0 = 0.04 is ~1.002 and recovers nothing), and it
+					// now lives INSIDE evalCoat -- so f_coat arrives already
+					// compensated and multiplying again here would double it.
+					// Moved inside because there are four NEE call sites and only
+					// two of them ever applied the external factor.
 #endif
 
 					bsdf_val = (brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)

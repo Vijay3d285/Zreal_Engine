@@ -1193,7 +1193,19 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 // EXACTLY to the pre-E2b isotropic one -- see brdf_inc.glsl Task 3 Step 2. The
 // WEIGHT half, below, DOES need an anisoActive branch (I1 fix, Task 3 review) --
 // see specularSampleWeightGGXVNDFAniso's doc comment.
-float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float ax, float ay, float anisoPhi, bool anisoActive, float2 u, OUT_PARAMETER(float3) weight) {
+//
+// E2d Task 5b: the body below is split at the ONE point where the base
+// specular lobe and the coat lobe diverge -- the Fresnel model and the
+// multiple-scattering factor. Everything before that point (the VNDF draw, the
+// reflect, the clamped dot products and the G2/G1 weight ratio) is identical
+// for both and now lives in sampleMicrofacetDirection, called by this function
+// and by sampleCoatMicrofacet. There is deliberately no second copy of the VNDF
+// machinery: a hand-rolled coat sampler that drifted from this one would be an
+// MIS desync against coatPdf, invisible in any rendered image.
+//
+// The extraction is operation-for-operation and order-for-order what this
+// function used to do inline, so the base specular path is unchanged.
+float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared, float ax, float ay, float anisoPhi, bool anisoActive, float2 u, OUT_PARAMETER(float) outHdotL, OUT_PARAMETER(float) outNdotV, OUT_PARAMETER(float) outWeightRatio) {
 	// Sample a microfacet normal (H) in local space
 	float3 Hlocal;
 	if (alpha == 0.0f) {
@@ -1226,13 +1238,6 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	float NdotL = max(0.00001f, min(1.0f, dot(Nlocal, Llocal)));
 	float NdotV = max(0.00001f, min(1.0f, dot(Nlocal, Vlocal)));
 	float NdotH = max(0.00001f, min(1.0f, dot(Nlocal, Hlocal)));
-	float3 F = evalFresnel(specularF0, shadowedF90(specularF0), HdotL);
-
-#if MICROFACET_DISTRIBUTION == GGX
-	float3 ms = evalMultiScatterApproximation(alpha, NdotV, specularF0);
-#else
-	float3 ms = vec3(1.0f, 1.0f, 1.0f);
-#endif
 
 	// Calculate weight of the sample specific for selected sampling method
 	// (this is microfacet BRDF divided by PDF of sampling method - notice how most terms cancel out)
@@ -1250,6 +1255,27 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	} else {
 		weightRatio = specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
 	}
+
+	outHdotL = HdotL;
+	outNdotV = NdotV;
+	outWeightRatio = weightRatio;
+	return Llocal;
+}
+
+float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float ax, float ay, float anisoPhi, bool anisoActive, float2 u, OUT_PARAMETER(float3) weight) {
+	float HdotL;
+	float NdotV;
+	float weightRatio;
+	float3 Llocal = sampleMicrofacetDirection(Vlocal, alpha, alphaSquared, ax, ay, anisoPhi, anisoActive, u, HdotL, NdotV, weightRatio);
+
+	float3 F = evalFresnel(specularF0, shadowedF90(specularF0), HdotL);
+
+#if MICROFACET_DISTRIBUTION == GGX
+	float3 ms = evalMultiScatterApproximation(alpha, NdotV, specularF0);
+#else
+	float3 ms = vec3(1.0f, 1.0f, 1.0f);
+#endif
+
 	weight = ms * F * weightRatio;
 
 	return Llocal;
@@ -1833,6 +1859,23 @@ layout(set = 0, binding = 38, std430) readonly buffer CoatAlbedoTable {
 }
 coat_albedo_table;
 
+// E2d Task 5b: the buffer above carries THREE concatenated tables, addressed by
+// offset, mirroring Cycles' single flat `lookup_table` + kernel_data.tables.*
+// integer offsets rather than spending a descriptor slot per table.
+//
+// THESE FOUR LITERALS ARE MIRRORED IN C++, in
+// servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h, which is what
+// render_raytracing.cpp fills the buffer through. GLSL cannot include that
+// header, so the two are pinned together by
+// tests/servers/rendering/test_pt_coat_albedo.cpp's "SSBO offsets are the ones
+// the shader hard-codes" case, which asserts the C++ constants equal exactly
+// these numbers. Change one, change the other, in the same commit -- otherwise
+// every coat lookup silently reads the wrong table and nothing crashes.
+#define RT_COAT_SSBO_ALBEDO_OFFSET 0 // GGX_COAT_ALBEDO_TABLE, 16x16x16
+#define RT_COAT_SSBO_E_OFFSET 4096 // GGX_E_TABLE, 32x32
+#define RT_COAT_SSBO_EAVG_OFFSET 5120 // GGX_EAVG_TABLE, 32
+#define RT_COAT_SSBO_FLOAT_COUNT 5152
+
 // Cycles' lookup_table_read* (intern/cycles/kernel/util/lookup_table.h:14-71),
 // transcribed. ENDPOINT-ALIGNED: [0,1] maps onto [0, size-1] and lerps between
 // integer entries.
@@ -1874,11 +1917,11 @@ float coatLutRead3D(float x, float y, float z) {
 	int index = min(int(z), d - 1);
 	int nindex = min(index + 1, d - 1);
 	float t = z - float(index);
-	float data0 = coatLutRead2D(d * d * index, x, y, d, d);
+	float data0 = coatLutRead2D(RT_COAT_SSBO_ALBEDO_OFFSET + d * d * index, x, y, d, d);
 	if (t == 0.0f) {
 		return data0;
 	}
-	float data1 = coatLutRead2D(d * d * nindex, x, y, d, d);
+	float data1 = coatLutRead2D(RT_COAT_SSBO_ALBEDO_OFFSET + d * d * nindex, x, y, d, d);
 	return (1.0f - t) * data0 + t * data1;
 }
 
@@ -1900,6 +1943,94 @@ float coatAlbedoEstimate(float coatRoughness, float cosNI, float ior) {
 	float z = sqrt(abs(q));
 	float s = coatLutRead3D(rough, cosNI, z);
 	return mix(f0, 1.0f, s);
+}
+
+// ---------------------------------------------------------------------------
+// E2d Task 5b: REAL multiple-scattering energy compensation for the coat.
+//
+// Transcribed from microfacet_ggx_preserve_energy
+// (intern/cycles/kernel/closure/bsdf_microfacet.h:432-485), which the coat
+// reaches through bsdf_microfacet_setup_fresnel_dielectric (:1024). A CPU
+// mirror of every function below lives in
+// tests/servers/rendering/test_pt_coat_albedo.cpp; keep the two textually
+// identical modulo type names, because the suite does NOT execute this shader.
+//
+// WHY NOT evalMultiScatterApproximation: that is `1 + F0 * Ems`, and at the
+// coat's F0 = 0.04 it is ~1.002 -- it recovers essentially none of the GGX
+// single-scattering deficit, which at the DEFAULT clearcoat_roughness of 0.5 is
+// 8.5%. Task 5 shipped the layer with the withdrawal built from the LUT's
+// energy-preserving albedo and the payout left uncompensated; the review
+// measured payout/withdrawal at 0.911 (normal incidence) and 0.736 (cosNI 0.3).
+//
+// THE DERIVATION, and the reason there are TWO functions here:
+//
+//   Cycles multiplies the BSDF VALUE by energy_scale = 1/E and the closure
+//   WEIGHT by darkening = (1 + Fms*(1-E)/E) / energy_scale = E + Fms*(1-E).
+//   An engine with no separate closure weight only ever sees their product:
+//
+//       coatEnergyScale = energy_scale * darkening = 1 + Fms * (1 - E) / E
+//
+//   That is what the coat's BSDF value and sample weight get multiplied by.
+//   But `darkening` ALONE is still needed, for the OTHER half of the layer:
+//   closure_layering_weight reads bsdf_albedo, which is sc->weight -- already
+//   multiplied by darkening inside preserve_energy -- times estimate_albedo
+//   (kernel/closure/bsdf.h:696, svm/closure.h:172-174). So Cycles withdraws
+//   `coat_weight * darkening * estimate`, not `coat_weight * estimate`.
+//
+//   That is not an accounting detail, it is the whole balance. The LUT behind
+//   coatAlbedoEstimate is built from a Fresnel RATIO with the single-scattering
+//   loss divided out (app/cycles_precompute.cpp:88-130, `eval.x / eval.y`), so
+//   it reports the albedo the coat WOULD have if GGX were energy-preserving --
+//   bsdf_microfacet_estimate_albedo says so at :507 and flags it in a TODO.
+//   The coat's real reflectance is E * coatEnergyScale * estimate, i.e.
+//   `darkening * estimate`, and that is exactly what must be withdrawn.
+//
+//   Compensating only the payout -- the obvious half-fix -- moves the ratio
+//   from E to E * coatEnergyScale, i.e. 0.915 -> 0.922 at roughness 0.5 and
+//   normal incidence. Both halves are required for the layer to balance.
+// ---------------------------------------------------------------------------
+
+// fresnel_dielectric_Fss (bsdf_util.h:131-137), eta >= 1 branch only. coatIor
+// is clamped to >= 1 on upload (render_raytracing.cpp), so the eta < 1
+// polynomial is unreachable here and is deliberately not ported -- an
+// unreachable branch is an untested branch.
+float coatFssFromIor(float ior) {
+	return (ior - 1.0f) / (4.08567f + 1.00071f * ior);
+}
+
+// E(rough, mu): directional albedo of a WHITE-Fresnel single-scattering GGX
+// lobe. `rough` is built exactly as coatAlbedoEstimate builds it, so the two
+// LUTs are always read on the same axis convention.
+float coatGgxE(float coatRoughness, float cosNI) {
+	float alpha = coatRoughness * coatRoughness;
+	float rough = sqrt(sqrt(alpha * alpha)); // sqrt(sqrt(ax*ay)); ax == ay for the coat.
+	return coatLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, cosNI, 32, 32);
+}
+
+// Fms: effective Fresnel of the MULTIPLY-scattered energy. One Fss is cancelled
+// out because this multiplies a BSDF that already carries one bounce of Fresnel
+// (bsdf_microfacet.h:474-476).
+float coatFms(float coatRoughness, float ior) {
+	float alpha = coatRoughness * coatRoughness;
+	float rough = sqrt(sqrt(alpha * alpha));
+	float eAvg = coatLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, rough, 32);
+	float fss = coatFssFromIor(ior);
+	return fss * eAvg / (1.0f - fss * (1.0f - eAvg));
+}
+
+// PAYOUT multiplier. Goes on the coat's BSDF value (evalCoat) and on the coat
+// sampler's weight (sampleCoatMicrofacet) -- both, or the two MIS strategies
+// estimate different integrands.
+float coatEnergyScale(float coatRoughness, float cosNI, float ior) {
+	float e = coatGgxE(coatRoughness, cosNI);
+	return 1.0f + coatFms(coatRoughness, ior) * (1.0f - e) / e;
+}
+
+// WITHDRAWAL multiplier -- Cycles' `darkening`, written in the reduced form
+// E + Fms*(1-E), identical to E * coatEnergyScale. Goes on coatLayerAlbedo.
+float coatDarkening(float coatRoughness, float cosNI, float ior) {
+	float e = coatGgxE(coatRoughness, cosNI);
+	return e + coatFms(coatRoughness, ior) * (1.0f - e);
 }
 
 // ---------------------------------------------------------------------------
@@ -1931,11 +2062,23 @@ float coatAlbedoEstimate(float coatRoughness, float cosNI, float ior) {
 // the phase invariant: at clearcoat == 0 every derived quantity below is 0 or
 // exactly 1.0f, and multiplying by exactly 1.0f is the IEEE identity, so the
 // three-lobe arithmetic reduces to E2c's two-lobe arithmetic bit-for-bit.
+//
+// E2d Task 5b: the coatDarkening factor is Cycles' `darkening`, and it is what
+// makes this number the coat's ACTUAL reflectance rather than the reflectance
+// it would have if GGX lost no single-scattering energy. See the derivation
+// block above coatFssFromIor. Cycles applies it in exactly this place: the
+// closure's weight carries it before closure_layering_weight reads
+// bsdf_albedo (bsdf.h:696, svm/closure.h:172-174).
+//
+// It is applied AFTER the coatWeight cutoff, so the literal 0.0f early return
+// -- and with it the phase invariant at clearcoat == 0 -- is untouched.
 float coatLayerAlbedo(MaterialProperties material, float cosNI) {
 	if (material.coatWeight <= 0.00001f) {
 		return 0.0f;
 	}
-	return material.coatWeight * coatAlbedoEstimate(material.coatRoughness, cosNI, material.coatIor);
+	return material.coatWeight *
+			coatAlbedoEstimate(material.coatRoughness, cosNI, material.coatIor) *
+			coatDarkening(material.coatRoughness, cosNI, material.coatIor);
 }
 
 // Selection probability mass for the coat, BEFORE normalisation against the
@@ -2056,11 +2199,48 @@ MaterialProperties coatMaterial(MaterialProperties material) {
 // either (see the dot(N,V) note at raytracing_closest_hit_common_inc.glsl), and
 // the coat must pay out on exactly the shading points the base specular does or
 // the two disagree about which vertices are lit.
+//
+// E2d Task 5b, TWO changes, both of which also land in sampleCoatMicrofacet
+// below. The evaluator and the sampler are two MIS strategies for one
+// integrand; changing either alone would turn a pure energy loss into a
+// desync, which is strictly worse.
+//
+//   1. EXACT DIELECTRIC FRESNEL, overwriting the Schlick value prepareBRDFData
+//      precomputed. prepareBRDFData ends in
+//      `evalFresnel(specularF0, shadowedF90(specularF0), LdotH)`, and
+//      shadowedF90 is `min(1, luminance(F0)/0.04)` (:690-696) -- which CAPS the
+//      coat's grazing reflectance below 1 for every clearcoat_ior under 1.5. At
+//      ior 1.1 the coat's F0 is 0.00227, shadowedF90 is 0.057, and the lobe can
+//      never exceed 5.7% at ANY angle, while coatAlbedoEstimate -- whose LUT
+//      Cycles built from the REAL dielectric Fresnel -- reads 0.110 at grazing.
+//      clearcoat_ior's inspector range is "1,3,0.01", so that is an ordinary
+//      artist setting, not a corner. Cycles gives the coat
+//      fresnel_type = DIELECTRIC (svm/closure.h:169 ->
+//      bsdf_microfacet_setup_fresnel_dielectric), i.e. exact
+//      fresnel_dielectric_cos, never Schlick.
+//
+//      Overwriting data.F rather than teaching prepareBRDFData a coat mode is
+//      deliberate: data.F is the ONLY place evalMicrofacet reads the Fresnel
+//      from (:1548, `data.F * (G2 * D * NdotL)`; its own inline evalFresnel is
+//      commented out as redundant), so this is complete, and it leaves the base
+//      specular path untouched.
+//
+//   2. coatEnergyScale, the real multiple-scattering compensation, replacing
+//      the coatMultiScatter/evalMultiScatterApproximation factor the NEE sites
+//      used to apply from outside. It lives INSIDE this function now because
+//      evalCombinedBRDFSeparate has SIX call sites across three NEE strategies
+//      (raytracing_lights_inc.glsl:394/568/617 for the analytic light types,
+//      raytracing_closest_hit_common_inc.glsl:1356 for the environment,
+//      raytracing_emissive_inc.glsl:489 for emissive meshes) and only the last
+//      two ever applied the old external factor -- a payout multiplier that
+//      some callers forget is the same class of bug this task is fixing. The
+//      base specular's external `ms` convention is left exactly as it is;
+//      Gap #17 is out of scope.
 float3 evalCoat(float3 N, float3 L, float3 V, MaterialProperties material) {
 	if (material.coatWeight <= 0.00001f) {
 		return float3(0.0f, 0.0f, 0.0f);
 	}
-	const BrdfData coatData = prepareBRDFData(N, L, V, coatMaterial(material));
+	BrdfData coatData = prepareBRDFData(N, L, V, coatMaterial(material));
 	// Defence for direct callers only. In production this is unreachable:
 	// evalCombinedBRDFSeparate's own Lbackfacing early-out fires first, on the
 	// identical predicate from the identical prepareBRDFData. See that function
@@ -2068,26 +2248,57 @@ float3 evalCoat(float3 N, float3 L, float3 V, MaterialProperties material) {
 	if (coatData.Lbackfacing) {
 		return float3(0.0f, 0.0f, 0.0f);
 	}
-	return material.coatWeight * evalSpecular(coatData);
+	// LdotH is the same quantity the sampler calls HdotL, and both are already
+	// clamped into [0,1] by their respective producers.
+	float cosThetaT;
+	float Fcoat = fresnel_dielectric(coatData.LdotH, material.coatIor, cosThetaT);
+	coatData.F = float3(Fcoat, Fcoat, Fcoat);
+
+	// cosNI is data.NdotV -- the same clamped dot(N, V) the sampler feeds
+	// coatEnergyScale, so the two strategies compensate by the same number on
+	// the same shading point.
+	float energyScale = coatEnergyScale(material.coatRoughness, coatData.NdotV, material.coatIor);
+
+	return material.coatWeight * energyScale * evalSpecular(coatData);
 }
 
-// GGX multiple-scattering compensation for the COAT, the partner of the factor
-// the env- and emissive-NEE sites already apply to the base specular term.
+// The coat's SAMPLER. Partner of evalCoat above, and the reason
+// sampleMicrofacetDirection was extracted: the direction draw, the G2/G1 weight
+// ratio and every clamp are literally the same code the base specular lobe
+// runs, so the sampled lobe and coatPdf cannot describe different geometry.
+// Only the two things evalCoat overrides differ -- exact dielectric Fresnel and
+// coatEnergyScale in place of evalMultiScatterApproximation.
 //
-// It is needed for the same reason theirs is: sampleSpecularMicrofacet folds
-// `ms` into the weight it hands back, and the coat lobe is sampled through that
-// very function, so the BSDF strategy's realised coat integrand carries `ms`
-// while evalCoat (evalMicrofacet) does not. Two MIS strategies must estimate the
-// SAME integrand. Built from coatMaterial so the alpha and F0 are the same ones
-// the sampler used.
+// Isotropic by construction: ax == ay == alpha and anisoPhi == 0, matching
+// coatMaterial's `anisotropy = 0` and Cycles' `bsdf->T = zero_float3()`
+// (svm/closure.h:162). Passing anisoActive false takes the structurally
+// isotropic branch rather than relying on sin/cos(-0) algebra, the same
+// reasoning as Minor #2 in sampleMicrofacetDirection.
 //
-// Roadmap Gap #17 (this approximation over-corrects by 3-8pp) therefore applies
-// to the coat too, exactly as E2d spec section 3.5 says it would.
-float3 coatMultiScatter(MaterialProperties material, float NdotV) {
-	MaterialProperties coatMat = coatMaterial(material);
-	float alpha = coatMat.roughness * coatMat.roughness;
-	float3 coatF0 = baseColorToSpecularF0(coatMat.baseColor, coatMat.metalness, coatMat.dielectricF0);
-	return evalMultiScatterApproximation(alpha, NdotV, coatF0);
+// The returned weight is scalar-valued (a float3 of three equal components):
+// dielectric Fresnel has no colour, and the coat's TINT is a separate Beer's-law
+// factor applied by coatLayeringTransmittance, never here.
+//
+// `alpha`/`alphaSquared` are NOT recomputed from coatRoughness here. The caller
+// passes the ones prepareBRDFData derived from coatMaterial(), which is the same
+// single definition evalCoat builds its BrdfData from -- exactly the shape the
+// SPECULAR arm already uses (it passes data.alpha/data.alphaSquared too).
+// coatRoughness itself is still needed, because coatEnergyScale indexes the
+// energy LUT on the PERCEPTUAL roughness axis, not on alpha.
+float3 sampleCoatMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float coatRoughness, float ior, float2 u, OUT_PARAMETER(float3) weight) {
+	float HdotL;
+	float NdotV;
+	float weightRatio;
+	float3 Llocal = sampleMicrofacetDirection(Vlocal, alpha, alphaSquared, alpha, alpha, 0.0f, false, u, HdotL, NdotV, weightRatio);
+
+	float cosThetaT;
+	float F = fresnel_dielectric(HdotL, ior, cosThetaT);
+	float energyScale = coatEnergyScale(coatRoughness, NdotV, ior);
+
+	float w = energyScale * F * weightRatio;
+	weight = float3(w, w, w);
+
+	return Llocal;
 }
 
 // What the coat leaves for everything beneath it. ONE function, called by BOTH
@@ -2502,8 +2713,22 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// the evaluated lobe cannot describe different coats. Built from
 		// materialLocal so the already-rotated tangent is carried (inert here,
 		// since coatMaterial zeroes anisotropy, but correct if that ever changes).
+		//
+		// E2d Task 5b: sampleCoatMicrofacet, not sampleSpecular. It shares
+		// sampleMicrofacetDirection with sampleSpecular -- identical VNDF draw,
+		// identical G2/G1 ratio -- and differs only in the two things evalCoat
+		// also changed: exact dielectric Fresnel from coatIor instead of Schlick
+		// with a shadowedF90 that caps the coat below 1 at every ior under 1.5,
+		// and coatEnergyScale instead of evalMultiScatterApproximation. Both
+		// changes land in the evaluator and the sampler together; either alone
+		// would be an MIS desync.
+		//
+		// data.specularF0 is deliberately no longer passed: the coat's Fresnel
+		// is now parameterised on the ior directly, which is what makes it
+		// agree with coatAlbedoEstimate's LUT (built by Cycles from the real
+		// dielectric Fresnel, not from F0).
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, coatMaterial(materialLocal));
-		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, data.anisoActive, u, sampleWeight);
+		rayDirectionLocal = sampleCoatMicrofacet(Vlocal, data.alpha, data.alphaSquared, materialLocal.coatRoughness, materialLocal.coatIor, u, sampleWeight);
 	}
 
 	// Transform sampled direction Llocal back to V vector space.

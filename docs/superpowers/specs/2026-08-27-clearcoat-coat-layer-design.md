@@ -109,6 +109,66 @@ therefore applies to the coat too.** No fix is attempted here, and the Cycles
 comparison in §5 must be read with that pedestal in mind — E2b's comparison
 went from +6.52% to +0.67% once it was accounted for.
 
+> **ERRATUM (Task 5b, 2026-08-27). The paragraph above is wrong, and §4.1's
+> withdrawal formula below is incomplete. Both were corrected in
+> `fix(pt): E2d real multi-scatter compensation and exact Fresnel for the coat`.**
+>
+> **What was wrong.** This section treated `evalMultiScatterApproximation` and
+> `microfacet_ggx_preserve_energy` as the same term with different accuracy.
+> They are not comparable at the coat's operating point.
+> `evalMultiScatterApproximation` is `1 + F0 · Ems`, and at the coat's
+> `F0 = 0.04` that is **≈ 1.002** — it recovers essentially none of the GGX
+> single-scattering deficit, which at Godot's default `clearcoat_roughness` of
+> 0.5 is 8.5%. Gap #17's "over-corrects by 3-8pp" describes its behaviour on a
+> *metal*, where `F0` is near 1; on the coat it under-corrects to the point of
+> being inert.
+>
+> That matters here and not for the base specular because §4.1 makes the coat a
+> **layer**: it withdraws `saturate(1 − coat_weight · estimate)` from everything
+> beneath it, using Cycles' LUT albedo. That LUT is legitimate as an albedo
+> *only* because Cycles' coat is fully energy-compensated. Task 5's review
+> re-implemented the shipped formulas on CPU and measured payout / withdrawal at
+> `clearcoat_roughness = 0.5`: **0.911 at normal incidence, 0.736 at
+> `cosNI = 0.3`**. A coated white sphere darkened toward its silhouette with no
+> physical source.
+>
+> **What replaced it.** The coat — and *only* the coat; Gap #17 still stands
+> untouched for the base specular — now runs the real Cycles compensation, from
+> `table_ggx_E` / `table_ggx_Eavg` uploaded alongside the existing coat LUT
+> (`ggx_energy_tables.h`, one SSBO at binding 38 addressed by offset, mirroring
+> Cycles' single flat `lookup_table`):
+>
+> ```
+> Fss  = fresnel_dielectric_Fss(coat_ior) = (eta - 1) / (4.08567 + 1.00071 * eta)
+> Fms  = Fss * E_avg / (1 - Fss * (1 - E_avg))
+> coatEnergyScale = 1 + Fms * (1 - E) / E          # payout    (= energy_scale * darkening)
+> coatDarkening   = E + Fms * (1 - E)              # withdrawal (= E * coatEnergyScale)
+> ```
+>
+> **§4.1's withdrawal formula was also incomplete, and that is the load-bearing
+> half.** It reads `saturate(1 - coat_weight * estimate_albedo)`; Cycles reads
+> `saturate(1 - coat_weight * darkening * estimate_albedo)`, because
+> `closure_layering_weight` is fed `bsdf_albedo`, which is `sc->weight` —
+> already multiplied by `darkening` inside `preserve_energy` — times
+> `estimate_albedo` (`bsdf.h:696`, `svm/closure.h:172-174`). The LUT behind
+> `estimate` is built from a Fresnel *ratio* with the single-scattering loss
+> divided out (`cycles_precompute.cpp:88-130`), so it reports the albedo the
+> coat would have if GGX were energy-preserving; the coat's real reflectance is
+> `darkening · estimate`. Compensating only the payout — the obvious half-fix —
+> moves the ratio from `E` to `E · coatEnergyScale`, i.e. 0.915 → 0.922 at
+> roughness 0.5 and normal incidence. Both halves are required, and with both
+> the two sides are equal by construction.
+>
+> **Second correction, same commit.** The coat's Fresnel was Schlick with
+> `shadowedF90(F0) = min(1, F0/0.04)`, which caps the coat's grazing reflectance
+> below 1 for every `clearcoat_ior < 1.5` — at ior 1.1 the lobe could never
+> exceed 5.7% at any angle while the withdrawal LUT reads 0.110 at grazing, and
+> `clearcoat_ior`'s inspector range is `"1,3,0.01"`. The coat now uses this
+> engine's exact dielectric `fresnel_dielectric` (E1), matching Cycles'
+> `fresnel_type = DIELECTRIC`. Both corrections land in the evaluator
+> (`evalCoat`) and the sampler (`sampleCoatMicrofacet`) together; either alone
+> would convert a pure energy loss into an MIS desync.
+
 ## 4. Design
 
 ### 4.1 The math
@@ -120,6 +180,14 @@ so the `w` cancels:
 ```
 base_throughput *= saturate(1.0 - coat_weight * estimate_albedo)
 ```
+
+> **ERRATUM (Task 5b): the line above is missing a factor and shipped that way
+> in Task 5.** The correct withdrawal is
+> `saturate(1.0 - coat_weight * coatDarkening * estimate_albedo)`. See the
+> erratum block in §3.5 for the derivation and the measured consequence; the
+> short version is that `estimate_albedo` is the albedo the coat would have if
+> GGX lost no single-scattering energy, and Cycles applies `darkening` before
+> `closure_layering_weight` ever reads it.
 
 `estimate_albedo` follows `bsdf_microfacet_estimate_albedo`'s dielectric branch
 (`bsdf_microfacet.h:556-579`) — reflection only, since the coat is neither a

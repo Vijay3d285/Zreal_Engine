@@ -478,10 +478,11 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 	//   - E2d fix round 1: the COAT is treated exactly as the environment-NEE block
 	//     treats it, because this path has the identical structure -- a second MIS
 	//     strategy paired against combinedPdf through power_heuristic below. So it
-	//     gets the multiple-scattering factor (the coat is sampled through the same
-	//     sampleSpecularMicrofacet) and a near-delta guard keyed on the COAT's own
-	//     roughness, matching coatPdf's cutoff. The base terms arrive already
-	//     attenuated by the coat, inside evalCombinedBRDFSeparate.
+	//     gets a near-delta guard keyed on the COAT's own roughness, matching
+	//     coatPdf's cutoff. Its multiple-scattering compensation is NOT applied
+	//     here: E2d Task 5b moved it inside evalCoat, where no NEE site can
+	//     forget it. The base terms arrive already attenuated by the coat, inside
+	//     evalCombinedBRDFSeparate.
 	vec3 bsdf_val = vec3(0.0);
 	if (dot(p_N, p_V) > 0.0) {
 		vec3 f_diff, f_spec, f_coat;
@@ -492,7 +493,10 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 		float NdotV = max(dot(p_N, p_V), 0.0001);
 		vec3 specular_f0 = baseColorToSpecularF0(p_mat.baseColor, p_mat.metalness, p_mat.dielectricF0);
 		f_spec *= evalMultiScatterApproximation(ms_alpha, NdotV, specular_f0);
-		f_coat *= coatMultiScatter(p_mat, NdotV);
+		// E2d Task 5b: the coat's compensation moved inside evalCoat (real
+		// Cycles preserve_energy via coatEnergyScale), so f_coat arrives
+		// already compensated. See the matching note in the environment-NEE
+		// block of raytracing_closest_hit_common_inc.glsl.
 #endif
 
 		bsdf_val = (p_mat.roughness < RT_MIS_DELTA_ROUGHNESS) ? f_diff : (f_diff + f_spec);

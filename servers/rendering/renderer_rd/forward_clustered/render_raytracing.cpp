@@ -34,6 +34,7 @@
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
+#include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
@@ -138,13 +139,25 @@ RID RenderRaytracing::_get_emissive_fallback_buffer() {
 // create-once-and-cache shape (mirrors GGX_COAT_ALBEDO_TABLE from Task 1's
 // ggx_coat_albedo_table.h verbatim; nothing computes or mutates it after
 // upload).
+//
+// E2d Task 5b: the buffer now carries THREE concatenated tables, not one --
+// GGX_COAT_ALBEDO_TABLE, then GGX_E_TABLE, then GGX_EAVG_TABLE -- mirroring
+// Cycles, which keeps a single flat `lookup_table` and addresses each table by
+// an integer offset. The copies below are written THROUGH the
+// RT_COAT_SSBO_*_OFFSET constants declared in ggx_energy_tables.h (which are
+// themselves static_assert'd against the three sizeof()s), so this function
+// cannot lay the buffer out differently from what those constants say, and the
+// shader reads through #defines mirroring the same constants.
 RID RenderRaytracing::_get_coat_albedo_buffer() {
 	if (coat_albedo_buffer.is_valid()) {
 		return coat_albedo_buffer;
 	}
 	Vector<uint8_t> bytes;
-	bytes.resize(sizeof(GGX_COAT_ALBEDO_TABLE));
-	memcpy(bytes.ptrw(), GGX_COAT_ALBEDO_TABLE, sizeof(GGX_COAT_ALBEDO_TABLE));
+	bytes.resize(RT_COAT_SSBO_FLOAT_COUNT * (int)sizeof(float));
+	float *dst = (float *)bytes.ptrw();
+	memcpy(dst + RT_COAT_SSBO_ALBEDO_OFFSET, GGX_COAT_ALBEDO_TABLE, sizeof(GGX_COAT_ALBEDO_TABLE));
+	memcpy(dst + RT_COAT_SSBO_E_OFFSET, GGX_E_TABLE, sizeof(GGX_E_TABLE));
+	memcpy(dst + RT_COAT_SSBO_EAVG_OFFSET, GGX_EAVG_TABLE, sizeof(GGX_EAVG_TABLE));
 	coat_albedo_buffer = RD::get_singleton()->storage_buffer_create(bytes.size(), bytes);
 	if (coat_albedo_buffer.is_valid()) {
 		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT Coat Albedo Table");
