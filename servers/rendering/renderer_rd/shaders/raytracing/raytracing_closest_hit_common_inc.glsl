@@ -945,6 +945,152 @@ void debug_visualize(
 				coatAlbedoEstimate(dbg_material.clearcoat_roughness, NdotV, dbg_material.clearcoat_ior),
 				coatAlbedoEstimate(dbg_material.clearcoat_roughness, 1.0, dbg_material.clearcoat_ior),
 				coatAlbedoEstimate(dbg_material.clearcoat_roughness, 0.0, dbg_material.clearcoat_ior));
+	} else if (vis_mode == 39) {
+		// E2d Task 6, probe A: the coat's MULTIPLE-SCATTERING energy tables,
+		// evaluated on the GPU so pt_coat_gate can compare them against
+		// test_pt_coat_albedo.cpp's CPU mirror.
+		//
+		// WHY THIS MODE HAS TO EXIST. coatGgxE / coatEnergyScale / coatDarkening
+		// (brdf_inc.glsl) are GLSL TRANSCRIPTIONS of CPU functions the doctest
+		// suite covers -- but doctest cannot execute GLSL, so the transcriptions
+		// themselves have no automated test at all. Every failure mode of a
+		// transcription is silent here: a transposed LUT axis
+		// (coatLutRead2D(base, cosNI, rough, ...) instead of
+		// (base, rough, cosNI, ...)), a swapped RT_COAT_SSBO_E_OFFSET /
+		// RT_COAT_SSBO_EAVG_OFFSET, a 32<->16 dimension slip. All three compile,
+		// all three return plausible numbers inside [0,1], and all three only
+		// ever reach the image multiplied into an attenuation or a payout where
+		// nothing distinguishes them from a slightly different coat.
+		//
+		// r = E(coat_roughness, cosNI)          -- GGX_E_TABLE, 32x32
+		// g = coatEnergyScale(...)              -- PAYOUT multiplier, adds GGX_EAVG_TABLE
+		// b = coatDarkening(...)                -- WITHDRAWAL multiplier
+		//
+		// cosNI is the NdotV parameter, i.e. dot(final_normal, V) floor-clamped
+		// to 0.0001 by the caller -- the same quantity vis mode 38 reads, and the
+		// same quantity evalCoat feeds coatEnergyScale (there it is
+		// coatData.NdotV). Deliberately NOT forced to a constant 1.0: the gate's
+		// assertion table is at cosNI == 1.0, and it obtains that from GEOMETRY (a
+		// quad squarely facing a narrow-FOV camera, cosNI >= 0.9987 over the
+		// crop, where E moves by ~1e-4 -- see pt_coat_gate.gd's probe A comment).
+		// Forcing the value here would have made the probe unable to see a wrong
+		// cosNI reaching these functions at all.
+		//
+		// The three arguments carry the SAME clamps shade_and_bounce applies when
+		// it builds brdf_mat (raytracing_closest_hit_common_inc.glsl, the
+		// brdf_mat.coat* block), not the raw material fields vis mode 38 reads --
+		// so what this mode measures is what production evaluates.
+		float dbg_ccr39 = clamp(dbg_material.clearcoat_roughness, 0.0, 1.0);
+		float dbg_ccior39 = max(dbg_material.clearcoat_ior, 1.0);
+		ps.radiance = vec3(
+				coatGgxE(dbg_ccr39, NdotV),
+				coatEnergyScale(dbg_ccr39, NdotV, dbg_ccior39),
+				coatDarkening(dbg_ccr39, NdotV, dbg_ccior39));
+	} else if (vis_mode == 40) {
+		// E2d Task 6, probe D: THREE-LOBE self-normalising pdf instrument.
+		//
+		// WHY NOT VIS MODE 35. E2b's instrument draws its direction from
+		// sampleSpecularMicrofacet ALONE and accumulates 1/combinedPdf(L). That
+		// reads 2*PI only because the anisotropy gate's material is fully
+		// metallic and uncoated, which makes combinedPdf's mixture collapse onto
+		// the single specular density the draw came from. Point mode 35 at a
+		// COATED material and the identity no longer holds even for a perfectly
+		// correct pdf: the draw is still p_specular while the report is
+		// baseShare*p_spec + coatMass*p_coat, and
+		// E_{L~p_spec}[1/G(L)] != 2*PI whenever G != p_spec. A gate built on mode
+		// 35 at clearcoat > 0 would therefore fail on correct code, which is why
+		// this task adds a second mode instead of repointing that one (a
+		// documented deviation from the Task 6 brief; see task-6-report.md).
+		//
+		// THE IDENTITY THIS MODE USES. Draw L from the FULL production mixture --
+		// the same coatLobeWeight/lobeWeight/selectLobe sequence shade_and_bounce
+		// runs, then evalIndirectCombinedBRDF, the real sampler -- and accumulate
+		// 1/combinedPdf(L). If combinedPdf reports the density the mixture
+		// actually realises, E[1/G(L)] is the support's solid-angle measure,
+		// 2*PI for the upper hemisphere, INDEPENDENT of every lobe's shape and of
+		// the mixture weights. A pdf wrong by a factor k reads back 1/k.
+		//
+		// What that makes it able to catch, which nothing else in this tree can:
+		// the coat term entering combinedPdf's mixture with a weight the sampler
+		// does not use (or vice versa), and coatPdf describing different geometry
+		// from sampleCoatMicrofacet. Both are mean-preserving MIS desyncs --
+		// invisible in any rendered furnace.
+		//
+		// The weights arithmetic below is written out rather than called, because
+		// there is no shared function for it -- shade_and_bounce has the only
+		// other copy. That is the point: this compares PRODUCTION'S SELECTION
+		// SPLIT against COMBINEDPDF'S REPORTED SPLIT, which are exactly the two
+		// halves that must agree. Every non-trivial term (coatLobeWeight,
+		// lobeWeight, selectLobe, evalIndirectCombinedBRDF, combinedPdf) is the
+		// shipped function, not a copy.
+		MaterialProperties dbg_mat40;
+		dbg_mat40.baseColor = albedo;
+		dbg_mat40.metalness = metalness;
+		dbg_mat40.roughness = roughness;
+		vec3 dbg_f0_40;
+		float dbg_eta_40;
+		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
+				dbg_material.specular_tint, dbg_f0_40, dbg_eta_40);
+		dbg_mat40.dielectricF0 = dbg_f0_40;
+		dbg_mat40.emissive = vec3(0.0);
+		dbg_mat40.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
+		dbg_mat40.eta = dbg_eta_40;
+		dbg_mat40.opacity = 1.0;
+		dbg_mat40.anisotropy = dbg_material.anisotropy;
+		dbg_mat40.anisotropyRotation = dbg_material.anisotropy_rotation; // already RADIANS
+		dbg_mat40.tangent = world_tangent;
+		dbg_mat40.coatWeight = max(dbg_material.clearcoat, 0.0);
+		dbg_mat40.coatRoughness = clamp(dbg_material.clearcoat_roughness, 0.0, 1.0);
+		dbg_mat40.coatIor = max(dbg_material.clearcoat_ior, 1.0);
+		dbg_mat40.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
+
+		// Same clamped shading normal shade_and_bounce bounces from (mirrors vis
+		// modes 33/35). On a sphere this is well away from world Z almost
+		// everywhere, which is what keeps E2b's two frame fixes live here too.
+		vec3 dbg_N40 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+		// UNCLAMPED dot(N, V), matching shade_and_bounce's cosNI and combinedPdf's
+		// -- data.NdotV is floored at 1e-5 and would silently desync the two.
+		float dbg_cosNI40 = dot(dbg_N40, V);
+
+		float dbg_coatMass40 = coatLobeWeight(dbg_mat40, dbg_cosNI40);
+		float dbg_pSpec40 = lobeWeight(dbg_mat40);
+		float dbg_baseShare40 = 1.0 - dbg_coatMass40;
+		float dbg_w40[LOBE_COUNT];
+		dbg_w40[LOBE_SPECULAR] = dbg_baseShare40 * dbg_pSpec40;
+		dbg_w40[LOBE_DIFFUSE] = dbg_baseShare40 * (1.0 - dbg_pSpec40);
+		dbg_w40[LOBE_COAT] = dbg_coatMass40;
+
+		RNGState dbg_rng40 = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
+		int dbg_lobe40 = selectLobe(rng_1d(dbg_rng40, RT_PRNG_LOBE), dbg_w40);
+		int dbg_brdfType40 = SPECULAR_TYPE;
+		if (dbg_lobe40 == LOBE_COAT) {
+			dbg_brdfType40 = COAT_TYPE;
+		} else if (dbg_lobe40 == LOBE_DIFFUSE) {
+			dbg_brdfType40 = DIFFUSE_TYPE;
+		}
+
+		vec2 dbg_u40 = rng_2d(dbg_rng40, RT_PRNG_SURFACE_BSDF);
+		vec3 dbg_dir40 = vec3(0.0);
+		vec3 dbg_weight40 = vec3(0.0);
+		bool dbg_ok40 = evalIndirectCombinedBRDF(dbg_u40, dbg_N40, geometry_normal, V,
+				dbg_mat40, dbg_brdfType40, dbg_dir40, dbg_weight40, vec4(0.0));
+
+		// Same hemisphere guard mode 35 applies, and for the same reason:
+		// combinedPdf's own `dot(N,L) <= 0` early-out returns 0.0, which is not a
+		// desync but a question production never asks (evalIndirectCombinedBRDF
+		// has already rejected those directions via dbg_ok40).
+		bool dbg_valid40 = dbg_ok40 && dot(dbg_N40, dbg_dir40) > 0.0;
+		float dbg_reported40 = dbg_valid40 ? combinedPdf(dbg_N40, dbg_dir40, V, dbg_mat40) : 0.0;
+		float dbg_selfnorm40 = (dbg_valid40 && dbg_reported40 > 0.0) ? (1.0 / dbg_reported40) : 0.0;
+
+		// r = 1.0 when the draw was accepted, 0.0 otherwise. Accumulated, this is
+		// the ACCEPTANCE RATE, and the gate needs it: every rejected sample
+		// contributes 0 to b, so E[b] converges to 2*PI only if acceptance is ~1.
+		// Without r a low acceptance rate would look exactly like a pdf that is
+		// too large, and the gate would report the wrong defect.
+		// g = combinedPdf's report for the drawn direction (diagnostic).
+		// b = 1/G(L) or 0 -- the real instrument, averaged against 2*PI.
+		ps.radiance = vec3(dbg_valid40 ? 1.0 : 0.0, dbg_reported40, dbg_selfnorm40);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

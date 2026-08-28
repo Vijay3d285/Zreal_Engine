@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://tests/pt_coat_gate.gd" id="1_coatgate"]
+
+[node name="PTCoatGate" type="Node"]
+script = ExtResource("1_coatgate")
