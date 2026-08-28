@@ -475,19 +475,30 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 	//   - the multiple-scattering factor is applied because sampleSpecularMicrofacet
 	//     folds it into the weight the BSDF strategy realises, while evalMicrofacet
 	//     does not.
+	//   - E2d fix round 1: the COAT is treated exactly as the environment-NEE block
+	//     treats it, because this path has the identical structure -- a second MIS
+	//     strategy paired against combinedPdf through power_heuristic below. So it
+	//     gets the multiple-scattering factor (the coat is sampled through the same
+	//     sampleSpecularMicrofacet) and a near-delta guard keyed on the COAT's own
+	//     roughness, matching coatPdf's cutoff. The base terms arrive already
+	//     attenuated by the coat, inside evalCombinedBRDFSeparate.
 	vec3 bsdf_val = vec3(0.0);
 	if (dot(p_N, p_V) > 0.0) {
-		vec3 f_diff, f_spec;
-		evalCombinedBRDFSeparate(p_N, L, p_V, p_mat, f_diff, f_spec);
+		vec3 f_diff, f_spec, f_coat;
+		evalCombinedBRDFSeparate(p_N, L, p_V, p_mat, f_diff, f_spec, f_coat);
 
 #if MICROFACET_DISTRIBUTION == GGX
 		float ms_alpha = p_mat.roughness * p_mat.roughness;
 		float NdotV = max(dot(p_N, p_V), 0.0001);
 		vec3 specular_f0 = baseColorToSpecularF0(p_mat.baseColor, p_mat.metalness, p_mat.dielectricF0);
 		f_spec *= evalMultiScatterApproximation(ms_alpha, NdotV, specular_f0);
+		f_coat *= coatMultiScatter(p_mat, NdotV);
 #endif
 
 		bsdf_val = (p_mat.roughness < RT_MIS_DELTA_ROUGHNESS) ? f_diff : (f_diff + f_spec);
+		if (p_mat.coatRoughness >= RT_MIS_DELTA_ROUGHNESS) {
+			bsdf_val += f_coat;
+		}
 	}
 
 	// Emitted radiance at the sampled point, through THE shared composition.

@@ -364,10 +364,36 @@ vec3 lights_eval_rect_light(
 	float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation);
 
 	// 9. BRDF
-	vec3 brdf_diffuse, brdf_specular;
-	evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
+	//
+	// E2d fix round 1, THE ANALYTIC-LIGHT RULE (all three sites in this file --
+	// rect here, positional and directional below -- follow it identically):
+	//
+	//   * The coat term IS added. Before this, NEE evaluated the unlayered base
+	//     while BSDF sampling applied the coat's attenuation, so a coated surface
+	//     lost its direct-light highlight and kept base light the coat should have
+	//     absorbed. The base terms now arrive already attenuated, inside
+	//     evalCombinedBRDFSeparate.
+	//   * NO multiple-scattering factor, unlike the env- and emissive-NEE sites.
+	//     Those apply it because they are MIS-paired against combinedPdf and the
+	//     two strategies must estimate one integrand. Analytic lights carry no MIS
+	//     weight and are unreachable by BSDF rays (see the env-NEE block in
+	//     raytracing_closest_hit_common_inc.glsl), so there is no second strategy
+	//     to agree with. The base specular here already omits it, deliberately and
+	//     on the record; the coat matches the base rather than inventing a third
+	//     convention.
+	//   * NO RT_MIS_DELTA_ROUGHNESS guard, for the same reason -- these sites have
+	//     never had one. The guard exists to hand delta lobes to the BSDF strategy
+	//     outright; with no competing strategy here it would simply delete a
+	//     mirror coat's direct highlight with nothing to collect it.
+	//   * The coat DOES take spec_mul. That is Godot's per-light `specular` knob,
+	//     an artistic scale on that light's specular response, and a clearcoat
+	//     highlight is specular response from that light. Deriving a second
+	//     multiplier from coatRoughness would make one light's knob behave
+	//     differently for the coat than for the base with nothing to justify it.
+	vec3 brdf_diffuse, brdf_specular, brdf_coat;
+	evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat);
 	float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-	vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+	vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul;
 
 	// 10. Combine — divide by solid angle pdf
 	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
@@ -534,9 +560,12 @@ vec3 lights_evaluate_direct_lighting(
 			return vec3(0.0);
 		}
 
-		// Evaluate BRDF (diffuse + specular separately for specular_amount control).
-		vec3 brdf_diffuse, brdf_specular;
-		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
+		// Evaluate BRDF (diffuse + specular + coat separately for specular_amount
+		// control). E2d fix round 1: see THE ANALYTIC-LIGHT RULE in
+		// lights_eval_rect_light above for why the coat is added plainly here, with
+		// no multiple-scatter factor and no near-delta guard.
+		vec3 brdf_diffuse, brdf_specular, brdf_coat;
+		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat);
 
 		// Distance attenuation.
 		LightSample ls_atten;
@@ -544,7 +573,7 @@ vec3 lights_evaluate_direct_lighting(
 		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation) * spot_atten;
 
 		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul;
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
@@ -583,11 +612,12 @@ vec3 lights_evaluate_direct_lighting(
 			return vec3(0.0);
 		}
 
-		vec3 brdf_diffuse, brdf_specular;
-		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
+		// E2d fix round 1: see THE ANALYTIC-LIGHT RULE in lights_eval_rect_light.
+		vec3 brdf_diffuse, brdf_specular, brdf_coat;
+		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat);
 
 		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
+		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul;
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 

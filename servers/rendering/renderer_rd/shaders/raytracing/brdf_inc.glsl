@@ -1902,35 +1902,70 @@ float coatAlbedoEstimate(float coatRoughness, float cosNI, float ior) {
 	return mix(f0, 1.0f, s);
 }
 
+// ---------------------------------------------------------------------------
+// The coat's albedo appears in TWO roles, and they are NOT the same number.
+// This is the concrete instance of the selection-weight vs throughput-scale
+// split documented at the top of this registry section, so getting it wrong
+// here is the exact defect that block exists to prevent.
+//
+//   coatLayerAlbedo  -- THROUGHPUT. The fraction of energy the coat withdraws
+//                       from everything beneath it. RAW, never clamped.
+//   coatLobeWeight   -- SELECTION. How often the RNG picks the coat lobe.
+//                       Clamped, purely to bound the sampler's divisor.
+//
+// Fix round 1 (E2d): these were one clamped value, and the attenuation read the
+// CLAMPED one. That is a real energy error with no physical source -- a faint
+// coat whose true albedo is 0.001 was attenuating the base by 0.99 instead of
+// 0.999, because a bound that exists only to stop fireflies in the SAMPLER had
+// leaked into the radiometry. The spec is explicit that the attenuation takes
+// the raw product (section 4.1, `saturate(1.0 - coat_weight * estimate_albedo)`),
+// as is Cycles: closure_layering_weight divides the coat closure's albedo by the
+// base weight (bsdf_util.h:440), and no clamp is involved.
+// ---------------------------------------------------------------------------
+
+// RAW layering albedo, coat_weight * estimate. THROUGHPUT quantity -- do not
+// clamp it, and do not feed it to selectLobe.
+//
+// Below CLOSURE_WEIGHT_CUTOFF (1e-5, svm/types.h:576) Cycles skips the coat
+// entirely; returning 0 here does the same. That EXACT ZERO is load-bearing for
+// the phase invariant: at clearcoat == 0 every derived quantity below is 0 or
+// exactly 1.0f, and multiplying by exactly 1.0f is the IEEE identity, so the
+// three-lobe arithmetic reduces to E2c's two-lobe arithmetic bit-for-bit.
+float coatLayerAlbedo(MaterialProperties material, float cosNI) {
+	if (material.coatWeight <= 0.00001f) {
+		return 0.0f;
+	}
+	return material.coatWeight * coatAlbedoEstimate(material.coatRoughness, cosNI, material.coatIor);
+}
+
 // Selection probability mass for the coat, BEFORE normalisation against the
 // base lobes. Cycles sets a closure's sample_weight from its estimated albedo
 // (bsdf_microfacet.h:1021), so sampling effort tracks how much light the coat
 // actually returns.
 //
-// Below CLOSURE_WEIGHT_CUTOFF (1e-5, svm/types.h:576) Cycles skips the coat
-// entirely; returning 0 here does the same. That EXACT ZERO is load-bearing for
-// the phase invariant: at clearcoat == 0 the caller's baseShare is 1.0f - 0.0f
-// == exactly 1.0f, and multiplying by exactly 1.0f is the IEEE identity, so the
-// three-lobe arithmetic reduces to E2c's two-lobe arithmetic bit-for-bit.
-//
-// THE CLAMP IS NOT COSMETIC. The sampler divides throughput by the selected
-// lobe's weight, so an unclamped mass is an unbounded variance source: a coat
-// just above the cutoff with a typical estimate near 0.04 yields ~4e-7, and
-// dividing by that is a 2.5-million-fold spike -- fireflies on any faintly
-// coated material. Symmetrically, a mass near 1 drives baseShare toward 0 and
-// does the same to the specular and diffuse divisors.
+// THE CLAMP IS NOT COSMETIC, and it is confined to THIS role. The sampler
+// divides throughput by the selected lobe's weight, so an unclamped mass is an
+// unbounded variance source: a coat just above the cutoff with a typical
+// estimate near 0.04 yields ~4e-7, and dividing by that is a 2.5-million-fold
+// spike -- fireflies on any faintly coated material. Symmetrically, a mass near
+// 1 drives baseShare toward 0 and does the same to the specular and diffuse
+// divisors.
 //
 // lobeWeight (above) already ends in clamp(..., 0.01f, 0.99f) for exactly this
 // reason. Mirror it rather than inventing a different bound. Cycles does not
 // clamp its sample_weight, but Cycles carries variance machinery this
 // integrator does not; matching its noise profile is not the goal, matching
 // its IMAGE is, and an unbounded divisor changes the image through noise.
+//
+// The clamp cannot resurrect a coat the cutoff killed: coatLayerAlbedo returns
+// literal 0.0f there, and the guard below passes it straight through, so
+// `coatMass <= 0.0` still means exactly "no coat lobe".
 float coatLobeWeight(MaterialProperties material, float cosNI) {
-	if (material.coatWeight <= 0.00001f) {
+	float albedo = coatLayerAlbedo(material, cosNI);
+	if (albedo <= 0.0f) {
 		return 0.0f;
 	}
-	float mass = material.coatWeight * coatAlbedoEstimate(material.coatRoughness, cosNI, material.coatIor);
-	return clamp(mass, 0.01f, 0.99f);
+	return clamp(albedo, 0.01f, 0.99f);
 }
 
 // Isotropic VNDF reflection pdf of the coat lobe, at alpha = coatRoughness^2.
@@ -1957,6 +1992,130 @@ float coatPdf(float coatRoughness, float NdotH, float NdotV, float LdotH) {
 	}
 	float alpha = coatRoughness * coatRoughness;
 	return specularPdf(alpha, alpha * alpha, NdotH, NdotV, LdotH);
+}
+
+// SINGLE SOURCE OF TRUTH for "what material is the coat". Both the SAMPLER
+// (evalIndirectCombinedBRDF's COAT_TYPE branch) and the EVALUATOR (evalCoat
+// below, reached from every NEE path) build their BrdfData from this, so they
+// cannot disagree about the coat's alpha or its F0. Two hand-rolled copies of
+// this six-line body is precisely the desync E2c's registry unification was
+// created to make impossible; do not reintroduce one.
+//
+//   - roughness  -> the coat's, so prepareBRDFData's alpha/alphaSquared are the
+//                   coat's. Cycles forces alpha_x == alpha_y == sqr(coat_roughness)
+//                   (svm/closure.h:165) -- NOT this engine's raster
+//                   mix(0.001, 0.1, r) remap; see E2d spec section 3.2.
+//   - metalness  -> 0 and baseColor -> black, so
+//                   baseColorToSpecularF0(black, 0, F0) returns exactly the coat
+//                   F0 and nothing underneath the coat leaks into this lobe.
+//                   There is no diffuse under a coat lobe.
+//   - transmissivness -> 0. The coat never transmits; leaving the base's value
+//                   would make a glass base drag its dielectric split into the
+//                   coat.
+//   - anisotropy -> 0, which is what forces prepareBRDFData's anisoActive false
+//                   and ax == ay == alpha. Cycles gives the coat no anisotropy
+//                   to match, so passing the base's would stretch a highlight
+//                   that should be round.
+MaterialProperties coatMaterial(MaterialProperties material) {
+	MaterialProperties coatMat = material;
+	coatMat.roughness = material.coatRoughness;
+	coatMat.metalness = 0.0f;
+	coatMat.transmissivness = 0.0f;
+	coatMat.baseColor = float3(0.0f, 0.0f, 0.0f);
+	// q = (ior-1)/(ior+1); F0 SQUARES q. coatAlbedoEstimate builds the same q and
+	// takes its square ROOT for the LUT's z axis -- opposite directions from one
+	// quantity, and swapping them type-checks. Keep them apart.
+	float q = (material.coatIor - 1.0f) / (material.coatIor + 1.0f);
+	coatMat.dielectricF0 = float3(q * q, q * q, q * q);
+	coatMat.anisotropy = 0.0f;
+	return coatMat;
+}
+
+// The coat's BSDF VALUE, for the NEE paths. N/L/V are WORLD-space, exactly as
+// evalCombinedBRDFSeparate receives them.
+//
+// EVAL CONVENTION -- deliberately NOT coatPdf's, and this file punishes anyone
+// who assumes otherwise (E2b's Critical, recorded in evalMicrofacet's C1 note).
+// The way this function guarantees parity is that it does not reimplement
+// anything: it calls `evalSpecular`, the SAME macro (:223 -> evalMicrofacet)
+// that produces `outSpecular` in evalCombinedBRDFSeparate, on a BrdfData built
+// by the SAME prepareBRDFData. So whatever convention the base specular term
+// carries, the coat carries identically and by construction:
+//   * G2 IS divided by 4*NdotL*NdotV (G2_DIVIDED_BY_DENOMINATOR, :946) -- the
+//     opposite of coatPdf, which is a raw D*G1/(4*NdotV) with no G2 at all;
+//   * Fresnel is baked in, evaluated at LdotH by prepareBRDFData;
+//   * the NdotL cosine is baked in.
+// Re-deriving any of those by hand here would reproduce E2b's defect exactly.
+//
+// The coatWeight scale is Cycles' closure weight: the coat closure is allocated
+// with `coat_weight * weight` (svm/closure.h), which is also why the spec writes
+// the coat's albedo as `coat_weight * w * estimate` (section 4.1). Without it
+// the coat returns 1/coat_weight too much light and a white furnace exceeds 1.
+//
+// Deliberately does NOT reject Vbackfacing: evalCombinedBRDFSeparate does not
+// either (see the dot(N,V) note at raytracing_closest_hit_common_inc.glsl), and
+// the coat must pay out on exactly the shading points the base specular does or
+// the two disagree about which vertices are lit.
+float3 evalCoat(float3 N, float3 L, float3 V, MaterialProperties material) {
+	if (material.coatWeight <= 0.00001f) {
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	const BrdfData coatData = prepareBRDFData(N, L, V, coatMaterial(material));
+	// Defence for direct callers only. In production this is unreachable:
+	// evalCombinedBRDFSeparate's own Lbackfacing early-out fires first, on the
+	// identical predicate from the identical prepareBRDFData. See that function
+	// for why the coat must be zero below the horizon.
+	if (coatData.Lbackfacing) {
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	return material.coatWeight * evalSpecular(coatData);
+}
+
+// GGX multiple-scattering compensation for the COAT, the partner of the factor
+// the env- and emissive-NEE sites already apply to the base specular term.
+//
+// It is needed for the same reason theirs is: sampleSpecularMicrofacet folds
+// `ms` into the weight it hands back, and the coat lobe is sampled through that
+// very function, so the BSDF strategy's realised coat integrand carries `ms`
+// while evalCoat (evalMicrofacet) does not. Two MIS strategies must estimate the
+// SAME integrand. Built from coatMaterial so the alpha and F0 are the same ones
+// the sampler used.
+//
+// Roadmap Gap #17 (this approximation over-corrects by 3-8pp) therefore applies
+// to the coat too, exactly as E2d spec section 3.5 says it would.
+float3 coatMultiScatter(MaterialProperties material, float NdotV) {
+	MaterialProperties coatMat = coatMaterial(material);
+	float alpha = coatMat.roughness * coatMat.roughness;
+	float3 coatF0 = baseColorToSpecularF0(coatMat.baseColor, coatMat.metalness, coatMat.dielectricF0);
+	return evalMultiScatterApproximation(alpha, NdotV, coatF0);
+}
+
+// What the coat leaves for everything beneath it. ONE function, called by BOTH
+// the sampler (shade_and_bounce, when a base lobe was drawn) and the evaluator
+// (evalCombinedBRDFSeparate, for every NEE path), so BSDF sampling and NEE
+// cannot disagree about the integrand -- which is the whole point of fix
+// round 1.
+//
+// Two steps, deliberately not fused. Cycles allocates the coat lobe inside a
+// reflective_caustics gate (svm/closure.h:155) but applies the tint OUTSIDE it
+// (:178), so the tint is owed whether or not a coat lobe exists -- it is
+// conditioned on coatTint, never on the lobe.
+//
+// `coatAlbedo` is the RAW coatLayerAlbedo, NOT the clamped selection mass; see
+// the two-roles block above.
+float3 coatLayeringTransmittance(MaterialProperties material, float cosNI, float coatAlbedo) {
+	// closure_layering_weight(a, w) = w * saturate(1 - max(a/w)) (bsdf_util.h:440).
+	// The coat's albedo is coatWeight*w*estimate, so the w cancels and the whole
+	// thing reduces to this one line.
+	float3 t = float3(clamp(1.0f - coatAlbedo, 0.0f, 1.0f));
+
+	// Beer's law through the coat.
+	if (material.coatTint != float3(1.0f, 1.0f, 1.0f)) {
+		float cosNT = sqrt(1.0f - (1.0f / (material.coatIor * material.coatIor)) * (1.0f - cosNI * cosNI));
+		float opticalDepth = 1.0f / max(cosNT, 0.00001f);
+		t *= mix(float3(1.0f, 1.0f, 1.0f), pow(material.coatTint, float3(opticalDepth)), material.coatWeight);
+	}
+	return t;
 }
 
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
@@ -2208,13 +2367,35 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	return combineLobePdf(weights, pdfs);
 }
 
-// Version that returns diffuse and specular separately.
-void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties material, OUT_PARAMETER(float3) outDiffuse, OUT_PARAMETER(float3) outSpecular) {
+// Version that returns diffuse, specular and coat separately.
+//
+// E2d fix round 1: the coat gets its OWN out-parameter rather than riding inside
+// outSpecular, and the reason is the RT_MIS_DELTA_ROUGHNESS guard every MIS
+// caller applies. Those callers drop outSpecular when the BASE roughness is
+// near-delta; a coat folded into outSpecular would be silently deleted along
+// with it, so a perfectly rough, perfectly NEE-able coat would vanish whenever
+// the base underneath happened to be a near-mirror. Separate out-params let each
+// call site key its guard on the roughness that actually governs that lobe.
+//
+// Every caller must decide what to do with outCoat -- there is no 2-parameter
+// overload on purpose. A caller that ignores it loses the coat's direct
+// lighting silently, which is the bug this fix round exists to close.
+void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties material, OUT_PARAMETER(float3) outDiffuse, OUT_PARAMETER(float3) outSpecular, OUT_PARAMETER(float3) outCoat) {
 	outDiffuse = float3(0.0f, 0.0f, 0.0f);
 	outSpecular = float3(0.0f, 0.0f, 0.0f);
+	outCoat = float3(0.0f, 0.0f, 0.0f);
 	// Prepare data needed for BRDF evaluation (uses shading normal N for all BRDF math).
 	const BrdfData data = prepareBRDFData(N, L, V, material);
-	// Ignore L rays "below" the hemisphere
+	// Ignore L rays "below" the hemisphere.
+	//
+	// E2d: this early-out zeroes the COAT too, and that is required, not
+	// incidental. combinedPdf's own first early-out returns 0.0 for NdotL <= 0
+	// across ALL THREE lobes, so a coat paid below the horizon would be a value
+	// with no matching density: power_heuristic(pdf_light, 0) = 1 hands it FULL
+	// MIS weight, and the BSDF strategy can never reach that direction to balance
+	// it. It is also unphysical -- a coat cannot reflect light arriving from
+	// beneath the surface it sits on. Leaving outCoat at its initialiser here is
+	// what makes value and density agree.
 	if (data.Lbackfacing) {
 		return;
 	}
@@ -2227,6 +2408,30 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// Specular is already multiplied by F, just attenuate diffuse
 	outDiffuse = (float3(1.0f, 1.0f, 1.0f) - data.F) * outDiffuse;
 #endif
+
+	// E2d fix round 1. The layer, both halves.
+	//
+	// Without the attenuation below, NEE evaluates the UNLAYERED base while
+	// combinedPdf reports a density that includes the coat, and BSDF sampling
+	// applies the attenuation that NEE does not. Two MIS strategies then estimate
+	// two different integrands, which is biased rather than merely noisy and which
+	// no amount of sampling repairs -- the B2 defect class.
+	//
+	// coatLayeringTransmittance is the SAME function shade_and_bounce calls, on
+	// the same raw coatLayerAlbedo, so the two cannot drift.
+	//
+	// cosNI is dot(N, V) unclamped, matching the sampler and combinedPdf exactly.
+	// At coatWeight == 0 coatLayerAlbedo returns literal 0.0f and the guard below
+	// is false, so every line here is skipped and the three outputs are
+	// bit-identical to the pre-E2d two-output form.
+	float cosNI = dot(N, V);
+	float coatAlbedo = coatLayerAlbedo(material, cosNI);
+	if (material.coatWeight > 0.00001f) {
+		float3 baseTransmittance = coatLayeringTransmittance(material, cosNI, coatAlbedo);
+		outDiffuse *= baseTransmittance;
+		outSpecular *= baseTransmittance;
+		outCoat = evalCoat(N, L, V, material);
+	}
 }
 
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for indirect light)
@@ -2289,38 +2494,15 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, data.anisoActive, u, sampleWeight);
 	} else if (brdfType == COAT_TYPE) {
 		// E2d. The coat is an isotropic GGX with alpha = sqr(coat_roughness) and a
-		// dielectric F0 from coat_ior. Cycles forces alpha_x == alpha_y ==
-		// sqr(coat_roughness) (svm/closure.h:165) -- NOT this engine's raster
-		// mix(0.001, 0.1, r) remap; see the E2d spec section 3.2 for why the
-		// raster and the path tracer deliberately disagree here.
+		// dielectric F0 from coat_ior, reusing the EXISTING isotropic specular path
+		// rather than writing a second one.
 		//
-		// Reuses the EXISTING isotropic specular path rather than writing a second
-		// one, by handing it a MaterialProperties describing the coat alone:
-		//   - roughness  -> the coat's, so prepareBRDFData's alpha/alphaSquared
-		//                   (:1653-1654) are the coat's.
-		//   - metalness  -> 0 and baseColor -> black, so
-		//                   baseColorToSpecularF0(black, 0, F0) returns exactly the
-		//                   coat F0 and nothing underneath the coat leaks into this
-		//                   lobe. There is no diffuse under a coat lobe.
-		//   - transmissivness -> 0. The coat never transmits; leaving the base's
-		//                   value here would make a glass base drag its dielectric
-		//                   split into the coat.
-		//   - anisotropy -> 0, which is what forces prepareBRDFData's anisoActive
-		//                   false and ax == ay == alpha (:1667). Cycles gives the
-		//                   coat no anisotropy to match, so passing the base's
-		//                   would stretch a highlight that should be round.
-		MaterialProperties coatMat = materialLocal;
-		coatMat.roughness = material.coatRoughness;
-		coatMat.metalness = 0.0f;
-		coatMat.transmissivness = 0.0f;
-		coatMat.baseColor = float3(0.0f, 0.0f, 0.0f);
-		// q = (ior-1)/(ior+1); F0 SQUARES q. coatAlbedoEstimate builds the same q
-		// and takes its square ROOT for the LUT's z axis -- opposite directions
-		// from one quantity, and swapping them type-checks. Keep them apart.
-		float q = (material.coatIor - 1.0f) / (material.coatIor + 1.0f);
-		coatMat.dielectricF0 = float3(q * q, q * q, q * q);
-		coatMat.anisotropy = 0.0f;
-		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, coatMat);
+		// coatMaterial() is the shared definition -- evalCoat, on the NEE side,
+		// builds its BrdfData from the very same function, so the sampled lobe and
+		// the evaluated lobe cannot describe different coats. Built from
+		// materialLocal so the already-rotated tangent is carried (inert here,
+		// since coatMaterial zeroes anisotropy, but correct if that ever changes).
+		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, coatMaterial(materialLocal));
 		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, data.anisoActive, u, sampleWeight);
 	}
 

@@ -1327,8 +1327,8 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 				// the delta regime stays bit-identical to before this fix.
 				vec3 bsdf_val = vec3(0.0);
 				if (dot(N, V) > 0.0) {
-					vec3 f_diff, f_spec;
-					evalCombinedBRDFSeparate(N, env_dir, V, brdf_mat, f_diff, f_spec);
+					vec3 f_diff, f_spec, f_coat;
+					evalCombinedBRDFSeparate(N, env_dir, V, brdf_mat, f_diff, f_spec, f_coat);
 
 					// GGX multiple-scattering compensation. sampleSpecularMicrofacet
 					// folds `ms` into the weight it hands back (brdf_inc.glsl:905),
@@ -1352,11 +1352,29 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 #if MICROFACET_DISTRIBUTION == GGX
 					float ms_alpha = brdf_mat.roughness * brdf_mat.roughness;
 					f_spec *= evalMultiScatterApproximation(ms_alpha, NdotV, specularF0);
+					// E2d fix round 1: the coat is sampled through the same
+					// sampleSpecularMicrofacet, so it carries the same `ms` on the
+					// BSDF side and needs the same compensation here. Built from the
+					// COAT's alpha and F0, not the base's -- coatMultiScatter does
+					// that from the shared coatMaterial. No-op at coatWeight 0
+					// because f_coat is already vec3(0) there.
+					f_coat *= coatMultiScatter(brdf_mat, NdotV);
 #endif
 
 					bsdf_val = (brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS)
 							? f_diff
 							: (f_diff + f_spec);
+					// E2d fix round 1: the coat's delta guard is keyed on the COAT's
+					// roughness, not the base's. That separation is the reason the
+					// coat has its own out-parameter -- folded into f_spec, a rough
+					// NEE-able coat would have been deleted by the line above
+					// whenever the base underneath happened to be a near-mirror.
+					// coatPdf drops the coat's DENSITY on exactly this predicate, and
+					// shade_and_bounce stores RT_MIS_PDF_NONE for a coat sample in
+					// the same regime, so value and density agree.
+					if (brdf_mat.coatRoughness >= RT_MIS_DELTA_ROUGHNESS) {
+						bsdf_val += f_coat;
+					}
 				}
 				float bsdf_pdf_for_dir = combinedPdf(N, env_dir, V, brdf_mat);
 
@@ -1407,6 +1425,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// direction by direction or MIS partitions one integrand while the estimator
 	// evaluates another (the B2 defect class).
 	float cosNI = dot(N, V);
+	// TWO quantities, deliberately. coatLayerAlbedo is the RAW throughput
+	// withdrawal; coatMass is the CLAMPED selection probability. Fix round 1 split
+	// them -- see the two-roles block above coatLayerAlbedo in brdf_inc.glsl for
+	// the energy error the clamped one caused when it was used for both.
+	float coatAlbedo = coatLayerAlbedo(brdf_mat, cosNI);
 	float coatMass = coatLobeWeight(brdf_mat, cosNI);
 
 	int brdfType;
@@ -1470,7 +1493,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		if (lobe == LOBE_COAT) {
 			brdfType = COAT_TYPE;
 			tookCoatLobe = true;
-			ps.throughput /= weights[LOBE_COAT];
+			// Fix round 1: `coatWeight /`, not a bare `1 /`. The other two lobes
+			// divide by their selection probability alone because their CLOSURE
+			// weight is 1; the coat's is not. Cycles allocates the coat closure with
+			// `coat_weight * weight` (svm/closure.h), which is why the spec writes
+			// its albedo as `coat_weight * w * estimate` (section 4.1), so the MC
+			// factor here is closure weight over selection probability.
+			//
+			// Shipped without it, the coat returned 1/coatWeight too much light --
+			// at coatWeight 0.5 over a white base a furnace reads 1.025, and
+			// "coat plus attenuated base never exceeds 1" is acceptance criterion 1.
+			// The base was attenuated by coatWeight*estimate while the coat paid out
+			// as though coatWeight were 1, so the two halves of the layer did not
+			// balance.
+			ps.throughput *= brdf_mat.coatWeight / weights[LOBE_COAT];
 		} else if (lobe == LOBE_SPECULAR) {
 			brdfType = SPECULAR_TYPE;
 			ps.throughput /= weights[LOBE_SPECULAR];
@@ -1484,27 +1520,23 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// returns light the base still returns in full -- which is the wrong render,
 	// which is why the lobe and this block land in one commit.
 	if (!tookCoatLobe && brdf_mat.coatWeight > 0.00001) {
-		// closure_layering_weight(a, w) = w * saturate(1 - max(a/w))
-		// (bsdf_util.h:440). The coat's albedo is coatWeight*w*estimate, so the w
-		// cancels and the whole thing reduces to this one line.
-		//
 		// THIS IS A THROUGHPUT FACTOR, NOT A SELECTION PROBABILITY. It must not be
 		// folded into weights[] above -- see the selection-vs-throughput block at
 		// the top of brdf_inc.glsl's registry section. Folding it in and
 		// renormalising would still integrate to the right mean (MIS is unbiased
 		// for ANY weights summing to 1 pointwise), so the error would be
 		// mean-preserving and invisible to every rendered gate this project has.
-		ps.throughput *= clamp(1.0 - coatMass, 0.0, 1.0);
-
-		// Beer's law through the coat. Cycles applies this OUTSIDE the coat lobe's
-		// own reflective_caustics branch (svm/closure.h:155 vs :178), so it is a
-		// separate step and must not be fused with the attenuation above.
-		if (brdf_mat.coatTint != vec3(1.0, 1.0, 1.0)) {
-			float cosNT = sqrt(1.0 - (1.0 / (brdf_mat.coatIor * brdf_mat.coatIor)) * (1.0 - cosNI * cosNI));
-			float opticalDepth = 1.0 / max(cosNT, 0.00001);
-			ps.throughput *= mix(vec3(1.0, 1.0, 1.0),
-					pow(brdf_mat.coatTint, vec3(opticalDepth)), brdf_mat.coatWeight);
-		}
+		//
+		// Fix round 1: routed through coatLayeringTransmittance, the SAME function
+		// evalCombinedBRDFSeparate calls for every NEE path, fed the same RAW
+		// coatAlbedo. Before that, BSDF sampling applied a layer NEE knew nothing
+		// about, so the two MIS strategies estimated different integrands. The
+		// attenuation and the Beer's-law tint remain two separate steps inside that
+		// function, per Cycles (svm/closure.h:155 vs :178).
+		//
+		// Note it takes coatAlbedo, NOT coatMass -- the clamp on coatMass exists
+		// only to bound the sampler's divisor and has no radiometric meaning.
+		ps.throughput *= coatLayeringTransmittance(brdf_mat, cosNI, coatAlbedo);
 	}
 
 	vec2 u = rng_2d(rng, RT_PRNG_SURFACE_BSDF);
