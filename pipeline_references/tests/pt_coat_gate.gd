@@ -70,8 +70,10 @@ extends "res://tests/pt_validation.gd"
 ##   At exactly 1.0 the albedo LUT's first z-slice is all zeros AND
 ##   fresnel_dielectric(c, 1.0) is exactly 0, so the coat must vanish -- but
 ##   evalCoat is still CALLED from every NEE site whenever coatWeight > 1e-5, so
-##   this is a live path, not a skipped one. FAILS IF: any of those calls
-##   contributes something at eta == 1.
+##   this is a live path, not a skipped one. Measured against a same-material
+##   control render, because the per-frame RNG seed is a free-running frame
+##   counter and no two accumulations of anything are bit-identical. FAILS IF:
+##   any of those calls contributes something at eta == 1.
 ##
 ## SCENE-BUILDING TRAPS, each of which has silently broken a sibling gate:
 ##   sky.process_mode = Sky.PROCESS_MODE_QUALITY   REALTIME force-clamps to 256
@@ -188,7 +190,17 @@ const PROBE_D_TOL := 0.03
 # rate is indistinguishable from a pdf that is too large. Mode 40's red channel
 # reports acceptance so the gate can tell those two apart rather than blaming
 # the wrong thing.
-const PROBE_D_MIN_ACCEPTANCE := 0.97
+#
+# THIS IS A DISAMBIGUATOR, NOT THE ASSERTION. Its job is to catch a COLLAPSE in
+# acceptance -- the regime where the 2*PI comparison below stops meaning
+# anything -- not to police a few percent. Production itself rejects a few
+# percent of draws on a sphere at roughness 0.4 (evalIndirectCombinedBRDF's
+# `dot(geometryNormal, rayDirection) <= 0` guard), and fix round 1 measured
+# 0.9732 / 0.9739 / 0.9745 across the three clearcoat values on the intact tree.
+# Round 0 set this at 0.97, close enough to those readings that noise alone
+# could trip it; loosening it to 0.90 does not weaken the real assertion, which
+# is the ratio against 2*PI immediately below.
+const PROBE_D_MIN_ACCEPTANCE := 0.90
 
 # ---------------------------------------------------------------------------
 # PROBE E -- exact dielectric Fresnel vs cosNI
@@ -196,9 +208,33 @@ const PROBE_D_MIN_ACCEPTANCE := 0.97
 const PROBE_E_IOR := [1.1, 1.5, 2.0]
 const PROBE_E_FRAMES := 128
 const PROBE_E_COAT_ROUGHNESS := 0.05
-# Bin centres on the cosNI axis, and the half-width of each bin.
-const PROBE_E_BINS := [0.15, 0.30, 0.50, 0.70, 0.90]
-const PROBE_E_BIN_HALFWIDTH := 0.05
+# Target cos(N,V) values, reached by TILTING A FLAT QUAD rather than by binning a
+# sphere.
+#
+# FIX ROUND 2, and the reason this probe changed geometry. Rounds 0 and 1 read a
+# sphere and bucketed pixels by an ANALYTIC ray-sphere cos map. Both rounds
+# reported the grazing bucket ~20% high at ior 1.1 and ~8% high at ior 1.5 and
+# 2.0 -- ior-independent, and decaying to ~1.00 by cos 0.70. That pattern is not
+# a Fresnel error, it is a resolution error in the instrument:
+#
+#   With the camera 4 units from a unit sphere at 40 deg FOV the sphere's
+#   projected radius is ~91 px, and cos(N,V) in [0.10, 0.20] maps to screen radii
+#   between 0.980 and 0.995 of that -- an annulus ONE AND A THIRD PIXELS WIDE.
+#   Worse, the cos map is built from the ANALYTIC sphere while the renderer traces
+#   a 64x32 tessellated one whose silhouette sits inside it, so a fraction of the
+#   pixels the map calls "a grazing hit" actually miss the mesh and return SKY,
+#   which is radiance 1.0. Solving for that fraction across the three IORs gives
+#   0.060 / 0.067 / 0.064 -- one consistent number, which is what a geometric
+#   leak looks like and what a Fresnel error does not.
+#
+# A tilted quad has no silhouette, no tessellation (it is exactly two triangles in
+# one plane), and a shading normal that IS the geometry normal, so
+# clampShadingNormal is a no-op on it as well. Every pixel's cos(N,V) is then
+# exact, from the plane's own normal and the engine's own camera model.
+const PROBE_E_TARGET_COS := [0.15, 0.30, 0.50, 0.70, 0.90]
+# Keeps the crop clear of the quad's edges, in world units, so no measured pixel
+# is a partially covered edge texel or background sky.
+const PROBE_E_EDGE_MARGIN := 1.0
 # Relative. Sized from the ONE approximation this probe makes: at
 # coat_roughness 0.05 the coat's directional albedo is the LUT's
 # coatAlbedoEstimate, not analytic Fresnel, and the two differ by up to 6.3%
@@ -246,14 +282,29 @@ const PROBE_F_TOL := 2.0e-3
 # PROBE G -- ior 1.0 is inert
 # ---------------------------------------------------------------------------
 const PROBE_G_FRAMES := 32
-# This is not a "close enough" tolerance, it is a bit-identity claim with room
-# for nothing but the readback. At ior 1.0 the LUT's z == 0 slice is all zeros so
-# coatAlbedoEstimate is exactly 0, coatLayerAlbedo is exactly 0, the layering
-# transmittance is exactly vec3(1.0) (and multiplying by 1.0f is the IEEE
-# identity), fresnel_dielectric(c, 1.0) returns exactly 0 so evalCoat's product
-# is exactly 0, and no RNG draw differs -- so the two renders must be the same
-# image, not merely a similar one.
-const PROBE_G_MAX_RMSE := 1.0e-6
+# FIX ROUND 1. Round 0 asserted a bit-identity here (rmse <= 1e-6) on the
+# argument that every coat term is exactly 0 at eta == 1 and no RNG draw
+# differs. The SHADER argument is correct -- see the long note in
+# _probe_g_inert_ior -- but the SEED is not per-accumulation: the per-frame RNG
+# seed is a free-running frame counter (RT_PARAM_FRAME_INDEX), so ANY two
+# accumulations of ANY two scenes, identical or not, differ by ordinary Monte
+# Carlo noise. Round 0 measured 7.57e-4 between them, which was the noise, not
+# the coat. Replaced by a comparison against a same-material control render, so
+# the assertion is "no further apart than two renders of the same thing" -- a
+# claim that keeps its teeth (a coat that is not inert shifts the image
+# systematically, which drives rmse well above a noise floor that scales as
+# 1/sqrt(frames)) without asserting something the estimator cannot deliver.
+#
+# 25%: two independent draws of the same random quantity give rmse ratios that
+# scatter by a few percent at this pixel count; 25% leaves room for that while
+# an image shifted by even a tenth of the coat's own albedo (0.037 at these
+# settings, versus a 7.6e-4 noise floor) would read as a ratio in the tens.
+const PROBE_G_RMSE_MARGIN := 0.25
+# The mean is the sharper of the two: spatial averaging over ~53k pixels removes
+# the seed noise instead of accumulating it (probe B's 36 configurations all sat
+# within 1.3e-4 of 1.0), so a systematic shift shows here at a scale rmse cannot
+# resolve. An inert coat must not move it at all.
+const PROBE_G_MAX_MEAN_DELTA := 5.0e-4
 
 # ---------------------------------------------------------------------------
 
@@ -261,9 +312,9 @@ var _quad: MeshInstance3D
 var _sphere: MeshInstance3D
 var _cam: Camera3D
 var _failures: Array[String] = []
-# Per-pixel cos(N,V) for the sphere under the sphere camera, built once by
-# _build_sphere_cos_map() and reused by every probe E render.
-var _sphere_cos: PackedFloat32Array = PackedFloat32Array()
+# Per-pixel cos(N,V) for probe E's tilted quad, rebuilt at each tilt by
+# _build_quad_cos_map() and reused by every probe E render at that tilt.
+var _cos_map: PackedFloat32Array = PackedFloat32Array()
 
 
 func _constant_panorama() -> ImageTexture:
@@ -369,45 +420,42 @@ func _use_sphere_camera_filled() -> void:
 	_cam.look_at(Vector3.ZERO, Vector3.UP)
 
 
-## Camera for probe E: the WHOLE sphere is in frame with margin, so the visible
-## surface spans cos(N,V) from 1 at the centre down to 0 at the silhouette --
-## which is the axis probe E measures along. Background pixels are excluded per
-## pixel by the cos map rather than by a crop.
-func _use_sphere_camera_full() -> void:
-	_sphere.visible = true
-	_quad.visible = false
-	_cam.projection = Camera3D.PROJECTION_PERSPECTIVE
-	_cam.fov = 40.0
-	_cam.near = 0.05
-	_cam.far = 4000.0
-	_cam.position = Vector3(0.0, 0.0, 4.0)
-	_cam.look_at(Vector3.ZERO, Vector3.UP)
-
-
-## cos(N,V) per pixel for the unit sphere at the origin, using the ENGINE'S OWN
-## camera model (project_ray_origin/project_ray_normal) rather than a
-## reimplementation of the projection matrix. -1.0 marks a pixel that misses.
-func _build_sphere_cos_map(p_w: int, p_h: int) -> void:
-	_sphere_cos = PackedFloat32Array()
-	_sphere_cos.resize(p_w * p_h)
+## EXACT per-pixel cos(N,V) for the tilted quad, from the plane's own world
+## normal and the engine's own camera model (project_ray_origin /
+## project_ray_normal) -- not a reimplementation of the projection matrix, and
+## not an analytic stand-in for a tessellated mesh. -1.0 marks a pixel that does
+## not land strictly inside the quad.
+##
+## Nothing here is an approximation: a QuadMesh is two coplanar triangles, so the
+## ray-plane intersection IS the ray-mesh intersection, and its shading normal is
+## its geometry normal everywhere.
+func _build_quad_cos_map(p_w: int, p_h: int) -> void:
+	_cos_map = PackedFloat32Array()
+	_cos_map.resize(p_w * p_h)
+	var xf := _quad.global_transform
+	# QuadMesh lies in its local XY plane facing local +Z.
+	var n := xf.basis.z.normalized()
+	var inv := xf.affine_inverse()
+	var qm := _quad.mesh as QuadMesh
+	var half_x: float = qm.size.x * 0.5 - PROBE_E_EDGE_MARGIN
+	var half_y: float = qm.size.y * 0.5 - PROBE_E_EDGE_MARGIN
 	for y in range(p_h):
 		for x in range(p_w):
+			var idx := y * p_w + x
+			_cos_map[idx] = -1.0
 			var sp := Vector2(float(x) + 0.5, float(y) + 0.5)
 			var o := _cam.project_ray_origin(sp)
 			var d := _cam.project_ray_normal(sp)
-			# |o + t*d| = 1, sphere centred at the origin.
-			var b := d.dot(o)
-			var c := o.dot(o) - 1.0
-			var disc := b * b - c
-			if disc <= 0.0:
-				_sphere_cos[y * p_w + x] = -1.0
-				continue
-			var t := -b - sqrt(disc)
+			var denom := n.dot(d)
+			if denom >= -1e-9:
+				continue # Parallel, or hitting the back face.
+			var t := n.dot(xf.origin - o) / denom
 			if t <= 0.0:
-				_sphere_cos[y * p_w + x] = -1.0
 				continue
-			var n := (o + d * t).normalized()
-			_sphere_cos[y * p_w + x] = n.dot(-d)
+			var local := inv * (o + d * t)
+			if absf(local.x) > half_x or absf(local.y) > half_y:
+				continue
+			_cos_map[idx] = n.dot(-d)
 
 
 # ---------------------------------------------------------------------------
@@ -505,28 +553,43 @@ func _crop_spread(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
 	return { "lo": lo, "hi": hi }
 
 
-## Mean of the luminance-free RGB average over the pixels whose precomputed
-## cos(N,V) falls in [centre - halfwidth, centre + halfwidth].
-func _measure_cos_bin(p_img: Image, p_centre: float, p_half: float) -> Dictionary:
+## Mean rendered value AND mean analytic Fresnel over every pixel the cos map
+## marks as a strictly-interior hit.
+##
+## FIX ROUND 1. The analytic reference is averaged PER PIXEL, over the same
+## pixels the measurement averages, rather than evaluated once at the region's
+## mean cos. Those are not the same number: Fresnel is strongly convex in cos
+## near grazing, so by Jensen's inequality E[F(cos)] > F(E[cos]). Round 0
+## evaluated F at the mean and over-reported the excess at the grazing bin by
+## about 11 percentage points on that account alone (at ior 1.1 over cos in
+## [0.10, 0.20], F at the mean cos is 0.2250 while the mean of F is 0.2498).
+## Averaging two quantities over the identical pixel set removes the whole class
+## of error, and removes it at every region width rather than only at narrow ones.
+func _measure_masked(p_img: Image, p_ior: float) -> Dictionary:
 	var w := p_img.get_width()
 	var h := p_img.get_height()
 	var acc := 0.0
+	var ref_acc := 0.0
 	var cos_acc := 0.0
+	var cos_lo := INF
+	var cos_hi := -INF
 	var n := 0
 	for y in range(h):
 		for x in range(w):
-			var mu := _sphere_cos[y * w + x]
+			var mu := _cos_map[y * w + x]
 			if mu < 0.0:
-				continue
-			if absf(mu - p_centre) > p_half:
 				continue
 			var c := p_img.get_pixel(x, y)
 			acc += (c.r + c.g + c.b) / 3.0
+			ref_acc += _fresnel_dielectric_cos(mu, p_ior)
 			cos_acc += mu
+			cos_lo = minf(cos_lo, mu)
+			cos_hi = maxf(cos_hi, mu)
 			n += 1
 	if n == 0:
-		return { "mean": 0.0, "cos": 0.0, "n": 0 }
-	return { "mean": acc / float(n), "cos": cos_acc / float(n), "n": n }
+		return { "mean": 0.0, "ref": 0.0, "cos": 0.0, "lo": 0.0, "hi": 0.0, "n": 0 }
+	return { "mean": acc / float(n), "ref": ref_acc / float(n),
+			"cos": cos_acc / float(n), "lo": cos_lo, "hi": cos_hi, "n": n }
 
 
 ## Cycles' fresnel_dielectric_cos (intern/cycles/kernel/util/math_float3.h ->
@@ -551,7 +614,7 @@ static func _fresnel_dielectric_cos(p_cosi: float, p_eta: float) -> float:
 func _probe_a_energy_tables(p_env: Environment) -> void:
 	print("\n=== PROBE A: coat energy tables, GPU vs CPU mirror (vis mode %d) ==="
 			% MODE_COAT_ENERGY_TABLES)
-	print("  face-on quad, cos(N,V) >= 0.99878 across the crop; tolerance %.1e absolute"
+	print("  face-on quad, cos(N,V) >= 0.99878 across the crop; tolerance %.9f absolute"
 			% PROBE_A_TOL)
 	_use_quad_camera()
 	await get_tree().process_frame
@@ -584,7 +647,7 @@ func _probe_a_energy_tables(p_env: Environment) -> void:
 			var expected: float = case[2 + i]
 			if absf(float(got[i]) - expected) > PROBE_A_TOL:
 				_failures.append(("probeA [%s]: %s read %.6f on the GPU, CPU mirror says %.6f " +
-						"(diff %.6f > %.1e) -- the GLSL transcription of the energy tables does " +
+						"(diff %.6f > %.9f) -- the GLSL transcription of the energy tables does " +
 						"not agree with test_pt_coat_albedo.cpp's mirror")
 						% [tag, names[i], got[i], expected, absf(float(got[i]) - expected), PROBE_A_TOL])
 	p_env.set_pathtracing_debug_mode(0)
@@ -744,38 +807,52 @@ func _probe_e_fresnel(p_env: Environment) -> void:
 	print("  black base (albedo 0, specular 0) so ALL returned light is the coat's;")
 	print("  coat_roughness %.2f so its directional albedo is ~F(cosNI); tolerance %.0f%% relative"
 			% [PROBE_E_COAT_ROUGHNESS, PROBE_E_TOL * 100.0])
-	_use_sphere_camera_full()
-	await get_tree().process_frame
-	_build_sphere_cos_map(get_viewport().get_visible_rect().size.x,
-			get_viewport().get_visible_rect().size.y)
+	_use_quad_camera()
+	var vp_size := get_viewport().get_visible_rect().size
 	var vp_rid := get_viewport().get_viewport_rid()
-	for ior in PROBE_E_IOR:
-		# Black, non-metallic, no dielectric specular: baseColorToSpecularF0 and
-		# baseColorToDiffuseReflectance are both exactly zero, so the base cannot
-		# return anything and the render IS the coat.
-		var mat := _white_lambertian(0.0)
-		_sphere.material_override = _apply_coat(mat, 1.0, PROBE_E_COAT_ROUGHNESS, ior)
-		var img: Image = await _render_accum(p_env, vp_rid, PROBE_E_FRAMES)
-		if img == null:
-			_failures.append("probeE [ior=%.2f]: accumulator readback returned null" % ior)
-			continue
-		for centre in PROBE_E_BINS:
-			var b := _measure_cos_bin(img, centre, PROBE_E_BIN_HALFWIDTH)
-			if int(b["n"]) < 64:
-				print("  ior=%.2f cos~%.2f  SKIPPED, only %d pixels in bin" % [ior, centre, int(b["n"])])
+	for target in PROBE_E_TARGET_COS:
+		# Tilt about X. QuadMesh faces local +Z, so a rotation of theta puts the
+		# world normal at theta from the view axis and every ray meets it at
+		# cos(N,V) ~ cos(theta), exactly, with only the FOV's own few-tenths of a
+		# degree of spread -- and that spread is accounted for per pixel below,
+		# not assumed away.
+		_quad.rotation = Vector3(acos(target), 0.0, 0.0)
+		await get_tree().process_frame
+		await get_tree().process_frame
+		_build_quad_cos_map(int(vp_size.x), int(vp_size.y))
+		for ior in PROBE_E_IOR:
+			# Black, non-metallic, no dielectric specular: baseColorToSpecularF0
+			# and baseColorToDiffuseReflectance are both exactly zero, so the base
+			# cannot return anything and the render IS the coat.
+			var mat := _white_lambertian(0.0)
+			_quad.material_override = _apply_coat(mat, 1.0, PROBE_E_COAT_ROUGHNESS, ior)
+			var img: Image = await _render_accum(p_env, vp_rid, PROBE_E_FRAMES)
+			if img == null:
+				_failures.append("probeE [cos~%.2f ior=%.2f]: accumulator readback returned null"
+						% [target, ior])
+				continue
+			var b := _measure_masked(img, ior)
+			if int(b["n"]) < 512:
+				_failures.append(("probeE [cos~%.2f ior=%.2f]: only %d interior pixels -- the quad " +
+						"no longer covers enough of the frame at this tilt for the measurement to " +
+						"mean anything") % [target, ior, int(b["n"])])
 				continue
 			var mu: float = b["cos"]
 			var measured: float = b["mean"]
-			var analytic := _fresnel_dielectric_cos(mu, ior)
+			# Mean of F over the SAME pixels, not F at the mean cos. See
+			# _measure_masked's fix-round-1 note.
+			var analytic: float = b["ref"]
 			var ratio: float = measured / maxf(analytic, 1e-9)
-			print("  ior=%.2f cos=%.4f  measured=%.6f  analytic F=%.6f  ratio=%.4f  (n=%d)"
-					% [ior, mu, measured, analytic, ratio, int(b["n"])])
+			print(("  cos=%.4f [%.4f, %.4f] ior=%.2f  measured=%.6f  mean analytic F=%.6f  " +
+					"ratio=%.4f  (n=%d)")
+					% [mu, b["lo"], b["hi"], ior, measured, analytic, ratio, int(b["n"])])
 			if absf(ratio - 1.0) > PROBE_E_TOL:
 				_failures.append(("probeE [ior=%.2f, cos=%.4f]: the coat returned %.6f where exact " +
 						"dielectric Fresnel says %.6f (ratio %.4f, tolerance %.0f%%). Task 5b " +
 						"replaced Schlick-with-shadowedF90 here; at ior 1.1 shadowedF90 is 0.0567 " +
 						"and caps the coat at 0.044 where exact Fresnel reaches 0.618")
 						% [ior, mu, measured, analytic, ratio, PROBE_E_TOL * 100.0])
+	_quad.rotation = Vector3.ZERO
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +862,7 @@ func _probe_e_fresnel(p_env: Environment) -> void:
 func _probe_f_selection(p_env: Environment) -> void:
 	print("\n=== PROBE F: vis mode %d with a coat present ===" % MODE_PDF_PARITY)
 	print("  metallic base => lobeWeight is exactly 1.0, so the reading is 1 - coatMass;")
-	print("  tolerance %.1e absolute" % PROBE_F_TOL)
+	print("  tolerance %.9f absolute" % PROBE_F_TOL)
 	_use_quad_camera()
 	await get_tree().process_frame
 	var vp_rid := get_viewport().get_viewport_rid()
@@ -805,7 +882,7 @@ func _probe_f_selection(p_env: Environment) -> void:
 		print("  %-18s (1-coatMass)*lobeWeight = %.6f   (expect %.6f)" % [tag, got, expected])
 		if absf(got - expected) > PROBE_F_TOL:
 			_failures.append(("probeF [%s]: vis mode 32 read %.6f, CPU mirror says %.6f " +
-					"(diff %.6f > %.1e). On a metal lobeWeight is exactly 1.0, so this IS the " +
+					"(diff %.6f > %.9f). On a metal lobeWeight is exactly 1.0, so this IS the " +
 					"coat's selection mass and its [0.01, 0.99] clamp")
 					% [tag, got, expected, absf(got - expected), PROBE_F_TOL])
 	p_env.set_pathtracing_debug_mode(0)
@@ -816,8 +893,9 @@ func _probe_f_selection(p_env: Environment) -> void:
 # ---------------------------------------------------------------------------
 
 func _probe_g_inert_ior(p_env: Environment) -> void:
-	print("\n=== PROBE G: clearcoat_ior == 1.0 must be exactly inert ===")
-	print("  full clearcoat at ior 1.0 vs no clearcoat at all; max RMSE %.1e" % PROBE_G_MAX_RMSE)
+	print("\n=== PROBE G: clearcoat_ior == 1.0 must be inert to within the estimator's own noise ===")
+	print("  RMSE(coat-off, inert-coat) must not exceed RMSE(coat-off, coat-off again) by more")
+	print("  than %.0f%%, and the means must agree to %.6f" % [PROBE_G_RMSE_MARGIN * 100.0, PROBE_G_MAX_MEAN_DELTA])
 	_use_sphere_camera_filled()
 	await get_tree().process_frame
 	var vp_rid := get_viewport().get_viewport_rid()
@@ -826,24 +904,59 @@ func _probe_g_inert_ior(p_env: Environment) -> void:
 	_sphere.material_override = _apply_coat(mat_off, 0.0, 0.5, 1.5)
 	var img_off: Image = await _render_accum(p_env, vp_rid, PROBE_G_FRAMES)
 
+	# FIX ROUND 1, and the reason this probe is not the bit-identity check it was
+	# drafted as. The SHADER side really is exact here -- at ior 1.0 the albedo
+	# LUT's z == 0 slice is all zeros so coatAlbedoEstimate is exactly 0,
+	# coatLayerAlbedo is exactly 0, coatLayeringTransmittance returns exactly
+	# vec3(1.0) (and multiplying by 1.0f is the IEEE identity), coatFssFromIor is
+	# exactly 0 so coatEnergyScale is exactly 1, and fresnel_dielectric(c, 1.0)
+	# returns exactly 0 so evalCoat's product is exactly 0. Not one RNG draw
+	# differs either: coatMass is 0, so the same branch arm is taken and the same
+	# lobe sequence is consumed.
+	#
+	# What is NOT identical is the SEED. The path tracer's per-frame RNG seed is
+	# RT_PARAM_FRAME_INDEX, a free-running frame counter -- not a per-accumulation
+	# one -- so two accumulations of the same scene started at different wall-clock
+	# frames draw different sample sequences and differ by ordinary Monte Carlo
+	# noise. Round 0 asserted rmse <= 1e-6 between two accumulations and measured
+	# 7.57e-4; this control render is what tells that number apart from a coat
+	# that is not actually inert. It renders the SAME coat-off material a second
+	# time, so its rmse against the first is pure seed noise and nothing else.
+	var mat_off2 := _white_lambertian(1.0)
+	_sphere.material_override = _apply_coat(mat_off2, 0.0, 0.5, 1.5)
+	var img_off2: Image = await _render_accum(p_env, vp_rid, PROBE_G_FRAMES)
+
 	var mat_inert := _white_lambertian(1.0)
 	_sphere.material_override = _apply_coat(mat_inert, 1.0, 0.5, 1.0)
 	var img_inert: Image = await _render_accum(p_env, vp_rid, PROBE_G_FRAMES)
 
-	if img_off == null or img_inert == null:
+	if img_off == null or img_off2 == null or img_inert == null:
 		_failures.append("probeG: accumulator readback returned null")
 		return
+	var noise_floor := rmse(img_off, img_off2)
 	var e := rmse(img_off, img_inert)
 	var s_off := _measure_crop(img_off, 0.05, 0.95)
+	var s_off2 := _measure_crop(img_off2, 0.05, 0.95)
 	var s_inert := _measure_crop(img_inert, 0.05, 0.95)
-	print("  clearcoat=0 mean=%.6f   clearcoat=1 ior=1.0 mean=%.6f   rmse=%.3e"
-			% [s_off["mean"], s_inert["mean"], e])
-	if e > PROBE_G_MAX_RMSE:
-		_failures.append(("probeG: a full coat at ior 1.0 changed the image (rmse %.3e > %.1e). " +
-				"The albedo LUT's z==0 slice is all zeros and fresnel_dielectric(c, 1.0) is " +
-				"exactly 0, so every coat term must be exactly 0 -- but evalCoat is still CALLED " +
-				"from every NEE site whenever coatWeight > 1e-5, so this is a live path")
-				% [e, PROBE_G_MAX_RMSE])
+	print("  clearcoat=0     mean=%.6f" % s_off["mean"])
+	print("  clearcoat=0 #2  mean=%.6f   rmse vs #1 = %.9f  <- the estimator's own noise floor"
+			% [s_off2["mean"], noise_floor])
+	print("  clearcoat=1 ior=1.0  mean=%.6f   rmse vs #1 = %.9f  (ratio %.4f)"
+			% [s_inert["mean"], e, e / maxf(noise_floor, 1e-12)])
+	var mean_delta: float = float(s_inert["mean"]) - float(s_off["mean"])
+	print("  mean delta = %+.8f" % mean_delta)
+	if e > noise_floor * (1.0 + PROBE_G_RMSE_MARGIN):
+		_failures.append(("probeG: a full coat at ior 1.0 moved the image further than the " +
+				"estimator's own seed noise (rmse %.9f vs noise floor %.9f, +%.1f%% allowed). " +
+				"Every coat term must be exactly 0 at eta == 1 -- but evalCoat is still CALLED " +
+				"from every NEE site whenever coatWeight > 1e-5, so this is a live path, not a " +
+				"skipped one")
+				% [e, noise_floor, PROBE_G_RMSE_MARGIN * 100.0])
+	if absf(mean_delta) > PROBE_G_MAX_MEAN_DELTA:
+		_failures.append(("probeG: a full coat at ior 1.0 shifted the furnace mean by %+.8f " +
+				"(limit %.6f) -- an inert coat cannot move the mean at all, and unlike rmse this " +
+				"quantity averages the seed noise away rather than accumulating it")
+				% [mean_delta, PROBE_G_MAX_MEAN_DELTA])
 
 
 # ---------------------------------------------------------------------------
