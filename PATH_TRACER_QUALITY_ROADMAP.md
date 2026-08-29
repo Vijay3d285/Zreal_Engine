@@ -2819,6 +2819,44 @@ Also carried, unfixed:
 - **The coat reads `materials[h.geometry_idx]`, not `MaterialResult`**, so a
   custom `ShaderMaterial` fragment cannot drive the coat per-pixel — identical
   to how E2b's anisotropy behaves. Recorded, not changed.
+- **The denoiser albedo AOVs do not know the coat exists.**
+  `raytracing_closest_hit_common_inc.glsl`'s DLSS-RR G-buffer block calls
+  `DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness)` and
+  `DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0,
+  m.roughness, NdotV)` — all base-material inputs, feeding `sl::kBufferTypeAlbedo`
+  / `kBufferTypeSpecularAlbedo` and OIDN's `cleanAux`. The diffuse albedo AOV
+  now **overstates**: it reports the base's pre-withdrawal reflectance, but the
+  coat's `darkening` factor (Task 5b) actually removes energy from the base
+  before it reaches the camera (roughly 4% at `ior 1.5` / `roughness 0.5`, up
+  to ~11% at grazing). The specular albedo AOV **omits the coat lobe entirely**
+  — a car-paint highlight the coat contributes is invisible to the denoiser's
+  specular-albedo guide. The normal/roughness AOV (`imageStore(...,
+  vec4(N, m.roughness))`) reports the **base's** roughness, but on a
+  clearcoated surface the visible highlight sharpness is the coat's, not the
+  base's. Transmission (E1) and anisotropy (E2b) already share the general
+  "AOVs are base-material-only" gap, but E2d is the **first** phase where the
+  base's own radiometry is actually reduced by something above it — which is
+  what turns the diffuse AOV from merely incomplete into actively wrong.
+  Recorded here as an open item; not fixed by this fix wave, which is
+  comment-and-constant-only.
+- **`evalCombinedBRDF` (`brdf_inc.glsl:1745`) is dead code and, since E2d,
+  silently coat-free.** Grepped every call site in the raytracing shader
+  tree: none — the only occurrence outside its own definition is the
+  definition itself. Confirmed **pre-existing, not an E2d regression**: it
+  was equally dead at `b30502af56` (the pre-E2d baseline), which has the same
+  single occurrence. Its risk is not that it runs, but that it is cited as
+  the authority for the `Vbackfacing` early-out by four comments in two other
+  files — `raytracing_closest_hit_common_inc.glsl:1488`, `:1503`, `:1890`,
+  and `raytracing_emissive_inc.glsl:470` (not the "five comments in three
+  files" a draft of this note claimed; only `evalCombinedBRDFSeparate`, not
+  the bare `evalCombinedBRDF`, appears in `brdf_inc.glsl` outside its own
+  definition). Those four comments are correct today, but a future caller
+  who trusts them and calls `evalCombinedBRDF` for its `Vbackfacing`
+  behaviour would get an **unlayered, coat-free** base BRDF that compiles
+  cleanly and silently omits the coat lobe entirely — `evalCombinedBRDF` was
+  never updated to call `evalCoat` the way `evalCombinedBRDFSeparate` was.
+  Recorded as an open item: either delete the dead function or teach it
+  about the coat so it cannot silently regress if resurrected.
 
 **One open item found here that is orthogonal to E2d and belongs to a later
 phase: 2.7% of production BSDF draws on a roughness-0.4 sphere are rejected
@@ -2826,6 +2864,35 @@ and mirrored back into the hemisphere with MIS weight 1.** Measured by Task
 6's vis mode 40, not fixed, not caused by the coat. It is a candidate roadmap
 item in its own right — a rejection-and-mirror with an unadjusted MIS weight is
 the F1 `recoverBelowHemisphereSample` family of problem, not a coat problem.
+
+**Unexercised paths.** "Read the code and found no defect" is not the same
+claim as "measured, and it works" — recorded here rather than left implicit,
+since the whole point of this gate suite is to not rely on the former:
+
+- **The three analytic-light coat NEE sites, and the emissive-mesh site, have
+  never executed under any gate or measurement in this repository.**
+  `raytracing_lights_inc.glsl:394/568/617` (the coat's contribution for
+  omni/spot/directional lights) and `raytracing_emissive_inc.glsl:489`/`:503`
+  (emissive-mesh NEE) are four of the five call sites Task 5's fix round
+  created for `evalCombinedBRDFSeparate`'s coat term. `pt_coat_gate.gd` has
+  no `Light3D` node and no emissive material anywhere in it (grepped) — it is
+  sky/furnace-only, same as `pt_energy_gate.gd`, `pt_anisotropy_gate.gd`, and
+  `pt_transmission_gate.gd`, none of which ever sets `clearcoat` at all
+  (grepped, zero matches in all three). §7.10.1's Cycles comparison is also
+  sky-only (a "spatially uniform environment"). A coated material lit by a
+  point light, a spot, a directional light, or standing next to an emissive
+  mesh has never been rendered by anything in this tree.
+- **The Beer's-law tint has no gate.** Every probe in `pt_coat_gate.gd`
+  builds its material through `_apply_coat`, which hardcodes
+  `p_mat.clearcoat_tint = Color(1.0, 1.0, 1.0).linear_to_srgb()` — white,
+  i.e. the identity transmittance. Task 7's single Cycles car-paint
+  measurement (tint agreement to 0.016%, §4) is the tint's **entire**
+  coverage; there is no automated regression check on `clearcoat_tint` at
+  any non-white value.
+- **Coat-on-glass has never rendered.** `pt_transmission_gate.gd` never sets
+  `clearcoat` (it stays at `BaseMaterial3D`'s default, 0), so the interaction
+  between the coat layer and the dielectric transmissive lobe — both drawing
+  from the same three-lobe registry — is unmeasured.
 
 #### 7.10.8 Verification
 
