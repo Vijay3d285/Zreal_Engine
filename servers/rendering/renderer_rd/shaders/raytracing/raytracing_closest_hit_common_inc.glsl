@@ -1850,7 +1850,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// returns light the base still returns in full -- which is the wrong render,
 	// which is why the lobe and this block land in one commit.
 	//
-	// E2e: routed through layerTransmittanceAbove(brdf_mat, cosNI, lobe), the
+	// E2e: routed through layerTransmittanceAbove(brdf_mat, N, V, lobe), the
 	// same walk evalCombinedBRDFSeparate now uses. Passing the actually-selected
 	// `lobe` replaces the old `!tookCoatLobe` guard: at lobe == LOBE_COAT the
 	// walk's `lobeIndex < LOBE_COAT` test is false, so it returns exactly
