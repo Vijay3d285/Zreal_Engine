@@ -1608,15 +1608,21 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// direction by direction or MIS partitions one integrand while the estimator
 	// evaluates another (the B2 defect class).
 	float cosNI = dot(N, V);
-	// TWO quantities, deliberately. coatLayerAlbedo is the RAW throughput
-	// withdrawal; coatMass is the CLAMPED selection probability. Fix round 1 split
-	// them -- see the two-roles block above coatLayerAlbedo in brdf_inc.glsl for
-	// the energy error the clamped one caused when it was used for both.
-	float coatAlbedo = coatLayerAlbedo(brdf_mat, cosNI);
+	// coatMass is the CLAMPED selection probability. Fix round 1 (E2d) also
+	// needed the RAW throughput withdrawal, coatLayerAlbedo, here; E2e moved
+	// that call inside layerTransmittanceAbove, at the point below where the
+	// selected lobe is actually known -- same function, same inputs, so the
+	// value is bit-identical to computing it here. See the two-roles block
+	// above coatLayerAlbedo in brdf_inc.glsl for the energy error the clamped
+	// one caused when it was used for both roles.
 	float coatMass = coatLobeWeight(brdf_mat, cosNI);
 
 	int brdfType;
-	bool tookCoatLobe = false;
+	// E2e: the lobe actually selected, in every branch including the two fast
+	// paths below (which never call selectLobe but still resolve to a known
+	// lobe). layerTransmittanceAbove reads this to decide self-attenuation,
+	// replacing the old `tookCoatLobe` bool.
+	int lobe;
 	// DEVIATION FROM THE TASK 5 BRIEF, deliberate. The brief replaces only the
 	// weights block, which lives in the `else` of this three-way branch -- but the
 	// first two arms return WITHOUT drawing a lobe or dividing throughput, so a
@@ -1642,8 +1648,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// baseShare >= 0.01, never zero.
 	if (coatMass <= 0.0 && diffuseLum < 0.0001) {
 		brdfType = SPECULAR_TYPE;
+		lobe = LOBE_SPECULAR;
 	} else if (coatMass <= 0.0 && specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
+		lobe = LOBE_DIFFUSE;
 	} else {
 		// E2c: routed through the N-way lobe registry (brdf_inc.glsl) --
 		// lobeWeight computes the same clamp(...) formula the old
@@ -1672,10 +1680,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// second draw or a remap here shifts every subsequent sample in the path --
 		// statistically valid, bitwise different everywhere, and invisible to every
 		// gate.
-		int lobe = selectLobe(rng_1d(rng, RT_PRNG_LOBE), weights);
+		lobe = selectLobe(rng_1d(rng, RT_PRNG_LOBE), weights);
 		if (lobe == LOBE_COAT) {
 			brdfType = COAT_TYPE;
-			tookCoatLobe = true;
 			// Fix round 1: `coatWeight /`, not a bare `1 /`. The other two lobes
 			// divide by their selection probability alone because their CLOSURE
 			// weight is 1; the coat's is not. Cycles allocates the coat closure with
@@ -1702,7 +1709,19 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// E2d: the layering half. Without it the coat is ADDITIVE -- a lobe that
 	// returns light the base still returns in full -- which is the wrong render,
 	// which is why the lobe and this block land in one commit.
-	if (!tookCoatLobe && brdf_mat.coatWeight > 0.00001) {
+	//
+	// E2e: routed through layerTransmittanceAbove(brdf_mat, cosNI, lobe), the
+	// same walk evalCombinedBRDFSeparate now uses. Passing the actually-selected
+	// `lobe` replaces the old `!tookCoatLobe` guard: at lobe == LOBE_COAT the
+	// walk's `lobeIndex < LOBE_COAT` test is false, so it returns exactly
+	// (1,1,1) without ever calling coatLayeringTransmittance -- bit-identical
+	// to skipping this block entirely, which is what the old guard did. The
+	// outer coatWeight epsilon check stays: it is what keeps this block (and
+	// the sqrt/pow inside the Beer's-law branch of coatLayeringTransmittance)
+	// off the hot path for every uncoated material, not a correctness guard --
+	// layerTransmittanceAbove is already a no-op at coatWeight == 0 because
+	// coatLayerAlbedo returns literal 0.0f there.
+	if (brdf_mat.coatWeight > 0.00001) {
 		// THIS IS A THROUGHPUT FACTOR, NOT A SELECTION PROBABILITY. It must not be
 		// folded into weights[] above -- see the selection-vs-throughput block at
 		// the top of brdf_inc.glsl's registry section. Folding it in and
@@ -1712,14 +1731,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		//
 		// Fix round 1: routed through coatLayeringTransmittance, the SAME function
 		// evalCombinedBRDFSeparate calls for every NEE path, fed the same RAW
-		// coatAlbedo. Before that, BSDF sampling applied a layer NEE knew nothing
+		// coatAlbedo (now computed inside layerTransmittanceAbove itself, from the
+		// same cosNI). Before that, BSDF sampling applied a layer NEE knew nothing
 		// about, so the two MIS strategies estimated different integrands. The
 		// attenuation and the Beer's-law tint remain two separate steps inside that
 		// function, per Cycles (svm/closure.h:155 vs :178).
-		//
-		// Note it takes coatAlbedo, NOT coatMass -- the clamp on coatMass exists
-		// only to bound the sampler's divisor and has no radiometric meaning.
-		ps.throughput *= coatLayeringTransmittance(brdf_mat, cosNI, coatAlbedo);
+		ps.throughput *= layerTransmittanceAbove(brdf_mat, cosNI, lobe);
 	}
 
 	vec2 u = rng_2d(rng, RT_PRNG_SURFACE_BSDF);

@@ -2345,6 +2345,39 @@ float3 coatLayeringTransmittance(MaterialProperties material, float cosNI, float
 	return t;
 }
 
+// The N-layer stack. Cycles layers SEQUENTIALLY -- sheen withdraws from the
+// running weight (svm/closure.h:141), then coat withdraws from what is left
+// (:174). Each layer attenuates everything allocated after it.
+//
+// Here that becomes: the transmittance applied to lobe i is the product of
+// every LAYER strictly above i in registry order. A layer is a lobe that
+// withdraws; specular and diffuse are not layers and contribute nothing to
+// this product.
+//
+// "Above" is REGISTRY ORDER, i.e. index, not the `>` spelling one might
+// reach for by analogy with "higher index sits above". LOBE_COAT (2) sits
+// above LOBE_SPECULAR (0) and LOBE_DIFFUSE (1): the layer's index exceeds
+// the base lobe's index, so the test a layer runs to decide whether it
+// covers lobe i is "is MY index greater than i", which from lobeIndex's own
+// side reads `lobeIndex < LOBE_COAT`. The coat's own index is LOBE_COAT, and
+// `LOBE_COAT < LOBE_COAT` is false, so the coat never attenuates itself --
+// confirmed against both call sites: evalCombinedBRDFSeparate needs this
+// true at lobeIndex == LOBE_SPECULAR (0 < 2) to reproduce E2d's
+// outDiffuse/outSpecular attenuation, and the sampler needs it false at
+// lobeIndex == LOBE_COAT (2 < 2 is false) to reproduce E2d's `!tookCoatLobe`
+// guard bit-for-bit.
+//
+// At LOBE_COUNT == 3 the only layer is coat, so this returns exactly what
+// E2d's single call site returned, for exactly the same lobes. That is the
+// phase invariant and it is why this landed before sheen existed.
+float3 layerTransmittanceAbove(MaterialProperties material, float cosNI, int lobeIndex) {
+	float3 t = float3(1.0f, 1.0f, 1.0f);
+	if (lobeIndex < LOBE_COAT) {
+		t *= coatLayeringTransmittance(material, cosNI, coatLayerAlbedo(material, cosNI));
+	}
+	return t;
+}
+
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
 // which today's `u < brdfProbability` picks SPECULAR_TYPE.
 //
@@ -2651,10 +2684,15 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// At coatWeight == 0 coatLayerAlbedo returns literal 0.0f and the guard below
 	// is false, so every line here is skipped and the three outputs are
 	// bit-identical to the pre-E2d two-output form.
+	//
+	// E2e: routed through layerTransmittanceAbove(..., LOBE_SPECULAR) -- the base
+	// terms sit at the bottom of the stack, so this asks for the product of
+	// every layer above index 0, which at LOBE_COUNT == 3 is coat alone and
+	// reproduces coatLayeringTransmittance's old return bit-for-bit (same
+	// coatLayerAlbedo call, same cosNI). outCoat is untouched here, same as E2d.
 	float cosNI = dot(N, V);
-	float coatAlbedo = coatLayerAlbedo(material, cosNI);
 	if (material.coatWeight > 0.00001f) {
-		float3 baseTransmittance = coatLayeringTransmittance(material, cosNI, coatAlbedo);
+		float3 baseTransmittance = layerTransmittanceAbove(material, cosNI, LOBE_SPECULAR);
 		outDiffuse *= baseTransmittance;
 		outSpecular *= baseTransmittance;
 		outCoat = evalCoat(N, L, V, material);
