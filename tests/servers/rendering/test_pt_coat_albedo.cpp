@@ -278,6 +278,15 @@ TEST_CASE("[PathTracer][CoatAlbedo] SSBO offsets are the ones the shader hard-co
 	CHECK(RT_COAT_SSBO_E_OFFSET == 4096);
 	CHECK(RT_COAT_SSBO_EAVG_OFFSET == 5120);
 	CHECK(RT_COAT_SSBO_FLOAT_COUNT == 5152);
+	// The offsets alone do not pin the table SHAPE: re-extracting GGX_E_TABLE /
+	// GGX_EAVG_TABLE at a different resolution can hold RT_COAT_SSBO_E_OFFSET
+	// and RT_COAT_SSBO_EAVG_OFFSET fixed (padding the tail) while every read
+	// above them silently samples the wrong sub-rectangle. brdf_inc.glsl mirrors
+	// GGX_E_DIM as its own #define (GGX_E_DIM, next to GGX_COAT_TABLE_DIM); this
+	// pins that mirror to the literal written into the shader, same as the
+	// offsets above -- if you edit this case, edit brdf_inc.glsl in the same commit.
+	CHECK(GGX_E_DIM == 32);
+	CHECK(GGX_COAT_TABLE_DIM == 16);
 }
 
 TEST_CASE("[PathTracer][CoatAlbedo] Fss matches Cycles' dielectric fit") {

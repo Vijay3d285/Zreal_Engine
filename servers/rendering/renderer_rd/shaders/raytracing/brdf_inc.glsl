@@ -1910,6 +1910,14 @@ float coatLutRead2D(int base, float x, float y, int xsize, int ysize) {
 }
 
 #define GGX_COAT_TABLE_DIM 16
+// Dimension of GGX_E_TABLE / GGX_EAVG_TABLE (coatGgxE / coatFms below). This is
+// NOT the same table as GGX_COAT_TABLE_DIM above -- it must track GGX_E_DIM in
+// ggx_energy_tables.h (the CPU mirror is tests/servers/rendering/test_pt_coat_albedo.cpp).
+// Re-extracting the energy tables at a different resolution and forgetting this
+// literal would silently read a sub-rectangle of the new table instead of the
+// whole thing -- every downstream static_assert and CPU-side test would still
+// pass, because none of them look at this shader.
+#define GGX_E_DIM 32
 
 float coatLutRead3D(float x, float y, float z) {
 	const int d = GGX_COAT_TABLE_DIM;
@@ -2004,7 +2012,7 @@ float coatFssFromIor(float ior) {
 float coatGgxE(float coatRoughness, float cosNI) {
 	float alpha = coatRoughness * coatRoughness;
 	float rough = sqrt(sqrt(alpha * alpha)); // sqrt(sqrt(ax*ay)); ax == ay for the coat.
-	return coatLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, cosNI, 32, 32);
+	return coatLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, cosNI, GGX_E_DIM, GGX_E_DIM);
 }
 
 // Fms: effective Fresnel of the MULTIPLY-scattered energy. One Fss is cancelled
@@ -2013,7 +2021,7 @@ float coatGgxE(float coatRoughness, float cosNI) {
 float coatFms(float coatRoughness, float ior) {
 	float alpha = coatRoughness * coatRoughness;
 	float rough = sqrt(sqrt(alpha * alpha));
-	float eAvg = coatLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, rough, 32);
+	float eAvg = coatLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, rough, GGX_E_DIM);
 	float fss = coatFssFromIor(ior);
 	return fss * eAvg / (1.0f - fss * (1.0f - eAvg));
 }
