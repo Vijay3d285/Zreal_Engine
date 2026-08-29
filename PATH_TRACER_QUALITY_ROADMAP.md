@@ -795,9 +795,9 @@ Add transmission, IOR, clearcoat (+roughness), sheen (+tint), anisotropy (+rotat
 GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_hit_common:474`). Handle front/back faces, IOR sides, total internal reflection. Wire `max_transmission_bounce` from B3.
 *Accept:* a glass vase refracts correctly; rough glass blurs plausibly; retire the "glass vanishing" workaround **for content that adopts transmission** (see the corrected OIDN claim above and the full closeout in §6).
 
-**E2. Anisotropy, clearcoat, sheen** — anisotropy portion **COMPLETE (E2b)**, clearcoat/sheen **NOT STARTED**
+**E2. Anisotropy, clearcoat, sheen** — anisotropy **COMPLETE (E2b)**, clearcoat **COMPLETE (E2d)**, sheen **NOT STARTED**
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint and velvet: not met** — clearcoat and sheen lobes do not exist yet; carried to E2d/E2e (§7.8, spec §9). The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9); anisotropy on the transmissive lobe remains.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint: met, see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised; the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. **Velvet: not met** — the sheen lobe does not exist yet; carried to E2e, which also carries `coat_normal` (Cycles couples it to the sheen normal, `svm/closure.h:127-129`). The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), and E2d is its first real N=3 (§7.10.5); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -2452,6 +2452,9 @@ machinery described at the end of section 7.8. Cycles'
 (`intern/cycles/kernel/svm/closure.h:141` sheen, `:174` coat) arrive with the
 first real layer in E2d; this phase deliberately changed no layering
 semantics, only selection and combination.
+**E2d landed after this closeout was written — see §7.10, which is also this
+registry's first real N=3 and answers both carried constraints above from
+shipped code (§7.10.5).**
 
 ### 7.10 E2d - clearcoat / coat layer
 
@@ -2559,3 +2562,285 @@ the base-colour ratio, but measured `1.831147` (R) and `3.141887` (G) sit
 the larger base ratio — exactly what a base-colour-independent additive term
 does, and the coat's own reflection is precisely such a term. The control
 therefore confirms both the trap's direction and the coat's presence.
+
+**Adjusted comparison — Gap #17's pedestal neutralised.** The rest of the
++0.381% is Gap #17, and this is the measurement that says so. Using the same
+technique E2b's Task 4 and Task 5 used — temporary shader edit, rebuild,
+measure, revert, rebuild, `git diff` confirmed empty on both files before and
+after — `ms` was forced to `vec3(1.0)` at the base-specular
+`evalMultiScatterApproximation` call sites, which the coat does not use:
+
+| arm | Godot `ms=1` | Cycles | ratio | **adjusted % off** | raw % off | points moved |
+|---|---|---|---|---|---|---|
+| car paint | 0.16787156 | 0.16803674 | 0.999017 | **−0.098%** | +0.381% | 0.479 |
+| uncoated control | 0.13274812 | 0.13292308 | 0.998684 | −0.132% | +0.499% | 0.630 |
+| amber-tinted coat | 0.14584120 | 0.14598414 | 0.999021 | −0.098% | +0.388% | 0.485 |
+
+**Raw +0.381%, adjusted −0.098%.** Both are reported; neither is the
+flattering one alone. The pedestal is worth 0.479 points on the coated arm and
+0.630 on the uncoated one, i.e. removing it slightly *overshoots* and flips the
+sign — consistent with §7.8's finding that `evalMultiScatterApproximation`
+over-corrects a real single-scatter deficit rather than inventing energy from
+nothing. E2b's precedent on this same technique was +6.52% → +0.67%; E2d's is
++0.381% → −0.098%, a far smaller pedestal because the base here is roughness
+0.25 and isotropic.
+
+**The `ms` edit did not touch the coat, and the numbers prove it, not the
+diff.** The coat-only delta under `ms = 1.0` is `0.03512344` against the
+production build's `0.03509048` — a ratio of `1.000939`, i.e. within
+Monte-Carlo run-to-run noise. Task 5b routed the coat's compensation through
+`coatEnergyScale` specifically so Gap #17 and the coat's own energy accounting
+would be separable, and this is that separation measured end to end. It is the
+same conclusion Task 6's probe C2 reached from the other side: the pedestal on
+a metal reads +6.0%, **unchanged by the coat**.
+
+**Correction to the brief this section was written from — four call sites,
+not three, and the line numbers had moved.** The brief named
+`brdf_inc.glsl:1192`, `:1348` and
+`raytracing_closest_hit_common_inc.glsl:1270`, inherited from §7.8. After Task
+5b split `sampleSpecularMicrofacet` the real sites are `brdf_inc.glsl:1274`,
+`:1418` and `raytracing_closest_hit_common_inc.glsl:1525` — **and a fourth,
+`raytracing_emissive_inc.glsl:495`, which predates E2b entirely** (added by C1,
+commit `72c45f163b`) and which §7.8's "all three reachable call sites"
+therefore already undercounted. It is unreachable in this scene (no emissive
+geometry, as is `:1418`'s dielectric path on a metallic base), so it does not
+affect the figures above, but the count is wrong wherever it appears.
+
+#### 7.10.2 The coat is a layer, not a lobe
+
+This is the distinction that makes it Blender's coat rather than a fourth
+highlight. The coat is a GGX lobe at registry index 2 — but it also
+**withdraws energy from everything beneath it**, and the withdrawal is what
+the feature is. Cycles does this with `closure_layering_weight`
+(`svm/closure.h:174`); E2d ports it.
+
+**The layer conserves energy, measured.** Task 6's probe B reads **1.0 to
+within 1.3e-4, flat across all 36 configurations** of clearcoat x coat
+roughness x ior. That is the first time any coat code in this phase had
+executed at all: every pre-existing gate scene is `clearcoat == 0`, so Tasks
+1-5b compiled and shipped a feature that had never run.
+
+**Task 5b closed a real energy gap, and spec §3.5 was wrong.** The spec
+claimed `evalMultiScatterApproximation` was the equivalent of Cycles'
+`microfacet_ggx_preserve_energy`. **It is not.** Ours is `1 + F0*Ems`, which
+at the coat's `F0 = 0.04` evaluates to about 1.002 and recovers almost none of
+the GGX single-scattering deficit, while Cycles is table-driven full
+compensation. Because the withdrawal uses Cycles' average Fresnel as an
+albedo — valid only *because* Cycles compensates — the base lost
+`coatWeight * <F>` while the coat paid back only `coatWeight * <F> * E_ss`. The
+difference vanished. Measured payout/withdrawal at the default
+`clearcoat_roughness` 0.5: **0.911 at normal incidence, 0.736 at cosNI 0.3** —
+a coated white sphere darkening toward its silhouette with no physical source.
+Fixed by porting Cycles' `table_ggx_E` (32x32) and `table_ggx_Eavg` (32).
+**Gap #17 remains untouched for the base specular**, deliberately: 5b's scope
+was the coat only, and probe C2 confirms the base pedestal is still +6.0% on a
+metal and unmoved by the coat.
+
+**Spec §4.1's withdrawal formula was incomplete too, and the proof is an
+ordering across three Cycles files.** The spec compensated only the payout.
+Cycles darkens the **withdrawal** as well:
+`bsdf_microfacet_setup_fresnel_dielectric` (`svm/closure.h:169`) runs
+`microfacet_ggx_preserve_energy`, which does `bsdf->weight *= darkening`
+(`bsdf_microfacet.h:482`); *then* `bsdf_albedo` (`closure.h:172-173`) starts
+from `sc->weight` (`bsdf.h:696`), which now carries that darkening; *then*
+`closure_layering_weight` consumes it (`closure.h:174`). So the withdrawal is
+`coat_weight * darkening * estimate`, not `coat_weight * estimate`.
+Payout-only compensation moves the ratio from `E = 0.915` to `E*C = 0.922` —
+it does **not** close the gap. The shipped fix puts
+`coatDarkening = E + Fms*(1-E)` on `coatLayerAlbedo` so both sides are equal by
+construction.
+
+**Exact dielectric Fresnel replaced Schlick-with-`shadowedF90`.**
+`shadowedF90(F0) = min(1, F0/0.04)` caps the coat's grazing reflectance below 1
+for *every* `clearcoat_ior < 1.5`, while the withdrawal's table assumes a
+Fresnel that reaches 1 — pure energy loss, and `clearcoat_ior`'s Inspector
+range is `1,3,0.01`, so this is an ordinary artist setting, not a corner. Task
+6's probe E measures the fix: all 15 readings land within 0.7% of exact
+Fresnel, **including ior 1.1 at cos 0.15, where the old path read 5.4x low.**
+
+#### 7.10.3 The raster divergence — read this before filing a bug
+
+**The same authored material does not look the same in the viewport and in the
+path tracer, and this is known, not a defect report waiting to be written.**
+Two independent divergences, both in `scene_forward_lights_inc.glsl`:
+
+1. **Roughness-to-alpha mapping.** The path tracer uses `alpha = r^2`,
+   matching Cycles (`svm/closure.h:165`,
+   `bsdf->alpha_x = bsdf->alpha_y = sqr(coat_roughness)`). The raster uses
+   `mix(0.001, 0.1, r)` (`scene_forward_lights_inc.glsl:212`) — a completely
+   different curve with a hard 0.1 ceiling, so the raster's coat can never get
+   rougher than `alpha = 0.1` no matter what the artist types.
+2. **The raster coat is purely additive.** It adds a clearcoat highlight on top
+   and **withdraws nothing** from the layers below. The path tracer's coat is a
+   layer that attenuates the base, per Cycles. A `clearcoat = 1.0` metal
+   therefore reads brighter in the viewport than in the path tracer *and* has a
+   differently-shaped highlight.
+
+Anyone comparing viewport and path-traced screenshots of a coated material will
+see a difference. It is the raster that diverges from Cycles here, not the path
+tracer, and closing it means changing every existing Forward+ scene's
+appearance — which is why E2d did not.
+
+#### 7.10.4 The albedo LUT, and why it is an SSBO
+
+`ggx_gen_schlick_ior_s` (16x16x16), `table_ggx_E` (32x32) and `table_ggx_Eavg`
+(32) are copied **verbatim** out of Cycles' `shader.tables` into
+`ggx_energy_tables.h` and uploaded as one flat SSBO at binding 38. The Task 1
+reviewer re-extracted the first table from `shader.tables` independently and
+diffed **all 4096 entries** — zero mismatches, not five spot checks — and Task
+5b's reviewer did the same for 1024/1024 and 32/32.
+
+**It is deliberately an SSBO with hand-written trilinear interpolation, not a
+filtered 3D texture,** and the shipped comment at `brdf_inc.glsl:1883` says
+why:
+
+> Hardware filtering is half-texel-centered; it would compile, render
+> plausibly, and be wrong by half a texel at every lookup — a small, uniform,
+> entirely silent energy error.
+
+Cycles' `lookup_table_read*` is **endpoint-aligned**: `[0,1]` maps onto
+`[0, size-1]` and lerps between integer entries. A `sampler3D` maps `[0,1]`
+onto texel *centres*. The two disagree everywhere. Task 1 proved the property
+rather than asserting it: the half-texel form was temporarily substituted and
+the grid-point and midpoint doctest cases failed with distinctly different
+values (midpoint x: `0.987179` observed against `0.849810` expected), then
+reverted clean.
+
+**The known limit, stated plainly.** The GLSL `coatLutRead3D` has **no
+automated test** — doctest cannot execute GLSL, and Task 1's cases guard only
+the CPU mirror. Vis mode 38 compares three sampled points; a transcription slip
+that happens to agree at those three would survive. The mitigation is the same
+one §7.9 recorded for lobe order: **read the two implementations side by side**,
+which the Task 4 reviewer did, line by line, against Cycles'
+`lookup_table.h:14-71`, `bsdf_microfacet.h:504-568` and `bsdf_util.h:290-292`.
+
+#### 7.10.5 The first real N=3
+
+§7.9's extensibility proof was inert by construction: a third lobe of weight
+`0.0` and pdf `0.0`, which `acc + 0.0f` makes bit-exact. **E2d is the first
+real third lobe**, and Task 5 answered §7.9's two carried constraints from
+shipped code rather than from the plan:
+
+1. **Summation order.** `combineLobePdf` still ascends specular -> diffuse ->
+   coat, so the grouping is pinned as `((s + d) + c)` and both consumers index
+   by name. Specular remains index 0, which §7.9 named as contract.
+2. **The trailing fallback is unreachable, and no guard was added.** §7.9
+   warned "a zero-weight lobe must not be placed last"; the coat is a real
+   lobe, so the fallback is correct for it. Beyond that, `selectLobe`'s
+   `return LOBE_COUNT-1` cannot fire on a zero-weight coat: at `coatMass == 0`
+   the base weights are `fl(pSpec)` and `fl(1-pSpec)`, which sum to **exactly**
+   `1.0f` for every float32 `pSpec` (Sterbenz above 0.5; half-ulp rounding back
+   below it — 10M random samples, zero exceptions), and `rng_1d` bottoms out in
+   `sb_uint_to_float_excl` (`sobol_burley_inc.glsl:118`, dividing by
+   `4294967808.0`) so `u < 1.0` strictly. `/fp:strict` is forced on this
+   platform (`platform/windows/detect.py:408`), closing the reassociation
+   escape hatch. **The proof is recorded so the guard is not added later out of
+   caution.**
+
+One real defect surfaced from the wrong analysis that produced this proof:
+`coatLobeWeight` originally returned `coatWeight * estimate` **unclamped**,
+while `lobeWeight` ends in `clamp(..., 0.01f, 0.99f)` for exactly this reason.
+The sampler divides throughput by the selected weight, so a coat just above the
+`1e-5` cutoff with estimate about 0.04 gives about 4e-7 and a 2.5-million-fold
+firefly, reachable on any faintly coated material. The clamp is mirrored.
+
+**Where the coat sits in the mixture is not where the plan said it was.** The
+weights block is inside the `else` of a **three-way** branch whose first arm is
+`diffuseLum < 0.0001` — i.e. **pure metal**, which is exactly what car paint
+is. Placing the coat there without gating that fast path would have left the
+feature silently inert on this phase's own stated acceptance target. Both fast
+paths are now gated on `coatMass <= 0.0`, exact at `clearcoat == 0`.
+
+#### 7.10.6 The gate, proven by breaking it
+
+Deleting `* coatDarkening` at `brdf_inc.glsl:2081` — one factor, the Task 5b
+fix — turns **7 of probe B's 17 rows red, worst −0.0591**, and takes probes C2
+and F with them. Restored, rebuilt, green. The magnitude follows from the code
+rather than from the observation: the deficit is
+`cw * estimate * (1 - darkening)`, which at (roughness 0.90, ior 2.00, `cw` 1)
+predicts about 0.060 against 0.0591 measured, with 1:2:4 linearity in `cw`
+because neither `estimate` nor `darkening` depends on it. The gate is an
+instrument, not a rubber stamp.
+
+**Two probes were red before the code was, and both times it was the probe.**
+Probe E's first two failures were (a) evaluating analytic `F` at the bin's
+*mean* cos — a Jensen error worth 11 percentage points — and (b) reading a
+1.3-pixel grazing annulus on a *tessellated* sphere through an *analytic* cos
+map, leaking sky at a fitted 0.060/0.067/0.064 across three IORs. Replaced with
+a tilted quad, where the ray-plane intersection **is** the ray-mesh
+intersection. Probe G was red because **the RNG seed is a free-running frame
+counter**: no two accumulations in this engine are bit-identical (7.6e-4 rmse
+between two renders of the *same* material). "Identical inputs produce
+identical pixels" is false here, and any future gate that assumes it will be
+red on correct code.
+
+#### 7.10.7 What E2d does not deliver
+
+**`coat_normal` is the one piece of Blender coat parity E2d does not ship.**
+Cycles exposes a separate normal for the coat layer, and it needs a texture
+slot on `BaseMaterial3D` plus the plumbing Phase D established. It is deferred
+not merely for cost but because it is **entangled with sheen**: in Cycles the
+coat normal also bends the *sheen* normal —
+`bsdf->N = safe_normalize(mix(N, coat_normal, saturatef(coat_weight)))` at
+`svm/closure.h:127-129`, inside the sheen block, before the coat block even
+runs. Implementing `coat_normal` without sheen would ship half of a coupled
+pair. **It belongs to E2e.**
+
+Also carried, unfixed:
+
+- **Self-emission is not attenuated by the coat.** Cycles multiplies emission
+  by the post-layering, post-tint weight (`svm/closure.h:204-210`, "attenuated
+  by sheen and coat"). An emissive panel with `clearcoat = 1` and a red tint
+  renders full-strength white here and red at about 78% in Cycles.
+- **Two different "is there a coat" predicates.** `evalCoat` gates on
+  `coatWeight <= 1e-5`; `coatLobeWeight` gates on `coatLayerAlbedo <= 0.0`.
+  They disagree at exactly `clearcoat_ior == 1.0` (a legal value), where the
+  coat would have a *value* in NEE but zero *density* in `combinedPdf`.
+  Harmless today only by two independent coincidences in two files — the
+  table's whole `z == 0` slice is zero **and** `F0 = F90 = 0` there. Make both
+  gates the same predicate.
+- **No near-delta guard on the coat at the three analytic-light sites.** At
+  `clearcoat_roughness 0` the `Microfacet_D` floor returns about
+  `F*7950/NdotL`. Pre-existing convention — the base specular behaves the same
+  — but a mirror-coated car body under a point light is E2d's own acceptance
+  target.
+- **`GGX_E_DIM` is hardcoded as a literal `32` at `brdf_inc.glsl:2007` and
+  `:2016`** while the albedo table gets a `#define`. The cross-language pin
+  covers offsets but not dimensions, so a 64-entry re-extraction would update
+  C++ and the offsets (all green) while the shader kept reading a 32x32
+  sub-rectangle of a 64x64 block — silent, no crash, no failing test. With the
+  one-directional offset pin (a GLSL-only edit to `RT_COAT_SSBO_E_OFFSET`
+  compiles and passes everything) this is the change's single silent-corruption
+  surface.
+- **The coat reads `materials[h.geometry_idx]`, not `MaterialResult`**, so a
+  custom `ShaderMaterial` fragment cannot drive the coat per-pixel — identical
+  to how E2b's anisotropy behaves. Recorded, not changed.
+
+**One open item found here that is orthogonal to E2d and belongs to a later
+phase: 2.7% of production BSDF draws on a roughness-0.4 sphere are rejected
+and mirrored back into the hemisphere with MIS weight 1.** Measured by Task
+6's vis mode 40, not fixed, not caused by the coat. It is a candidate roadmap
+item in its own right — a rejection-and-mirror with an unadjusted MIS weight is
+the F1 `recoverBelowHemisphereSample` family of problem, not a coat problem.
+
+#### 7.10.8 Verification
+
+doctest **1542 passed / 0 failed / 3 skipped** (2,066,790 assertions), on the
+restored production binary after the `ms` diagnostic was reverted and rebuilt.
+All four GPU gates PASS on that same binary: `pt_coat_gate` (all seven probes),
+`pt_energy_gate`, `pt_anisotropy_gate`, `pt_transmission_gate` (44 checks;
+probe 6 on the good mode of the bimodality §7.9 records). No engine source file
+is modified by this closeout — `git diff` on `servers/` is empty.
+
+**Phase table.** Under §4's "E2. Anisotropy, clearcoat, sheen": anisotropic GGX
+is complete (§7.8), the two-way to N-way lobe rewrite is complete (§7.9), and
+**clearcoat is now complete (E2d, this section)** — the acceptance target "car
+paint ... responds comparably to Cycles" is **met**, at +0.381% raw / −0.098%
+adjusted against a 5% bar, with the layer's own contribution matching to 0.066%
+and its Beer's-law tint to 0.016%. What remains under that heading:
+
+- **Sheen (E2e)** — not started.
+- **`coat_normal`** — deferred into E2e, since Cycles couples it to the sheen
+  normal (`svm/closure.h:127-129`).
+- **Anisotropy on the transmissive lobe** — still needs the refracted-direction
+  eval/pdf machinery described at the end of §7.8.
