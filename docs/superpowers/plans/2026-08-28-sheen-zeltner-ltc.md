@@ -55,7 +55,7 @@ Copied from `docs/superpowers/specs/2026-08-28-sheen-zeltner-ltc-design.md`. Eve
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `SHEEN_LTC_TABLE[3072]`, `SHEEN_LTC_DIM = 16` **(see Step 1 — verify this, do not assume)**. CPU mirrors `sheen_ltc_read(kind, cos_ni, roughness)`, `sheen_make_frame(N, V, T, B)`, `sheen_eval(...)`, `sheen_sample(...)`, all `static` inside `namespace TestPTSheen`.
+- Produces: `SHEEN_LTC_TABLE[3072]`, `SHEEN_LTC_DIM = 32` (3 blocks x 32 x 32 = 3072; `bsdf_sheen.h:38-42` passes `32, 32`). CPU mirrors `sheen_ltc_read(kind, cos_ni, roughness)`, `sheen_make_frame(N, V, T, B)`, `sheen_eval(...)`, `sheen_sample(...)`, all `static` inside `namespace TestPTSheen`.
 
 **Why first.** Everything rests on three table reads whose axes are transposed relative to the coat's. A probe on the diagonal cannot tell them apart, so the tests must read where the two orders genuinely differ.
 
@@ -202,8 +202,10 @@ static float sheen_eval(const SheenData &p_d, const Vector3 &p_l) {
 	return (1.0f / Math_PI) * MAX(lo.z, 0.0f) * q * q;
 }
 
-// bsdf_sheen.h:83-89.
-static Vector3 sheen_sample(const SheenData &p_d, float p_u1, float p_u2) {
+// bsdf_sheen.h:83-99. Returns the direction AND the pdf, because Cycles does
+// (`*pdf = val; *eval = make_spectrum(val);` at :97-99) and because a sampler
+// that returns only a direction cannot be checked against the evaluator.
+static Vector3 sheen_sample(const SheenData &p_d, float p_u1, float p_u2, float &r_pdf) {
 	const float r = Math::sqrt(p_u1);
 	const float phi = Math_TAU * p_u2;
 	const float dx = r * Math::cos(phi);
@@ -211,6 +213,12 @@ static Vector3 sheen_sample(const SheenData &p_d, float p_u1, float p_u2) {
 	const float dz = Math::sqrt(MAX(0.0f, 1.0f - (dx * dx + dy * dy)));
 	Vector3 lo(dx - dz * p_d.b, dy, dz * p_d.a);
 	lo.normalize();
+	// The sampler's OWN pdf expression, from its own localO -- not a call into
+	// sheen_eval. Keeping them separate is what makes the identity testable.
+	const float len_sqr = (p_d.a * lo.x + p_d.b * lo.z) * (p_d.a * lo.x + p_d.b * lo.z) +
+			(p_d.a * lo.y) * (p_d.a * lo.y) + lo.z * lo.z;
+	const float q = p_d.a / len_sqr;
+	r_pdf = (1.0f / Math_PI) * lo.z * q * q;
 	return p_d.T * lo.x + p_d.B * lo.y + p_d.N * lo.z;
 }
 
@@ -267,15 +275,33 @@ TEST_CASE("[PathTracer][Sheen] pdf equals eval, exactly") {
 			const float u2 = float(j) / 9.0f;
 			CAPTURE(u1);
 			CAPTURE(u2);
-			const Vector3 l = sheen_sample(d, u1, u2);
-			const float e = sheen_eval(d, l);
-			// The sampler's own returned value is the same expression; the
-			// mirror recomputes it through sheen_eval, so equality here means
-			// the eval path reproduces the sample path exactly.
-			CHECK(e > 0.0f);
-			CHECK(e == sheen_eval(d, l));
+			float sample_pdf = 0.0f;
+			const Vector3 l = sheen_sample(d, u1, u2, sample_pdf);
+			const float eval_val = sheen_eval(d, l);
+
+			// The real property: the SAMPLER's pdf, computed from its own
+			// local-frame direction, equals the EVALUATOR's value for the same
+			// world direction. Two independent code paths, one number.
+			//
+			// Approx, not ==, and the reason is specific: the sampler builds
+			// localO directly, while the evaluator receives the world-space
+			// direction and projects it back onto the frame. That round trip
+			// costs a few ulp. The tolerance measures the round trip, it does
+			// not hide a discrepancy -- 1e-5 is far tighter than any real
+			// transcription error would be.
+			CHECK(eval_val > 0.0f);
+			CHECK(sample_pdf == doctest::Approx(eval_val).epsilon(1e-5));
 		}
 	}
+
+	// Prove the case can fail: two different draws must give different pdfs,
+	// so the assertion above is not trivially satisfied by a constant.
+	float pdf_a = 0.0f;
+	float pdf_b = 0.0f;
+	const Vector3 la = sheen_sample(d, 0.2f, 0.3f, pdf_a);
+	const Vector3 lb = sheen_sample(d, 0.8f, 0.7f, pdf_b);
+	CHECK(la != lb);
+	CHECK(Math::abs(pdf_a - pdf_b) > 1e-6f);
 }
 
 TEST_CASE("[PathTracer][Sheen] the view-dependent frame is orthonormal and V-aligned") {
@@ -311,8 +337,10 @@ TEST_CASE("[PathTracer][Sheen] the degenerate frame fallback fires at normal inc
 	// And the sheen still evaluates finitely through that frame.
 	const SheenData d = sheen_setup(n, n, 0.5f);
 	if (d.valid) {
-		const Vector3 l = sheen_sample(d, 0.5f, 0.5f);
+		float pdf = 0.0f;
+		const Vector3 l = sheen_sample(d, 0.5f, 0.5f, pdf);
 		CHECK(!Math::is_nan(sheen_eval(d, l)));
+		CHECK(!Math::is_nan(pdf));
 	}
 }
 
