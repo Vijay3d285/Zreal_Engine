@@ -2452,3 +2452,110 @@ machinery described at the end of section 7.8. Cycles'
 (`intern/cycles/kernel/svm/closure.h:141` sheen, `:174` coat) arrive with the
 first real layer in E2d; this phase deliberately changed no layering
 semantics, only selection and combination.
+
+### 7.10 E2d - clearcoat / coat layer
+
+**Status: landed and measured against Cycles.** Full task-by-task record:
+`.superpowers/sdd/2026-08-27-clearcoat-coat-layer/task-{1..7}-report.md`.
+
+*(This section was committed in two parts: the Cycles measurement first, so it
+could not be lost, then the closeout narrative. See §7.10.1 onward.)*
+
+#### 7.10.1 The Cycles comparison — car paint
+
+**Blender ran headlessly here.** `Blender 4.5.3 LTS`, `blender.exe -b -P`,
+Cycles on **OptiX / NVIDIA RTX A4000** (device selected by the E2a/E2b
+fallback chain and printed, not assumed), 1024 samples, denoising and adaptive
+sampling off, `view_transform = Standard`, exposure 0, gamma 1. The harness
+also printed Blender's live Principled BSDF socket list before touching it, so
+`Coat Weight` / `Coat Roughness` / `Coat IOR` / `Coat Tint` are confirmed to
+exist under those names in this version rather than assumed from the manual.
+
+**Scene** — a **car-paint sphere**, E2's own stated acceptance target (§4,
+"car paint and velvet"): metallic base `roughness = 0.25`, base colour linear
+`(0.30, 0.05, 0.05)`, `clearcoat = 1.0`, `clearcoat_roughness = 0.1`,
+`clearcoat_ior = 1.5` (the default), under a spatially uniform environment of
+radiance 1.0. Sphere radius 1.0 at origin, 64×32 segments; camera at Godot
+`(0,0,2.5)` / Blender `(0,-2.5,0)` under `blender(x,y,z) = godot(x,-z,y)`; 20°
+vertical FOV on 256×256. Radius 1.0 at distance 2.5 subtends 23.58° against a
+14.0° diagonal half-angle, so **every pixel in every render is a sphere hit**
+and the whole-image mean is a surface-only statistic. Godot: `max_bounces=3`,
+`SPP=1`, 256 accumulated frames. Cycles: bounces matched at 3. **Bounce depth
+is not a free variable here** — a lone convex sphere cannot re-hit itself.
+
+**Colour space, the trap this phase family has hit twice.**
+`render_raytracing.cpp:1585` sRGB-decodes `albedo_color` on upload and `:1855`
+does the same to `clearcoat_tint`; Cycles' sockets are linear. So both colours
+were authored `Color(<linear>).linear_to_srgb()` on the Godot side and Blender
+was given the same `<linear>` number — each renderer compared against the same
+authored *linear* value, never field-for-field against the other. The harness
+printed the round trip through the engine's own `Color` methods:
+
+```
+ALBEDO linear=(0.30000001,0.05,0.05) -> authored srgb=(0.58383155,0.24780053,0.24780053)
+                                     -> engine decode=(0.30000004,0.05,0.05)
+```
+
+**Raw comparison** (production code, HEAD `df779c6b65`, nothing tuned):
+
+| arm | Godot mean | Cycles mean | ratio | % off |
+|---|---|---|---|---|
+| car paint (`clearcoat=1.0`) | 0.16867638 | 0.16803674 | 1.003807 | **+0.381%** |
+| uncoated control (`clearcoat=0`) | 0.13358590 | 0.13292308 | 1.004986 | +0.499% |
+| amber-tinted coat | 0.14654985 | 0.14598414 | 1.003875 | +0.388% |
+
+Per channel, car paint: R `1.005603`, G `1.000476`, B `1.000476`.
+
+**The raw figure passes the 5% bar with an order of magnitude to spare, with
+no adjustment at all** — a materially better starting point than E2b, which
+needed the `ms` attribution to get from +6.52% to +0.67%. The per-channel
+split says why: the gap sits almost entirely in R, the channel with the bright
+base colour (linear 0.30), and is near zero in G/B where the base is dark
+(0.05). That is Gap #17's `F0`-dependent pedestal, small here because the base
+roughness is 0.25 rather than E2b's 0.4-plus-anisotropy.
+
+**The coat-only delta — the layer isolated by subtraction.** Subtracting the
+uncoated arm from the coated arm *inside each engine* cancels every
+base-specular term, Gap #17 included, without touching any code. What remains
+is exactly what the layer contributes: its own reflection minus the withdrawal
+it takes from the base.
+
+| | R | G | B | mean |
+|---|---|---|---|---|
+| Godot delta | 0.02829920 | 0.03848612 | 0.03848612 | 0.03509048 |
+| Cycles delta | 0.02836713 | 0.03848692 | 0.03848692 | 0.03511366 |
+| ratio | 0.997605 | 0.999979 | 0.999979 | **0.999340 (-0.066%)** |
+
+**The layer itself agrees with Cycles to 0.066% in the mean and 0.002% on the
+dark channels.** The residual −0.24% on R is in the channel Gap #17 lives in,
+in the direction subtraction leaves when the pedestal is not perfectly linear
+in the base's contribution.
+
+**Beer's-law coat tint** — `tinted / carpaint` within each engine isolates the
+optical-depth attenuation from everything else:
+
+| | Godot | Cycles | ratio of ratios |
+|---|---|---|---|
+| R | 0.909826 | 0.909898 | 0.999921 (−0.0079%) |
+| G | 0.861141 | 0.861197 | 0.999934 (−0.0066%) |
+| B | 0.723697 | 0.723813 | 0.999840 (−0.0160%) |
+
+Better than 0.02% on all three channels, with `clearcoat_tint` authored
+linear `(0.90, 0.75, 0.50)` on both sides. This is a genuine formula match:
+`brdf_inc.glsl:2324-2327` mirrors `svm/closure.h:196-203` term for term,
+including refracting into the coat before measuring path length
+(`cosNT = sqrt(1 - (1/ior)^2 (1 - cosNI^2))`, `optical_depth = 1/cosNT`) and
+including the `mix` against `coat_weight` rather than a bare multiply.
+
+**Positive control — the colour-space trap, reproduced.** A Cycles-only arm
+with `Base Color` set to the sRGB-encoded number an artist reads off the Godot
+Inspector, fed to Blender as if it were linear — the exact field-for-field
+error that inverted §7.7's verdict — measured `0.38487698` against the
+reconciled arm's `0.16803674`: **ratio 2.290434, +129.0%**, i.e. 340× the size
+of the gap being measured. The control is internally consistent too: if the
+render were exactly linear in base colour, `srgbcontrol/carpaint` would equal
+the base-colour ratio, but measured `1.831147` (R) and `3.141887` (G) sit
+*below* predictions of `1.946105` and `4.956011`, by more on the channel with
+the larger base ratio — exactly what a base-colour-independent additive term
+does, and the coat's own reflection is precisely such a term. The control
+therefore confirms both the trap's direction and the coat's presence.
