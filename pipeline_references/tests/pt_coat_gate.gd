@@ -181,10 +181,43 @@ const PROBE_C_BAND := 0.005
 # ---------------------------------------------------------------------------
 const PROBE_D_CLEARCOAT := [0.0, 0.5, 1.0]
 const PROBE_D_FRAMES := 64
+const PROBE_D_COAT_ROUGHNESS := 0.5
+# FIX ROUND 1 (review Important #1): 1.5 -> 2.0. THIS IS THE PROBE'S LEVER, and
+# at 1.5 it was the same size as the tolerance.
+#
+# The self-normalising identity is insensitive to the mixture WEIGHTS by
+# construction -- that is exactly what makes it able to catch a shape error in
+# any lobe. The price is that a PROPORTIONAL mis-weighting of the coat term can
+# only perturb E[1/G] by about coatMass, so coatMass is the whole sensitivity
+# budget for that defect class. At coat_roughness 0.5 / ior 1.5 the CPU mirror
+# gives coatMass = cw * 0.040546 * 0.922042, i.e. 0.0187 and 0.0374 at the two
+# non-zero clearcoat values -- and the rendered diagnostic agreed, with mean_pdf
+# moving only 1.123268 -> 1.090280 across the entire sweep, a 3.0% total
+# contribution against a 3% tolerance. A coat weighted by coatLayerAlbedo on one
+# side and coatLobeWeight on the other (a plausible edit: brdf_inc.glsl's
+# two-roles block records that those were ONE value until E2d fix round 1) would
+# have reported green.
+#
+# ior 2.0 takes the estimate to 0.111747 and coatMass to 0.103679 at cw = 1 --
+# 2.77x the lever, at zero cost and with no new risk, because 2.0 is already
+# exercised by probes A, B and E, so this introduces no untested LUT corner into
+# the one probe whose job is pdf consistency.
+#
+# The review offered `coat_roughness 0.9` as the alternative. It goes the WRONG
+# WAY: darkening falls from 0.922042 to 0.447361 there while the estimate barely
+# moves (0.040546 -> 0.041384), so coatMass drops to 0.018514 -- HALF the
+# original lever, not a larger one. Recorded because the arithmetic is easy to
+# read the wrong way round.
+#
+# RAISING THE LEVER, NOT TIGHTENING THE TOLERANCE, is the fix on purpose:
+# PROBE_D_TOL is a Monte Carlo noise bound chosen a priori, and shrinking it
+# would trade a real sensitivity gain for run-to-run flakiness.
+const PROBE_D_IOR := 2.0
 # 3%, the same a-priori Monte Carlo bound pt_anisotropy_gate's probe 2 chose and
 # for the same reason: 1/combinedPdf is a modest low-variance quantity here, the
 # effective sample count across a sphere-filling crop is in the millions, and a
 # genuine missing-factor or mismatched-weight pdf bug moves this by 10-30%+.
+# Unchanged by fix round 1 -- see PROBE_D_IOR.
 const PROBE_D_TOL := 0.03
 # Rejected draws contribute 0 to the self-normalised mean, so a low acceptance
 # rate is indistinguishable from a pdf that is too large. Mode 40's red channel
@@ -295,10 +328,39 @@ const PROBE_G_FRAMES := 32
 # systematically, which drives rmse well above a noise floor that scales as
 # 1/sqrt(frames)) without asserting something the estimator cannot deliver.
 #
-# 25%: two independent draws of the same random quantity give rmse ratios that
-# scatter by a few percent at this pixel count; 25% leaves room for that while
-# an image shifted by even a tenth of the coat's own albedo (0.037 at these
-# settings, versus a 7.6e-4 noise floor) would read as a ratio in the tens.
+# FIX ROUND 2 (review Important #2) corrected WHICH PAIRS this bound is applied
+# to -- see the long note in _probe_g_inert_ior. The value is unchanged.
+#
+# READ THE EVIDENCE BEFORE THE ARGUMENT. The review's diagnosis was that the
+# round-1 pairing (floor from an ADJACENT pair, assertion from a pair two
+# accumulation windows apart) produced a systematic 8-12% excess, on the strength
+# of two readings: 1.0792 and 1.1174. Fix round 2 made both pairs adjacent and
+# then measured BOTH pairings on two further runs of the same correct code:
+#
+#   order-matched (adjacent) ratio : 0.9856, 1.0368
+#   two-windows-apart ratio        : 1.0792, 1.1174, 0.9735
+#
+# The order-matched readings do sit near 1.00. But the UNMATCHED pairing also
+# read 0.9735 on the last run, which is below 1.0 -- so across five observations
+# the rmse ratio scatters roughly 0.97 to 1.12 REGARDLESS of pairing, and the
+# original 1.0792 / 1.1174 pair is inside that scatter rather than evidence of a
+# separation artifact. The diagnosis is NOT confirmed, and this comment does not
+# claim it is. See section 9 of task-6-report.md.
+#
+# The order-matched construction is kept anyway, because it is the right
+# construction a priori -- a floor and an assertion should span the same
+# separation in a sequence that has correlation structure (scrambled
+# Sobol-Burley, indexed by a free-running frame counter) -- and it costs nothing.
+# What changed is only the claim made for it.
+#
+# 25% is therefore LOAD-BEARING, not slack absorbing a fixable bias: the measured
+# run-to-run scatter of this ratio reaches ~12%, so a materially tighter bound
+# would flake. Tightening was considered and rejected on that evidence. The
+# probe's SHARP claim is the mean-shift assertion below -- a 5e-4 bound against
+# measured deltas of 2.5e-6 and 1.9e-6, i.e. ~200x of margin -- which is
+# independent of rmse entirely. An image shifted by even a tenth of the coat's
+# own albedo (0.037 at these settings, against a ~8e-4 floor) reads as a ratio in
+# the tens here, so 25% is nowhere near the defect scale either way.
 const PROBE_G_RMSE_MARGIN := 0.25
 # The mean is the sharper of the two: spatial averaging over ~53k pixels removes
 # the seed noise instead of accumulating it (probe B's 36 configurations all sat
@@ -765,13 +827,16 @@ func _probe_d_pdf(p_env: Environment) -> void:
 			% MODE_COAT_PDF_SELFNORM)
 	print("  E[1/combinedPdf(L)] over REAL mixture draws vs 2*PI=%.6f, tolerance %.1f%%"
 			% [TAU, PROBE_D_TOL * 100.0])
+	print("  lever: coat_roughness %.2f ior %.2f -> coatMass ~%.4f at cosNI 1 and clearcoat 1 "
+			% [PROBE_D_COAT_ROUGHNESS, PROBE_D_IOR, 0.103679]
+			+ "(watch mean_pdf's spread below -- it IS the lever)")
 	_use_sphere_camera_filled()
 	await get_tree().process_frame
 	var vp_rid := get_viewport().get_viewport_rid()
 	p_env.set_pathtracing_debug_mode(MODE_COAT_PDF_SELFNORM)
 	for cw in PROBE_D_CLEARCOAT:
 		var mat := _metal(Color(1.0, 1.0, 1.0), 0.4)
-		_sphere.material_override = _apply_coat(mat, cw, 0.5, 1.5)
+		_sphere.material_override = _apply_coat(mat, cw, PROBE_D_COAT_ROUGHNESS, PROBE_D_IOR)
 		var img: Image = await _render_accum(p_env, vp_rid, PROBE_D_FRAMES)
 		var tag := "clearcoat=%.2f" % cw
 		if img == null:
@@ -894,8 +959,11 @@ func _probe_f_selection(p_env: Environment) -> void:
 
 func _probe_g_inert_ior(p_env: Environment) -> void:
 	print("\n=== PROBE G: clearcoat_ior == 1.0 must be inert to within the estimator's own noise ===")
-	print("  RMSE(coat-off, inert-coat) must not exceed RMSE(coat-off, coat-off again) by more")
-	print("  than %.0f%%, and the means must agree to %.6f" % [PROBE_G_RMSE_MARGIN * 100.0, PROBE_G_MAX_MEAN_DELTA])
+	print("  three ADJACENT renders: coat-off, coat-off again, inert-coat. Floor is rmse(1,2)")
+	print("  (same material); the assertion is rmse(2,3), which spans the SAME one-window seed")
+	print("  separation. Must not exceed the floor by more than %.0f%%, and the means must agree"
+			% (PROBE_G_RMSE_MARGIN * 100.0))
+	print("  to %.6f" % PROBE_G_MAX_MEAN_DELTA)
 	_use_sphere_camera_filled()
 	await get_tree().process_frame
 	var vp_rid := get_viewport().get_viewport_rid()
@@ -933,24 +1001,52 @@ func _probe_g_inert_ior(p_env: Environment) -> void:
 	if img_off == null or img_off2 == null or img_inert == null:
 		_failures.append("probeG: accumulator readback returned null")
 		return
+
+	# FIX ROUND 2 (review Important #2): THE FLOOR AND THE ASSERTION MUST SPAN
+	# THE SAME SEPARATION IN THE SEED SEQUENCE.
+	#
+	# Round 1 declared the floor as rmse(off, off2) -- renders 1 and 2, ADJACENT
+	# -- and asserted on rmse(off, inert) -- renders 1 and 3, TWO accumulation
+	# windows plus their settle frames apart. Given this probe's own premise
+	# above (the seed is a free-running frame counter over a scrambled
+	# Sobol-Burley sequence, so nearby windows may be more alike than distant
+	# ones) those are not obviously draws from one distribution, and a floor
+	# should span the same separation as the quantity it bounds.
+	#
+	# Both pairs below are now ADJACENT renders: (1,2) is same-material and is
+	# the floor, (2,3) is the material change under test. Nothing about the
+	# render order changed -- only which pair each number is taken from.
+	#
+	# rmse(off, inert) is still printed, UNASSERTED, so the separation effect
+	# stays measurable rather than being quietly dropped. That readout is what
+	# stopped fix round 2 from overclaiming: it read 0.9735 on the run after the
+	# 1.0792 and 1.1174 that motivated this change, which means the round-1
+	# excess was ordinary scatter and NOT a demonstrated separation artifact.
+	# The construction below is still the correct one, but do not cite it as a
+	# fix for a bias that was never established. See PROBE_G_RMSE_MARGIN.
 	var noise_floor := rmse(img_off, img_off2)
-	var e := rmse(img_off, img_inert)
+	var e := rmse(img_off2, img_inert)
+	var e_unmatched := rmse(img_off, img_inert)
 	var s_off := _measure_crop(img_off, 0.05, 0.95)
 	var s_off2 := _measure_crop(img_off2, 0.05, 0.95)
 	var s_inert := _measure_crop(img_inert, 0.05, 0.95)
-	print("  clearcoat=0     mean=%.6f" % s_off["mean"])
-	print("  clearcoat=0 #2  mean=%.6f   rmse vs #1 = %.9f  <- the estimator's own noise floor"
+	print("  render 1  clearcoat=0        mean=%.6f" % s_off["mean"])
+	print("  render 2  clearcoat=0 #2     mean=%.6f   rmse(1,2) = %.9f  <- FLOOR, adjacent, same material"
 			% [s_off2["mean"], noise_floor])
-	print("  clearcoat=1 ior=1.0  mean=%.6f   rmse vs #1 = %.9f  (ratio %.4f)"
+	print("  render 3  clearcoat=1 ior=1  mean=%.6f   rmse(2,3) = %.9f  <- ASSERTED, adjacent (ratio %.4f)"
 			% [s_inert["mean"], e, e / maxf(noise_floor, 1e-12)])
+	print("            [diagnostic, NOT asserted] rmse(1,3) = %.9f  (ratio %.4f) -- two windows apart, "
+			% [e_unmatched, e_unmatched / maxf(noise_floor, 1e-12)]
+			+ "which is the order mismatch fix round 2 removed")
 	var mean_delta: float = float(s_inert["mean"]) - float(s_off["mean"])
-	print("  mean delta = %+.8f" % mean_delta)
+	print("  mean delta vs render 1 = %+.8f   vs render 2 = %+.8f"
+			% [mean_delta, float(s_inert["mean"]) - float(s_off2["mean"])])
 	if e > noise_floor * (1.0 + PROBE_G_RMSE_MARGIN):
 		_failures.append(("probeG: a full coat at ior 1.0 moved the image further than the " +
-				"estimator's own seed noise (rmse %.9f vs noise floor %.9f, +%.1f%% allowed). " +
-				"Every coat term must be exactly 0 at eta == 1 -- but evalCoat is still CALLED " +
-				"from every NEE site whenever coatWeight > 1e-5, so this is a live path, not a " +
-				"skipped one")
+				"estimator's own seed noise (rmse %.9f vs order-matched noise floor %.9f, " +
+				"+%.1f%% allowed). Every coat term must be exactly 0 at eta == 1 -- but evalCoat " +
+				"is still CALLED from every NEE site whenever coatWeight > 1e-5, so this is a live " +
+				"path, not a skipped one")
 				% [e, noise_floor, PROBE_G_RMSE_MARGIN * 100.0])
 	if absf(mean_delta) > PROBE_G_MAX_MEAN_DELTA:
 		_failures.append(("probeG: a full coat at ior 1.0 shifted the furnace mean by %+.8f " +
