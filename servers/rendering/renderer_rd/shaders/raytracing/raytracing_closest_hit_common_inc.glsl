@@ -1166,12 +1166,33 @@ void debug_visualize(
 		// gives a different answer, the same way vis mode 39 is the only
 		// instrument that can catch a transposed coatLutRead2D call.
 		//
-		// r = transformA, g = transformB, b = ltcAlbedo, all read at this
-		// hit's clamped shading normal, the view vector, and the material's
+		// r = transformA, g = 0.5 + 0.5*transformB, b = ltcAlbedo, all read at
+		// this hit's clamped shading normal, the view vector, and the material's
 		// (unclamped -- sheenSetup clamps internally) sheen_roughness.
+		//
+		// E2e Task 5: THE GREEN CHANNEL IS SIGN-ENCODED, AND IT HAS TO BE.
+		// Task 3 shipped this mode emitting the raw `dbg_sheen41.b`, and the
+		// first run of pt_sheen_gate.gd read it back as EXACTLY 0.000000 where
+		// the CPU mirror of sheen_ltc_table.h says -0.094282. The path is not
+		// the shader's: every payload write goes through path_pack ->
+		// sanitize_payload_value (raytracing_inc.glsl:88-91), which clamps
+		// radiance to [0, RT_PAYLOAD_VALUE_CLAMP], and path_unpack applies
+		// max(p.radiance, 0) again on the way back out. A NEGATIVE debug value
+		// therefore cannot survive the payload at all.
+		//
+		// transformB is negative in 909 of the table's 1024 cells and its whole
+		// range is [-0.181330, 0.001960], so the raw form made this channel read
+		// a constant 0 over 89% of the table -- an instrument that could not see
+		// the quantity it was added for, and could not fail. 0.5 + 0.5*b maps
+		// [-1, 1] onto [0, 1] with an order of magnitude of headroom over the
+		// real range; the gate decodes with b = 2*(g - 0.5).
+		//
+		// The other two channels are unaffected: transformA is in [0, 0.879580]
+		// and the albedo in [0, 0.749730], both non-negative over the whole
+		// table, so they are still emitted raw.
 		vec3 dbg_N41 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
 		SheenData dbg_sheen41 = sheenSetup(dbg_N41, V, dbg_material.sheen_roughness);
-		ps.radiance = vec3(dbg_sheen41.a, dbg_sheen41.b, dbg_sheen41.albedo);
+		ps.radiance = vec3(dbg_sheen41.a, 0.5 + 0.5 * dbg_sheen41.b, dbg_sheen41.albedo);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
