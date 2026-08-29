@@ -410,3 +410,44 @@ inline constexpr float SHEEN_LTC_TABLE[3072] = {
 	0.49191f, 0.47875f, 0.46632f, 0.45401f, 0.44209f, 0.43044f, 0.42005f, 0.40990f,
 	0.39997f, 0.39069f, 0.38171f, 0.37342f, 0.36523f, 0.35675f, 0.34897f, 0.34187f,
 };
+
+// ---------------------------------------------------------------------------
+// E2e Task 3: placement of the sheen table within the SINGLE binding-38 SSBO,
+// immediately after the coat's three tables (RT_COAT_SSBO_ALBEDO/E/EAVG_OFFSET
+// in ggx_energy_tables.h, which end at RT_COAT_SSBO_FLOAT_COUNT). Mirrors that
+// file's RT_COAT_SSBO_*_OFFSET pattern -- Cycles keeps one flat lookup_table
+// and addresses every table in it by an integer offset, and this SSBO already
+// follows that shape for the coat's tables.
+//
+// render_raytracing.cpp's _get_coat_albedo_buffer() assembles the buffer FROM
+// THESE CONSTANTS. GLSL cannot include this header, so brdf_inc.glsl mirrors
+// them as #defines (RT_SHEEN_SSBO_A_OFFSET etc. and SHEEN_LTC_DIM), pinned
+// together by tests/servers/rendering/test_pt_coat_albedo.cpp's "SSBO offsets
+// are the ones the shader hard-codes" case, which now also covers these.
+//
+// DELIBERATELY NOT reusing RT_COAT_SSBO_FLOAT_COUNT as "the whole buffer's
+// size": that constant's own static_assert in ggx_energy_tables.h reads
+// "RT_COAT_SSBO_FLOAT_COUNT must cover exactly the three [coat] tables" --
+// repointing it to a four-table total would falsify that assertion's own
+// stated meaning without touching its text. RT_SHEEN_SSBO_FLOAT_COUNT is the
+// new, separate total render_raytracing.cpp sizes the combined buffer with.
+#include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
+
+inline constexpr int RT_SHEEN_SSBO_A_OFFSET = RT_COAT_SSBO_FLOAT_COUNT;
+inline constexpr int RT_SHEEN_SSBO_B_OFFSET = RT_SHEEN_SSBO_A_OFFSET + SHEEN_LTC_BLOCK;
+inline constexpr int RT_SHEEN_SSBO_ALBEDO_OFFSET = RT_SHEEN_SSBO_B_OFFSET + SHEEN_LTC_BLOCK;
+inline constexpr int RT_SHEEN_SSBO_FLOAT_COUNT = RT_SHEEN_SSBO_ALBEDO_OFFSET + SHEEN_LTC_BLOCK;
+
+static_assert(RT_SHEEN_SSBO_A_OFFSET == 5152, "Sheen's A block must start immediately after the coat's three tables.");
+static_assert(RT_SHEEN_SSBO_B_OFFSET == 6176, "Sheen's B block must start immediately after its A block.");
+static_assert(RT_SHEEN_SSBO_ALBEDO_OFFSET == 7200, "Sheen's albedo block must start immediately after its B block.");
+static_assert(RT_SHEEN_SSBO_FLOAT_COUNT == 8224, "RT_SHEEN_SSBO_FLOAT_COUNT must cover the coat's three tables plus the sheen's three blocks.");
+
+// Guards the single memcpy in _get_coat_albedo_buffer(): SHEEN_LTC_TABLE's
+// internal A/B/albedo sub-offsets must stay in the same relative order as the
+// global RT_SHEEN_SSBO_*_OFFSET placements, or copying the whole flat array
+// in one shot would transplant a block to the wrong global slot.
+static_assert(RT_SHEEN_SSBO_B_OFFSET - RT_SHEEN_SSBO_A_OFFSET == SHEEN_LTC_B_OFFSET - SHEEN_LTC_A_OFFSET,
+		"Sheen A->B spacing must match between the local table and the global SSBO placement.");
+static_assert(RT_SHEEN_SSBO_ALBEDO_OFFSET - RT_SHEEN_SSBO_A_OFFSET == SHEEN_LTC_ALBEDO_OFFSET - SHEEN_LTC_A_OFFSET,
+		"Sheen A->albedo spacing must match between the local table and the global SSBO placement.");

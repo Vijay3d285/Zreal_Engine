@@ -35,6 +35,7 @@ TEST_FORCE_LINK(test_pt_coat_albedo)
 #include "core/math/math_funcs.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
+#include "servers/rendering/renderer_rd/storage_rd/sheen_ltc_table.h"
 
 namespace TestPTCoatAlbedo {
 
@@ -287,6 +288,22 @@ TEST_CASE("[PathTracer][CoatAlbedo] SSBO offsets are the ones the shader hard-co
 	// offsets above -- if you edit this case, edit brdf_inc.glsl in the same commit.
 	CHECK(GGX_E_DIM == 32);
 	CHECK(GGX_COAT_TABLE_DIM == 16);
+
+	// E2e Task 3: the sheen LTC table's placement in the SAME binding-38 SSBO,
+	// immediately after the coat's three tables. Same reasoning as above --
+	// brdf_inc.glsl mirrors these as #defines (RT_SHEEN_SSBO_A_OFFSET etc. and
+	// SHEEN_LTC_DIM) because GLSL cannot include sheen_ltc_table.h, so this
+	// case pins the literals written into the shader; if you edit this case,
+	// edit brdf_inc.glsl in the same commit.
+	CHECK(RT_SHEEN_SSBO_A_OFFSET == 5152);
+	CHECK(RT_SHEEN_SSBO_B_OFFSET == 6176);
+	CHECK(RT_SHEEN_SSBO_ALBEDO_OFFSET == 7200);
+	CHECK(RT_SHEEN_SSBO_FLOAT_COUNT == 8224);
+	// SHEEN_LTC_DIM (32) is its own #define in the shader, deliberately not
+	// reusing GGX_E_DIM even though both are 32 today -- a re-extraction of
+	// either table at a different resolution must not silently corrupt reads
+	// of the other. See sheen_ltc_table.h's SSBO-placement comment.
+	CHECK(SHEEN_LTC_DIM == 32);
 }
 
 TEST_CASE("[PathTracer][CoatAlbedo] Fss matches Cycles' dielectric fit") {

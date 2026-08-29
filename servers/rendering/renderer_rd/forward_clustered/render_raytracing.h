@@ -500,6 +500,14 @@ class RenderRaytracing {
 	// by evalCoat / sampleCoatMicrofacet on every NEE and BSDF-sample path that
 	// carries a clearcoat lobe -- not just the debug vis modes (39/40) that also
 	// read it back.
+	//
+	// E2e Task 3: a FOURTH table, SHEEN_LTC_TABLE (sheen_ltc_table.h), is
+	// appended immediately after the coat's three, through the
+	// RT_SHEEN_SSBO_*_OFFSET constants declared alongside it. Still the same
+	// RID, same binding 38, same lazy-create-once shape -- only the byte count
+	// and the memcpy list grew. Read in brdf_inc.glsl (sheenSetup) and, as of
+	// this task, consumed by nothing but debug vis mode 41 -- Task 4 wires the
+	// sheen lobe into production shading.
 	RID coat_albedo_buffer;
 	RID _get_coat_albedo_buffer();
 

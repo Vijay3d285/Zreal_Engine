@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/sheen_ltc_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
@@ -148,19 +149,28 @@ RID RenderRaytracing::_get_emissive_fallback_buffer() {
 // themselves static_assert'd against the three sizeof()s), so this function
 // cannot lay the buffer out differently from what those constants say, and the
 // shader reads through #defines mirroring the same constants.
+//
+// E2e Task 3: a FOURTH table, SHEEN_LTC_TABLE, is appended immediately after
+// the coat's three -- same reasoning, same shape. SHEEN_LTC_TABLE is already a
+// single flat array with transformA/transformB/albedo as three contiguous
+// 1024-float blocks (sheen_ltc_table.h), and RT_SHEEN_SSBO_A_OFFSET is defined
+// to sit right after RT_COAT_SSBO_FLOAT_COUNT with the same relative A/B/albedo
+// spacing (static_assert'd in that header), so ONE memcpy of the whole array
+// lands all three blocks in their correct global slots.
 RID RenderRaytracing::_get_coat_albedo_buffer() {
 	if (coat_albedo_buffer.is_valid()) {
 		return coat_albedo_buffer;
 	}
 	Vector<uint8_t> bytes;
-	bytes.resize(RT_COAT_SSBO_FLOAT_COUNT * (int)sizeof(float));
+	bytes.resize(RT_SHEEN_SSBO_FLOAT_COUNT * (int)sizeof(float));
 	float *dst = (float *)bytes.ptrw();
 	memcpy(dst + RT_COAT_SSBO_ALBEDO_OFFSET, GGX_COAT_ALBEDO_TABLE, sizeof(GGX_COAT_ALBEDO_TABLE));
 	memcpy(dst + RT_COAT_SSBO_E_OFFSET, GGX_E_TABLE, sizeof(GGX_E_TABLE));
 	memcpy(dst + RT_COAT_SSBO_EAVG_OFFSET, GGX_EAVG_TABLE, sizeof(GGX_EAVG_TABLE));
+	memcpy(dst + RT_SHEEN_SSBO_A_OFFSET, SHEEN_LTC_TABLE, sizeof(SHEEN_LTC_TABLE));
 	coat_albedo_buffer = RD::get_singleton()->storage_buffer_create(bytes.size(), bytes);
 	if (coat_albedo_buffer.is_valid()) {
-		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT Coat Energy Tables (Albedo+E+EAvg)");
+		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT Coat+Sheen LUTs (Albedo+E+EAvg+SheenLTC)");
 	}
 	return coat_albedo_buffer;
 }
@@ -4115,10 +4125,11 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		}
 	}
 
-	// Binding 38: E2d coat directional-albedo LUT (GGX_COAT_ALBEDO_TABLE).
+	// Binding 38: E2d coat directional-albedo LUT (GGX_COAT_ALBEDO_TABLE), plus
+	// the coat's energy tables, plus (E2e Task 3) the sheen LTC table.
 	// Always bound -- unlike 31/34-37 above, there is no disabled-feature
 	// fallback path here; _get_coat_albedo_buffer() lazily uploads the fixed
-	// table once and caches the RID for every frame after.
+	// tables once and caches the RID for every frame after.
 	{
 		RD::Uniform u;
 		u.binding = 38;

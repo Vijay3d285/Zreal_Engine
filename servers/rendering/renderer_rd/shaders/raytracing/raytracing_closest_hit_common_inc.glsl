@@ -1102,6 +1102,28 @@ void debug_visualize(
 		// g = combinedPdf's report for the drawn direction (diagnostic).
 		// b = 1/G(L) or 0 -- the real instrument, averaged against 2*PI.
 		ps.radiance = vec3(dbg_valid40 ? 1.0 : 0.0, dbg_reported40, dbg_selfnorm40);
+	} else if (vis_mode == 41) {
+		// E2e Task 3: sheenSetup's transformA/transformB/albedo, evaluated on
+		// the GPU so the gate can compare them against test_pt_sheen.cpp's CPU
+		// mirror. Follows vis mode 38's pattern (coatAlbedoEstimate) and reads
+		// nothing sheenSetup itself does not already clamp/derive.
+		//
+		// THIS IS THE INSTRUMENT FOR THE AXIS ORDER. Task 1 Step 4 established
+		// that the CPU tests structurally cannot catch a transposed
+		// sheenLutRead2D(base, cosNI, roughness) call at sheenSetup's own call
+		// site -- swapping the two arguments there compiles, stays in range,
+		// and every CPU test stays green, because the CPU tests exercise the
+		// reader function directly and never the GLSL call site that feeds it.
+		// Task 5's gate reads this mode at a point where the transposed order
+		// gives a different answer, the same way vis mode 39 is the only
+		// instrument that can catch a transposed coatLutRead2D call.
+		//
+		// r = transformA, g = transformB, b = ltcAlbedo, all read at this
+		// hit's clamped shading normal, the view vector, and the material's
+		// (unclamped -- sheenSetup clamps internally) sheen_roughness.
+		vec3 dbg_N41 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+		SheenData dbg_sheen41 = sheenSetup(dbg_N41, V, dbg_material.sheen_roughness);
+		ps.radiance = vec3(dbg_sheen41.a, dbg_sheen41.b, dbg_sheen41.albedo);
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

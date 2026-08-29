@@ -2378,6 +2378,147 @@ float3 layerTransmittanceAbove(MaterialProperties material, float cosNI, int lob
 	return t;
 }
 
+// ---------------------------------------------------------------------------
+// E2e Task 3: Zeltner sheen LTC (velvet closure). Transcribed from Cycles'
+// bsdf_sheen.h:27-110 and its view-dependent frame, mapping.h:55-68. The CPU
+// mirror is tests/servers/rendering/test_pt_sheen.cpp -- keep the two
+// textually identical modulo type names; the doctest suite cannot execute
+// this shader, so that file is this code's only cross-check.
+//
+// NOTHING CALLS INTO THIS YET. LOBE_COUNT is still 3 (specular/diffuse/coat);
+// Task 4 adds LOBE_SHEEN to the registry and the layering stack. Until then
+// the only caller is debug vis mode 41, below.
+// ---------------------------------------------------------------------------
+
+// Shares the binding-38 SSBO (coat_albedo_table, brdf_inc.glsl:1857) with the
+// coat's tables, immediately after them. RT_SHEEN_SSBO_*_OFFSET mirror the
+// C++ constants in
+// servers/rendering/renderer_rd/storage_rd/sheen_ltc_table.h (GLSL cannot
+// include that header), pinned together by test_pt_coat_albedo.cpp's "SSBO
+// offsets are the ones the shader hard-codes" case, which now also covers
+// these -- if you edit one side, edit the other in the same commit.
+#define RT_SHEEN_SSBO_A_OFFSET 5152
+#define RT_SHEEN_SSBO_B_OFFSET 6176
+#define RT_SHEEN_SSBO_ALBEDO_OFFSET 7200
+
+// Dimension of the sheen LTC's three 32x32 blocks. Mirrors GGX_E_DIM's own
+// treatment (brdf_inc.glsl:1920), NOT a bare literal: even though both
+// dimensions happen to be 32 today, they are two independently-extracted
+// tables, and re-extracting one at a different resolution must not silently
+// corrupt reads of the other. Used at every sheen LUT read below.
+#define SHEEN_LTC_DIM 32
+
+// THE LUT AXES ARE (cos_NI, roughness) -- coatGgxE next door reads
+// coatLutRead2D(base, rough, cosNI, ...), the TRANSPOSE. Both go through this
+// SAME generic reader with the same argument order, so a swap here is a
+// compile-clean, in-range, wrong-everywhere defect. See
+// sheen_ltc_table.h:7-17 and test_pt_sheen.cpp's transpose test.
+float sheenLutRead2D(int base, float cosNI, float roughness) {
+	return coatLutRead2D(base, cosNI, roughness, SHEEN_LTC_DIM, SHEEN_LTC_DIM);
+}
+
+struct SheenData {
+	float3 T, B, N;
+	float a, b, albedo;
+	bool valid;
+};
+
+// mapping.h:55-68. The frame is VIEW-DEPENDENT -- nothing else in this BRDF
+// registry is.
+//
+// READ THE THRESHOLD CAREFULLY. Cycles normalizes FIRST:
+//     *b = safe_normalize(cross(N, T));
+//     if (len_squared(*b) < 0.99f) { make_orthonormals(N, a, b); }
+// safe_normalize (math_float3.h:527-531) returns the ORIGINAL vector when the
+// length is zero, so len_squared(*b) is 1 after a successful normalize and 0
+// only when the cross product was exactly zero. The test fires ONLY on true
+// degeneracy -- V exactly parallel to N.
+//
+// Testing the RAW cross product instead would make len_squared = sin^2(theta),
+// which is < 0.99 below ~84 degrees, sending nearly every practical view down
+// the fallback. Task 1's mirror shipped exactly that once; copy the fixed
+// version in test_pt_sheen.cpp, not this comment's memory of Cycles.
+void sheenMakeFrame(float3 N, float3 V, OUT_PARAMETER(float3) rT, OUT_PARAMETER(float3) rB) {
+	float3 raw = cross(N, V);
+	float t = length(raw);
+	float3 b = (t != 0.0f) ? raw / t : raw; // safe_normalize
+	if (dot(b, b) < 0.99f) {
+		// Cycles' make_orthonormals, math_float3.h:741-750, verbatim.
+		float3 a;
+		if (N.x != N.y || N.x != N.z) {
+			a = float3(N.z - N.y, N.x - N.z, N.y - N.x); // (1,1,1) x N
+		} else {
+			a = float3(N.z - N.y, N.x + N.z, -N.y - N.x); // (-1,1,1) x N
+		}
+		rT = normalize(a);
+		rB = cross(N, rT);
+		return;
+	}
+	rB = b;
+	rT = cross(rB, N);
+}
+
+SheenData sheenSetup(float3 N, float3 V, float sheenRoughness) {
+	SheenData d;
+	d.N = N;
+	sheenMakeFrame(N, V, d.T, d.B);
+	float rough = clamp(sheenRoughness, 1e-3f, 1.0f);
+	float cosNI = dot(N, V);
+	d.a = sheenLutRead2D(RT_SHEEN_SSBO_A_OFFSET, cosNI, rough);
+	d.b = sheenLutRead2D(RT_SHEEN_SSBO_B_OFFSET, cosNI, rough);
+	d.albedo = sheenLutRead2D(RT_SHEEN_SSBO_ALBEDO_OFFSET, cosNI, rough);
+	// bsdf_sheen.h:44-49 -- the closure is dropped, not merely dimmed.
+	d.valid = !(abs(d.a) < 1e-5f || d.albedo < 1e-5f);
+	return d;
+}
+
+// bsdf_sheen.h:70-74. pdf and eval are THE SAME VALUE -- the LTC is perfectly
+// importance-sampled, so the sample weight is exactly 1. This ONE function
+// serves both roles; sheenSample below does not recompute it, so the two
+// cannot drift apart the way two hand-written copies could.
+float sheenEval(SheenData d, float3 L) {
+	float3 lo = float3(dot(L, d.T), dot(L, d.B), dot(L, d.N));
+	float t = d.a * lo.x + d.b * lo.z;
+	float lenSqr = t * t + (d.a * lo.y) * (d.a * lo.y) + lo.z * lo.z;
+	float q = d.a / lenSqr;
+	return (1.0f / PI) * max(lo.z, 0.0f) * q * q;
+}
+
+// mapping.h:21-41. Concentric (Shirley-Chiu) square-to-disk mapping -- NOT the
+// naive r=sqrt(u1), phi=TAU*u2 polar mapping. Matched to Cycles because this
+// sampler is the reference the GPU probe (vis mode 41) and Task 5's gate are
+// checked against, not merely "an" unbiased disk sampler.
+float2 sheenSampleUniformDisk(float u1, float u2) {
+	float a = 2.0f * u1 - 1.0f;
+	float b = 2.0f * u2 - 1.0f;
+	if (a == 0.0f && b == 0.0f) {
+		return float2(0.0f, 0.0f);
+	}
+	float r, phi;
+	if (a * a > b * b) {
+		r = a;
+		phi = (PI / 4.0f) * (b / a);
+	} else {
+		r = b;
+		phi = (PI / 2.0f) - (PI / 4.0f) * (a / b);
+	}
+	return float2(r * cos(phi), r * sin(phi));
+}
+
+// bsdf_sheen.h:83-99. Returns the sampled WORLD-space direction only; callers
+// that need the pdf call sheenEval on the result -- eval and pdf are the same
+// function by construction (see above), so that recomputation cannot diverge
+// from what this function drew, up to the sub-ulp round trip local<->world
+// projection costs (test_pt_sheen.cpp's "pdf equals eval" case measures it at
+// 1e-5, far tighter than any real transcription error).
+float3 sheenSample(SheenData d, float2 u) {
+	float2 disk = sheenSampleUniformDisk(u.x, u.y);
+	float diskZ = sqrt(max(0.0f, 1.0f - (disk.x * disk.x + disk.y * disk.y)));
+	float3 lo = float3(disk.x - diskZ * d.b, disk.y, diskZ * d.a);
+	lo = normalize(lo);
+	return d.T * lo.x + d.B * lo.y + d.N * lo.z;
+}
+
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
 // which today's `u < brdfProbability` picks SPECULAR_TYPE.
 //
