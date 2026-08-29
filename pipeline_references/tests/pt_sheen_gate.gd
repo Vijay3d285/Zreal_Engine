@@ -103,14 +103,40 @@ extends "res://tests/pt_validation.gd"
 ##   shade_and_bounce's four-lobe sampler actually draws -- a mean-preserving
 ##   MIS desync that no rendered image can show.
 ##
-## PROBE E -- the frame near normal incidence.
+## PROBE E1 -- the frame near normal incidence: FINITENESS AND ORTHONORMALITY.
 ##   sheenMakeFrame is the only VIEW-DEPENDENT frame in this BRDF registry, and
 ##   it degenerates as cross(N, V) -> 0. See the long deviation note on
-##   _probe_e_degenerate_frame: the exact-zero branch is UNREACHABLE from a
+##   _probe_e1_degenerate_frame: the exact-zero branch is UNREACHABLE from a
 ##   rendered image on this engine, so this probe measures the ill-conditioned
-##   NEIGHBOURHOOD -- finiteness, and flatness against an a-priori LUT value --
-##   rather than the fallback the Task 5 brief asked for.
-##   FAILS IF: any pixel is NaN/Inf, or the near-axis field has a seam.
+##   NEIGHBOURHOOD.
+##   WHAT IT DOES NOT COVER, stated up front because fix round 1 found this
+##   probe claiming more than it delivers: it is BLIND TO FRAME ORIENTATION.
+##   Under a CONSTANT environment the returned radiance is the closure weight
+##   sheenColor * ltcAlbedo for ANY orthonormal frame about N, because
+##   sheenEval is a normalized density and rotating (T, B) only reparametrises
+##   the domain of an integral over the whole hemisphere. That is true at every
+##   transformB, not just the ~0 one here, so no amount of retilting fixes it.
+##   Orientation is PROBE E2's job.
+##   FAILS IF: any pixel is NaN/Inf; the frame is not orthonormal (an
+##   unnormalized rT breaks lo.x^2 + lo.y^2 + lo.z^2 == 1, which moves the
+##   level); or the near-axis field has a seam.
+##
+## PROBE E2 -- the frame's ORIENTATION, under DIRECTIONAL light.
+##   The one place frame orientation is observable is a density evaluated at a
+##   SINGLE direction, which needs a delta light rather than an environment.
+##   sheenEval's `t = a*lo.x + b*lo.z` privileges the T axis over B: with
+##   b != 0 the density at a light in the T-N plane differs from the density at
+##   a light in the B-N plane at the same polar angle. With b == 0 it does not
+##   -- lenSqr collapses to a^2*(lo.x^2 + lo.y^2) + lo.z^2 and lo.x^2 + lo.y^2
+##   is 1 - lo.z^2 for any frame -- which is precisely why this probe measures
+##   at cosNI ~ 0.21 / roughness 0.80, where the CPU mirror gives b = -0.094278.
+##   The assertion is the RATIO of the two lights' responses against the CPU
+##   mirror's own prediction, so every constant in the light plumbing (energy,
+##   solid-angle pdf, the emission/area clamp, the light-selection pdf) cancels.
+##   FAILS IF: rT and rB are swapped (predicted ratio 1.1994 -> 0.8338), rT is
+##   negated or the frame is rotated about N (-> 0.8465), or transformB enters
+##   with the wrong sign (-> 0.8465). All three are ~30% moves against a 5%
+##   tolerance and a ~0.5% noise floor.
 ##
 ## SCENE-BUILDING TRAPS, each of which has silently broken a sibling gate:
 ##   sky.process_mode = Sky.PROCESS_MODE_QUALITY   REALTIME force-clamps to 256
@@ -325,7 +351,7 @@ const PROBE_D_MIN_LEVER := 0.06
 const PROBE_D_MIN_ACCEPTANCE := 0.90
 
 # ---------------------------------------------------------------------------
-# PROBE E -- the frame near normal incidence
+# PROBE E1 -- the frame near normal incidence (finiteness, orthonormality)
 # ---------------------------------------------------------------------------
 const PROBE_E_FRAMES := 128
 const PROBE_E_ROUGHNESS := 0.90
@@ -347,6 +373,38 @@ const PROBE_E_MEAN_TOL := 0.05
 # 6% is ~6 sigma. A frame defect at the axis moves the LTC's whole orientation
 # there and shows up far larger than that.
 const PROBE_E_AXIS_TOL := 0.06
+
+# ---------------------------------------------------------------------------
+# PROBE E2 -- the frame's ORIENTATION, under directional light
+#
+# Measured at PROBE_A_CASES[0] -- cosNI cell 6, roughness 0.80 -- because that
+# is where the CPU mirror puts transformB at -0.094278. THE LEVER IS THE WHOLE
+# POINT OF THAT CHOICE and the gate prints it: the predicted ratio is 1.1994
+# there and 1.0000 at probe E1's own point (cosNI 1.0, roughness 0.9, where
+# transformB is -7e-6), so this probe would be dead if it were merged into E1's
+# geometry.
+#
+# TWO LIGHTS AT THE SAME POLAR ANGLE FROM N, one in the T-N plane and one in the
+# B-N plane. 45 degrees is not tuned: at psi -> 0 both lights approach N and the
+# T/B distinction vanishes (lo.x = lo.y = 0), and at psi -> 90 lo.z -> 0 kills
+# the max(lo.z, 0) factor and the returned radiance with it. 45 sits at the
+# middle of the usable range and gives a 20% separation.
+const PROBE_E2_FRAMES := 128
+const PROBE_E2_PSI := 0.78539816339744831 # PI/4, polar angle from N for both lights.
+const PROBE_E2_LIGHT_ENERGY := 8.0
+# Relative, on the ratio. The measurement is (m1 - m0)/(m2 - m0) where m0 is the
+# same scene with the light removed, so the sky pedestal cancels by subtraction
+# rather than by assumption. Each difference carries the Monte Carlo noise of
+# two independent 128-frame accumulations over ~23000 masked pixels, which the
+# sibling probes measure at ~0.1% each, so the ratio's floor is ~0.5%. 5% is
+# 10x that and 6x below the smallest defect the probe exists to catch (the
+# 1.1994 -> 0.8465 move, 29% relative).
+const PROBE_E2_TOL := 0.05
+# The lever, asserted the way probe D asserts its own: if the predicted ratio
+# is not far enough from 1.0, the two lights are not distinguishing the axes and
+# a green reading means nothing. Raise the lever (a point with larger
+# |transformB|); do not tighten the tolerance.
+const PROBE_E2_MIN_LEVER := 0.05
 
 # ---------------------------------------------------------------------------
 
@@ -1133,13 +1191,15 @@ func _probe_d_pdf(p_env: Environment) -> void:
 ## symmetric about N -- and THAT is the claim being tested. A black base makes
 ## the expected image an exactly known constant, so both the level and the
 ## flatness are assertable.
-func _probe_e_degenerate_frame(p_env: Environment) -> void:
-	print("\n=== PROBE E: the sheen frame near normal incidence ===")
+func _probe_e1_degenerate_frame(p_env: Environment) -> void:
+	print("\n=== PROBE E1: the sheen frame near normal incidence (finiteness, orthonormality) ===")
+	print("  THIS PROBE IS BLIND TO FRAME ORIENTATION and does not claim otherwise -- see the")
+	print("  header. Orientation is probe E2's job.")
 	print("  face-on quad, black base, white sheen at roughness %.2f. Expected image is a" % PROBE_E_ROUGHNESS)
 	print("  UNIFORM %.6f (the mirror's ltcAlbedo at cosNI 1.0, flat to 0.13%% across the crop)."
 			% PROBE_E_EXPECTED)
 	print("  NOTE: the exact cross(N,V) == 0 fallback is UNREACHABLE from a rendered image on")
-	print("  this engine -- see the deviation note above _probe_e_degenerate_frame.")
+	print("  this engine -- see the deviation note above _probe_e1_degenerate_frame.")
 	_use_quad_camera()
 	_quad.rotation = Vector3.ZERO
 	await get_tree().process_frame
@@ -1148,7 +1208,7 @@ func _probe_e_degenerate_frame(p_env: Environment) -> void:
 	_quad.material_override = _apply_sheen(_lambertian(0.0), Color(1, 1, 1), PROBE_E_ROUGHNESS)
 	var img: Image = await _render_accum(p_env, vp_rid, PROBE_E_FRAMES)
 	if img == null:
-		_failures.append("probeE: accumulator readback returned null")
+		_failures.append("probeE1: accumulator readback returned null")
 		return
 
 	var w := img.get_width()
@@ -1187,22 +1247,199 @@ func _probe_e_degenerate_frame(p_env: Environment) -> void:
 			% [axis_mean, axis_n, rest_mean, rest_n, axis_mean / maxf(rest_mean, 1e-9)])
 	print("  per-pixel spread over the crop = [%.6f, %.6f]" % [lo, hi])
 	if nonfinite > 0:
-		_failures.append(("probeE: %d non-finite pixels in a sheen-only render near normal " +
+		_failures.append(("probeE1: %d non-finite pixels in a sheen-only render near normal " +
 				"incidence. sheenMakeFrame divides the cross product by its own length, and " +
 				"sheenEval divides transformA by a squared length -- either can produce a NaN " +
 				"where the frame is ill-conditioned") % nonfinite)
 	if absf(all_mean / PROBE_E_EXPECTED - 1.0) > PROBE_E_MEAN_TOL:
-		_failures.append(("probeE: a white sheen at roughness %.2f over a black base returned " +
+		_failures.append(("probeE1: a white sheen at roughness %.2f over a black base returned " +
 				"%.6f where the mirror's ltcAlbedo(cosNI=1, %.2f) is %.6f (ratio %.4f, tolerance " +
 				"%.0f%%)") % [PROBE_E_ROUGHNESS, all_mean, PROBE_E_ROUGHNESS, PROBE_E_EXPECTED,
 				all_mean / PROBE_E_EXPECTED, PROBE_E_MEAN_TOL * 100.0])
 	if absf(axis_mean / maxf(rest_mean, 1e-9) - 1.0) > PROBE_E_AXIS_TOL:
-		_failures.append(("probeE: the 16x16 block straddling the view axis read %.6f against " +
+		# FIX ROUND 1: this failure text used to name "the frame's direction leaking
+		# into a density that is supposed to be rotationally symmetric about N" as
+		# the mechanism. It cannot be: at transformB == 0 sheenEval's lenSqr is
+		# a^2*(lo.x^2 + lo.y^2) + lo.z^2, and lo.x^2 + lo.y^2 == 1 - lo.z^2 for ANY
+		# orthonormal frame about N, so the density here does not depend on the
+		# frame's direction at all. What this assertion CAN see is a frame that
+		# stops being orthonormal near the axis (an unnormalized or non-orthogonal
+		# rT breaks lo.x^2 + lo.y^2 + lo.z^2 == 1 and moves the level) and any
+		# spatial discontinuity in the level from any cause. Probe E2 covers
+		# orientation.
+		_failures.append(("probeE1: the 16x16 block straddling the view axis read %.6f against " +
 				"%.6f over the rest of the crop (ratio %.4f, tolerance %.0f%%). That is where " +
-				"|cross(N, V)| is smallest and the sheen frame is worst conditioned; a " +
-				"discontinuity there is the frame's direction leaking into a density that is " +
-				"supposed to be rotationally symmetric about N (transformB is -7e-6 at cosNI 1)")
+				"|cross(N, V)| is smallest and the sheen frame is worst conditioned. This is a " +
+				"discontinuity in the LEVEL -- an ORTHONORMALITY defect (sheenMakeFrame's " +
+				"normalize or its cross product), not an orientation one, which this probe " +
+				"cannot see by construction")
 				% [axis_mean, rest_mean, axis_mean / maxf(rest_mean, 1e-9), PROBE_E_AXIS_TOL * 100.0])
+
+
+# ---------------------------------------------------------------------------
+# PROBE E2 -- the frame's ORIENTATION
+# ---------------------------------------------------------------------------
+
+## GDScript mirror of sheenMakeFrame (brdf_inc.glsl:2433-2451), degenerate
+## branch omitted -- it is unreachable here (cross(N, V) is ~0.98 in length at
+## this tilt) and the caller asserts that.
+static func _sheen_frame(p_n: Vector3, p_v: Vector3) -> Array:
+	var raw := p_n.cross(p_v)
+	var b := raw.normalized()
+	# GLSL: rB = b; rT = cross(rB, N).
+	return [b.cross(p_n), b]
+
+
+## GDScript mirror of sheenEval (brdf_inc.glsl:2471-2477), verbatim.
+static func _sheen_eval(p_a: float, p_b: float, p_t: Vector3, p_bt: Vector3,
+		p_n: Vector3, p_l: Vector3) -> float:
+	var lo := Vector3(p_l.dot(p_t), p_l.dot(p_bt), p_l.dot(p_n))
+	var t: float = p_a * lo.x + p_b * lo.z
+	var len_sqr: float = t * t + (p_a * lo.y) * (p_a * lo.y) + lo.z * lo.z
+	var q: float = p_a / len_sqr
+	return (1.0 / PI) * maxf(lo.z, 0.0) * q * q
+
+
+## Sum of the per-pixel reference `ltcAlbedo * sheenEval(d, L)` over exactly the
+## pixels _measure_masked averages, using each pixel's OWN frame and its OWN
+## cosNI through the CPU mirror. Averaging the reference and the measurement
+## over the identical pixel set is the same discipline probe A uses, and it is
+## what makes the ratio exact rather than approximate: the frame rotates by up
+## to 2.8 degrees across the crop as V swings, and evaluating the reference once
+## at the centre would fold that into the answer.
+func _e2_reference_sum(p_case: Dictionary, p_l: Vector3) -> Array:
+	var w := int(get_viewport().get_visible_rect().size.x)
+	var h := int(get_viewport().get_visible_rect().size.y)
+	var n_world := _quad.global_transform.basis.z.normalized()
+	var target: float = p_case["target"]
+	var acc := 0.0
+	var n := 0
+	for y in range(h):
+		for x in range(w):
+			var mu := _cos_map[y * w + x]
+			if mu < 0.0 or absf(mu - target) > PROBE_CELL_BAND:
+				continue
+			var sp := Vector2(float(x) + 0.5, float(y) + 0.5)
+			var v := -_cam.project_ray_normal(sp)
+			var f := _sheen_frame(n_world, v)
+			acc += _mirror(p_case, "albedo", mu) * _sheen_eval(
+					_mirror(p_case, "a", mu), _mirror(p_case, "b", mu),
+					f[0], f[1], n_world, p_l)
+			n += 1
+	return [acc, n]
+
+
+## A delta light shining FROM direction p_l (a unit vector pointing from the
+## surface towards the light).
+##
+## render_raytracing.cpp:3135 packs `dir = -xform.basis.get_column(2)` and
+## raytracing_lights_inc.glsl:178 takes `dir_axis = -normalize(light.position)`,
+## so the direction TO the light is the light's own +Z column. The basis is
+## built explicitly rather than through look_at() so that column is p_l exactly.
+func _place_dir_light(p_light: DirectionalLight3D, p_l: Vector3) -> void:
+	var zc := p_l.normalized()
+	var xc := Vector3.UP.cross(zc)
+	if xc.length() < 1e-4:
+		xc = Vector3.RIGHT.cross(zc)
+	xc = xc.normalized()
+	p_light.global_transform = Transform3D(Basis(xc, zc.cross(xc), zc), Vector3.ZERO)
+
+
+func _probe_e2_frame_orientation(p_env: Environment) -> void:
+	print("\n=== PROBE E2: the sheen frame's ORIENTATION, under directional light ===")
+	print("  Two delta lights at %.1f degrees from N -- one in the T-N plane, one in the B-N"
+			% rad_to_deg(PROBE_E2_PSI))
+	print("  plane. sheenEval's `t = a*lo.x + b*lo.z` privileges T over B whenever b != 0, so")
+	print("  the ratio of the two responses is a direct read of which axis is which.")
+	print("  Asserted against the CPU mirror's own prediction, tolerance %.0f%% relative."
+			% (PROBE_E2_TOL * 100.0))
+	var case: Dictionary = PROBE_A_CASES[0]
+	_use_quad_camera()
+	var vp_size := get_viewport().get_visible_rect().size
+	var vp_rid := get_viewport().get_viewport_rid()
+	await _tilt_quad(float(case["target"]), int(vp_size.x), int(vp_size.y))
+	_quad.material_override = _apply_sheen(_lambertian(0.0), Color(1, 1, 1), float(case["rough"]))
+
+	# The two light directions, built from the frame at the centre of the crop.
+	# They are WORLD-space constants -- one light illuminates every pixel from
+	# the same direction -- while each pixel's own frame is used in the
+	# reference sum above, which is where the crop's 2.8 degrees of frame
+	# rotation is accounted for rather than assumed away.
+	var n_world := _quad.global_transform.basis.z.normalized()
+	var v_centre := -_cam.project_ray_normal(vp_size * 0.5)
+	var f0 := _sheen_frame(n_world, v_centre)
+	var l_t: Vector3 = (cos(PROBE_E2_PSI) * n_world + sin(PROBE_E2_PSI) * (f0[0] as Vector3)).normalized()
+	var l_b: Vector3 = (cos(PROBE_E2_PSI) * n_world + sin(PROBE_E2_PSI) * (f0[1] as Vector3)).normalized()
+	print("  N = (%.4f, %.4f, %.4f)  T = (%.4f, %.4f, %.4f)  B = (%.4f, %.4f, %.4f)"
+			% [n_world.x, n_world.y, n_world.z,
+				(f0[0] as Vector3).x, (f0[0] as Vector3).y, (f0[0] as Vector3).z,
+				(f0[1] as Vector3).x, (f0[1] as Vector3).y, (f0[1] as Vector3).z])
+
+	var ref_t := _e2_reference_sum(case, l_t)
+	var ref_b := _e2_reference_sum(case, l_b)
+	if int(ref_t[1]) < 512 or float(ref_b[0]) <= 0.0:
+		_failures.append("probeE2: reference sum degenerate (n=%d, sumB=%.9f)"
+				% [int(ref_t[1]), float(ref_b[0])])
+		return
+	var predicted: float = float(ref_t[0]) / float(ref_b[0])
+	var lever: float = absf(predicted - 1.0)
+	print("  CPU-mirror predicted ratio = %.6f over n=%d pixels  (lever |ratio-1| = %.4f, need >= %.2f)"
+			% [predicted, int(ref_t[1]), lever, PROBE_E2_MIN_LEVER])
+
+	# m0: the same scene with NO light, so the sky pedestal is measured rather
+	# than assumed and cancels by subtraction.
+	var img0: Image = await _render_accum(p_env, vp_rid, PROBE_E2_FRAMES)
+	var light := DirectionalLight3D.new()
+	light.light_energy = PROBE_E2_LIGHT_ENERGY
+	light.light_color = Color(1, 1, 1)
+	light.light_angular_distance = 0.0 # Delta: cos_theta_max clamps to 0.999999.
+	add_child(light)
+	_place_dir_light(light, l_t)
+	await get_tree().process_frame
+	var img1: Image = await _render_accum(p_env, vp_rid, PROBE_E2_FRAMES)
+	_place_dir_light(light, l_b)
+	await get_tree().process_frame
+	var img2: Image = await _render_accum(p_env, vp_rid, PROBE_E2_FRAMES)
+	light.queue_free()
+	if img0 == null or img1 == null or img2 == null:
+		_failures.append("probeE2: accumulator readback returned null")
+		return
+
+	var t: float = float(case["target"])
+	var m0 := _measure_masked(img0, t, PROBE_CELL_BAND)
+	var m1 := _measure_masked(img1, t, PROBE_CELL_BAND)
+	var m2 := _measure_masked(img2, t, PROBE_CELL_BAND)
+	var d1: float = float(m1["mean"]) - float(m0["mean"])
+	var d2: float = float(m2["mean"]) - float(m0["mean"])
+	print("  sky-only pedestal m0 = %.6f   light in T-N plane m1 = %.6f   light in B-N plane m2 = %.6f"
+			% [m0["mean"], m1["mean"], m2["mean"]])
+	print("  light-only responses: T-N = %.6f   B-N = %.6f" % [d1, d2])
+	if d1 <= 0.0 or d2 <= 0.0:
+		_failures.append(("probeE2: a light contributed nothing (T-N %.6f, B-N %.6f). The " +
+				"analytic-light NEE path adds sheen unconditionally at " +
+				"raytracing_lights_inc.glsl:403 (`brdf_value = ... + brdf_sheen`); a zero here " +
+				"means that term is not reaching the estimator at all") % [d1, d2])
+		return
+	var measured: float = d1 / d2
+	var ratio: float = measured / predicted
+	print("  measured ratio = %.6f   predicted = %.6f   ratio-of-ratios = %.4f"
+			% [measured, predicted, ratio])
+	print("      for reference, this predicted ratio becomes 0.8338 with rT/rB swapped and")
+	print("      0.8465 with rT negated, rotated about N, or transformB's sign flipped")
+	if lever < PROBE_E2_MIN_LEVER:
+		_failures.append(("probeE2: the predicted ratio is %.6f, only %.4f away from 1.0 (need " +
+				">= %.2f). At that lever the two lights are not distinguishing T from B and a " +
+				"green reading means nothing -- transformB is what separates them, so MOVE THE " +
+				"PROBE to a point with a larger |transformB|; do not tighten the tolerance")
+				% [predicted, lever, PROBE_E2_MIN_LEVER])
+	if absf(ratio - 1.0) > PROBE_E2_TOL:
+		_failures.append(("probeE2: the two lights' responses are in ratio %.6f where the CPU " +
+				"mirror of sheenEval on this geometry says %.6f (%.4f, tolerance %.0f%%). The " +
+				"sheen frame's ORIENTATION is wrong: sheenMakeFrame sets rB = normalize(cross(N, " +
+				"V)) and rT = cross(rB, N), and sheenEval's `t = a*lo.x + b*lo.z` reads lo.x off " +
+				"rT specifically. Swapped rT/rB predicts 0.8338; a negated or rotated rT, or a " +
+				"sign error on transformB, predicts 0.8465")
+				% [measured, predicted, ratio, PROBE_E2_TOL * 100.0])
 
 
 # ---------------------------------------------------------------------------
@@ -1226,7 +1463,9 @@ func _ready() -> void:
 	await _probe_b_renders_at_all(env)
 	await _probe_c_furnace(env)
 	await _probe_d_pdf(env)
-	await _probe_e_degenerate_frame(env)
+	await _probe_e1_degenerate_frame(env)
+	# LAST, because it is the only probe that adds a light to the scene.
+	await _probe_e2_frame_orientation(env)
 
 	print("\n=== RESULT ===")
 	if _failures.is_empty():
