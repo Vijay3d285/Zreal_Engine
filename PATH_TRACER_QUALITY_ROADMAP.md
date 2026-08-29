@@ -797,7 +797,7 @@ GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_h
 
 **E2. Anisotropy, clearcoat, sheen** — anisotropy **COMPLETE (E2b)**, clearcoat **COMPLETE (E2d)**, sheen **NOT STARTED**
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint: met, see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised; the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. **Velvet: not met** — the sheen lobe does not exist yet; carried to E2e, which also carries `coat_normal` (Cycles couples it to the sheen normal, `svm/closure.h:127-129`). The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), and E2d is its first real N=3 (§7.10.5); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint: met (radiometrically) — see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised; the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. Geometrically incomplete, though: `coat_normal` — the coat's own bump/orange-peel normal — is not shipped (§7.10.7 calls it "the one piece of Blender coat parity E2d does not ship"); a reader who only sees this table's "met" would not know a coat-normal texture on a car-paint material still renders identically to a base-normal one. **Velvet: not met** — the sheen lobe does not exist yet; carried to E2e, which also carries `coat_normal` (Cycles couples it to the sheen normal, `svm/closure.h:127-129`). The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), and E2d is its first real N=3 (§7.10.5); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -2684,8 +2684,10 @@ appearance — which is why E2d did not.
 #### 7.10.4 The albedo LUT, and why it is an SSBO
 
 `ggx_gen_schlick_ior_s` (16x16x16), `table_ggx_E` (32x32) and `table_ggx_Eavg`
-(32) are copied **verbatim** out of Cycles' `shader.tables` into
-`ggx_energy_tables.h` and uploaded as one flat SSBO at binding 38. The Task 1
+(32) are copied **verbatim** out of Cycles' `shader.tables` -- the 16x16x16
+albedo table into `ggx_coat_albedo_table.h`, the two energy tables into
+`ggx_energy_tables.h` -- and uploaded as one flat, concatenated SSBO at
+binding 38 (`RenderRaytracing::_get_coat_albedo_buffer`). The Task 1
 reviewer re-extracted the first table from `shader.tables` independently and
 diffed **all 4096 entries** — zero mismatches, not five spot checks — and Task
 5b's reviewer did the same for 1024/1024 and 32/32.
@@ -2801,17 +2803,19 @@ Also carried, unfixed:
   gates the same predicate.
 - **No near-delta guard on the coat at the three analytic-light sites.** At
   `clearcoat_roughness 0` the `Microfacet_D` floor returns about
-  `F*7950/NdotL`. Pre-existing convention — the base specular behaves the same
-  — but a mirror-coated car body under a point light is E2d's own acceptance
-  target.
-- **`GGX_E_DIM` is hardcoded as a literal `32` at `brdf_inc.glsl:2007` and
-  `:2016`** while the albedo table gets a `#define`. The cross-language pin
-  covers offsets but not dimensions, so a 64-entry re-extraction would update
-  C++ and the offsets (all green) while the shader kept reading a 32x32
-  sub-rectangle of a 64x64 block — silent, no crash, no failing test. With the
-  one-directional offset pin (a GLSL-only edit to `RT_COAT_SSBO_E_OFFSET`
-  compiles and passes everything) this is the change's single silent-corruption
-  surface.
+  `F*7950/NdotV` (evalMicrofacet's optimized G2 already carries the
+  `4*NdotL*NdotV` denominator, so the returned `G2*D*NdotL` term cancels
+  `NdotL`, leaving only `NdotV`). Pre-existing convention — the base specular
+  behaves the same — but a mirror-coated car body under a point light is
+  E2d's own acceptance target.
+- ~~`GGX_E_DIM` is hardcoded as a literal `32` at `brdf_inc.glsl:2007` and
+  `:2016`~~ **Fixed in the E2d final fix wave.** `brdf_inc.glsl` now defines
+  `#define GGX_E_DIM 32` beside `GGX_COAT_TABLE_DIM` and both call sites read
+  through it; `test_pt_coat_albedo.cpp`'s SSBO-offset doctest additionally
+  pins `GGX_E_DIM == 32` and `GGX_COAT_TABLE_DIM == 16` as literals, the same
+  way it already pinned the four byte offsets. A re-extraction that resizes
+  the energy tables now has to touch the shader's own dimension constant and
+  its doctest pin, not just the offsets, to stay green.
 - **The coat reads `materials[h.geometry_idx]`, not `MaterialResult`**, so a
   custom `ShaderMaterial` fragment cannot drive the coat per-pixel — identical
   to how E2b's anisotropy behaves. Recorded, not changed.

@@ -248,10 +248,19 @@ TEST_CASE("[PathTracer][LobeRegistry] select_lobe never returns a zero-weight lo
 	//
 	// This version calls the REAL lobe_weight, builds the pair exactly as the
 	// sampler does (w1 = 1 - w0), appends the zero third entry Task 5 appends,
-	// and asserts on select_lobe's OUTPUT. It fails if lobe_weight's clamp
-	// bounds change, if the diffuse weight is ever computed some other way, or
-	// if select_lobe's accumulation changes -- any of which can make index 2
-	// reachable.
+	// and asserts on select_lobe's OUTPUT. w1 is a COMPLEMENT of whatever w0
+	// comes back, not an independent call, so w0 + w1 == 1.0 by construction
+	// regardless of where lobe_weight's clamp bounds sit -- an ordinary clamp
+	// retuning (e.g. narrowing [0.01, 0.99] to [0.02, 0.98]) leaves this case
+	// green, because select_lobe never sees anything but a complementary pair.
+	// What it actually fails on: select_lobe's accumulation/threshold logic
+	// falling through to the zero-weight index 2 for some w0 in lobe_weight's
+	// real output range and some u the sampler can hand it -- i.e. if the
+	// diffuse weight is ever computed some other way than `1 - w0`, or if
+	// select_lobe's accumulation changes, at any of the w0 magnitudes and u
+	// values exercised below. It would also fail if lobe_weight's clamp
+	// bounds were widened to include exactly 0.0 or 1.0 (the one way a clamp
+	// change reaches this test, since it makes w0 or w1 non-positive).
 	const float lums[][2] = {
 		{ 0.04f, 0.5f }, { 0.5f, 0.04f }, { 1.0f, 1.0f },
 		{ 0.9f, 0.1f }, { 0.001f, 0.999f }, { 0.37f, 0.63f },

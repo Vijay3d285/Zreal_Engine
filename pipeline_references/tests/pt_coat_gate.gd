@@ -78,7 +78,7 @@ extends "res://tests/pt_validation.gd"
 ## SCENE-BUILDING TRAPS, each of which has silently broken a sibling gate:
 ##   sky.process_mode = Sky.PROCESS_MODE_QUALITY   REALTIME force-clamps to 256
 ##   env.background_mode = Environment.BG_SKY      BG_COLOR renders pure black
-##   albedo_color = Color(A,A,A).linear_to_srgb()  render_raytracing.cpp:1542
+##   albedo_color = Color(A,A,A).linear_to_srgb()  render_raytracing.cpp:1585
 ##   clearcoat_tint = Color(1,1,1).linear_to_srgb() same path at :1855
 ##   clearcoat_enabled = true                      else set_clearcoat publishes 0
 ##
@@ -558,7 +558,7 @@ func _apply_coat(p_mat: StandardMaterial3D, p_coat: float, p_roughness: float,
 ## points: larger than the band, and blamed on the wrong subsystem.
 func _white_lambertian(p_albedo: float) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
-	# LOAD-BEARING pre-encode; render_raytracing.cpp:1540-1542 runs albedo_color
+	# LOAD-BEARING pre-encode; render_raytracing.cpp:1585 runs albedo_color
 	# through srgb_to_linear() on upload.
 	m.albedo_color = Color(p_albedo, p_albedo, p_albedo).linear_to_srgb()
 	m.metallic = 0.0

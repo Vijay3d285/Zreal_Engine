@@ -342,18 +342,32 @@ TEST_CASE("[PathTracer][CoatAlbedo] darkening is E times the energy scale, and b
 	}
 }
 
-TEST_CASE("[PathTracer][CoatAlbedo] withdrawal and payout balance after compensation") {
-	// The defect this task exists to fix, stated as an equality.
+TEST_CASE("[PathTracer][CoatAlbedo] withdrawal and payout collapse to the same algebraic form") {
+	// NOT an independent measurement of the energy-balance defect -- this is
+	// the "darkening is E times the energy scale" identity from the test case
+	// twelve lines above, restated with both sides multiplied by the same
+	// `coat_weight * estimate` factor:
 	//
 	// withdrawal = coat_weight * estimate * darkening        (coatLayerAlbedo)
 	// payout     = coat_weight * A_ss     * energy_scale     (evalCoat / sampler)
 	// with A_ss = E * estimate, because the LUT behind `estimate` divides the
 	// single-scattering loss out (cycles_precompute.cpp:88-130).
 	//
-	// Both sides therefore collapse to coat_weight * estimate * E * C, and the
-	// ratio is 1. Uncompensated it was E (0.915 at roughness 0.5 / normal
-	// incidence); with the payout compensated but the withdrawal left raw --
-	// the half-fix -- it is E*C, only 0.922. This case fails for BOTH of those.
+	// Substituting darkening == E * energy_scale (asserted above) collapses
+	// both sides to coat_weight * estimate * E * C algebraically -- so this
+	// case is true BY CONSTRUCTION of that substitution, not by any additional
+	// evidence that E*C is the right number. It is a guard against the two
+	// call sites (coatLayerAlbedo vs. evalCoat/sampler) drifting to different
+	// SHAPES of the same formula, nothing more. The real balance measurement
+	// -- whether a coated white-furnace scene actually returns 1.0, which is
+	// the only check that would catch both formulas being wrong THE SAME WAY
+	// -- is pt_coat_gate.gd's PROBE B (its own header comment calls itself
+	// "the only real balance instrument"), not this file.
+	//
+	// The two counterfactuals pinned numerically below are still useful as a
+	// regression pin: uncompensated the ratio was E (0.915 at roughness 0.5 /
+	// normal incidence); payout-only compensation (the historical half-fix)
+	// gives E*C, 0.922.
 	const float coat_weight = 0.7f;
 	for (float rough : { 0.2f, 0.5f, 0.8f }) {
 		for (float mu : { 1.0f, 0.7f, 0.3f }) {

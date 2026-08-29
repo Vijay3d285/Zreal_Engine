@@ -160,7 +160,7 @@ RID RenderRaytracing::_get_coat_albedo_buffer() {
 	memcpy(dst + RT_COAT_SSBO_EAVG_OFFSET, GGX_EAVG_TABLE, sizeof(GGX_EAVG_TABLE));
 	coat_albedo_buffer = RD::get_singleton()->storage_buffer_create(bytes.size(), bytes);
 	if (coat_albedo_buffer.is_valid()) {
-		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT Coat Albedo Table");
+		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT Coat Energy Tables (Albedo+E+EAvg)");
 	}
 	return coat_albedo_buffer;
 }

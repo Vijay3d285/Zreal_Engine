@@ -1016,13 +1016,24 @@ void debug_visualize(
 		// from sampleCoatMicrofacet. Both are mean-preserving MIS desyncs --
 		// invisible in any rendered furnace.
 		//
-		// The weights arithmetic below is written out rather than called, because
-		// there is no shared function for it -- shade_and_bounce has the only
-		// other copy. That is the point: this compares PRODUCTION'S SELECTION
-		// SPLIT against COMBINEDPDF'S REPORTED SPLIT, which are exactly the two
-		// halves that must agree. Every non-trivial term (coatLobeWeight,
-		// lobeWeight, selectLobe, evalIndirectCombinedBRDF, combinedPdf) is the
-		// shipped function, not a copy.
+		// The three-line dbg_w40[...] assembly below is a HAND COPY of
+		// shade_and_bounce's weights[...] block (search this file for
+		// `weights[LOBE_COAT] = coatMass`), not a call into it -- there is no
+		// shared function for that step, only for the
+		// non-trivial terms feeding it (coatLobeWeight, lobeWeight are the
+		// shipped functions; selectLobe, evalIndirectCombinedBRDF, combinedPdf
+		// below are too). The two copies are textually identical today, which
+		// makes this mode's comparison true, but true BY CONSTRUCTION of that
+		// duplication rather than by construction of a live call -- if
+		// shade_and_bounce's split formula changes and this copy is not
+		// updated in lockstep, this mode keeps comparing combinedPdf against a
+		// stale split and would not notice. What it actually compares is: this
+		// mode's copy of the selection split (built from the same shipped
+		// coatLobeWeight/lobeWeight calls shade_and_bounce makes) against
+		// combinedPdf's reported density for a direction drawn from that
+		// split. Vis mode 32 (pt_coat_gate.gd's probe F) is what reads a
+		// production-computed split value directly -- `(1 - coatLobeWeight) *
+		// lobeWeight` -- with no second copy to diverge from.
 		MaterialProperties dbg_mat40;
 		dbg_mat40.baseColor = albedo;
 		dbg_mat40.metalness = metalness;

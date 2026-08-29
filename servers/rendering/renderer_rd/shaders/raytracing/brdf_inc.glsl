@@ -2148,18 +2148,20 @@ float coatPdf(float coatRoughness, float NdotH, float NdotV, float LdotH) {
 // SINGLE SOURCE OF TRUTH for "what material is the coat". Both the SAMPLER
 // (evalIndirectCombinedBRDF's COAT_TYPE branch) and the EVALUATOR (evalCoat
 // below, reached from every NEE path) build their BrdfData from this, so they
-// cannot disagree about the coat's alpha or its F0. Two hand-rolled copies of
-// this six-line body is precisely the desync E2c's registry unification was
-// created to make impossible; do not reintroduce one.
+// cannot disagree about the coat's alpha. (Not its F0 -- neither consumer
+// reads the F0 this produces; see the note below the field list.) Two
+// hand-rolled copies of this five-line body is precisely the desync E2c's
+// registry unification was created to make impossible; do not reintroduce one.
 //
 //   - roughness  -> the coat's, so prepareBRDFData's alpha/alphaSquared are the
 //                   coat's. Cycles forces alpha_x == alpha_y == sqr(coat_roughness)
 //                   (svm/closure.h:165) -- NOT this engine's raster
 //                   mix(0.001, 0.1, r) remap; see E2d spec section 3.2.
 //   - metalness  -> 0 and baseColor -> black, so
-//                   baseColorToSpecularF0(black, 0, F0) returns exactly the coat
-//                   F0 and nothing underneath the coat leaks into this lobe.
-//                   There is no diffuse under a coat lobe.
+//                   baseColorToSpecularF0(black, 0, dielectricF0) returns
+//                   dielectricF0 unchanged and nothing underneath the coat
+//                   leaks into this lobe. There is no diffuse under a coat
+//                   lobe.
 //   - transmissivness -> 0. The coat never transmits; leaving the base's value
 //                   would make a glass base drag its dielectric split into the
 //                   coat.
@@ -2167,17 +2169,23 @@ float coatPdf(float coatRoughness, float NdotH, float NdotV, float LdotH) {
 //                   and ax == ay == alpha. Cycles gives the coat no anisotropy
 //                   to match, so passing the base's would stretch a highlight
 //                   that should be round.
+//
+// dielectricF0 is DELIBERATELY left as the base's, not set from coatIor: this
+// function's F0 never survives to be read. evalCoat overwrites coatData.F with
+// the exact fresnel_dielectric(coatIor) value immediately after calling
+// prepareBRDFData on this material (see the comment above evalCoat), and the
+// sampler path only reads data.alpha/data.alphaSquared out of the BrdfData
+// this builds (see the "data.specularF0 is deliberately no longer passed"
+// comment above sampleCoatMicrofacet's call site) -- data.F is computed and
+// discarded there too. An earlier version of this function set dielectricF0
+// from coatIor to "look" self-consistent; that value was never read by either
+// consumer, so it was removed rather than kept as decoration.
 MaterialProperties coatMaterial(MaterialProperties material) {
 	MaterialProperties coatMat = material;
 	coatMat.roughness = material.coatRoughness;
 	coatMat.metalness = 0.0f;
 	coatMat.transmissivness = 0.0f;
 	coatMat.baseColor = float3(0.0f, 0.0f, 0.0f);
-	// q = (ior-1)/(ior+1); F0 SQUARES q. coatAlbedoEstimate builds the same q and
-	// takes its square ROOT for the LUT's z axis -- opposite directions from one
-	// quantity, and swapping them type-checks. Keep them apart.
-	float q = (material.coatIor - 1.0f) / (material.coatIor + 1.0f);
-	coatMat.dielectricF0 = float3(q * q, q * q, q * q);
 	coatMat.anisotropy = 0.0f;
 	return coatMat;
 }
@@ -2236,9 +2244,9 @@ MaterialProperties coatMaterial(MaterialProperties material) {
 //   2. coatEnergyScale, the real multiple-scattering compensation, replacing
 //      the coatMultiScatter/evalMultiScatterApproximation factor the NEE sites
 //      used to apply from outside. It lives INSIDE this function now because
-//      evalCombinedBRDFSeparate has SIX call sites across three NEE strategies
+//      evalCombinedBRDFSeparate has FIVE call sites across three NEE strategies
 //      (raytracing_lights_inc.glsl:394/568/617 for the analytic light types,
-//      raytracing_closest_hit_common_inc.glsl:1356 for the environment,
+//      raytracing_closest_hit_common_inc.glsl:1502 for the environment,
 //      raytracing_emissive_inc.glsl:489 for emissive meshes) and only the last
 //      two ever applied the old external factor -- a payout multiplier that
 //      some callers forget is the same class of bug this task is fixing. The
