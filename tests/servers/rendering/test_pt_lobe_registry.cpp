@@ -63,15 +63,32 @@ static float lobe_weight(float p_specular_lum, float p_diffuse_lum) {
 
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
 // which today's `u < brdfProbability` picks SPECULAR_TYPE.
+//
+// E2e Task 4 fix round 1: RESYNCED with brdf_inc.glsl's repaired body. This
+// mirror held the PRE-REPAIR form (`for i < p_n - 1` / no zero skip /
+// `return p_n - 1`) while the shader had already moved on, and the file header
+// four lines above says the two must stay textually identical -- so a
+// contributor obeying that instruction could have ported this body BACK into
+// the shader and reintroduced a live divide-by-zero, with nothing red to stop
+// them. Three lines differed; all three are below.
+//
+// `p_n` stays a parameter rather than becoming the shader's LOBE_COUNT: the
+// mirror's own LOBE_COUNT is the N == 2 baseline the first case pins, and the
+// higher-N cases pass 3 or 4 explicitly.
 static int select_lobe(float p_u, const float *p_weights, int p_n) {
 	float acc = 0.0f;
-	for (int i = 0; i < p_n - 1; i++) {
+	int last = 0;
+	for (int i = 0; i < p_n; i++) {
+		if (p_weights[i] <= 0.0f) {
+			continue;
+		}
+		last = i;
 		acc += p_weights[i];
 		if (p_u < acc) {
 			return i;
 		}
 	}
-	return p_n - 1;
+	return last;
 }
 
 // Sum in registry order: specular term first, then diffuse.
@@ -287,6 +304,119 @@ TEST_CASE("[PathTracer][LobeRegistry] select_lobe never returns a zero-weight lo
 			CHECK(selected != 2);
 		}
 	}
+}
+
+TEST_CASE("[PathTracer][LobeRegistry] four lobes: a trailing zero weight is never selected") {
+	// E2e Task 4 fix round 1. THE INSTRUMENT FOR THE REPAIR, and the reason the
+	// case below it is not enough on its own.
+	//
+	// The pre-existing zero-weight case (above) builds only {w0, 1 - w0, 0}, and
+	// `fl(w0 + fl(1 - w0)) == 1.0f` for EVERY float32 w0 -- so `u < acc` always
+	// fires at i == 1 and the fallthrough is unreachable. That case therefore
+	// passes against the pre-repair body AND the repaired one; it cannot see the
+	// thing that changed.
+	//
+	// At FOUR weights it can. The sampler builds
+	//     w0 = (1 - coatMass) * pSpec
+	//     w1 = (1 - coatMass) * (1 - pSpec)
+	//     w2 = coatMass
+	//     w3 = sheenMass, which is exactly 0 on every material without sheen
+	// and those four sum to 1 only in exact arithmetic. The pre-repair body
+	// stopped the loop at p_n - 1, so it accumulated w0..w2 and fell through to
+	// index 3 -- the ZERO one -- whenever fl(w0 + w1 + w2) landed below u. The
+	// caller then divides throughput by that zero.
+	//
+	// The window is real, not theoretical: at pSpec = lobe_weight(0.04, 0.5) =
+	// 0.0740740672f and coatMass = 0.0397f the sum is 0.999999881f, which is
+	// 5.96e-08 BELOW the largest u the sampler can draw. rng_1d bottoms out in
+	// sb_uint_to_float_excl (sobol_burley_inc.glsl), whose largest output is
+	// 0.99999994f, so that gap is live at run time.
+	const float lums[][2] = {
+		{ 0.04f, 0.5f }, { 0.5f, 0.04f }, { 1.0f, 1.0f },
+		{ 0.9f, 0.1f }, { 0.001f, 0.999f }, { 0.37f, 0.63f },
+		{ 2.5f, 0.125f }, { 0.125f, 2.5f },
+	};
+	// 0.99999994f is the largest float32 strictly below 1.0 and the worst case
+	// the sampler can hand select_lobe.
+	const float us[] = { 0.0f, 0.5f, 0.9f, 0.999f, 0.999999f, 0.99999994f };
+
+	int zero_weight_selections = 0;
+	// GUARDS THE GUARD. If a future change made the four weights always sum to
+	// exactly 1.0f, this case would go on passing while testing nothing -- the
+	// unfalsifiable-instrument failure this project has already paid for twice.
+	// Counting how many (pSpec, coatMass) pairs actually land in the residue
+	// window, and asserting that count is positive, makes the case fail loudly
+	// if it ever stops exercising the property it is named for.
+	int residue_pairs = 0;
+
+	for (const float *lum : lums) {
+		const float p_spec = lobe_weight(lum[0], lum[1]);
+		// Swept, not sampled: coat_lobe_weight's clamp range is [0.01, 0.99],
+		// and which values inside it produce a short sum is a float-rounding
+		// property with no usable closed form.
+		for (int ci = 100; ci <= 9900; ci++) {
+			const float coat_mass = float(ci) / 10000.0f;
+			const float base_share = 1.0f - coat_mass;
+			// Built exactly as shade_and_bounce and combined_pdf build them,
+			// with sheen_mass == 0 (every material without sheen), so
+			// after_sheen is exactly 1.0f and drops out.
+			const float weights4[4] = {
+				base_share * p_spec,
+				base_share * (1.0f - p_spec),
+				coat_mass,
+				0.0f
+			};
+			const float acc = (weights4[0] + weights4[1]) + weights4[2];
+			if (acc < 0.99999994f) {
+				residue_pairs++;
+			}
+			for (float u : us) {
+				const int selected = select_lobe(u, weights4, 4);
+				// The general property, deliberately not "selected != 3": it
+				// survives a future reordering of the registry.
+				if (!(weights4[selected] > 0.0f)) {
+					zero_weight_selections++;
+				}
+			}
+		}
+	}
+
+	CHECK(zero_weight_selections == 0);
+	CHECK(residue_pairs > 0);
+}
+
+TEST_CASE("[PathTracer][LobeRegistry] four lobes: the measured residue pair, pinned") {
+	// The single (pSpec, coatMass) pair the case above finds first, pinned as a
+	// named regression so the failure is readable rather than a count. Values
+	// measured in float32, not derived:
+	//
+	//   p_spec   = lobe_weight(0.04f, 0.5f) = 0.0740740672f
+	//   coatMass = 0.0397f
+	//   w0 = 0.071133323f  w1 = 0.889166594f  w2 = 0.0397000015f  w3 = 0
+	//   w0 + w1 + w2       = 0.999999881f
+	//   largest sampler u  = 0.99999994f      (gap 5.96e-08)
+	//
+	// Pre-repair body: acc never reaches u, the loop stops at p_n - 1, and it
+	// returns index 3 with weight 0.
+	// Repaired body:   index 3 is skipped as zero-weight and it returns the
+	// last non-zero index, 2.
+	const float p_spec = lobe_weight(0.04f, 0.5f);
+	const float coat_mass = 0.0397f;
+	const float base_share = 1.0f - coat_mass;
+	const float weights4[4] = {
+		base_share * p_spec,
+		base_share * (1.0f - p_spec),
+		coat_mass,
+		0.0f
+	};
+
+	// The premise. If float32 rounding ever stopped producing a short sum here
+	// the assertion below would become vacuous, so state the premise as its own
+	// check rather than trusting it.
+	CHECK((weights4[0] + weights4[1]) + weights4[2] < 0.99999994f);
+
+	const int selected = select_lobe(0.99999994f, weights4, 4);
+	CHECK(weights4[selected] > 0.0f);
 }
 
 } // namespace TestPTLobeRegistry
