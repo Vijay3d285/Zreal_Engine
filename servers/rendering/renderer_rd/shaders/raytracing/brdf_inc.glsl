@@ -110,6 +110,10 @@ V mul(const M &m, const V &v) {
 // only ever meet through the sampler's `if (lobe == LOBE_COAT) brdfType =
 // COAT_TYPE` mapping (raytracing_closest_hit_common_inc.glsl).
 #define COAT_TYPE 3
+// E2e. The sheen (Zeltner LTC) lobe's own sampler tag. Same two-namespace rule
+// as COAT_TYPE above: this is 4 while LOBE_SHEEN is 3, and the only bridge is
+// the sampler's `if (lobe == LOBE_SHEEN) brdfType = SHEEN_TYPE` mapping.
+#define SHEEN_TYPE 4
 
 // PIs
 #ifndef PI
@@ -321,6 +325,20 @@ struct MaterialProperties {
 	float coatRoughness;
 	float coatIor;
 	float3 coatTint;
+
+	// E2e sheen. ONE field carries what Cycles splits into `sheen_weight` (a
+	// scalar) and `sheen_tint` (a colour): closure.h:124 allocates the sheen
+	// closure with `sheen_weight * rgb_to_spectrum(sheen_tint) * weight`, and
+	// this engine's material never separates the two -- render_raytracing.cpp
+	// uploads a single `sheen_color` (:1825-1831, defaulted to black at :1521).
+	// So sheenColor IS that product, and every cutoff Cycles applies to
+	// sheen_weight alone is applied here to sheenColor's max channel instead.
+	//
+	// sheenColor 0 disables the layer entirely -- like coatWeight it is the ONLY
+	// field that says so. sheenRoughness is published unconditionally, so never
+	// gate on it.
+	float3 sheenColor;
+	float sheenRoughness;
 };
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
@@ -1776,7 +1794,12 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 // contract. The coat is physically outermost, but layering happens through the
 // throughput scale, not through registry position.
 #define LOBE_COAT 2
-#define LOBE_COUNT 3
+// E2e. APPENDS, exactly as the coat did. Registry position is not physical
+// position -- but see layerTransmittanceAbove: for the two LAYERS this registry
+// carries, index order and Cycles' layering order happen to COINCIDE, and that
+// coincidence is what makes the walk's single `<` comparison correct for both.
+#define LOBE_SHEEN 3
+#define LOBE_COUNT 4
 
 // ---------------------------------------------------------------------------
 // SELECTION WEIGHT vs THROUGHPUT SCALE (E2d).
@@ -2345,39 +2368,6 @@ float3 coatLayeringTransmittance(MaterialProperties material, float cosNI, float
 	return t;
 }
 
-// The N-layer stack. Cycles layers SEQUENTIALLY -- sheen withdraws from the
-// running weight (svm/closure.h:141), then coat withdraws from what is left
-// (:174). Each layer attenuates everything allocated after it.
-//
-// Here that becomes: the transmittance applied to lobe i is the product of
-// every LAYER strictly above i in registry order. A layer is a lobe that
-// withdraws; specular and diffuse are not layers and contribute nothing to
-// this product.
-//
-// "Above" is REGISTRY ORDER, i.e. index, not the `>` spelling one might
-// reach for by analogy with "higher index sits above". LOBE_COAT (2) sits
-// above LOBE_SPECULAR (0) and LOBE_DIFFUSE (1): the layer's index exceeds
-// the base lobe's index, so the test a layer runs to decide whether it
-// covers lobe i is "is MY index greater than i", which from lobeIndex's own
-// side reads `lobeIndex < LOBE_COAT`. The coat's own index is LOBE_COAT, and
-// `LOBE_COAT < LOBE_COAT` is false, so the coat never attenuates itself --
-// confirmed against both call sites: evalCombinedBRDFSeparate needs this
-// true at lobeIndex == LOBE_SPECULAR (0 < 2) to reproduce E2d's
-// outDiffuse/outSpecular attenuation, and the sampler needs it false at
-// lobeIndex == LOBE_COAT (2 < 2 is false) to reproduce E2d's `!tookCoatLobe`
-// guard bit-for-bit.
-//
-// At LOBE_COUNT == 3 the only layer is coat, so this returns exactly what
-// E2d's single call site returned, for exactly the same lobes. That is the
-// phase invariant and it is why this landed before sheen existed.
-float3 layerTransmittanceAbove(MaterialProperties material, float cosNI, int lobeIndex) {
-	float3 t = float3(1.0f, 1.0f, 1.0f);
-	if (lobeIndex < LOBE_COAT) {
-		t *= coatLayeringTransmittance(material, cosNI, coatLayerAlbedo(material, cosNI));
-	}
-	return t;
-}
-
 // ---------------------------------------------------------------------------
 // E2e Task 3: Zeltner sheen LTC (velvet closure). Transcribed from Cycles'
 // bsdf_sheen.h:27-110 and its view-dependent frame, mapping.h:55-68. The CPU
@@ -2385,9 +2375,11 @@ float3 layerTransmittanceAbove(MaterialProperties material, float cosNI, int lob
 // textually identical modulo type names; the doctest suite cannot execute
 // this shader, so that file is this code's only cross-check.
 //
-// NOTHING CALLS INTO THIS YET. LOBE_COUNT is still 3 (specular/diffuse/coat);
-// Task 4 adds LOBE_SHEEN to the registry and the layering stack. Until then
-// the only caller is debug vis mode 41, below.
+// E2e Task 4 wires these into the registry (LOBE_SHEEN) and the layer stack
+// below. sheenSetup/sheenEval/sheenSample themselves are UNCHANGED from Task 3
+// -- deliberately, because the CPU mirror is textually pinned to them and vis
+// mode 41 reads them. Everything Task 4 adds sits underneath, in terms of
+// these three.
 // ---------------------------------------------------------------------------
 
 // Shares the binding-38 SSBO (coat_albedo_table, brdf_inc.glsl:1857) with the
@@ -2519,6 +2511,194 @@ float3 sheenSample(SheenData d, float2 u) {
 	return d.T * lo.x + d.B * lo.y + d.N * lo.z;
 }
 
+// ---------------------------------------------------------------------------
+// E2e Task 4. The sheen lobe's THREE numbers, in exactly the roles the coat's
+// two-roles block above defines. Read that block first; the split is the same
+// and the failure mode is the same.
+//
+//   sheenLayerAlbedo -- THROUGHPUT. What sheen withdraws from everything
+//                       beneath it. RAW, never clamped.
+//   sheenLobeWeight  -- SELECTION. How often the RNG picks the sheen lobe.
+//                       Clamped, purely to bound the sampler's divisor.
+//   evalSheen        -- the BSDF VALUE, for the NEE paths.
+//
+// THE REDUCTION IS reduce_max, AND IT IS LOAD-BEARING HERE FOR THE FIRST TIME.
+// closure_layering_weight(a, w) = w * saturate(1 - reduce_max(a/w))
+// (bsdf_util.h:439-443). For sheen, `a` is bsdf_albedo(sc), and bsdf_albedo
+// returns sc->weight UNMODIFIED (bsdf.h:695 + :707) because sheen is not
+// CLOSURE_IS_BSDF_MICROFACET, so the microfacet estimate branch never runs.
+// sc->weight is `sheen_weight * sheen_tint * weight` (closure.h:124) times the
+// LTC albedo (bsdf_sheen.h:51, `bsdf->weight *= albedo`). The `weight` cancels
+// against the divisor, leaving a/w = sheenColor * ltcAlbedo -- a float3 whose
+// reduction is over its MAX CHANNEL, not its luminance and not per-channel.
+//
+// E2d's coat hid this: its albedo was a scalar broadcast, so reduce_max was
+// trivially that scalar. Sheen carries a real per-channel tint, so a luminance
+// here would under-withdraw from a saturated tint (luminance(0,0,1) = 0.0722
+// against a max channel of 1.0, a 13x error on a blue velvet).
+// ---------------------------------------------------------------------------
+
+// reduce_max of the tint. Cycles gates the whole sheen block on
+// `sheen_weight > CLOSURE_WEIGHT_CUTOFF` (1e-5, svm/types.h:576;
+// svm/closure.h:119), and this engine folds sheen_weight into sheenColor, so
+// the cutoff lands on this quantity.
+float sheenMaxTint(MaterialProperties material) {
+	return max(material.sheenColor.r, max(material.sheenColor.g, material.sheenColor.b));
+}
+
+// RAW layering albedo, reduce_max(sheenColor) * ltcAlbedo. THROUGHPUT quantity
+// -- do not clamp it, and do not feed it to selectLobe.
+//
+// TWO cutoffs, and only the FIRST can be hoisted:
+//
+//   1. the tint cutoff, on an authored parameter, exactly like the coat's
+//      `coatWeight <= 1e-5`. The literal 0.0f it returns is what carries the
+//      phase invariant: at sheenColor == 0 every derived quantity below is 0
+//      or exactly 1.0f, and multiplying by exactly 1.0f is the IEEE identity,
+//      so the four-lobe arithmetic reduces to E2d/E2e-Task-2's three-lobe
+//      arithmetic bit-for-bit.
+//
+//   2. the INVALID-LTC skip (bsdf_sheen.h:44-49). Cycles does not dim the
+//      closure there, it sets CLOSURE_NONE_ID and sample_weight = 0 -- the
+//      closure ceases to exist. This one depends on the TABLE'S OWN OUTPUT
+//      (|transformA| < 1e-5 or albedo < 1e-5), so unlike the coat's gate it
+//      CANNOT be hoisted above the lookup. sheenSetup already computes it as
+//      d.valid; that is the single definition, not re-tested here.
+float sheenLayerAlbedo(MaterialProperties material, float3 N, float3 V) {
+	if (sheenMaxTint(material) <= 0.00001f) {
+		return 0.0f;
+	}
+	SheenData d = sheenSetup(N, V, material.sheenRoughness);
+	if (!d.valid) {
+		return 0.0f;
+	}
+	return sheenMaxTint(material) * d.albedo;
+}
+
+// Selection probability mass for sheen, BEFORE normalisation against the lobes
+// underneath it.
+//
+// SIGNATURE NOTE: (material, N, V), not coatLobeWeight's (material, cosNI).
+// sheenSetup takes N and V and derives cosNI = dot(N, V) itself, and reusing it
+// rather than re-reading the two LUT entries from a bare cosNI is what keeps the
+// invalid-LTC test at ONE site. Every caller (shade_and_bounce, combinedPdf,
+// vis modes 32/40) already has world-space N and V in scope, and each passes
+// the SAME N and V it would have used to compute cosNI -- so the coat's cosNI
+// and sheen's dot(N, V) are the same expression on the same inputs.
+//
+// THE CLAMP IS NOT COSMETIC, and it is confined to THIS role -- see
+// coatLobeWeight's block for the firefly arithmetic; it applies verbatim.
+//
+// DEVIATION FROM CYCLES, deliberate and recorded. Cycles' sample_weight is
+// `fabsf(average(weight))` (alloc.h:62) times the LTC albedo
+// (bsdf_sheen.h:52) -- a MEAN over channels, not a max. We use the max
+// channel, i.e. the same reduction the LAYERING uses, so that sheenLobeWeight
+// and sheenLayerAlbedo are one number in two roles exactly as
+// coatLobeWeight/coatLayerAlbedo are. This changes only how often the RNG picks
+// sheen, never what sheen pays out: MIS is unbiased for any positive selection
+// weights, and the sampler divides by whichever number it selected with. Using
+// the max also makes the per-channel MC factor sheenColor/max(sheenColor) never
+// exceed 1, which `average` does not guarantee.
+float sheenLobeWeight(MaterialProperties material, float3 N, float3 V) {
+	float albedo = sheenLayerAlbedo(material, N, V);
+	if (albedo <= 0.0f) {
+		return 0.0f;
+	}
+	return clamp(albedo, 0.01f, 0.99f);
+}
+
+// What sheen leaves for everything beneath it. ONE function, called by BOTH the
+// sampler (shade_and_bounce, through layerTransmittanceAbove) and the evaluator
+// (evalCombinedBRDFSeparate, same walk), so BSDF sampling and NEE cannot
+// disagree about the integrand.
+//
+// Unlike the coat there is no second, Beer's-law step: Cycles gives sheen no
+// tint-through-the-layer term (compare closure.h:181-205, which the coat has
+// and the sheen block does not).
+float3 sheenLayeringTransmittance(MaterialProperties material, float sheenAlbedo) {
+	return float3(clamp(1.0f - sheenAlbedo, 0.0f, 1.0f));
+}
+
+// Sheen's BSDF VALUE, for the NEE paths. N/L/V are WORLD-space, exactly as
+// evalCombinedBRDFSeparate receives them.
+//
+// The d.albedo factor is Cycles' `bsdf->weight *= albedo` (bsdf_sheen.h:51) --
+// it belongs to the CLOSURE WEIGHT, not to the density, which is why
+// combinedPdf's sheen term below is the bare sheenEval with no albedo and no
+// tint. Folding albedo into the pdf would make MIS partition a different
+// integrand from the one this returns.
+//
+// NOT attenuated by anything: sheen is the outermost layer, so
+// layerTransmittanceAbove(..., LOBE_SHEEN) is (1,1,1) by construction and the
+// caller does not apply it.
+float3 evalSheen(float3 N, float3 L, float3 V, MaterialProperties material) {
+	if (sheenMaxTint(material) <= 0.00001f) {
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	SheenData d = sheenSetup(N, V, material.sheenRoughness);
+	if (!d.valid) {
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	return material.sheenColor * d.albedo * sheenEval(d, L);
+}
+
+// The N-layer stack. Cycles layers SEQUENTIALLY: "First layer: Sheen"
+// (svm/closure.h:115) withdraws from the running weight at :140, then "Second
+// layer: Coat" (:146) withdraws from what is left at :170. Each layer
+// attenuates everything allocated after it, so SHEEN IS OUTERMOST AND THE COAT
+// SITS UNDER IT -- the coat closure is itself allocated with the
+// already-sheen-attenuated `weight` (:157).
+//
+// Here that becomes: the transmittance applied to lobe i is the product of
+// every LAYER strictly above i in registry order. A layer is a lobe that
+// withdraws; specular and diffuse are not layers and contribute nothing to
+// this product. The product form is exact, not an approximation: in Cycles
+// each closure_layering_weight call divides the layer albedo by the running
+// weight, so the running weight cancels and what is left is a plain product of
+// per-layer scalars (see the derivation in sheenLayerAlbedo's block).
+//
+// "ABOVE" IS REGISTRY ORDER, AND FOR THE TWO LAYERS THIS REGISTRY CARRIES,
+// REGISTRY ORDER AND CYCLES' LAYERING ORDER COINCIDE. That is a fact to check,
+// not a coincidence to assume, and this task's brief asserted the opposite:
+//
+//   LOBE_COAT  == 2 attenuates {specular 0, diffuse 1}         -> `i < 2`
+//   LOBE_SHEEN == 3 attenuates {specular 0, diffuse 1, coat 2} -> `i < 3`
+//
+// Both are `lobeIndex < LAYER_INDEX`, i.e. "is MY index greater than i", and a
+// layer never attenuates itself because `L < L` is false. If sheen had been
+// registered at index 2 and the coat at 3 the comparison would still be `<`,
+// but it would then describe the WRONG stack -- so what is being asserted here
+// is the ORDER OF THE INDICES, not the direction of the operator. The order is
+// asserted by the two Blender line numbers above: sheen is allocated first,
+// therefore sheen is outermost, therefore sheen's index must exceed the coat's.
+//
+// Do not "fix" this to `>`. `lobeIndex > LOBE_SHEEN` is true for no lobe at
+// all (LOBE_SHEEN is the largest index in the registry), which would silently
+// delete sheen's withdrawal entirely and turn it into an additive lobe -- the
+// exact defect this function's two halves exist to prevent.
+//
+// Ordering of the two multiplies is irrelevant to the result: IEEE
+// multiplication is commutative bit-exactly, so (1*sheenT)*coatT and
+// (1*coatT)*sheenT are the same float3. They are written outermost-first to
+// read in Cycles' own order.
+//
+// PHASE INVARIANT. At sheenColor == 0, sheenLayerAlbedo returns literal 0.0f,
+// so sheenLayeringTransmittance returns exactly float3(1,1,1) and `t *=` it is
+// the IEEE multiplicative identity. What remains is E2e Task 2's body, on the
+// same lobes, with cosNI recomputed from the same N and V the caller used to
+// compute it -- the identical expression, hence the identical float.
+float3 layerTransmittanceAbove(MaterialProperties material, float3 N, float3 V, int lobeIndex) {
+	float cosNI = dot(N, V);
+	float3 t = float3(1.0f, 1.0f, 1.0f);
+	if (lobeIndex < LOBE_SHEEN) {
+		t *= sheenLayeringTransmittance(material, sheenLayerAlbedo(material, N, V));
+	}
+	if (lobeIndex < LOBE_COAT) {
+		t *= coatLayeringTransmittance(material, cosNI, coatLayerAlbedo(material, cosNI));
+	}
+	return t;
+}
+
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
 // which today's `u < brdfProbability` picks SPECULAR_TYPE.
 //
@@ -2535,18 +2715,57 @@ float3 sheenSample(SheenData d, float2 u) {
 // empty. test_pt_lobe_registry.cpp's "select_lobe never returns a zero-weight
 // lobe" case pins this against the REAL lobe_weight, including u ==
 // 0.99999994f, the largest float32 below 1.0.
+//
+// E2e Task 4 BREAKS that argument, and this body is the repair. NOT A
+// COSMETIC CHANGE -- read before simplifying it back.
+//
+// At LOBE_COUNT == 4 the trailing fallthrough is LOBE_SHEEN, and on every
+// existing scene weights[LOBE_SHEEN] is exactly 0. The old body's escape hatch
+// was that the loop STOPPED before the last lobe, so the accumulated residue
+// (weights summing to 1 only up to float rounding) was absorbed by the
+// fallthrough. With a fourth entry the coat is no longer last: the loop now
+// accumulates coatMass too, and if fl(w0 + w1 + coatMass) lands a few ULPs
+// below 1.0 while u is above it -- u reaches 0.99999994f, so the window is
+// roughly 1e-7 wide, i.e. of order ten hits per 1080p frame at 64 spp -- the
+// fallthrough returns the ZERO-weight sheen lobe and shade_and_bounce divides
+// throughput by it. That is a NaN, on coated materials, on the coat gate.
+//
+// The repair keeps the CDF walk identical and only changes what "last" means:
+// skip zero-weight entries entirely (they can never be selected anyway, since
+// a zero increment leaves acc where the previous iteration already failed
+// `u < acc`), and fall through to the last NON-ZERO entry rather than to
+// LOBE_COUNT - 1. The loop now runs the full range so the last real lobe still
+// gets its own `u < acc` test.
+//
+// Bit-identical to the old body on every input the old body handled:
+//   * two lobes {p, 1-p}: acc after i=1 is exactly 1.0f, so `u < acc` fires
+//     there and the fallthrough is unreachable -- same answer as before.
+//   * three lobes {w0, w1, 0}: index 2 is skipped, last stays 1, and the
+//     fallthrough returns 1 -- which is exactly what the old body returned,
+//     because acc after i=1 was exactly 1.0f. This is the case
+//     test_pt_lobe_registry.cpp's zero-weight case asserts, and it still
+//     passes.
+//   * three lobes {w0, w1, coatMass>0}: old body fell through to 2 without
+//     testing it; new body tests `u < acc` at i=2 and otherwise returns
+//     last == 2. Same index either way.
 int selectLobe(float u, float weights[LOBE_COUNT]) {
 	float acc = 0.0f;
-	for (int i = 0; i < LOBE_COUNT - 1; i++) {
+	int last = 0;
+	for (int i = 0; i < LOBE_COUNT; i++) {
+		if (weights[i] <= 0.0f) {
+			continue;
+		}
+		last = i;
 		acc += weights[i];
 		if (u < acc) {
 			return i;
 		}
 	}
-	return LOBE_COUNT - 1;
+	return last;
 }
 
-// Sum in REGISTRY ORDER: specular term first, then diffuse, then coat (E2d).
+// Sum in REGISTRY ORDER: specular first, then diffuse, then coat (E2d), then
+// sheen (E2e). ASCENDING index, which is what fixes the grouping.
 //
 // At N == 2 that order was unfalsifiable -- IEEE addition is commutative
 // bit-exactly, so reversing this loop was a provable no-op. At N == 3 the
@@ -2744,7 +2963,13 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// would silently desync the two on backfacing V.
 	float cosNI = dot(N, V);
 	float coatMass = coatLobeWeight(material, cosNI);
-	// At coatMass == 0 this is exactly 1.0f, so weights[LOBE_SPECULAR] is
+	// E2e: sheen's selection mass, on the SAME world-space N and V the sampler
+	// hands sheenLobeWeight. Absolute, i.e. taken off the top before the coat --
+	// mirroring the withdrawal order, where sheen is outermost (svm/closure.h:115
+	// vs :146). See layerTransmittanceAbove.
+	float sheenMass = sheenLobeWeight(material, N, V);
+	float afterSheen = 1.0f - sheenMass;
+	// At coatMass == 0 baseShare is exactly 1.0f, so weights[LOBE_SPECULAR] is
 	// 1.0f * pSpec == pSpec and weights[LOBE_DIFFUSE] is 1.0f * (1.0f - pSpec)
 	// == 1.0f - pSpec -- the IEEE identity, bit-identical to the E2c form this
 	// replaces. The coat term then contributes weights[LOBE_COAT] * coatPdfValue
@@ -2753,17 +2978,40 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// floors alphaSquared, NdotH and NdotV), which is what keeps that 0.0f from
 	// being a NaN -- the corner the transmitScale note above flags for "a future
 	// lobe with an unfloored pdf".
-	float baseShare = 1.0f - coatMass;
+	//
+	// E2e adds one more layer of exactly the same argument: at sheenColor == 0,
+	// sheenLobeWeight returns literal 0.0f, afterSheen is exactly 1.0f, and both
+	// `afterSheen * coatMass` and `afterSheen * (1.0f - coatMass)` are the IEEE
+	// identity on the E2d values. sheenPdfValue is then multiplied by a zero
+	// weight, and it is a finite 0.0f rather than a garbage read because the
+	// `sheenMass > 0.0f` guard below skips the table lookup entirely.
+	float coatShare = afterSheen * coatMass;
+	float baseShare = afterSheen * (1.0f - coatMass);
+
+	// The sheen density. sheenEval IS the pdf (bsdf_sheen.h:70-74 assigns the
+	// same value to *pdf and to the returned spectrum), so this is deliberately
+	// the bare eval with neither the LTC albedo nor the tint -- both belong to
+	// the closure WEIGHT, which evalSheen carries and the density must not.
+	float sheenPdfValue = 0.0f;
+	if (sheenMass > 0.0f) {
+		SheenData sheenData = sheenSetup(N, V, material.sheenRoughness);
+		// Reachable only when sheenLobeWeight already saw d.valid, so this is
+		// the same table read reaching the same verdict; kept because the two
+		// calls are separate evaluations and the cost is a branch.
+		sheenPdfValue = sheenData.valid ? sheenEval(sheenData, L) : 0.0f;
+	}
 
 	float weights[LOBE_COUNT];
 	weights[LOBE_SPECULAR] = baseShare * pSpec;
 	weights[LOBE_DIFFUSE] = baseShare * (1.0f - pSpec);
-	weights[LOBE_COAT] = coatMass;
+	weights[LOBE_COAT] = coatShare;
+	weights[LOBE_SHEEN] = sheenMass;
 
 	float pdfs[LOBE_COUNT];
 	pdfs[LOBE_SPECULAR] = specularContribution * transmitScale;
 	pdfs[LOBE_DIFFUSE] = pdfDiffuse;
 	pdfs[LOBE_COAT] = coatPdf(material.coatRoughness, NdotH, NdotV, LdotH);
+	pdfs[LOBE_SHEEN] = sheenPdfValue;
 
 	return combineLobePdf(weights, pdfs);
 }
@@ -2781,10 +3029,18 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 // Every caller must decide what to do with outCoat -- there is no 2-parameter
 // overload on purpose. A caller that ignores it loses the coat's direct
 // lighting silently, which is the bug this fix round exists to close.
-void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties material, OUT_PARAMETER(float3) outDiffuse, OUT_PARAMETER(float3) outSpecular, OUT_PARAMETER(float3) outCoat) {
+//
+// E2e adds outSheen on the same terms, and for a second reason on top of the
+// delta-guard one: sheen is never a delta lobe, so every call site that guards
+// outSpecular or outCoat on RT_MIS_DELTA_ROUGHNESS must NOT guard this one.
+// Folding sheen into either would have made a rough velvet vanish behind a
+// mirror base. There is still no shorter overload, deliberately -- five call
+// sites, five explicit decisions.
+void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties material, OUT_PARAMETER(float3) outDiffuse, OUT_PARAMETER(float3) outSpecular, OUT_PARAMETER(float3) outCoat, OUT_PARAMETER(float3) outSheen) {
 	outDiffuse = float3(0.0f, 0.0f, 0.0f);
 	outSpecular = float3(0.0f, 0.0f, 0.0f);
 	outCoat = float3(0.0f, 0.0f, 0.0f);
+	outSheen = float3(0.0f, 0.0f, 0.0f);
 	// Prepare data needed for BRDF evaluation (uses shading normal N for all BRDF math).
 	const BrdfData data = prepareBRDFData(N, L, V, material);
 	// Ignore L rays "below" the hemisphere.
@@ -2828,15 +3084,50 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	//
 	// E2e: routed through layerTransmittanceAbove(..., LOBE_SPECULAR) -- the base
 	// terms sit at the bottom of the stack, so this asks for the product of
-	// every layer above index 0, which at LOBE_COUNT == 3 is coat alone and
-	// reproduces coatLayeringTransmittance's old return bit-for-bit (same
-	// coatLayerAlbedo call, same cosNI). outCoat is untouched here, same as E2d.
-	float cosNI = dot(N, V);
-	if (material.coatWeight > 0.00001f) {
-		float3 baseTransmittance = layerTransmittanceAbove(material, cosNI, LOBE_SPECULAR);
+	// every layer above index 0, which is sheen * coat.
+	//
+	// E2e Task 4, THREE changes, all forced by sheen being a SECOND layer:
+	//
+	//   1. The outer guard is now "any layer at all", not "coat". A sheen-only
+	//      material has coatWeight == 0 and would have skipped this block
+	//      entirely, so its base terms would have been unattenuated while
+	//      shade_and_bounce attenuated them -- two MIS strategies on two
+	//      integrands, the B2 defect class, which is exactly what E2d's fix
+	//      round 1 closed for the coat.
+	//
+	//   2. outCoat is now itself attenuated, by layerTransmittanceAbove(...,
+	//      LOBE_COAT) == sheen's transmittance. Cycles allocates the coat
+	//      closure with `coat_weight * weight` where `weight` has ALREADY had
+	//      sheen withdrawn from it (svm/closure.h:157, after the withdrawal at
+	//      :140). Without this the coat would be the additive lobe under sheen
+	//      that E2d's own fix round made it stop being under nothing.
+	//
+	//   3. outSheen is NOT attenuated: it is the outermost layer, and
+	//      layerTransmittanceAbove(..., LOBE_SHEEN) is (1,1,1) by construction.
+	//      Multiplying by it would be a no-op, so it is omitted rather than
+	//      written as one -- and evalSheen's own value already carries the LTC
+	//      albedo, which is the closure weight, not a layer factor.
+	//
+	// PHASE INVARIANT. At sheenColor == 0, hasSheen is false, so this reduces to
+	// E2e Task 2's block with one added multiply -- outCoat times
+	// layerTransmittanceAbove(..., LOBE_COAT), which returns exactly
+	// float3(1,1,1) there (the coat does not attenuate itself, and sheen's
+	// factor is a literal 1.0f). That is the IEEE multiplicative identity.
+	// cosNI is no longer computed here: layerTransmittanceAbove now takes N and V
+	// and derives dot(N, V) itself, from the same two vectors, so the coat still
+	// sees the identical unclamped expression it saw when this line fed it.
+	bool hasCoat = material.coatWeight > 0.00001f;
+	bool hasSheen = sheenMaxTint(material) > 0.00001f;
+	if (hasCoat || hasSheen) {
+		float3 baseTransmittance = layerTransmittanceAbove(material, N, V, LOBE_SPECULAR);
 		outDiffuse *= baseTransmittance;
 		outSpecular *= baseTransmittance;
-		outCoat = evalCoat(N, L, V, material);
+		if (hasCoat) {
+			outCoat = evalCoat(N, L, V, material) * layerTransmittanceAbove(material, N, V, LOBE_COAT);
+		}
+		if (hasSheen) {
+			outSheen = evalSheen(N, L, V, material);
+		}
 	}
 }
 
@@ -2924,6 +3215,43 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// dielectric Fresnel, not from F0).
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, coatMaterial(materialLocal));
 		rayDirectionLocal = sampleCoatMicrofacet(Vlocal, data.alpha, data.alphaSquared, materialLocal.coatRoughness, materialLocal.coatIor, u, sampleWeight);
+	} else if (brdfType == SHEEN_TYPE) {
+		// E2e. Zeltner LTC, sampled in THIS function's local frame (Nlocal is
+		// +Z, Vlocal is the rotated view vector) exactly as the specular and coat
+		// arms are -- the returned direction is rotated back below by the shared
+		// invertRotation, and the geometry-plane rejection/recovery downstream
+		// applies unchanged.
+		//
+		// WHY LOCAL AND NOT WORLD, given that combinedPdf evaluates sheen's
+		// density in WORLD space: sheenMakeFrame is built from cross(N, V) and
+		// normalize, both of which commute with a proper rotation, so the frame
+		// this produces is qRotationToZ applied to the world frame and the drawn
+		// direction is the same one up to float round-off -- the identical
+		// argument the specular arm already relies on (see combinedPdf's
+		// materialLocal note). The single exception is sheenMakeFrame's
+		// make_orthonormals FALLBACK, which branches on N's components and is
+		// therefore NOT rotation-equivariant; it fires only when cross(N, V) is
+		// exactly zero, i.e. V exactly parallel to N, where the LTC's transformB
+		// is 0 and the lobe is rotationally symmetric about N, so the two frames
+		// give the same density anyway.
+		//
+		// SAMPLE WEIGHT IS THE CLOSURE WEIGHT, FULL STOP. bsdf_sheen_sample
+		// returns eval == pdf (bsdf_sheen.h:104-106), so eval/pdf is exactly 1
+		// and nothing about the DIRECTION survives into the weight; what remains
+		// is Cycles' sc->weight = sheenColor * ltcAlbedo (closure.h:124 +
+		// bsdf_sheen.h:51). Unlike the coat arm, that includes the material's
+		// tint, so shade_and_bounce divides by the selection weight alone and
+		// does NOT re-apply a closure factor.
+		SheenData sheenData = sheenSetup(Nlocal, Vlocal, materialLocal.sheenRoughness);
+		if (sheenData.valid) {
+			rayDirectionLocal = sheenSample(sheenData, u);
+			sampleWeight = materialLocal.sheenColor * sheenData.albedo;
+		} else {
+			// Unreachable in production: sheenLobeWeight returns 0 on an invalid
+			// LTC, so weights[LOBE_SHEEN] is 0 and selectLobe cannot return it.
+			// Defence for direct callers, matching evalCoat's Lbackfacing note.
+			sampleWeight = float3(0.0f, 0.0f, 0.0f);
+		}
 	}
 
 	// Transform sampled direction Llocal back to V vector space.

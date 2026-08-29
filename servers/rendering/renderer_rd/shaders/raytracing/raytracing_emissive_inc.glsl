@@ -485,8 +485,8 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 	//     evalCombinedBRDFSeparate.
 	vec3 bsdf_val = vec3(0.0);
 	if (dot(p_N, p_V) > 0.0) {
-		vec3 f_diff, f_spec, f_coat;
-		evalCombinedBRDFSeparate(p_N, L, p_V, p_mat, f_diff, f_spec, f_coat);
+		vec3 f_diff, f_spec, f_coat, f_sheen;
+		evalCombinedBRDFSeparate(p_N, L, p_V, p_mat, f_diff, f_spec, f_coat, f_sheen);
 
 #if MICROFACET_DISTRIBUTION == GGX
 		float ms_alpha = p_mat.roughness * p_mat.roughness;
@@ -503,6 +503,14 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 		if (p_mat.coatRoughness >= RT_MIS_DELTA_ROUGHNESS) {
 			bsdf_val += f_coat;
 		}
+		// E2e: sheen added unconditionally -- no near-delta guard (the LTC has
+		// no delta regime, and combinedPdf's sheen term is likewise ungated, so
+		// value and density describe the same lobe set) and no multiple-
+		// scattering factor (the Zeltner LTC already is one, and the BSDF
+		// strategy's realised sheen weight is exactly what evalSheen returns).
+		// Same decision, same reasons, as the environment-NEE block in
+		// raytracing_closest_hit_common_inc.glsl.
+		bsdf_val += f_sheen;
 	}
 
 	// Emitted radiance at the sampled point, through THE shared composition.
