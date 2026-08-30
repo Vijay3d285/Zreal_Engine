@@ -3032,7 +3032,7 @@ attributed it to sheen.
 
 **The roughness ladder — the cross-engine test of the transposed LUT axes.** The
 sheen table is indexed `(cosNI, roughness)`, transposed relative to the coat's
-`(roughness, mu)` (`bsdf_sheen.h:38-42` against `brdf_inc.glsl:2015`). A
+`(roughness, mu)` (`bsdf_sheen.h:38-42` against `brdf_inc.glsl:2038`). A
 transposition does not merely rescale the response; it changes its *shape* along
 roughness, which no single arm can see. The three deltas' ratios to each other:
 
@@ -3300,6 +3300,21 @@ the `zero_weight_selections == 0` assertion covers, making it conservative
 rather than vacuous. A third party reimplemented both bodies and the sweep in
 numpy float32 and reproduced 1412 and 169 exactly.
 
+**The residue analysis above is per-shape, not general.** The 2.6%/0.13%
+figures, the `lobe_weight(0.04, 0.5)`/`coatMass = 0.0397f` case, and the
+`{1.0, 1.0 - 1ULP, 1.0 - 2ULP}` collapse are all properties of the specific
+four-weight (three-non-zero-plus-one-zero) distribution E2e produced. Nothing
+in the suite parameterises the sweep over `LOBE_COUNT`:
+`test_pt_lobe_registry.cpp` pins `LOBE_COUNT` at exactly 2 (`:51`) for the
+baseline cases and calls `select_lobe` with the literal arguments `3` (`:299`)
+and `4` (`:374`, `:418`) for the three- and four-lobe cases — each shape is its
+own hard-coded test, not a swept parameter. The repair itself (skip zero
+weights, fall through to the last non-zero one) is general, but the *evidence*
+that it is safe is not: it is a brute-force sweep over the four-lobe case's
+specific weight distribution. **A fifth-lobe phase must redo the sweep against
+its own weight distribution rather than assume this one's numbers, or even its
+qualitative shape, carries over.**
+
 #### 7.11.8 The gate, proven by breaking it
 
 `pipeline_references/tests/pt_sheen_gate.gd` — the phase's sixth GPU gate and,
@@ -3390,12 +3405,41 @@ and the CPU test load-bearing.
 
 #### 7.11.10 What E2e does not deliver
 
+- **Below-hemisphere recovery is applied to sheen, where Cycles hard-rejects
+  the sample instead.** `bsdf_sheen_sample` sets `*eval = zero, *pdf = 0`
+  (`bsdf_sheen.h:96-101`) when the sampled direction misses — the sample is
+  meant to be dead. This engine's `recoverBelowHemisphereSample`
+  (`brdf_inc.glsl:1666`) is lobe-agnostic: for ANY rejected sample it mirrors
+  the direction across the geometry plane and reuses the ORIGINAL BRDF
+  weight, with MIS weight 1 because no density exists for a mirrored
+  direction. For sheen that means the rejected sample keeps its full closure
+  weight, `sheenColor * ltcAlbedo`. Sheen makes this a worse instance of the
+  general below-hemisphere-recovery family than the lobes the guard was
+  designed around (the family itself is F1's, `recoverBelowHemisphereSample`
+  is deliberately kept for the energy-vs-black-pixel trade-off it documents at
+  its own definition): the Zeltner LTC is grazing-concentrated — the CPU
+  mirror gives albedo `0.021623 -> 0.380802` between roughness 0.30 and 0.80
+  at `cosNI 0.5`, an 18x swing — and its sampling frame (`sheenMakeFrame`) is
+  view-dependent, so on tessellated geometry it fires more often for sheen
+  than for a cosine or GGX lobe. **Nothing in the suite can see it**: vis mode
+  33's `RT_DEBUG_GUARD_FIRING_RATE` instruments the TRANSMISSIVE
+  hemisphere-consistency guard inside `sampleTransmissiveLobe`
+  (`raytracing_closest_hit_common_inc.glsl:1945-1960`), a different guard
+  entirely; and `pt_sheen_gate`'s probe B crop stays away from the silhouette
+  where this would fire. Open, unmeasured.
 - **`coat_normal`** — still deferred, and now touching **both** layers. Cycles
   couples the sheen normal to it: `bsdf->N = safe_normalize(mix(N, coat_normal,
-  coat_weight))` (`svm/closure.h:127-129`). A coat-normal texture on a
-  car-paint-plus-sheen material renders identically to a base-normal one, and
-  §7.11.1's arms deliberately held `coat_weight = 0` so the comparison would not
-  silently depend on it.
+  coat_weight))` (`svm/closure.h:127-129`). This engine has **no coat-normal
+  input at all**: there is no `coat_normal` / `clearcoat_normal` field anywhere
+  in `scene/resources/material.{h,cpp}` or `RT_MaterialData`
+  (`render_raytracing.h`), and the glTF importer explicitly drops it on import
+  — `modules/gltf/gltf_document.cpp:3293` calls
+  `note_dropped_texture(ext, "clearcoatNormalTexture")`, which surfaces as an
+  import-time diagnostic (`:3335-3339`) rather than silently discarding the
+  texture. So a car-paint-plus-sheen material authored with a coat-normal
+  texture in glTF is diagnosed and dropped at import, not carried through and
+  silently ignored at render time. §7.11.1's arms deliberately held
+  `coat_weight = 0` so the comparison would not depend on this gap.
 - **The denoiser AOVs know about neither layer**, and are now one entry worse
   than §7.10.7 recorded: `RB_TEX_DLSS_RR_*` diffuse/specular albedo and
   normal/roughness are computed from the base material with no coat *or* sheen
@@ -3406,10 +3450,24 @@ and the CPU test load-bearing.
   and sheen-over-coat-over-base, but no gate scene combines sheen with a
   transmissive or emissive base.
 - **The frame's degenerate fallback is untested on GPU**, per §7.11.9 item 3.
-- **`sheen_color` is uploaded unclamped above 1** while the sibling
-  `attenuation_color` clamps, giving unbounded per-bounce gain. Cycles does the
-  same, but Godot's `Color` is unbounded from GDScript where Blender's socket is
-  not. Parked minor.
+- **`sheen_color` is uploaded unclamped above 1** (`render_raytracing.cpp:1824-1829`)
+  while the sibling `attenuation_color` clamps to `[0,1]` (`:1806-1809`). The
+  corrected reason this is not the same bug: Cycles is *also* unbounded here
+  (`svm/closure.h:116,120`), so the upload is faithful to the reference — but
+  the failure modes are not symmetric with `attenuation_color`, where a
+  component above 1 flips `sigma_a` negative and `exp(-sigma_a * d)` grows
+  without bound. Sheen has no such runaway: the withdrawal
+  (`sheenLayeringTransmittance`) saturates to 0 while the payout
+  (`sheenColor * ltcAlbedo`) grows linearly with `sheenColor`, and **this
+  engine's `[0.01, 0.99]` selection-weight clamp (`sheenLobeWeight`) is what
+  makes the `sheen_color > 1` regime noisier than Cycles'**, whose
+  `fabsf(average(weight))` selection weight (`alloc.h:62`) is self-normalising
+  with no cap. Verified: at `sheenColor = 5, ltcAlbedo = 0.4` (a uniform tint,
+  sheen the only active lobe) the selection weight clamps at its 0.99 ceiling
+  while the sample weight is `5 * 0.4 = 2.0`, so the per-bounce multiplier is
+  `2.0 / 0.99 = 2.02`. Bounded by `max_bounces`, unbiased in expectation, and
+  reachable only by authoring `sheen_color > 1` from GDScript (Godot's `Color`
+  is unbounded; Blender's socket is not). Parked minor.
 
 **The standing structural limit, unchanged since §7.9 and §7.10 and restated
 because it now covers more code.** The GLSL has **no automated execution**.
@@ -3428,15 +3486,24 @@ still a tautology (two identical literal arguments compared for equality) and
 the commit that renamed it **claims in its message that it was deleted**, which
 is false and now outlives the code; `sheen_ltc_table.h`'s include sits out of
 alphabetical order at `render_raytracing.cpp:39`; probes C2/C3 have no lever
-floor; `PROBE_B_MIN_ABSOLUTE = 0.05` mis-diagnoses the "closure weight applied
-twice" bug, which reads 0.0359 at tint 0.25 and so trips the wrong message;
-C2/C3 run at roughness 0.80 rather than the briefed `{0.05, 0.5, 0.9}`;
-`sheenSetup` is walked 2–4× per hit plus 2× per NEE light and discards `a`/`b`
-in four of six; the five debug `MaterialProperties` sites drop production's
-`[0,1]` roughness clamp and their two comments contradict each other; and the
-local-frame sampling comment's justification is factually wrong (`transformB` is
-not 0 at `cosNI == 1` except in the four lowest roughness rows, reaching
-±0.00394).
+floor; C2/C3 run at roughness 0.80 rather than the briefed `{0.05, 0.5, 0.9}`;
+and `sheenSetup` is walked 2–4× per hit plus 2× per NEE light and discards
+`a`/`b` in four of six.
+
+Fixed in the merge fix wave: `PROBE_B_MIN_ABSOLUTE = 0.05` mis-diagnosed the
+"closure weight applied twice" bug (reads 0.0359 at tint 0.25) as "sheen
+renders nothing" — the floor is now `0.1 * expected`, verified against the
+arm's own three numbers (`pipeline_references/tests/pt_sheen_gate.gd`); the
+five debug `MaterialProperties` sites' comment on the `[0,1]` roughness clamp
+no longer contradicts production's — both now state the settled math,
+`clamp(x, 1e-3, 1) == clamp(clamp(x, 0, 1), 1e-3, 1)` for every finite `x`,
+which is why the debug sites' omission of the `[0,1]` step is provably
+harmless (`raytracing_closest_hit_common_inc.glsl`); and the local-frame
+sampling comment's justification — `transformB` is not 0 at `cosNI == 1`
+except in the four lowest roughness rows, reaching ±0.00394 — is corrected to
+cite §7.11.9 item 3 (the raygen is pinhole-only, so the fallback this comment
+guards is unreachable regardless) instead of the false claim that the lobe is
+rotationally symmetric there.
 
 #### 7.11.11 Verification
 
