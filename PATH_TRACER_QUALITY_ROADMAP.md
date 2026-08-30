@@ -75,7 +75,7 @@ Ranked by impact on offline still quality.
 | 10 | **No firefly clamp** | absent | `data_template.h:202-203` (`sample_clamp_direct/indirect`) | Medium |
 | 11 | **Sky/IBL sampled uniformly** — no env importance sampling | `raygen.glsl:232` | `light/background.h:29,118` (marginal/conditional CDF) | Medium |
 | 12 | **glTF PBR extensions dropped at import** | only `_pbr`, `_unlit`, `_emissive_strength` | Cycles Principled BSDF carries all | High (blocks #13) |
-| 13 | **Missing BSDFs** — transmission hardcoded off, no SSS/aniso/clearcoat/sheen | `closest_hit_common:474-475` | `subsurface_random_walk.h`, Principled | Medium |
+| 13 | **Missing BSDFs** — transmission (E1, §7.5), anisotropy (E2b, §7.8), clearcoat (E2d, §7.10) and sheen (E2e, §7.11) now all ship; **SSS is what remains** | `closest_hit_common:474-475` | `subsurface_random_walk.h`, Principled | Medium |
 | 14 | **fp16 radiance/throughput payload** | `raytracing_inc.glsl:75-87` | fp32 throughout | Medium |
 | 15 | **Biased bump-map mirror recovery** | `brdf_inc.glsl:998-1009` | offset/position normals, no bias | Low-Med |
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
@@ -795,9 +795,9 @@ Add transmission, IOR, clearcoat (+roughness), sheen (+tint), anisotropy (+rotat
 GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_hit_common:474`). Handle front/back faces, IOR sides, total internal reflection. Wire `max_transmission_bounce` from B3.
 *Accept:* a glass vase refracts correctly; rough glass blurs plausibly; retire the "glass vanishing" workaround **for content that adopts transmission** (see the corrected OIDN claim above and the full closeout in §6).
 
-**E2. Anisotropy, clearcoat, sheen** — anisotropy **COMPLETE (E2b)**, clearcoat **COMPLETE (E2d)**, sheen **NOT STARTED**
-`sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a Charlie/sheen lobe.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint: met (radiometrically) — see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised; the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. Geometrically incomplete, though: `coat_normal` — the coat's own bump/orange-peel normal — is not shipped (§7.10.7 calls it "the one piece of Blender coat parity E2d does not ship"); a reader who only sees this table's "met" would not know a coat-normal texture on a car-paint material still renders identically to a base-normal one. **Velvet: not met** — the sheen lobe does not exist yet; carried to E2e, which also carries `coat_normal` (Cycles couples it to the sheen normal, `svm/closure.h:127-129`). The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), and E2d is its first real N=3 (§7.10.5); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
+**E2. Anisotropy, clearcoat, sheen** — anisotropy **COMPLETE (E2b)**, clearcoat **COMPLETE (E2d)**, sheen **COMPLETE (E2e, §7.11)**. All three acceptance targets measured against Blender/Cycles; `coat_normal` and transmissive-lobe anisotropy are the named remainders.
+`sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a sheen lobe. **Not Charlie** — Cycles replaced the Charlie/velvet sheen with Zeltner's linearly-transformed-cosine lobe (`bsdf_sheen.h`), and E2e ports that; see §7.11.3.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint: met (radiometrically) — see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised; the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. Geometrically incomplete, though: `coat_normal` — the coat's own bump/orange-peel normal — is not shipped (§7.10.7 calls it "the one piece of Blender coat parity E2d does not ship"); a reader who only sees this table's "met" would not know a coat-normal texture on a car-paint material still renders identically to a base-normal one. **Velvet: met — see §7.11** — sheen ships as Cycles' Zeltner LTC lobe (`pdf == eval`, so its sample weight is exactly 1), against a byte-exact copy of Cycles' 32×32×3 table, and as a *layer* on the same general N-layer stack the coat uses: sheen at registry index 3 withdraws from coat, specular and diffuse via `closure_layering_weight`, and Cycles' allocation order (`svm/closure.h:115` sheen first, `:146` coat second) makes registry index order and physical layer order agree. Measured against Blender 4.5.3/Cycles on a velvet sphere at **−1.710% raw**, **−2.137%** with Gap #17's pedestal neutralised — *worse* adjusted, because here the pedestal partially masks a base deficit rather than causing an excess (§7.11.2). **The sheen layer's own contribution, isolated by subtracting each engine's un-sheened control, agrees to +0.324%**, and to +0.269% / +0.257% at sheen roughness 0.30 / 0.80; the 0.30:0.50:0.80 roughness ladder reproduces a 169× dynamic range to 1.1e-4. **The raw residual is the dielectric base, not the sheen** — the un-sheened control is the worst arm at −2.062% — which is a new open item (§7.11.2), not a sheen one. Geometrically incomplete for the same reason car paint is: `coat_normal` is still not shipped, and Cycles couples it to the *sheen* normal too (`svm/closure.h:127-129`), so it now blocks both. **This closes E2's original acceptance line: all three of brushed metal, car paint and velvet are measured against Cycles and all three clear the 5% bar raw.** The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), E2d is its first real N=3 (§7.10.5) and E2e its first N=4 (§7.11.4); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -2948,7 +2948,7 @@ reused deliberately so the two comparisons sit on one footing. Godot:
 `max_bounces = 3`, `SPP = 1`, 256 accumulated frames. Cycles: bounces matched at
 3; a lone convex sphere cannot re-hit itself, so bounce depth is not a free
 variable either way. **Coat is off on both sides** — `coat_normal` is not
-shipped (§7.11.8), and at `coat_weight = 0` Cycles' sheen normal
+shipped (§7.11.10), and at `coat_weight = 0` Cycles' sheen normal
 `mix(N, coat_normal, coat_weight)` (`svm/closure.h:127-129`) collapses to `N`,
 holding the one known geometric divergence at zero rather than leaving it free.
 
@@ -3130,3 +3130,353 @@ coat, re-established for sheen without relying on it.
 After `git checkout` of the three shader files and a full rebuild, the velvet
 arm reads `0.10321904` against the original `0.10321895` — 8.7e-7 relative,
 inside the same-binary noise floor. `git status -- servers/` is empty.
+
+#### 7.11.3 Sheen is an LTC lobe, and `pdf == eval` is the whole design
+
+Cycles' sheen is Zeltner's *Practical Multiple-Scattering Sheen Using Linearly
+Transformed Cosines*: a cosine hemisphere pushed through a 2×2 linear transform
+`[[a, 0], [b, 1]]` whose two coefficients, plus the lobe's directional albedo,
+are read from a 32×32×3 precomputed table. E2e ports it as
+`sheenSetup` / `sheenEval` / `sheenSample` (`brdf_inc.glsl:2453`, `:2471`,
+`:2506`) against a byte-exact copy of Cycles' table
+(`storage_rd/sheen_ltc_table.h`, 3072 floats, re-extracted and diffed by the
+reviewer with zero mismatches).
+
+**The LTC is a normalised density, so `pdf` and `eval` are literally the same
+number**, and `sheenEval` is the only place it is computed — `sheenSample` does
+not recompute it, so the two cannot drift (`brdf_inc.glsl:2469-2471`). What that
+bought:
+
+- **A sample weight of exactly 1.** `f / pdf` is 1 by construction, so the
+  sheen arm of the sampler carries no ratio that could be subtly wrong.
+- **A CPU-testable identity that is not a tautology.** `test_pt_sheen.cpp`
+  asserts the *sampler's* pdf — computed from its own local direction as Cycles
+  does (`bsdf_sheen.h:97-99`) — against the *evaluator's* value for the same
+  world direction. Two independent paths, one number, `Approx(1e-5)` for the
+  round trip through the frame projection, plus a falsifiability check that two
+  different draws give different pdfs. The version this replaced compared
+  `sheen_eval(d,l)` to a deterministic recomputation of itself and could not
+  fail for any implementation; that pattern was caught in pre-flight, which is
+  the third phase running to catch one.
+
+**The invalid-LTC guard is reachable, not decorative.** `bsdf_sheen.h:44-49`
+drops the closure when `|transformA| < 1e-5` or `albedo < 1e-5`. Across the
+sampled domain the CPU mirror counts **104 invalid points**, and **90 of the
+1024 table cells** fail it outright — all in the lowest roughness rows. That
+number is why §7.11.1's arms set `sheen_roughness` explicitly and why the
+reader should treat a "sheen renders nothing" report as a roughness default
+before anything else.
+
+**Table block ranges, measured** (they matter for what a bounds test can catch):
+`transformA` `[0, 0.87958]`, `transformB` `[−0.18133, 0.00196]`, `albedo`
+`[0, 0.74973]`. `transformA` sits entirely inside `[0,1]`, so an
+albedo↔transformA offset mix-up passes a `[0,1]` bounds check undetected; only
+`transformB`, which has negatives, is caught by one. The comment claiming
+otherwise was corrected.
+
+#### 7.11.4 The N-layer stack — landed before sheen existed, with no behaviour change
+
+The single most useful structural decision in the phase. Task 2 replaced E2d's
+hardcoded `tookCoatLobe` bookkeeping with a general walk,
+`layerTransmittanceAbove(material, N, V, lobeIndex)` (`brdf_inc.glsl:2690`),
+**and shipped it while `LOBE_COUNT` was still 3 and no sheen code existed**. The
+evidence that it changed nothing is that the four then-existing GPU gates stayed
+green, `pt_anisotropy_gate`'s output was **byte-identical**, and every moved
+number on the other three sat inside a **same-binary** floor — the implementer
+built the pre-task binary, ran all four, then ran the after binary twice, so the
+drift was compared against re-running the identical build rather than against
+nothing. That is the E2c lesson applied without being asked.
+
+**Registry index order runs innermost → outermost, and it MATCHES layer order.**
+The plan asserted the opposite and the implementer corrected it from the source:
+Cycles allocates **sheen first** (`svm/closure.h:115`, withdrawal at `:141`) and
+**coat second** (`:146`, withdrawal at `:170`), so the coat closure at `:157` is
+built from an already-sheen-attenuated weight. Sheen (index 3) attenuates coat
+(2), specular (0) and diffuse (1); coat (2) attenuates 0 and 1. **Both are
+`lobeIndex < LAYER_INDEX`.** The "trap" the plan warned about was the plan's own
+error.
+
+It did not stop the plan from committing the same inversion for real: Task 2's
+brief wrote `lobeIndex > LOBE_COAT`, which with specular 0 / diffuse 1 / coat 2
+is true for **no lobe at all**, returns identity always, and silently deletes
+E2d's entire coat attenuation. The implementer caught it by reading. The phase
+invariant would have caught it a step later — probe B's furnace would have gone
+non-flat — which is the invariant working as designed, but the reading came
+first.
+
+#### 7.11.5 The max-channel reduction, and one real divergence from Cycles
+
+Two different quantities, easy to conflate, and the brief did conflate them:
+
+- **The withdrawal** is `reduce_max` in Cycles (`bsdf_util.h:439-443`,
+  `closure_layering_weight`), and E2e ships `reduce_max`. Correct, and the
+  reviewer verified the weight really cancels, leaving
+  `a/w = sheenColor * ltcAlbedo` exactly. Because `ltcAlbedo` is scalar,
+  `reduce_max(sheenColor * ltcAlbedo)` is `reduce_max(sheenColor) * ltcAlbedo`,
+  which is why `sheenMaxTint` (`brdf_inc.glsl:2545`) can be one number in two
+  roles.
+- **The lobe-selection weight** is `fabsf(average(weight))` in Cycles
+  (`closure_sample_weight`, `alloc.h:55-62`), and E2e ships **max-channel**.
+  **This is a genuine divergence and it is deliberate.** It is *unbiased and
+  variance-only*: the four weights sum to exactly 1 and the estimator is
+  `sheenColor * ltcAlbedo / sheenMass`, precisely the throughput factor applied,
+  so the mean is untouched and only the sampling density moves. On a saturated
+  tint the max is arguably the **lower-variance** choice, since it keeps the
+  per-channel MC factor `sheenColor / max(sheenColor)` at or below 1 in every
+  channel. It also keeps sheen symmetric with the coat, which uses max-channel
+  for the same reason. Recorded in-code and here so a future reader does not
+  "fix" it into a bias.
+
+**Why E2d did not have to face this.** The coat's albedo is a *scalar*; sheen's
+is a tinted `float3`. Every reduction question that a scalar makes vacuous
+becomes live the moment the layer carries a colour.
+
+#### 7.11.6 The transposed LUT axes, and what actually guards them
+
+The sheen table is read `(cosNI, roughness)` — `bsdf_sheen.h:38-42` passes them
+in that order — while this engine's coat energy table is read
+`(rough, cosNI)` (`brdf_inc.glsl:2038`). Both go through the same
+`coatLutRead2D` primitive, so **the transposition lives entirely in the argument
+order at the call site** and the compiler cannot see it. `sheenLutRead2D`
+(`:2408-2409`) exists to name it rather than leave it implicit, and the
+reviewer separately confirmed the reader's internal row/column arithmetic
+matches `lookup_table.h:31-47` (y drives the row, x the column) so the call
+lands in the same slots Cycles uses.
+
+**What guards it, in ascending order of what it can actually catch:**
+
+1. `test_pt_sheen.cpp`'s axis-order case — guards the **mirror's reader**, not
+   the call site. Task 1 Step 4 proved this by swapping the arguments inside
+   `sheen_setup`'s three reads and watching **all six cases stay green**,
+   including this one. The limitation was reported rather than papered over.
+2. `pt_sheen_gate`'s **probe A** — compares twelve GPU-rendered points against
+   an independent parse of `sheen_ltc_table.h`, to 1e-7. Catches a transposition
+   at those twelve points.
+3. **§7.11.1's roughness ladder** — the only guard that is cross-engine and
+   covers the whole axis: three arms at sheen roughness 0.30 / 0.50 / 0.80,
+   whose deltas stand in the ratio `1 : 22.332 : 169.406` against Cycles'
+   `1 : 22.320 : 169.425`. A transposition changes the *shape* of the roughness
+   response, which is exactly what that ladder measures.
+
+#### 7.11.7 The `selectLobe` repair, which nothing asked for and the arithmetic demanded
+
+Appending a fourth, always-zero weight to the lobe registry made a float-residue
+window **reachable**. `selectLobe` (`brdf_inc.glsl:2751`) accumulates weights and
+returns the first whose running sum exceeds `u`; the old body's trailing
+fallthrough was the last index. E2c had proved that fallthrough unreachable —
+but **only for the exact two-weight case**, where `fl(p) + fl(1-p) == 1.0f`
+holds. With three non-zero weights plus a zero there are three roundings and the
+sum need not be exactly 1, so `u` near 1 on a **coated** material falls through
+to the zero-weight sheen lobe and divides by zero.
+
+**Quantified by brute force over 3M float32 `(pSpec, coatMass)` pairs:**
+`acc < 1.0f` for **2.6%**, and `acc < 0.99999994f` — the largest `u` the RNG can
+return — for **0.13%**. Roughly **one coated material in 800** carried a live
+divide-by-zero window. The repair skips zero weights and falls through to the
+last non-zero one, and is bit-identical on every prior input.
+
+**The CPU mirror had to follow, and the case that "covered" it could not fail.**
+`test_pt_lobe_registry.cpp` states in its own header that it must stay textually
+identical to the GLSL; after the repair it was the pre-repair body. The one case
+pinning it built only `{w0, 1-w0, 0}`, whose sum is exactly `1.0f`, so it could
+not distinguish either body. The failure scenario is specific: a contributor
+obeys the header, ports the mirror *back* into the shader, and reintroduces the
+divide-by-zero with nothing going red. Fix round 1 resynced the mirror and
+**proved the new cases can fail** — with the pre-repair body restored they go
+red at 1412 zero-weight selections, while the old "never returns a zero-weight
+lobe" case stays green, demonstrating empirically that it was never an
+instrument for this.
+
+**Two arithmetic corrections worth keeping.** The reviewer's named residue pair
+`(0.3118, 0.2078)` does **not** reproduce — in float32 those weights sum to
+exactly `1.0f`. The window sits at *small* `pSpec`. The implementer swept for a
+real one that runs through the production `lobe_weight`:
+`lobe_weight(0.04, 0.5) = 0.0740740672f` with `coatMass = 0.0397f` sums to
+`0.999999881f`, a 5.96e-08 gap below the largest `u`. Separately, `acc` collapses
+to just three float32 values across the sweep — `1.0`, `1.0 − 1 ULP` and
+`1.0 − 2 ULP` — and since the test is `u < acc`, the `u == acc` boundary *also*
+falls through; so the strict `residue_pairs` counter measures a subset of what
+the `zero_weight_selections == 0` assertion covers, making it conservative
+rather than vacuous. A third party reimplemented both bodies and the sweep in
+numpy float32 and reproduced 1412 and 169 exactly.
+
+#### 7.11.8 The gate, proven by breaking it
+
+`pipeline_references/tests/pt_sheen_gate.gd` — the phase's sixth GPU gate and,
+in the reviewer's words, the strongest instrument in it. Every a-priori
+reference was reproduced from an **independent parse** of `sheen_ltc_table.h`
+rather than accepted from the report.
+
+**Break-the-guard.** Deleting sheen's entry from `layerTransmittanceAbove` turns
+**10 assertions red across probes C1/C2/C3**, with the furnace reading
+**`1.413032`** against control **`0.999919`** and lever **`0.413156`** — i.e.
+exactly `1 + ltcAlbedo`, the signature of a layer that reflects without
+withdrawing. Probes A/B/D/E correctly stay green (black base or pdf-only, so
+layering never enters), which is what distinguishes a targeted instrument from
+one that fails at everything. Restored and re-confirmed.
+
+**Probe E2, and why probe E1 alone could not be an orientation instrument.**
+E1 integrates the sheen density over a **constant environment**. For any
+rotation of `(T, B)` about `N` by θ, `f(L; T', B') = f(R_θ⁻¹L; T, B)`, and
+rotation preserves the sphere's measure — so **the integral is identical for any
+orthonormal frame about `N`, at every value of `transformB`, not merely near
+zero**. Rotating the frame only reparametrises the domain. E1's failure text
+named a mechanism the same sentence proves cannot occur; it now says plainly
+that it guards finiteness and orthonormality and is **blind to orientation**.
+Both the original finding and the proposed remedy (retilt E1 to a point of large
+`|transformB|`) were wrong for the same reason, and the implementer refuted both.
+
+Orientation is observable only where the density is evaluated at a **single
+direction**, which needs a delta light. Probe **E2** is that: two delta
+directional lights 45° from `N`, one in the T–N plane and one in the B–N plane,
+at `cosNI ≈ 0.21` / roughness 0.80 where `transformB = −0.094278`. The assertion
+is the **ratio** of the two responses against a per-pixel CPU mirror, so all
+light plumbing cancels, and the sky pedestal is *subtracted* rather than assumed.
+Predicted `1.199338`, measured `1.199354` — 1.3e-5 relative; lever `0.1993`;
+pedestal `m0 = 0.567556` independently reproducing probe B's `0.567553`.
+
+**It fails when it should.** Swapping `rT`/`rB` drove E2 to `0.833806` against
+the a-priori swap prediction `0.833759`, **while E1 read `1.0000` and passed**.
+The swap is algebraically a 90° rotation about `N`, so E1 *must* stay at 1.0000
+and E2's ratio *must* become its own reciprocal, `1/1.199338 = 0.833793`. The
+falsification reconciles from the code rather than by coincidence.
+
+#### 7.11.9 Three findings that outlive this phase
+
+**1. NO DEBUG VIS MODE IN THIS ENGINE CAN REPORT A NEGATIVE NUMBER.**
+`sanitize_payload_value` clamps radiance to `[0, 1e6]`
+(`raytracing_inc.glsl:88-91`) and `path_unpack` re-applies `max(…, 0)` at `:109`;
+`debug_visualize` ends at `path_pack`, so **every vis mode goes through both**.
+Task 3's vis mode 41 read `transformB` as exactly `0.000000` against a mirror
+value of `−0.094282` — and `transformB` is negative in **909 of 1024 cells**
+(32 positive, 83 zero), so **that instrument was inert over 89% of its domain**
+from the day it shipped. Fixed for mode 41 by sign-encoding that one channel
+(`0.5 + 0.5*b`).
+
+**A second live instance, not fixed here, recorded deliberately:** **vis mode
+25** (`raytracing_closest_hit_common_inc.glsl:520`) emits
+`dbg_material.anisotropy` **raw** in blue, and `BaseMaterial3D::anisotropy` has
+range `−1,1` (`scene/resources/material.cpp:3848`). `pt_material_data_gate` is
+not holed **today** only because its test value happens to be positive
+(`V_ANISOTROPY = 0.83`) — the instrument is **latently blind**, and a negative
+anisotropy would read as zero and pass. The normal-carrying modes already
+sign-encode (`:356-367`, `:412`), so the convention existed and two modes missed
+it. **Any past or future vis mode carrying a signed quantity has this defect;
+prior phases' instruments should be audited against it.**
+
+**2. A pre-existing E2d coat defect: 0.705pp of energy lost at grazing
+incidence.** Found by E2e's gate, at `cos ≈ 0.21` with `clearcoat = 1.0`, and
+scaling with clearcoat (0.359 at `clearcoat = 0.5`) — the coat's own signature.
+**`pt_coat_gate` structurally cannot see it**: its sphere crop never leaves
+`cos ≥ 0.79`. **Confirmed not sheen's**, line by line: at `sheen_color == 0`
+`sheenLayerAlbedo` returns literal `0.0f` *above* the LUT read,
+`sheenLayeringTransmittance` is exactly `float3(1)`, `sheenLobeWeight` is 0 so
+`selectLobe` cannot reach it, and `hasSheen` is false so `evalSheen` is never
+called. **Open against E2d, not against E2e.**
+
+**3. `sheenMakeFrame`'s `make_orthonormals` fallback is unreachable from any
+render.** The raygen is **pinhole-only** — `camera_ray`
+(`scene_raytracing_raygen.glsl:107-120`) sets the origin unconditionally with no
+orthographic branch — and it jitters every primary ray, so `cross(N, V)` is
+never exactly zero. It has a **CPU test only** (`test_pt_sheen.cpp`'s degenerate
+case, against Cycles' exact `(1,1,1)×N` / `(−1,1,1)×N` construction from
+`math_float3.h:741-750`), and no GPU probe can be built for it.
+
+**The bigger finding is the premise:** `PROJECTION_ORTHOGONAL` **is not honoured
+by the path tracer at all.** An orthographic `Camera3D` renders as a pinhole
+one. That is a defect in its own right, unrelated to sheen, and it is what makes
+the fallback unreachable — so fixing the camera would make this code path live
+and the CPU test load-bearing.
+
+#### 7.11.10 What E2e does not deliver
+
+- **`coat_normal`** — still deferred, and now touching **both** layers. Cycles
+  couples the sheen normal to it: `bsdf->N = safe_normalize(mix(N, coat_normal,
+  coat_weight))` (`svm/closure.h:127-129`). A coat-normal texture on a
+  car-paint-plus-sheen material renders identically to a base-normal one, and
+  §7.11.1's arms deliberately held `coat_weight = 0` so the comparison would not
+  silently depend on it.
+- **The denoiser AOVs know about neither layer**, and are now one entry worse
+  than §7.10.7 recorded: `RB_TEX_DLSS_RR_*` diffuse/specular albedo and
+  normal/roughness are computed from the base material with no coat *or* sheen
+  term, so DLSS-RR is guided by a G-buffer that does not describe what was
+  rendered.
+- **Any coat NEE path the fourth out-parameter touched but no scene exercised.**
+  The layer walk is general over `LOBE_COUNT`; the gates drive sheen-over-base
+  and sheen-over-coat-over-base, but no gate scene combines sheen with a
+  transmissive or emissive base.
+- **The frame's degenerate fallback is untested on GPU**, per §7.11.9 item 3.
+- **`sheen_color` is uploaded unclamped above 1** while the sibling
+  `attenuation_color` clamps, giving unbounded per-bounce gain. Cycles does the
+  same, but Godot's `Color` is unbounded from GDScript where Blender's socket is
+  not. Parked minor.
+
+**The standing structural limit, unchanged since §7.9 and §7.10 and restated
+because it now covers more code.** The GLSL has **no automated execution**.
+doctest cannot run it; the CPU mirrors guard only the CPU side. Worse for
+honesty: `pt_sheen_gate`'s `_sheen_frame` / `_sheen_eval` are **verbatim
+transcriptions of the production shader**, not an independently-sourced
+reference the way probe A's LUT parser is. They test that the GPU faithfully
+executes the agreed formula — which the fault injection demonstrates they do —
+but they **do not validate the formula's physics against Cycles**. §7.11.1's
+velvet comparison is the only measurement in the phase that does, and it does so
+at three points on one axis. A reviewer should read the two implementations side
+by side rather than trust the gate.
+
+Parked minors carried forward: the `test_pt_sheen.cpp` "diagonal" sub-check is
+still a tautology (two identical literal arguments compared for equality) and
+the commit that renamed it **claims in its message that it was deleted**, which
+is false and now outlives the code; `sheen_ltc_table.h`'s include sits out of
+alphabetical order at `render_raytracing.cpp:39`; probes C2/C3 have no lever
+floor; `PROBE_B_MIN_ABSOLUTE = 0.05` mis-diagnoses the "closure weight applied
+twice" bug, which reads 0.0359 at tint 0.25 and so trips the wrong message;
+C2/C3 run at roughness 0.80 rather than the briefed `{0.05, 0.5, 0.9}`;
+`sheenSetup` is walked 2–4× per hit plus 2× per NEE light and discards `a`/`b`
+in four of six; the five debug `MaterialProperties` sites drop production's
+`[0,1]` roughness clamp and their two comments contradict each other; and the
+local-frame sampling comment's justification is factually wrong (`transformB` is
+not 0 at `cosNI == 1` except in the four lowest roughness rows, reaching
+±0.00394).
+
+#### 7.11.11 Verification
+
+doctest **1550 passed / 0 failed / 3 skipped** (2,067,991 assertions), on the
+restored production binary after the `ms` diagnostic was reverted and rebuilt.
+**All six GPU gates PASS on that same binary**: `pt_sheen_gate`, `pt_coat_gate`,
+`pt_energy_gate`, `pt_anisotropy_gate`, `pt_transmission_gate` (44 checks; probe
+6 on the good mode of the bimodality §7.9 records), `pt_material_data_gate` (25
+fields). `git status -- servers/` is empty; the only files this closeout adds
+are the roadmap text and the committed velvet harness.
+
+**Phase table.** Under §4's "E2. Anisotropy, clearcoat, sheen": anisotropic GGX
+is complete (§7.8), the two-way→N-way lobe rewrite is complete (§7.9), clearcoat
+is complete (§7.10), and **sheen is now complete (E2e, this section)**.
+
+**E2's original acceptance line — "brushed metal, car paint, and velvet respond
+comparably to Cycles" — is now fully addressed, all three targets measured
+against Blender 4.5.3/Cycles:** brushed metal +6.52% raw / +0.67% adjusted
+(§7.8), car paint +0.381% raw / −0.098% adjusted with the coat layer isolated to
+0.066% (§7.10.1), velvet −1.710% raw / −2.137% adjusted with the sheen layer
+isolated to **+0.324%** (§7.11.1). All three clear the 5% bar raw.
+
+Two qualifiers a reader must carry away with that:
+
+- **`coat_normal` remains outstanding, and it is no longer only car paint's
+  problem** — Cycles couples it to the sheen normal (`svm/closure.h:127-129`),
+  so it is now geometrically incomplete for *both* velvet and car paint.
+- **Velvet's raw residual is the dielectric base, not the sheen layer**, and the
+  Gap #17 adjustment makes it *worse* rather than better (§7.11.2). "Velvet
+  responds comparably" is true of the sheen lobe to 0.33%; the −2% sits under it
+  in a `metallic = 0 / roughness = 0.60` base configuration no prior phase had
+  measured against Cycles.
+
+What remains under the E2 heading:
+
+- **`coat_normal`** — deferred again, now blocking full geometric parity for
+  both the coat and the sheen.
+- **Anisotropy on the transmissive lobe** — still needs the refracted-direction
+  eval/pdf machinery described at the end of §7.8.
+- **The dielectric base's −2% deficit** (§7.11.2) — new, opened by this
+  measurement, and orthogonal to every layer E2 added.
+- **The coat's 0.705pp grazing-incidence loss** (§7.11.9 item 2) — open against
+  E2d, invisible to `pt_coat_gate` by construction.
