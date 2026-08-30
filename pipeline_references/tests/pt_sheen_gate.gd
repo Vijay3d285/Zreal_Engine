@@ -269,9 +269,21 @@ const PROBE_B_TINTS := [1.0, 0.25]
 # further. 5% covers that with an order of margin and is still 20x below the
 # smallest defect the arm exists to catch (the 4.0x factor above).
 const PROBE_B_TOL := 0.05
-# An absolute floor asserted BEFORE the ratio, so "sheen rendered nothing at
-# all" reports as itself rather than as a ratio failure. This is the trap check.
-const PROBE_B_MIN_ABSOLUTE := 0.05
+# A floor asserted BEFORE the ratio, so "sheen rendered nothing at all" reports
+# as itself rather than as a ratio failure. This is the trap check -- and it
+# has to be relative to `expected`, not a fixed constant, because the two
+# defects this arm exists to separate are themselves small multiples of
+# `expected`: at tint 0.25 (expected 0.1436), "division omitted entirely"
+# reads 0.0206 (0.1435x, ~1/7) and "closure weight applied twice" reads 0.0359
+# (0.2500x, ~1/4). A fixed 0.05 floor -- or the reviewer's first suggestion of
+# 0.3 * expected, which is 0.0431 here and STILL above 0.0359 -- traps both
+# defects before the ratio branch at :871 ever sees them, printing "SHEEN IS
+# RENDERING NOTHING" for bugs that are not that. 0.1 * expected (0.01436) sits
+# comfortably below the smaller of the two (0.1435x, ~30% margin) so both fall
+# through to the ratio check, which names them correctly, while remaining far
+# above a genuine zero-output measurement (which reads within float noise of
+# 0.0, not a fraction of expected at all).
+const PROBE_B_MIN_ABSOLUTE_FRACTION := 0.1
 
 # ---------------------------------------------------------------------------
 # PROBE C -- furnace, stack, max-channel
@@ -829,7 +841,8 @@ func _probe_b_renders_at_all(p_env: Environment) -> void:
 	print("  BLACK base (albedo 0, metallic_specular 0) under a constant-radiance-%.1f sky,"
 			% SKY_RADIANCE)
 	print("  so the render IS the sheen. Expected = tint * ltcAlbedo, a priori from the mirror;")
-	print("  tolerance %.0f%% relative, absolute floor %.3f" % [PROBE_B_TOL * 100.0, PROBE_B_MIN_ABSOLUTE])
+	print("  tolerance %.0f%% relative, floor %.0f%% of expected (relative, not fixed)"
+			% [PROBE_B_TOL * 100.0, PROBE_B_MIN_ABSOLUTE_FRACTION * 100.0])
 	_use_quad_camera()
 	var vp_size := get_viewport().get_visible_rect().size
 	var vp_rid := get_viewport().get_viewport_rid()
@@ -859,12 +872,13 @@ func _probe_b_renders_at_all(p_env: Environment) -> void:
 				% [(s["lo"] as Vector3).x, (s["hi"] as Vector3).x,
 					(s["lo"] as Vector3).y, (s["hi"] as Vector3).y,
 					(s["lo"] as Vector3).z, (s["hi"] as Vector3).z])
-		if measured < PROBE_B_MIN_ABSOLUTE:
-			_failures.append(("probeB [%s]: the sheened surface returned %.6f, below the %.3f floor. " +
-					"SHEEN IS RENDERING NOTHING. The first thing to check is sheen_roughness: the " +
-					"LTC table is invalid over 90 of its 1024 cells, ALL of them in the four lowest " +
-					"roughness rows, and Godot defaults sheen_roughness to 0")
-					% [tag, measured, PROBE_B_MIN_ABSOLUTE])
+		var min_absolute: float = PROBE_B_MIN_ABSOLUTE_FRACTION * expected
+		if measured < min_absolute:
+			_failures.append(("probeB [%s]: the sheened surface returned %.6f, below the %.3f floor " +
+					"(%.0f%% of expected %.6f). SHEEN IS RENDERING NOTHING. The first thing to check is " +
+					"sheen_roughness: the LTC table is invalid over 90 of its 1024 cells, ALL of them in " +
+					"the four lowest roughness rows, and Godot defaults sheen_roughness to 0")
+					% [tag, measured, min_absolute, PROBE_B_MIN_ABSOLUTE_FRACTION * 100.0, expected])
 			continue
 		if absf(ratio - 1.0) > PROBE_B_TOL:
 			_failures.append(("probeB [%s]: the sheened surface returned %.6f where the closure " +
