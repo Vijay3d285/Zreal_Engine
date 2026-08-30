@@ -3072,3 +3072,61 @@ was run twice: `velvet` `0.10321895` vs `0.10321940`, `nosheen` `0.08770339` vs
 4.4e-6, 2.3e-7 and 2.0e-5. Every figure quoted above sits two to four orders of
 magnitude above that floor, **including the 0.00069 `velvetsharp` delta**, which
 is the only one small enough to be worth checking.
+
+#### 7.11.2 The Gap #17 adjustment — and the result it did not give
+
+Same technique §7.8's Task 4/5 and §7.10.1 used: temporary shader edit, full
+rebuild, measure, revert, rebuild, `git status` on `servers/` confirmed clean
+before and after. `ms` was forced to `float3(1.0)` at **all four**
+`evalMultiScatterApproximation` call sites.
+
+**The four sites, and their line numbers have moved again.** §7.10.1 named
+`brdf_inc.glsl:1274`, `:1418`, `raytracing_closest_hit_common_inc.glsl:1525` and
+`raytracing_emissive_inc.glsl:495`. At this HEAD they are **`brdf_inc.glsl:1292`,
+`:1436`, `raytracing_closest_hit_common_inc.glsl:1639`,
+`raytracing_emissive_inc.glsl:495`**. Three of the four have drifted between two
+consecutive phases; quote them with a commit or not at all. The reachable one
+here is `:1436`, the **dielectric** path — the opposite of §7.10.1, whose
+metallic base reached `:1292`.
+
+| arm | Godot `ms=1` | Cycles | ratio | **adjusted % off** | raw % off | points moved |
+|---|---|---|---|---|---|---|
+| velvet | 0.10277130 | 0.10501504 | 0.978634 | **−2.137%** | −1.710% | −0.426 |
+| velvetsharp | 0.08794067 | 0.09024246 | 0.974493 | −2.551% | −2.044% | −0.507 |
+| velvetrough | 0.20501054 | 0.20694485 | 0.990653 | −0.935% | −0.746% | −0.189 |
+| nosheen | 0.08724560 | 0.08954956 | 0.974272 | −2.573% | −2.062% | −0.511 |
+
+**Raw −1.710%, adjusted −2.137%. Both are reported; the flattering one is the
+raw one, and it is not the adjusted one this time.**
+
+**Gap #17 does not explain this scene's residual — it partially masks it.** In
+§7.8 and §7.10.1 Godot ran *above* Cycles and removing `ms` moved it down
+towards agreement (+6.52% → +0.67%; +0.381% → −0.098%). Here Godot already runs
+*below* Cycles, `ms` is still adding energy, and removing it moves the gap the
+wrong way by 0.43 points. The **direction is consistent with §7.8's reading**
+that `evalMultiScatterApproximation` over-corrects a real single-scatter
+deficit; what is new is a base configuration — `metallic = 0`, `roughness =
+0.60`, dielectric — where the deficit it is over-correcting is *larger than the
+over-correction*, so the compensated result still lands 2% short. **That is a
+base-BRDF finding, not a sheen finding, and it is recorded rather than closed.**
+
+**The `ms` edit did not touch the sheen layer, and the numbers say so, not the
+diff.** The sheen-only delta under `ms = 1.0` against the production build:
+
+| arm | production delta | `ms=1` delta | ratio |
+|---|---|---|---|
+| velvetsharp | 0.00069477 | 0.00069507 | 1.000432 |
+| velvet | 0.01551556 | 0.01552570 | 1.000654 |
+| velvetrough | 0.11769747 | 0.11776494 | 1.000573 |
+
+Three arms spanning a 169× range move by 0.04–0.07%, all in the same direction
+and all an order of magnitude below the raw shift the edit produced (−0.43% to
+−0.52%). The sheen layer's agreement with Cycles is **+0.324% raw / +0.389%
+adjusted** on the headline arm — the conclusion does not depend on which build
+it is measured in. This is the same separability §7.10.1 established for the
+coat, re-established for sheen without relying on it.
+
+**The production binary was restored and re-measured, not assumed restored.**
+After `git checkout` of the three shader files and a full rebuild, the velvet
+arm reads `0.10321904` against the original `0.10321895` — 8.7e-7 relative,
+inside the same-binary noise floor. `git status -- servers/` is empty.
