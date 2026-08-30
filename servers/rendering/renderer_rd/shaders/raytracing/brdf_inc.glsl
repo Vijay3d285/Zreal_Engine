@@ -3231,9 +3231,16 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// materialLocal note). The single exception is sheenMakeFrame's
 		// make_orthonormals FALLBACK, which branches on N's components and is
 		// therefore NOT rotation-equivariant; it fires only when cross(N, V) is
-		// exactly zero, i.e. V exactly parallel to N, where the LTC's transformB
-		// is 0 and the lobe is rotationally symmetric about N, so the two frames
-		// give the same density anyway.
+		// exactly zero, i.e. V exactly parallel to N. That is NOT a case where
+		// the two frames are guaranteed to agree by symmetry: transformB is
+		// zero at cosNI == 1 only in the four lowest roughness rows -- outside
+		// those it reaches +/-0.00394 (sheen_ltc_table.h), so the lobe is not
+		// rotationally symmetric about N there and a frame-choice-dependent
+		// sampler/pdf mismatch of O(b) would be real if this path executed.
+		// It does not: the raygen is pinhole-only and jitters every primary
+		// ray, so cross(N, V) is never exactly zero and this fallback is
+		// unreachable from any render (see PATH_TRACER_QUALITY_ROADMAP.md
+		// §7.11.9 item 3 for the full argument and its CPU-only test).
 		//
 		// SAMPLE WEIGHT IS THE CLOSURE WEIGHT, FULL STOP. bsdf_sheen_sample
 		// returns eval == pdf (bsdf_sheen.h:104-106), so eval/pdf is exactly 1

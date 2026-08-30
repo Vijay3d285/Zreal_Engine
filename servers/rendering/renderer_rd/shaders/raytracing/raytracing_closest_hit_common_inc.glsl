@@ -474,8 +474,12 @@ void debug_visualize(
 		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 		// E2e Task 4, same undefined-if-unset rule as the E2b/E2d notes above.
 		// Production's clamps: sheenColor is max(.., 0) (Cycles closure.h:120's
-		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW because
-		// sheenSetup clamps it to [1e-3, 1] internally (bsdf_sheen.h:33).
+		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW here --
+		// provably harmless, not merely convenient: clamp(x, 1e-3, 1) ==
+		// clamp(clamp(x, 0, 1), 1e-3, 1) for every finite x, so sheenSetup's
+		// own internal [1e-3, 1] clamp (bsdf_sheen.h:33) makes production's
+		// extra [0,1] pre-clamp a no-op on any value this debug path can
+		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
 
@@ -606,8 +610,12 @@ void debug_visualize(
 		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 		// E2e Task 4, same undefined-if-unset rule as the E2b/E2d notes above.
 		// Production's clamps: sheenColor is max(.., 0) (Cycles closure.h:120's
-		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW because
-		// sheenSetup clamps it to [1e-3, 1] internally (bsdf_sheen.h:33).
+		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW here --
+		// provably harmless, not merely convenient: clamp(x, 1e-3, 1) ==
+		// clamp(clamp(x, 0, 1), 1e-3, 1) for every finite x, so sheenSetup's
+		// own internal [1e-3, 1] clamp (bsdf_sheen.h:33) makes production's
+		// extra [0,1] pre-clamp a no-op on any value this debug path can
+		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
 
@@ -693,8 +701,12 @@ void debug_visualize(
 		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 		// E2e Task 4, same undefined-if-unset rule as the E2b/E2d notes above.
 		// Production's clamps: sheenColor is max(.., 0) (Cycles closure.h:120's
-		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW because
-		// sheenSetup clamps it to [1e-3, 1] internally (bsdf_sheen.h:33).
+		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW here --
+		// provably harmless, not merely convenient: clamp(x, 1e-3, 1) ==
+		// clamp(clamp(x, 0, 1), 1e-3, 1) for every finite x, so sheenSetup's
+		// own internal [1e-3, 1] clamp (bsdf_sheen.h:33) makes production's
+		// extra [0,1] pre-clamp a no-op on any value this debug path can
+		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
 
@@ -850,8 +862,12 @@ void debug_visualize(
 		dbg_mat.coatTint = max(dbg_material.clearcoat_tint, vec3(0.0));
 		// E2e Task 4, same undefined-if-unset rule as the E2b/E2d notes above.
 		// Production's clamps: sheenColor is max(.., 0) (Cycles closure.h:120's
-		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW because
-		// sheenSetup clamps it to [1e-3, 1] internally (bsdf_sheen.h:33).
+		// `max(sheen_tint, zero)`) and sheenRoughness is left RAW here --
+		// provably harmless, not merely convenient: clamp(x, 1e-3, 1) ==
+		// clamp(clamp(x, 0, 1), 1e-3, 1) for every finite x, so sheenSetup's
+		// own internal [1e-3, 1] clamp (bsdf_sheen.h:33) makes production's
+		// extra [0,1] pre-clamp a no-op on any value this debug path can
+		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
 
@@ -1468,12 +1484,16 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// carries no sheen fields.
 	//
 	// Cycles' clamps, svm/closure.h:120-121. sheen_tint is max(.., 0) and
-	// sheen_roughness is saturatef()'d there -- but sheenSetup ALSO clamps
-	// roughness to [1e-3, 1] (bsdf_sheen.h:33), and clamping to [0,1] first is
-	// not redundant: it is what stops a NaN or a huge authored value from
-	// reaching the LUT's normalised axis. sheenColor is the ONLY gate; a material
-	// with no sheen still arrives here carrying whatever roughness it was
-	// authored with, so gating on roughness would switch sheen on scene-wide.
+	// sheen_roughness is saturatef()'d there; sheenSetup ALSO clamps roughness
+	// to [1e-3, 1] internally (bsdf_sheen.h:33). The two are mathematically
+	// IDENTICAL for finite input -- clamp(x, 1e-3, 1) == clamp(clamp(x, 0, 1),
+	// 1e-3, 1) for every finite x -- so this explicit [0,1] step exists to
+	// mirror Cycles' own saturatef() call, not because sheenSetup's clamp
+	// would otherwise be reached by an out-of-range value; the debug sites
+	// above that skip it are not thereby unsafe. sheenColor is the ONLY gate;
+	// a material with no sheen still arrives here carrying whatever roughness
+	// it was authored with, so gating on roughness would switch sheen on
+	// scene-wide.
 	brdf_mat.sheenColor = max(raw_mat.sheen_color, vec3(0.0));
 	brdf_mat.sheenRoughness = clamp(raw_mat.sheen_roughness, 0.0, 1.0);
 
