@@ -2915,3 +2915,160 @@ and its Beer's-law tint to 0.016%. What remains under that heading:
   normal (`svm/closure.h:127-129`).
 - **Anisotropy on the transmissive lobe** — still needs the refracted-direction
   eval/pdf machinery described at the end of §7.8.
+
+### 7.11 E2e — sheen (Zeltner LTC) and the N-layer stack
+
+**Status: landed and measured against Cycles.** Full task-by-task record:
+`.superpowers/sdd/2026-08-28-sheen-zeltner-ltc/task-{1..6}-report.md`, with the
+dispatch ledger in that directory's `progress.md`.
+
+*(Committed in two parts, as §7.10 was: the Cycles measurement first so it
+cannot be lost, then the closeout narrative. §7.11.1 is the measurement.)*
+
+#### 7.11.1 The Cycles comparison — velvet
+
+**Blender ran headlessly here.** `Blender 4.5.3 LTS` (hash `67807e1800cc`),
+`blender.exe -b -P`, Cycles on **OptiX / NVIDIA RTX A4000** (selected by the
+E2a/E2b/E2d fallback chain and *printed*, not assumed), 1024 samples, denoising
+and adaptive sampling off, `view_transform = Standard`, exposure 0, gamma 1.
+The harness printed Blender's live Principled BSDF socket list before touching
+it, so **`Sheen Weight` / `Sheen Tint` / `Sheen Roughness` are confirmed to
+exist under those names in this version** rather than assumed from the manual.
+
+**Scene** — a **velvet sphere**, E2's own second stated acceptance target (§4,
+"car paint and velvet"): dielectric base `metallic = 0`, `roughness = 0.60`,
+base colour linear `(0.12, 0.02, 0.03)` (a deep red velvet), sheen colour linear
+`(0.75, 0.70, 0.55)`, under a spatially uniform environment of radiance 1.0.
+Sphere radius 1.0 at origin, 64×32 segments; camera at Godot `(0,0,2.5)` /
+Blender `(0,-2.5,0)` under `blender(x,y,z) = godot(x,-z,y)`; 20° vertical FOV on
+256×256. Radius 1.0 at distance 2.5 subtends 23.58° against a 14.00° diagonal
+half-angle, so **every pixel in every render is a sphere hit** and the
+whole-image mean is a surface-only statistic — the same geometry §7.10.1 used,
+reused deliberately so the two comparisons sit on one footing. Godot:
+`max_bounces = 3`, `SPP = 1`, 256 accumulated frames. Cycles: bounces matched at
+3; a lone convex sphere cannot re-hit itself, so bounce depth is not a free
+variable either way. **Coat is off on both sides** — `coat_normal` is not
+shipped (§7.11.8), and at `coat_weight = 0` Cycles' sheen normal
+`mix(N, coat_normal, coat_weight)` (`svm/closure.h:127-129`) collapses to `N`,
+holding the one known geometric divergence at zero rather than leaving it free.
+
+Harness: `pipeline_references/tests/pt_sheen_reference.gd`, **committed**. E2d's
+equivalent was kept outside the repo and is now unrecoverable, which is why this
+one is not.
+
+**`sheen_color` is Cycles' `sheen_weight * sheen_tint`, not its tint.**
+`brdf_inc.glsl:334-338` folds the weight into the colour; `svm/closure.h:123-124`
+forms the closure weight as `sheen_weight * rgb_to_spectrum(sheen_tint) *
+weight`. The Blender arms therefore set `Sheen Weight = 1.0` and `Sheen Tint` to
+the same linear triple, reproducing an identical closure weight rather than an
+approximately equal one.
+
+**`sheen_roughness` had to be set explicitly, and that is a trap, not a detail.**
+Godot defaults it to `0` (`scene/resources/material.h:579`) while Cycles'
+Principled defaults it to `0.5`, and **90 of the 1024 LTC cells fail the
+invalid-LTC test, all of them in the lowest roughness rows**. A velvet scene
+that sets `sheen_color` and leaves roughness alone renders *no sheen at all*,
+measures a zero delta against its own control, and **reads as a suspiciously
+good match**. Every arm below sets it.
+
+**Colour space, the trap this phase family has now had to defuse three times.**
+`render_raytracing.cpp:1827` sRGB-**decodes** `sheen_color` on upload, exactly as
+`:1595` does to `albedo`; Cycles' sockets are linear. Both colours were authored
+`Color(<linear>).linear_to_srgb()` on the Godot side and Blender was handed the
+same `<linear>` number — each renderer compared against the same authored
+*linear* value, never field-for-field against the other. The harness printed the
+round trip through the engine's own `Color` methods:
+
+```
+BASE  linear=(0.12000000,0.02000000,0.03000000) -> authored srgb=(0.38109186,0.15170372,0.18974829) -> engine decode=(0.12000000,0.02000000,0.03000000)
+SHEEN linear=(0.75000000,0.69999999,0.55000001) -> authored srgb=(0.88082504,0.85430586,0.76737565) -> engine decode=(0.75000000,0.70000005,0.54999995)
+```
+
+**One reader, two sides.** The Blender script measures the Godot EXRs with the
+*same* numpy / `foreach_get` path it measures its own with. Godot's in-engine
+GDScript mean and Blender's reading of the same EXR agree to 1e-8
+(`0.10321895` vs `0.10321895`), so the whole-image means come from one code path
+rather than two that could quietly disagree.
+
+**Raw comparison** (production code, HEAD `90dee99fd9`, nothing tuned):
+
+| arm | sheen rough | Godot mean | Cycles mean | ratio | % off |
+|---|---|---|---|---|---|
+| velvet | 0.50 | 0.10321895 | 0.10501504 | 0.982897 | **−1.710%** |
+| velvetsharp | 0.30 | 0.08839816 | 0.09024246 | 0.979563 | −2.044% |
+| velvetrough | 0.80 | 0.20540086 | 0.20694485 | 0.992539 | −0.746% |
+| nosheen (control) | — | 0.08770339 | 0.08954956 | 0.979384 | −2.062% |
+
+Per channel, velvet: R `0.986766`, G `0.978182`, B `0.978850`.
+
+**Every arm passes the 5% bar with no adjustment at all**, but the *shape* of
+the table is the finding: the un-sheened control is the **worst** arm at
+−2.062%, and the more sheen an arm carries the closer it gets (−2.06% → −2.04%
+→ −1.71% → −0.75% as the sheen's share of the image rises). The residual is the
+**base**, not the sheen — and it is a *deficit*, the opposite sign to §7.10.1's,
+on a `metallic = 0, roughness = 0.60` dielectric base rather than E2d's polished
+metal. §7.11.2 is the measurement that tests whether Gap #17 explains it.
+
+**The sheen-only delta — the layer isolated by subtraction.** Subtracting the
+`nosheen` arm from each sheen arm *inside each engine* cancels every base
+diffuse and base-specular term, Gap #17 included, without touching any code.
+What remains is exactly what the layer contributes: its own reflection minus the
+withdrawal it takes from the base.
+
+| arm | Godot delta (mean) | Cycles delta (mean) | ratio | % off |
+|---|---|---|---|---|
+| velvetsharp (0.30) | 0.00069477 | 0.00069290 | 1.002689 | **+0.269%** |
+| velvet (0.50) | 0.01551556 | 0.01546548 | 1.003238 | **+0.324%** |
+| velvetrough (0.80) | 0.11769747 | 0.11739529 | 1.002574 | **+0.257%** |
+
+Per channel on the headline arm: R `1.003567`, G `1.002802`, B `1.003394` — a
+**flat** offset across channels, i.e. a scale, not a tint error.
+
+**The sheen layer itself agrees with Cycles to better than 0.33% at every
+roughness, and its sign is opposite to the raw figure's.** The layer is slightly
+*brighter* while the whole image is *darker*, which is only visible because the
+control arm exists. A comparison without one would have reported −1.71% and
+attributed it to sheen.
+
+**The roughness ladder — the cross-engine test of the transposed LUT axes.** The
+sheen table is indexed `(cosNI, roughness)`, transposed relative to the coat's
+`(roughness, mu)` (`bsdf_sheen.h:38-42` against `brdf_inc.glsl:2015`). A
+transposition does not merely rescale the response; it changes its *shape* along
+roughness, which no single arm can see. The three deltas' ratios to each other:
+
+| | 0.30 | 0.50 | 0.80 |
+|---|---|---|---|
+| Godot | 1 | 22.332 | 169.406 |
+| Cycles | 1 | 22.320 | 169.425 |
+
+**A 169× dynamic range reproduced to 1.1e-4 relative.** This is the strongest
+evidence in the phase that the axis order is right, and it is evidence Task 1's
+CPU mirror structurally could not give: the mirror's axis-order case guards its
+own *reader*, not the call site (ledger, Task 1 Step 4), and Task 5's probe A
+compares a handful of table points against a parser of the same header. The
+ladder compares the engine's *rendered response* against an independent
+implementation across the whole roughness axis.
+
+**Where the sheen's own colour goes.** Normalised to R, the delta's hue is
+`1 : 1.0344 : 0.7881` in Godot and `1 : 1.0352 : 0.7883` in Cycles — agreeing to
+0.08%, and both *differing* from the authored tint's `1 : 0.9333 : 0.7333`,
+because the delta is the sheen's reflection *minus its withdrawal from a red
+base* and the two mix per channel. Both engines mix them the same way. That is
+`closure_layering_weight`'s arithmetic showing up in a measurement rather than
+in a comment.
+
+**Positive control — the colour-space trap, reproduced.** A Cycles-only arm with
+`Base Color` *and* `Sheen Tint` set to the sRGB-encoded numbers an artist reads
+off the Godot Inspector, fed to Blender as if they were linear — the exact
+field-for-field error that inverted §7.7's verdict — measured `0.28263608`
+against the reconciled arm's `0.10501504`: **ratio 2.691387, +169.1%**, i.e.
+**99× the size of the gap being measured**. The harness would not miss this
+error. E2d's equivalent control read +129.0%; the trap is larger here because
+both the base and the sheen colour carry it.
+
+**Run-to-run noise floor, measured rather than assumed.** The identical binary
+was run twice: `velvet` `0.10321895` vs `0.10321940`, `nosheen` `0.08770339` vs
+`0.08770337`, `velvetrough` `0.20540086` vs `0.20539667` — relative spreads of
+4.4e-6, 2.3e-7 and 2.0e-5. Every figure quoted above sits two to four orders of
+magnitude above that floor, **including the 0.00069 `velvetsharp` delta**, which
+is the only one small enough to be worth checking.
