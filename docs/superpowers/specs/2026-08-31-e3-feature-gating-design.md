@@ -48,14 +48,25 @@ use them, driven by three new `RT_FLAGS` specialization bits.
 
 ### 3.1 Flag bits
 
-Three bits after `RT_FLAG_TRANSMISSION_ENABLED` (`1<<10`), declared in
-`raytracing_common_inc.glsl` and mirrored in `scene_shader_raytracing.h`:
+**ERRATUM (corrected before planning).** An earlier draft of this section put
+the three bits at `1<<11 / 1<<12 / 1<<13`. Those are not free: E1 took bits
+11-14 for `RT_MAX_TRANSMISSION_BOUNCE_SHIFT`
+(`scene_shader_raytracing.h:115`), and the collision would corrupt the
+transmission bounce cap's readback. The documented free range is **bits 15-19**
+(`scene_shader_raytracing.h:76`).
+
+Three bits in the free range, declared in `raytracing_common_inc.glsl` and
+mirrored in `scene_shader_raytracing.h`:
 
 ```
-#define RT_FLAG_ANISOTROPY_ENABLED 2048u  // 1 << 11
-#define RT_FLAG_COAT_ENABLED       4096u  // 1 << 12
-#define RT_FLAG_SHEEN_ENABLED      8192u  // 1 << 13
+#define RT_FLAG_ANISOTROPY_ENABLED 32768u   // 1 << 15
+#define RT_FLAG_COAT_ENABLED       65536u   // 1 << 16
+#define RT_FLAG_SHEEN_ENABLED      131072u  // 1 << 17
 ```
+
+Both `static_assert`s at `scene_shader_raytracing.h:122` and `:128` must gain
+the three new names, and the bit-layout comment at `:76` must change from
+"Bits 15-19: Free" to record the three taken bits and "Bits 18-19: Free".
 
 **These bits drive the preprocessor, not the spec constant.** There are two
 mechanisms in this file and they are not interchangeable:
