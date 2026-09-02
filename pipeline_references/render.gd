@@ -266,7 +266,8 @@ func setup_camera(data):
 	# Attach after add_child() so the camera is already in the scene tree.
 	# CompositorEffect requires Forward+ renderer (Godot 4.3+). We guard with
 	# ClassDB so this script doesn't crash on compatibility renderer builds.
-	if USE_POST_FX:
+	# Day-render only: night renders keep their current (no post-fx) look untouched.
+	if USE_POST_FX and day_render:
 		# Compositor is a native C++ class (Godot 4.3+) — ClassDB check is correct here.
 		# UnrealPostFX is a GDScript class: ClassDB never sees it, so we load by path instead.
 		if ClassDB.class_exists("Compositor"):
@@ -458,35 +459,69 @@ func render_image(data, output_path):
 					await _wait_frames(40)
 
 	var img = await _capture_viewport_image(6)
-	if img:
-		img.save_png(output_path)
-		print("Image saved to: ", output_path)
-		_save_thumbnail_webp(img, output_path)
-		if accumulate_enabled:
-			# The .png above is the deliverable — it is the converged, anti-aliased,
-			# tonemapped result, and it is lossless. Note Godot's PNG writer is 8-bit
-			# only (drivers/png/png_driver_common.cpp converts anything else to
-			# RGB8/RGBA8), which matches Blender's default PNG output.
-			#
-			# The linear EXR is an OPTIONAL extra for grading or for verifying that
-			# highlights above 1.0 survived. It is off by default; set ZR_PT_EXR=1 to
-			# emit it alongside the PNG.
-			if OS.get_environment("ZR_PT_EXR") == "1":
-				var exr_path: String = output_path.get_basename() + ".exr"
-				var hdr: Image = RenderingServer.viewport_get_pathtracing_accum_image(
-						get_viewport().get_viewport_rid())
-				if hdr != null and not hdr.is_empty():
-					var err: int = hdr.save_exr(exr_path, false)
-					if err == OK:
-						print("[Render] Linear HDR EXR saved to: ", exr_path)
-					else:
-						push_warning("[Render] EXR save failed (err %d): %s" % [err, exr_path])
+
+	# HARD FAIL if the image did not make it to disk.
+	# Previously both failure paths below fell through to quit(0): the caller saw
+	# a success exit code, then found no PNG, and the queue re-ran the entire 4K
+	# trace up to MAX_RENDER_ATTEMPTS times — each attempt failing identically
+	# with nothing in the log explaining why. An expensive silent loop.
+	# The usual root cause is VRAM: the readback needs a full-resolution
+	# allocation and a local LLM that was never unloaded is still holding the
+	# card. Both zlendo_llm passes unload in a `finally`, so if this fires,
+	# check for a stray `ollama ps` process first.
+	if img == null:
+		printerr("[Render] FATAL: viewport capture returned no image after 6 attempts.")
+		printerr("[Render] FATAL: output would have been: %s" % output_path)
+		printerr("[Render] FATAL: most likely out of VRAM for the full-resolution readback — ")
+		printerr("[Render] FATAL: check that no LLM/Ollama model is still resident on the GPU.")
+		save_logs(data, output_path)
+		get_tree().quit(1)
+		return
+
+	var _save_err: int = img.save_png(output_path)
+	if _save_err != OK:
+		printerr("[Render] FATAL: save_png failed with error %d for: %s" % [_save_err, output_path])
+		printerr("[Render] FATAL: check the directory exists and is writable, and that the disk is not full.")
+		save_logs(data, output_path)
+		get_tree().quit(1)
+		return
+
+	# save_png reported OK but the file is not there — rare, but it is the exact
+	# symptom the caller sees, so name it here rather than letting the caller
+	# rediscover it as a missing-file mystery.
+	if not FileAccess.file_exists(output_path):
+		printerr("[Render] FATAL: save_png reported OK but no file exists at: %s" % output_path)
+		save_logs(data, output_path)
+		get_tree().quit(1)
+		return
+
+	print("Image saved to: ", output_path)
+	_save_thumbnail_webp(img, output_path)
+	if accumulate_enabled:
+		# The .png above is the deliverable — it is the converged, anti-aliased,
+		# tonemapped result, and it is lossless. Note Godot's PNG writer is 8-bit
+		# only (drivers/png/png_driver_common.cpp converts anything else to
+		# RGB8/RGBA8), which matches Blender's default PNG output.
+		#
+		# The linear EXR is an OPTIONAL extra for grading or for verifying that
+		# highlights above 1.0 survived. It is off by default; set ZR_PT_EXR=1 to
+		# emit it alongside the PNG.
+		if OS.get_environment("ZR_PT_EXR") == "1":
+			var exr_path: String = output_path.get_basename() + ".exr"
+			var hdr: Image = RenderingServer.viewport_get_pathtracing_accum_image(
+					get_viewport().get_viewport_rid())
+			if hdr != null and not hdr.is_empty():
+				var err: int = hdr.save_exr(exr_path, false)
+				if err == OK:
+					print("[Render] Linear HDR EXR saved to: ", exr_path)
 				else:
-					push_warning("[Render] Accumulator readback returned no image; EXR skipped.")
-			var denoise_note := " with in-process OIDN final-denoise" if oidn_enabled else (" with DLSS-RR reconstruct-final" if dlss_rr_final_enabled else "")
-			print("[Render] PHASE A accumulated still captured%s (PNG, tonemapped, converged)." % denoise_note)
-		elif dlss_rr_realtime:
-			print("[Render] Realtime DLSS-RR still captured (PNG, tonemapped) — %d-frame temporal accumulation." % DLSS_RR_REALTIME_STILL_FRAMES)
+					push_warning("[Render] EXR save failed (err %d): %s" % [err, exr_path])
+			else:
+				push_warning("[Render] Accumulator readback returned no image; EXR skipped.")
+		var denoise_note := " with in-process OIDN final-denoise" if oidn_enabled else (" with DLSS-RR reconstruct-final" if dlss_rr_final_enabled else "")
+		print("[Render] PHASE A accumulated still captured%s (PNG, tonemapped, converged)." % denoise_note)
+	elif dlss_rr_realtime:
+		print("[Render] Realtime DLSS-RR still captured (PNG, tonemapped) — %d-frame temporal accumulation." % DLSS_RR_REALTIME_STILL_FRAMES)
 
 	save_logs(data, output_path)
 	get_tree().quit(0)
@@ -644,6 +679,10 @@ func setup_fixed_fill_lights():
 		print("[Render] No authored lights detected. Boosting automated room fill lights (1.75x).")
 
 	var placed = 0
+	# Declared at function scope: the summary print below sits outside the
+	# `areas.size() > 0` block where the gating loop lives.
+	var active_area_id := ""
+	var skipped_areas := 0
 
 	var areas = _get_floor_plan_areas()
 	var verts = _get_floor_plan_vertices()
@@ -661,7 +700,25 @@ func setup_fixed_fill_lights():
 			if sun_dir_flat.length() > 0.001:
 				sun_dir_flat = sun_dir_flat.normalized()
 				
+		# ── Active-room gating for area fill lights ───────────────────────────────
+		# Every light placed in this loop has shadow_enabled = false, and in this
+		# fork's path tracer a shadowless light traces NO occlusion ray at all
+		# (raytracing_lights_inc.glsl: the shadow test is skipped entirely when
+		# shadow_enabled == 0.0). So a fill light sitting in the Living Room does not
+		# stop at the partition — it illuminates the bedroom through the wall at up to
+		# its full 20 m range. With one light set per area, most of the fill landing in
+		# any given frame was leaking in from rooms that are not even on camera.
+		# Gating to the camera's room is what lets the surviving fills be tuned at a
+		# sane energy instead of being crushed globally to suppress the leak.
+		# Resolved via the same helper the portal gate uses, so the two can never
+		# disagree about which room is active. Empty id (camera outside every area, i.e.
+		# a facade/exterior view) leaves every area lit, exactly as before.
+		active_area_id = str(_resolve_active_area().get("id", ""))
+
 		for area_id in areas:
+			if active_area_id != "" and str(area_id) != active_area_id:
+				skipped_areas += 1
+				continue
 			var area = areas[area_id]
 			var v_ids = area.get("vertices", [])
 			if v_ids.size() < 3:
@@ -883,6 +940,8 @@ func setup_fixed_fill_lights():
 		_add_ceiling_fill_grid("RoomLight_FallbackCeiling", room_center, room_extent, room_ceiling_y, 2.35 * energy_multiplier, 24.0, fill_color)
 		placed = 9
 	
+	if skipped_areas > 0:
+		print("[Render] Room-gated fill: skipped %d area(s) the camera is not in (active='%s')." % [skipped_areas, active_area_id])
 	print("[Render] Placed %d room light(s)." % placed)
 
 func _apply_no_authored_light_boost() -> void:

@@ -41,6 +41,9 @@ var _dir_light = null
 var _directional_light_authoring_locked = false
 var _lighting_color_mood: String = "day"
 var _lighting_illumination_scale: float = 1.0
+# Editor "keep night lights on during day" toggle. When true AND a fixture carries
+# per-light metadata, day renders honor the intensity slider (dampened) instead of off.
+var _night_light_on: bool = false
 # Count of ceiling_mount fixtures — used by sqrt normalisation to prevent
 # N fixtures contributing N× the intended luminance additively.
 var _ceiling_fixture_count: int = 1
@@ -49,6 +52,9 @@ var _scene_rotation_is_radians: bool = false
 var _scene_plan_rotation_radians: float = 0.0
 var _scene_plan_pivot: Vector2 = Vector2.ZERO
 var _floor_plan_root_data: Dictionary = {}
+# Every camera position along the flythrough, in world metres. Portal gating tests
+# against ALL of them, not just the first frame — see _collect_camera_path_samples.
+var _camera_path_samples: Array = []
 var structure_builder
 
 func _accumulate_plan_bounds(raw_vertex, bounds: Array) -> bool:
@@ -411,6 +417,10 @@ func build_scene(data):
 	print("[VideoGLB] Using scene unit scale: ", _scene_unit_scale, " m/source-unit")
 	print("[VideoGLB] Using plan rotation: ", rad_to_deg(_scene_plan_rotation_radians), " deg | pivot=", _scene_plan_pivot)
 
+	# Resolved here, after the plan rotation/pivot globals are ready, so the samples
+	# land in the same frame as the area polygons they will be tested against.
+	_camera_path_samples = _collect_camera_path_samples(data)
+
 	# ── Unwrap layers structure ───────────────────────────────────────────────
 	# scene_optimizer_video.py writes geometry inside geom_data["layers"][layer_id].
 	# Flatten the selected (or first) layer up to the top level so all downstream
@@ -730,6 +740,38 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		# Day videos should stay neutral; mood tinting is reserved for night.
 		_lighting_color_mood = "day"
 	_lighting_illumination_scale = _resolve_illumination_scale(data)
+
+	# ── Automation colour-aware multipliers ────────────────────────────────
+	# Written by zlendo_llm/automation (main.py calls auto_adjust_lighting in
+	# _run_godot_video_render after video scene culling). The LLM analyses
+	# wall/floor/ceiling colours of the rooms that survived culling and sets
+	# these to compensate:
+	#   dark surfaces  -> boost > 1.0   (more light to fill absorbing walls)
+	#   light surfaces -> boost < 1.0   (less light to avoid washout)
+	# Default 1.0 = no change, so scenes without the automation pass are
+	# bit-for-bit unaffected.
+	# MUST stay identical to image_glb_creation.gd — a still and the walkthrough
+	# of the same room are compared side by side, so if one builder responds to
+	# the automation pass and the other does not, they diverge on every scene the
+	# pass touches. Same key names, same clamp, same application points.
+	var _auto_ambient_boost: float = 1.0
+	var _auto_sun_multiplier: float = 1.0
+	if typeof(data) == TYPE_DICTIONARY:
+		if data.has("_automationAmbientBoost"):
+			_auto_ambient_boost = clampf(float(data["_automationAmbientBoost"]), 0.5, 2.5)
+		if data.has("_automationSunMultiplier"):
+			_auto_sun_multiplier = clampf(float(data["_automationSunMultiplier"]), 0.5, 2.5)
+		if _auto_ambient_boost != 1.0 or _auto_sun_multiplier != 1.0:
+			print("[AUTO-LIGHTING] ambientBoost=%.2f, sunMultiplier=%.2f" % [_auto_ambient_boost, _auto_sun_multiplier])
+
+	# Resolve the scene-level "night lights on during day" toggle (JSON: nightLightOn).
+	_night_light_on = false
+	if typeof(data) == TYPE_DICTIONARY:
+		if data.has("nightLightOn"):
+			_night_light_on = bool(data["nightLightOn"])
+		elif data.has("_lightingSettings") and typeof(data["_lightingSettings"]) == TYPE_DICTIONARY and data["_lightingSettings"].has("nightLightOn"):
+			_night_light_on = bool(data["_lightingSettings"]["nightLightOn"])
+	print("[NightLight] resolved _night_light_on=", _night_light_on, " (day_render=", day_render, ")")
 	# Pre-count ceiling fixtures for sqrt energy normalisation.
 	if typeof(geom_data) == TYPE_DICTIONARY:
 		_ceiling_fixture_count = max(1, _count_ceiling_fixture_lights(geom_data))
@@ -797,7 +839,8 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		# Reduced from 2.8 — was blowing out wall surfaces and making shadows too harsh.
 		# 2.0 gives natural 10AM brightness without overexposure.
 		dir_energy = 2.0
-		dir_color = Color(1.0, 0.835, 0.50) # 10AM sunlight — warm golden white
+		# Crisp daylight white so glossy black metals (chandelier frames) reflect clean, not yellow.
+		dir_color = Color(1.0, 1.0, 1.0) # Color(1.0, 0.99, 0.97)
 		print("[Sun] Day render: 10AM sunlight energy=2.0, warm golden color (soft shadows).")
 	else:
 		# Night: read from JSON as before — authored moods still apply.
@@ -824,7 +867,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 				)
 
 	if day_render:
-		dir_light.light_energy = dir_energy # hardcoded physical sun — no scale
+		dir_light.light_energy = dir_energy * _auto_sun_multiplier # automation scales for dark/light surfaces
 		dir_light.light_color = dir_color # hardcoded golden color — no mood tint
 	else:
 		var mood_dir_color = _get_color_mood_light_color("directional")
@@ -922,7 +965,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	if day_render:
 		# DAY RENDERS: Switched back to ACES as requested for photorealism.
 		# The higher sun energy (5.5) will compensate for ACES highlight compression.
-		env.tonemap_mode = Environment.TONE_MAPPER_ACES
+		env.tonemap_mode = Environment.TONE_MAPPER_AGX
 	else:
 		match mood_key:
 			"soft", "day":
@@ -936,19 +979,38 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 
 	env.tonemap_exposure = lighting["tonemap_exposure"]
 	if day_render:
-		# exposure=1.5: matches image render for consistent day brightness.
+		# Global day exposure. This multiplies EVERYTHING — sun, sky ambient, portals,
+		# fixtures — so it is the right knob when the whole frame sits too high, and the
+		# wrong one when only part of it does (for shadow/corner lift use
+		# ambient_light_energy below; for hot sun pools use the sun energy).
+		# MUST match image_glb_creation.gd: a still and the walkthrough of the same room
+		# are compared side by side, so any drift here is immediately visible. This had
+		# drifted to 1.5 while the comment still claimed it matched the image path.
+		# If this reads too dark, change BOTH builders together.
 		env.tonemap_exposure = 1.5
+		# Automation exposure compensation, deliberately damped: exposure
+		# multiplies EVERYTHING, so applying the raw boost here on top of the
+		# ambient boost below would double-count. At 0.25 a 2.0x ambient boost
+		# only adds ~25% exposure. Only lifts, never cuts — darkening is the
+		# ambient term's job. Damping factor MUST match image_glb_creation.gd.
+		if _auto_ambient_boost > 1.0:
+			var _expo_factor = 1.0 + (_auto_ambient_boost - 1.0) * 0.25
+			env.tonemap_exposure *= _expo_factor
+			print("[AUTO-LIGHTING] exposure compensation: base 1.5 × %.2f = %.2f" % [_expo_factor, env.tonemap_exposure])
 		# ambient_light_energy=6.0: sky dome energy sampled from all directions
 		# to fill dark corners and shadowed walls without casting shadows.
-		env.ambient_light_energy = 6.0
-		env.ambient_light_color = Color(1.0, 0.835, 0.50) # warm golden sky
-		print("[Lighting] Day: exposure=1.5, sky ambient energy=6.0")
+		env.ambient_light_energy = 10.0 * _auto_ambient_boost
+		env.ambient_light_color = Color(1.0, 1.0, 1.0) # Color(1.0, 0.835, 0.50) # warm golden sky
+		# Printed from the live values, never hardcoded — the image builder's equivalent
+		# line claimed "exposure=1.0" while the constant said 1.5, which sent a brightness
+		# investigation looking in the wrong place.
+		print("[Lighting] Day: exposure=", env.tonemap_exposure, ", sky ambient energy=", env.ambient_light_energy)
 	if not day_render:
 		# Keep our authored ambient energy from the profile instead of crushing it
 		if mood_key == "warm":
-			env.ambient_light_energy = lighting["ambient_energy"] * 1.2 * _lighting_illumination_scale
+			env.ambient_light_energy = lighting["ambient_energy"] * 1.2 * _lighting_illumination_scale * _auto_ambient_boost
 		else:
-			env.ambient_light_energy = lighting["ambient_energy"] * _lighting_illumination_scale
+			env.ambient_light_energy = lighting["ambient_energy"] * _lighting_illumination_scale * _auto_ambient_boost
 
 	if env.tonemap_mode == Environment.TONE_MAPPER_AGX:
 		env.tonemap_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
@@ -1060,10 +1122,10 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	env.glow_enabled = true
 	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
 	if day_render:
-		env.glow_intensity = 0.18
-		env.glow_bloom = 0.04
-		env.glow_hdr_threshold = 0.85 # Only the very brightest window glass triggers bloom
-		env.glow_hdr_scale = 1.0
+		env.glow_intensity = 0.32 # stronger day bloom so bright fixtures visibly out-glow dim ones
+		env.glow_bloom = 0.08
+		env.glow_hdr_threshold = 1.0 # Only the very brightest window glass / lit fixtures trigger bloom
+		env.glow_hdr_scale = 1.3
 		env.glow_map_strength = 0.0
 	elif mood_key == "warm":
 		env.glow_intensity = lighting["glow_intensity"]
@@ -1101,9 +1163,9 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	# ── Colour Grading ──
 	env.adjustment_enabled = true
 	if day_render:
-		env.adjustment_brightness = 0.95
+		env.adjustment_brightness = 0.97
 		# Contrast 1.25 deepens the gap between lit and shadow areas.
-		# 1.05 was too flat — shadow under sofa/plants looked same as lit floor. so 1.08
+		# 1.05 was too flat — shadow under sofa/plants looked same as lit floor.
 		env.adjustment_contrast = 1.10
 		env.adjustment_saturation = 1.05
 	else:
@@ -1136,7 +1198,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		var fill = OmniLight3D.new()
 		fill.name = "FillLight"
 		fill.position = Vector3(room_center.x, room_ceiling_y - 0.55, room_center.z)
-		fill.light_energy = lighting["fill_energy"] * _lighting_illumination_scale * 0.01
+		fill.light_energy = lighting["fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
 		fill.omni_range = max(room_extent.x, room_extent.y) * 2.5 + 10.0
 		var mood_fill_color = _get_color_mood_light_color("fill")
 		fill.light_color = Color(
@@ -1153,7 +1215,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		var fill_front = OmniLight3D.new()
 		fill_front.name = "FrontFillLight"
 		fill_front.position = Vector3(room_center.x, room_ceiling_y - 0.9, room_center.z) + cam_forward * fill_offset
-		fill_front.light_energy = lighting["front_back_fill_energy"] * _lighting_illumination_scale * 0.01
+		fill_front.light_energy = lighting["front_back_fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
 		fill_front.omni_range = max(room_extent.x, room_extent.y) * 1.6 + 4.0
 		fill_front.light_color = Color(
 			lighting["front_back_fill_color"].r * mood_fill_color.r,
@@ -1167,7 +1229,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		var fill_back = OmniLight3D.new()
 		fill_back.name = "BackFillLight"
 		fill_back.position = Vector3(room_center.x, room_ceiling_y - 0.9, room_center.z) - cam_forward * fill_offset
-		fill_back.light_energy = lighting["front_back_fill_energy"] * _lighting_illumination_scale * 0.01
+		fill_back.light_energy = lighting["front_back_fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
 		fill_back.omni_range = max(room_extent.x, room_extent.y) * 1.6 + 4.0
 		fill_back.light_color = Color(
 			lighting["front_back_fill_color"].r * mood_fill_color.r,
@@ -1181,7 +1243,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		var fill = OmniLight3D.new()
 		fill.name = "FillLight"
 		fill.position = Vector3(room_center.x, room_ceiling_y - 0.55, room_center.z)
-		fill.light_energy = lighting["fill_energy"] * _lighting_illumination_scale * 0.01
+		fill.light_energy = lighting["fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
 		fill.omni_range = max(room_extent.x, room_extent.y) * 2.2 + 7.0
 		var mood_fill_color = _get_color_mood_light_color("fill")
 		fill.light_color = Color(
@@ -2073,6 +2135,8 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 			structure_builder._add_niche_structure(root, width, depth, height, mat_data)
 		"baywindowsill":
 			structure_builder._add_baywindowsill_structure(root, width, depth, mat_data)
+		"custom_shape":
+			structure_builder._add_custom_shape_structure(root, structure, scale_factor)
 		"flooropening":
 			pass # handled by _add_floor_opening_cutters
 		_:
@@ -2091,6 +2155,18 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 	var all_holes = {}
 	if layer_data.has("holes"):
 		all_holes = layer_data["holes"]
+	# FIX (Defect 2 – floating window): root-level holes are only used as a
+	# last-resort backfill for holes that the optimizer did not emit into the
+	# layer-level dict.  With the scene_optimizer.py rescue fix in place this
+	# path should rarely (if ever) fire for active-room openings.  Log a
+	# warning whenever it does so the staleness is immediately visible.
+	if _floor_plan_root_data.has("holes") and typeof(_floor_plan_root_data["holes"]) == TYPE_DICTIONARY:
+		for hole_id in _floor_plan_root_data["holes"]:
+			if not all_holes.has(hole_id):
+				all_holes[hole_id] = _floor_plan_root_data["holes"][hole_id]
+				print("[WARN] Hole '", hole_id, "' sourced from root-level fallback — "
+					+ "layer-level copy was absent (optimizer may have culled the parent wall). "
+					+ "Altitude/position may be stale; check scene_optimizer.py logs.")
 
 	var areas = {}
 	if layer_data.has("areas"):
@@ -2463,12 +2539,25 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 
 									var scale_x = h_width / dims.x
 									var scale_y = h_height / dims.y
-									var scale_z = wall_thickness / dims.z
+									var h_depth_raw = hole.get("thickness", hole.get("depth", wall_thickness / scale_factor))
+									if hole.has("properties"):
+										var p = hole["properties"]
+										if p.has("thickness"): h_depth_raw = p["thickness"]
+										elif p.has("depth"): h_depth_raw = p["depth"]
+									var h_depth = get_dimension_value(h_depth_raw) * scale_factor
+									var scale_z = h_depth / dims.z
 
 									var bounds_y_min = aabb.position.y * scale_y
+									var center_x_local = (aabb.position.x + aabb.size.x / 2.0) * scale_x
+									var center_z_local = (aabb.position.z + aabb.size.z / 2.0) * scale_z
 
 									asset_node.position = h_center_pos
 									asset_node.position.y = (layer_altitude + h_alt) - bounds_y_min
+
+									var local_offset = Vector3(-center_x_local, 0, -center_z_local)
+									var rotated_offset = Basis(Vector3.UP, wall_angle) * local_offset
+									asset_node.position += rotated_offset
+
 									asset_node.rotation.y = wall_angle
 
 									var flip_x = -1.0 if hole.get("flipX", false) else 1.0
@@ -2478,7 +2567,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 									# Smart shadow control: frame/mullion meshes keep shadows ON
 									# (cast grid pattern), glass panes get shadows OFF.
 									_apply_item_materials(asset_node, hole)
-									_fix_glass_materials_for_shadows(asset_node)
+									#_fix_glass_materials_for_shadows(asset_node)
 									print("[VideoGLB] Loaded hole asset: ", model_path, " scale: ", asset_node.scale, " (shadows: handled by material)")
 
 									# Keep the actual window GLB only.
@@ -2564,17 +2653,30 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					var props = hole["properties"]
 					if props.has("width"): hw = get_dimension_value(props["width"]) * scale_factor
 					if props.has("height"): hh = get_dimension_value(props["height"]) * scale_factor
-					if props.has("altitude"): ha = get_dimension_value(props["altitude"]) * scale_factor
+					# FIX (Defect 2 – floating window): properties.altitude is the
+					# edited value written by the frontend; the top-level altitude
+					# field may be stale.  Always prefer properties.altitude and
+					# log when the two values disagree so staleness is detectable.
+					if props.has("altitude"):
+						var props_alt = get_dimension_value(props["altitude"]) * scale_factor
+						if abs(props_alt - ha) > 0.001:
+							print("[WARN] Hole '", hid, "': top-level altitude=", ha,
+								" differs from properties.altitude=", props_alt,
+								" — using properties value (top-level may be stale).")
+						ha = props_alt
 				if hw < 0.01 or hh < 0.01: continue
-				var raw_off = 0.0
-				if hole.has("offset"): raw_off = float(hole["offset"])
-				elif hole.has("properties") and hole["properties"].has("offset"):
+				var off_ratio = 0.5
+				var raw_off = float(hole.get("offset", 0.0))
+				if hole.has("properties") and hole["properties"].has("offset"):
 					raw_off = float(hole["properties"]["offset"])
-				var off_ratio = raw_off
 				if raw_off > 1.0:
 					var wl = p1.distance_to(p2)
 					if wl > 0.0001:
 						off_ratio = clamp((raw_off * scale_factor) / wl, 0.0, 1.0)
+					else:
+						off_ratio = 0.5
+				else:
+					off_ratio = raw_off
 				var h_cx_along = off_ratio * length
 				var hole_rect = PackedVector2Array()
 				hole_rect.append(Vector2(h_cx_along - hw * 0.5, ha))
@@ -2834,7 +2936,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 
 			var uv_polygon = polygon.duplicate()
 			# Expand polygon outward to fill wall-thickness gaps at edges
-			polygon = _expand_polygon_outward(polygon, max_wall_thickness / 2.0)
+			# polygon = _expand_polygon_outward(polygon, max_wall_thickness / 2.0)
 
 			# ── Floor ──────────────────────────────────────────────────────────
 			var floor_depth = 0.1
@@ -3327,8 +3429,11 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 			
 	# Dynamically calculate final emission energy to preserve illumination levels from JSON
 	# Base night emission_energy is around 6.5 to 10.0. Multiplying by 1.5 reaches ~10 to 15.
-	var final_emission_energy = emission_energy * 1.5 * mood_emission_scale
-	
+	# Night: boost by mood + scale. Day: keep the raw faint value (0.3) — no scaling.
+	var final_emission_energy = emission_energy
+	if not day_render:
+		final_emission_energy *= 1.5 * mood_emission_scale
+
 	for m in meshes:
 		if not m.mesh:
 			continue
@@ -3341,24 +3446,49 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 				var mat_name = str(mat.resource_name).to_lower()
 				var surface_name = str(m.mesh.surface_get_name(i)).to_lower()
 				
-				var is_emissive_surface = false
-				# STRICT WORKAROUND: Only enable emission if the material or surface name explicitly contains bulb/led/filament keywords.
-				# This ignores the GLB's base emission colors to prevent incorrectly authored assets from glowing entirely.
-				if mat.emission_enabled:
-					var strict_keywords = ["bulb", "filament", "led", "emiss", "glow", "neon"]
+				# Emitter detection. The reliable discriminator across these GLBs is the authored
+				# emissiveFactor: in every fixture exactly one material has a non-black emission
+				# (shade/bulb), while poles, frames and glass are all [0,0,0]. Material NAMES are
+				# generic (metal.005, plastic.001, adskMatPhysicalMaterial_55) and the emitter is
+				# sometimes just called "light", so keywords alone miss it. metallic is unreliable
+				# too - pole and shade are both metallic=1.0. Do NOT re-add broad keywords
+				# (glass/plastic/fabric) or an albedo-luminance fallback: they light the whole
+				# fixture, flattening it into one blob so per-fixture intensity becomes invisible.
+				var is_emissive_surface = mat.emission_enabled
+				if not is_emissive_surface and mat.emission != Color(0, 0, 0):
+					is_emissive_surface = true
+				if not is_emissive_surface:
+					var strict_keywords = ["bulb", "filament", "led", "emiss", "glow", "neon", "diffuser", "tube", "lampshade", "shade"]
 					for kw in strict_keywords:
 						if kw in mat_name or kw in surface_name:
 							is_emissive_surface = true
 							break
-				
+
 				if not is_emissive_surface:
 					continue
-				
+
 				var new_mat = mat.duplicate()
-				if day_render:
+				# Emissive fixtures (bulbs/shades) are often authored near-black (artists rely on
+				# glow alone). Force a soft white albedo so they don't render as black holes when
+				# emission is off/faint. Metal frames are excluded by keyword match.
+				#
+				# Day renders normally SKIP this lift: the shade is already lit by sun and sky, and
+				# its authored albedo is what makes the fixture read as a physical object —
+				# overriding it washes the lamp out and drags the surrounding surfaces up with it.
+				# The exception is the emission-disabled branch just below: when day emission has
+				# been normalized down to <= 0.1 the glow is switched off entirely, and without the
+				# lift a near-black shade really would render as the black hole this guard exists
+				# to prevent. (image_glb_creation.gd has no such branch, so there the lift is
+				# simply night-only.)
+				var lift_dark_albedo = (not day_render) or final_emission_energy <= 0.1
+				if lift_dark_albedo and new_mat.albedo_color.get_luminance() < 0.2:
+					new_mat.albedo_color = Color(0.9, 0.9, 0.9)
+				if final_emission_energy <= 0.1:
+					# Too faint to matter (e.g. day fixture after sqrt-normalization): keep dark.
 					new_mat.emission_enabled = false
 					new_mat.emission_energy_multiplier = 0.0
 				else:
+					# Day (faint 0.3) or night: apply mood emissive color at final energy.
 					new_mat.emission_enabled = true
 					
 					var hardcoded_mood_color = Color(1.0, 1.0, 1.0)
@@ -3376,8 +3506,17 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 						_:
 							hardcoded_mood_color = light_color # Fallback to passed color
 					
-					new_mat.emission = hardcoded_mood_color
+					if day_render:
+						# Day render: pure white so emission_energy_multiplier alone drives
+						# per-fixture brightness (mirrors staging engine and image_glb_creation.gd).
+						new_mat.emission = Color(1.0, 1.0, 1.0)
+					else:
+						if mat.emission_enabled and mat.emission != Color(0, 0, 0):
+							new_mat.emission = mat.emission
+						else:
+							new_mat.emission = hardcoded_mood_color
 					new_mat.emission_energy_multiplier = final_emission_energy
+					print("[Emission] Applied: surface='%s' mat='%s' multiplier=%s day=%s" % [surface_name, mat_name, final_emission_energy, day_render])
 				m.set_surface_override_material(i, new_mat)
 				applied = true
 	return applied
@@ -3585,34 +3724,69 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 				light_energy = 5.0
 				emission_energy = 10.0
 
-	if not day_render:
-		# Boosted Night Logic: t = scale / 0.5
-		var t = _lighting_illumination_scale / 0.5
-		var illuminationLevel = float(item.get("illumination_level", 5.0))
-		
-		# Updated Fixture energy calculation (Reduced to 2.2 for better night atmosphere)
-		light_energy = _lighting_illumination_scale * (illuminationLevel / 5.0) * 2.2
-		
-		# Reduced 8.5m range for ceiling fixtures to avoid washing out walls/cupboards
-		if mounting_type == "ceiling_mount":
-			light_range = 8.5
-		
-		emission_energy *= _lighting_illumination_scale * (illuminationLevel / 5.0)
+	# Per-fixture light metadata (editor intensity slider). JSON source (confirm names):
+	# item.light_meta / item.lightMeta / item.properties.light_meta.
+	var light_meta = {}
+	if item.has("light_meta") and typeof(item["light_meta"]) == TYPE_DICTIONARY:
+		light_meta = item["light_meta"]
+	elif item.has("lightMeta") and typeof(item["lightMeta"]) == TYPE_DICTIONARY:
+		light_meta = item["lightMeta"]
+	elif item.has("properties") and typeof(item["properties"]) == TYPE_DICTIONARY:
+		if item["properties"].has("light_meta") and typeof(item["properties"]["light_meta"]) == TYPE_DICTIONARY:
+			light_meta = item["properties"]["light_meta"]
+		elif item["properties"].has("lightMeta") and typeof(item["properties"]["lightMeta"]) == TYPE_DICTIONARY:
+			light_meta = item["properties"]["lightMeta"]
+	var has_light_meta = light_meta.size() > 0
+	var skip_normalization = false
+
+	if day_render:
+		print("[NightLight] fixture '%s': _night_light_on=%s has_light_meta=%s light_meta=%s" % [item.get("name", "?"), _night_light_on, has_light_meta, light_meta])
+
+	# Night render OR a day render with night-lights toggled ON enter the lit path.
+	if not day_render or _night_light_on:
+		if day_render and _night_light_on and has_light_meta:
+			# Scenario A — day + night-lights-on + per-fixture slider. Honor the slider,
+			# dampened 0.35 so fixtures don't fight the sun. (Video has no Kelvin→RGB path.)
+			var base_intensity = float(light_meta.get("intensity", light_energy))
+			light_energy = base_intensity * 0.35
+			emission_energy = max(0.5, base_intensity * 2.0)
+			skip_normalization = true # honor the manual slider exactly (no sqrt(N) dimming)
+			print("[Diagnostics] Daytime META light: item '%s' intensity=%s -> light_energy=%s emission=%s" % [item.get("name", "?"), base_intensity, light_energy, emission_energy])
+		else:
+			# Night energy calc (real night, OR day + night-lights-on with no slider meta).
+			var illuminationLevel = float(item.get("illumination_level", 5.0))
+			light_energy = _lighting_illumination_scale * (illuminationLevel / 5.0) * 2.2
+			if mounting_type == "ceiling_mount":
+				light_range = 8.5
+			emission_energy *= _lighting_illumination_scale * (illuminationLevel / 5.0)
+			# Scenario B — day render, night-lights ON, but no slider: dampen generically.
+			if day_render and _night_light_on:
+				light_energy *= 0.35
+				# Day: the shade only needs to read as "switched on" — the sun and sky
+				# already carry the room. 2.0 is a night-scale value and at day exposure
+				# renders as a blown-out white blob that lifts everything around it.
+				emission_energy = 0.6
+				print("[Diagnostics] Daytime NON-META dampen: item '%s' light_energy=%s" % [item.get("name", "?"), light_energy])
 	else:
+		# Scenario C — day + night-lights OFF: fixture lights off, shade glows faintly (0.3)
+		# so the lampshade reads as white paper, not a pitch-black void.
 		light_energy = 0.0
-		emission_energy = 0.0
+		emission_energy = 0.3
 
 	# Ceiling fixture sqrt normalisation — mirrors image_glb_creation.gd.
 	# Divides per-fixture energy by sqrt(N) so total luminance grows as sqrt(N) not N.
 	# Cap divisor at sqrt(16)=4.0 to avoid over-dimming in very large plans.
-	if mounting_type == "ceiling_mount":
+	if mounting_type == "ceiling_mount" and not skip_normalization:
 		var sqrt_n := sqrt(float(clamp(_ceiling_fixture_count, 1, 16)))
 		light_energy /= sqrt_n
 		emission_energy /= sqrt_n
 
 	var emissive_surface_found = _apply_light_fixture_emission(node, light_color, emission_energy)
 
-	var world_pos = node.to_global(emitter_local)
+	# Tree-safe world position (see image_glb_creation.gd): node.to_global() fails when the
+	# builder root isn't in the tree yet, dumping lights at the origin. node is a direct child
+	# of the root, so its local transform already maps emitter_local into the root frame.
+	var world_pos = node.transform * emitter_local
 	var is_wall_panel_light = (
 		"wall" in full_desc
 		and (
@@ -3626,7 +3800,7 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 	if is_wall_panel_light:
 		var omni = OmniLight3D.new()
 		omni.name = "FixtureLight_" + str(item.get("id", item.get("name", "Light")))
-		omni.global_position = world_pos
+		omni.position = world_pos
 		omni.light_color = light_color
 		omni.light_energy = light_energy
 		omni.light_specular = 0.25
@@ -3639,7 +3813,7 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 		# Ceiling fixtures — SpotLight3D pointing downward to prevent ceiling reflections
 		var spot_ceil = SpotLight3D.new()
 		spot_ceil.name = "FixtureLight_" + str(item.get("id", item.get("name", "Light")))
-		spot_ceil.global_position = world_pos
+		spot_ceil.position = world_pos
 		spot_ceil.rotation_degrees = Vector3(-90, 0, 0)
 		spot_ceil.light_color = light_color
 		spot_ceil.light_energy = light_energy
@@ -3656,26 +3830,28 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 		add_child(spot_ceil)
 		
 		# Upward ceiling bounce spotlight (to fix dark ceiling near fixtures)
-		var spot_ceil_up = SpotLight3D.new()
-		spot_ceil_up.name = "FixtureLightUp_" + str(item.get("id", item.get("name", "Light")))
-		# Position 0.8 meters below the ceiling fixture so it hits the ceiling at a good angle (dot product)
-		spot_ceil_up.global_position = world_pos - Vector3(0, 0.8, 0)
-		spot_ceil_up.rotation_degrees = Vector3(90, 0, 0) # Point straight UP
-		spot_ceil_up.light_color = light_color
-		spot_ceil_up.light_energy = light_energy * 0.90
-		spot_ceil_up.light_specular = 0.0
-		spot_ceil_up.shadow_enabled = false
-		spot_ceil_up.spot_range = max(light_range * 1.2, 10.0)
-		spot_ceil_up.spot_angle = 160.0 # Wide angle to spread across the ceiling
-		spot_ceil_up.spot_angle_attenuation = 1.0 # Smooth edge
-		spot_ceil_up.spot_attenuation = 0.5 # Smooth falloff
-		spot_ceil_up.add_to_group("fixture_lights")
-		add_child(spot_ceil_up)
+		# Skip this if skip_normalization is true to avoid blowing out the ceiling with raw intensity
+		if not skip_normalization:
+			var spot_ceil_up = SpotLight3D.new()
+			spot_ceil_up.name = "FixtureLightUp_" + str(item.get("id", item.get("name", "Light")))
+			# Position 0.8 meters below the ceiling fixture so it hits the ceiling at a good angle (dot product)
+			spot_ceil_up.position = world_pos - Vector3(0, 0.8, 0)
+			spot_ceil_up.rotation_degrees = Vector3(90, 0, 0) # Point straight UP
+			spot_ceil_up.light_color = light_color
+			spot_ceil_up.light_energy = light_energy * 0.90
+			spot_ceil_up.light_specular = 0.0
+			spot_ceil_up.shadow_enabled = false
+			spot_ceil_up.spot_range = max(light_range * 1.2, 10.0)
+			spot_ceil_up.spot_angle = 160.0 # Wide angle to spread across the ceiling
+			spot_ceil_up.spot_angle_attenuation = 1.0 # Smooth edge
+			spot_ceil_up.spot_attenuation = 0.5 # Smooth falloff
+			spot_ceil_up.add_to_group("fixture_lights")
+			add_child(spot_ceil_up)
 	elif "wall" in full_desc or is_street_light:
 		# Wall sconces and street lights — SpotLight3D aimed downward/outward
 		var spot = SpotLight3D.new()
 		spot.name = "FixtureLight_" + str(item.get("id", item.get("name", "Light")))
-		spot.global_position = world_pos
+		spot.position = world_pos
 		spot.light_color = light_color
 		spot.light_energy = light_energy
 		spot.light_specular = 0.25
@@ -3689,12 +3865,22 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 
 		var target_local = emitter_local + Vector3(0, -max(1.0, light_range * 0.45), 0)
 		if "wall" in full_desc and not is_street_light:
-			target_local = emitter_local + Vector3(0, -0.15, -max(0.8, light_range * 0.25))
-		spot.look_at(node.to_global(target_local), Vector3.UP)
+			# Aim offset based on the FIXTURE'S OWN physical depth (scaled_size.z), not the
+			# generic light_range — light_range floors at 3.6m for any small item, which sent
+			# a tiny sconce's spotlight far into/through the wall instead of gently outward
+			# from the fixture, making the light land far from the visible bulb/shade
+			# ("light below the asset" instead of at it). See image_glb_creation.gd.
+			var wall_aim_depth = max(0.3, scaled_size.z * 2.0)
+			target_local = emitter_local + Vector3(0, -0.15, -wall_aim_depth)
+		# Tree-safe aim (see image): orient the spot's -Z toward the target in the root frame.
+		var target_pos = node.transform * target_local
+		var aim_dir = target_pos - spot.position
+		if aim_dir.length() > 0.001:
+			spot.basis = Basis.looking_at(aim_dir, Vector3.UP)
 	else:
 		var omni = OmniLight3D.new()
 		omni.name = "FixtureLight_" + str(item.get("id", item.get("name", "Light")))
-		omni.global_position = world_pos
+		omni.position = world_pos
 		omni.light_color = light_color
 		omni.light_energy = light_energy
 		omni.light_specular = 0.25
@@ -3924,87 +4110,87 @@ func _load_layer_items(items, layer_altitude, layer_id = "root"):
 # Automatically detects glass materials and default unnamed materials that resemble glass
 # and configures them with alpha transparency so that sunlight can pass through them.
 # Opaque parts of the window (like frames and mullions) remain opaque to cast shadows.
-func _fix_glass_materials_for_shadows(node: Node) -> void:
-	if not node:
-		return
-	if node is MeshInstance3D:
-		var mesh_inst := node as MeshInstance3D
-		if mesh_inst.mesh != null:
-			var surface_count := mesh_inst.get_surface_override_material_count()
-			if surface_count == 0:
-				surface_count = mesh_inst.mesh.get_surface_count()
+# func _fix_glass_materials_for_shadows(node: Node) -> void:
+# 	if not node:
+# 		return
+# 	if node is MeshInstance3D:
+# 		var mesh_inst := node as MeshInstance3D
+# 		if mesh_inst.mesh != null:
+# 			var surface_count := mesh_inst.get_surface_override_material_count()
+# 			if surface_count == 0:
+# 				surface_count = mesh_inst.mesh.get_surface_count()
 				
-			# Step 1: Detect if this mesh contains any transparent or glass surfaces
-			var mesh_has_glass = false
-			var surfaces_info = []
+# 			# Step 1: Detect if this mesh contains any transparent or glass surfaces
+# 			var mesh_has_glass = false
+# 			var surfaces_info = []
 			
-			for s in range(surface_count):
-				var mat = mesh_inst.get_surface_override_material(s)
-				if mat == null:
-					mat = mesh_inst.mesh.surface_get_material(s)
-				if mat == null:
-					surfaces_info.append({"mat": null, "is_glass": false})
-					continue
+# 			for s in range(surface_count):
+# 				var mat = mesh_inst.get_surface_override_material(s)
+# 				if mat == null:
+# 					mat = mesh_inst.mesh.surface_get_material(s)
+# 				if mat == null:
+# 					surfaces_info.append({"mat": null, "is_glass": false})
+# 					continue
 					
-				var is_glass = false
-				if mat is StandardMaterial3D:
-					var std_mat := mat as StandardMaterial3D
-					var mat_name := std_mat.resource_name.to_lower()
+# 				var is_glass = false
+# 				if mat is StandardMaterial3D:
+# 					var std_mat := mat as StandardMaterial3D
+# 					var mat_name := std_mat.resource_name.to_lower()
 					
-					# Case A: Name-based check
-					for keyword in ["glass", "glaz", "pane", "transp", "glazing", "window_fill"]:
-						if keyword in mat_name:
-							is_glass = true
-							break
+# 					# Case A: Name-based check
+# 					for keyword in ["glass", "glaz", "pane", "transp", "glazing", "window_fill"]:
+# 						if keyword in mat_name:
+# 							is_glass = true
+# 							break
 							
-					# Case B: Already transparent in GLB
-					if not is_glass:
-						if std_mat.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
-							is_glass = true
-						elif std_mat.albedo_color.a < 0.95:
-							is_glass = true
+# 					# Case B: Already transparent in GLB
+# 					if not is_glass:
+# 						if std_mat.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
+# 							is_glass = true
+# 						elif std_mat.albedo_color.a < 0.95:
+# 							is_glass = true
 							
-					# Case C: Generic material with high gloss
-					if not is_glass:
-						if mat_name.begins_with("material") and std_mat.roughness < 0.2:
-							is_glass = true
+# 					# Case C: Generic material with high gloss
+# 					if not is_glass:
+# 						if mat_name.begins_with("material") and std_mat.roughness < 0.2:
+# 							is_glass = true
 							
-				surfaces_info.append({"mat": mat, "is_glass": is_glass})
-				if is_glass:
-					mesh_has_glass = true
+# 				surfaces_info.append({"mat": mat, "is_glass": is_glass})
+# 				if is_glass:
+# 					mesh_has_glass = true
 			
-			# Step 2: Fix materials. If the mesh contains glass, we also treat any default
-			# "material.xxx" surface in it as a glass pane.
-			for s in range(surface_count):
-				var info = surfaces_info[s]
-				var mat = info["mat"]
-				if mat == null:
-					continue
+# 			# Step 2: Fix materials. If the mesh contains glass, we also treat any default
+# 			# "material.xxx" surface in it as a glass pane.
+# 			for s in range(surface_count):
+# 				var info = surfaces_info[s]
+# 				var mat = info["mat"]
+# 				if mat == null:
+# 					continue
 					
-				var should_be_glass = info["is_glass"]
-				if not should_be_glass and mesh_has_glass:
-					if mat is StandardMaterial3D:
-						var std_mat := mat as StandardMaterial3D
-						var mat_name := std_mat.resource_name.to_lower()
-						if mat_name.begins_with("material"):
-							should_be_glass = true
-							print("  [SmartGlass] Coerced default material '", mat_name, "' in glass-bearing mesh '", mesh_inst.name, "' to glass transparency.")
+# 				var should_be_glass = info["is_glass"]
+# 				if not should_be_glass and mesh_has_glass:
+# 					if mat is StandardMaterial3D:
+# 						var std_mat := mat as StandardMaterial3D
+# 						var mat_name := std_mat.resource_name.to_lower()
+# 						if mat_name.begins_with("material"):
+# 							should_be_glass = true
+# 							print("  [SmartGlass] Coerced default material '", mat_name, "' in glass-bearing mesh '", mesh_inst.name, "' to glass transparency.")
 				
-				if should_be_glass and mat is StandardMaterial3D:
-					var std_mat := mat as StandardMaterial3D
-					var mat_name := std_mat.resource_name.to_lower()
-					var new_mat = std_mat.duplicate() as StandardMaterial3D
-					new_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-					if new_mat.albedo_color.a > 0.9:
-						new_mat.albedo_color.a = 0.35
-					new_mat.roughness = min(new_mat.roughness, 0.05)
-					new_mat.metallic_specular = 1.0
+# 				if should_be_glass and mat is StandardMaterial3D:
+# 					var std_mat := mat as StandardMaterial3D
+# 					var mat_name := std_mat.resource_name.to_lower()
+# 					var new_mat = std_mat.duplicate() as StandardMaterial3D
+# 					new_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+# 					if new_mat.albedo_color.a > 0.9:
+# 						new_mat.albedo_color.a = 0.35
+# 					new_mat.roughness = min(new_mat.roughness, 0.05)
+# 					new_mat.metallic_specular = 1.0
 					
-					mesh_inst.set_surface_override_material(s, new_mat)
-					print("  [SmartGlass] Fixed transparency for material '", mat_name, "' on mesh '", mesh_inst.name, "'")
+# 					mesh_inst.set_surface_override_material(s, new_mat)
+# 					print("  [SmartGlass] Fixed transparency for material '", mat_name, "' on mesh '", mesh_inst.name, "'")
 
-	for child in node.get_children():
-		_fix_glass_materials_for_shadows(child)
+# 	for child in node.get_children():
+# 		_fix_glass_materials_for_shadows(child)
 
 func _disable_shadow_casting_recursive(node: Node) -> void:
 	if node is MeshInstance3D:
@@ -4492,7 +4678,9 @@ func _sanitize_glb_lights(node: Node) -> void:
 			node.shadow_enabled = false
 			node.light_energy = min(node.light_energy, 0.3)
 	
-	if day_render and node is MeshInstance3D:
+	# Day-render emission stripping DISABLED so light-fixture assets can glow faintly
+	# during day renders (day-glow rule). Body kept for reference; never executes.
+	if false and day_render and node is MeshInstance3D:
 		if node.material_override:
 			if not node.material_override.is_local_to_scene():
 				node.material_override = node.material_override.duplicate()
@@ -4523,9 +4711,47 @@ func _create_window_portal_lights() -> void:
 
 	# Window portal SpotLights simulate diffuse sky light entering through windows.
 	# Synced with image_glb_creation.gd portal light logic.
-	print("[VideoGLB] Creating window portal lights (sky diffuse) for ", _window_sunlight_data.size(), " windows.")
-	for i in range(_window_sunlight_data.size()):
-		var win = _window_sunlight_data[i]
+	# ── Active-room gating ────────────────────────────────────────────────────
+	# A portal is an artificial interior fill, not real light transport — the path
+	# tracer already carries sky light through the opening geometry itself. So a
+	# portal is only justified for an opening that fills a room the camera actually
+	# visits. Each opening is tested at the exact position its light would occupy.
+	# Unlike the image builder this tests the WHOLE camera path, so every room in the
+	# flythrough keeps its portals. Empty polygon list = gating disabled.
+	var active_polys := _resolve_active_area_polygons()
+	var kept_windows: Array = []
+	var kept_doors: Array = []
+	for win_data in _window_sunlight_data:
+		var w_center = win_data["center"] as Vector3
+		var w_inner = win_data["inner_dir"] as Vector3
+		if _light_pos_serves_active_room(w_center + w_inner * 0.5, active_polys):
+			kept_windows.append(win_data)
+		else:
+			print("  [PortalSpot] SKIPPED window at ", w_center, " — serves a room the camera never enters.")
+	for door_data in _door_hole_data:
+		var d_center = door_data["center"] as Vector3
+		var d_inner = door_data["inner_dir"] as Vector3
+		if _light_pos_serves_active_room(d_center + d_inner * 0.4, active_polys):
+			kept_doors.append(door_data)
+		else:
+			print("  [DoorFill] SKIPPED ", door_data.get("hole_type", "opening"), " at ", d_center, " — serves a room the camera never enters.")
+
+	# ── Opening-count normalization ───────────────────────────────────────────
+	# Kept in sync with image_glb_creation.gd. N portals flooding one room add
+	# energy linearly, so a plan that survives culling with 4 windows instead of 1
+	# receives 4x the sky fill. Same sqrt(N) treatment the ceiling fixtures use:
+	#   N=1 → 1.00 (no change)  |  N=4 → 0.50  |  N=16+ → 0.25
+	# Counts are the KEPT openings: gating first and normalizing second lets the
+	# survivors return toward their calibrated level instead of double-dimming.
+	var window_norm := sqrt(float(clamp(kept_windows.size(), 1, 16)))
+	var door_norm := sqrt(float(clamp(kept_doors.size(), 1, 16)))
+
+	print("[VideoGLB] Creating window portal lights (sky diffuse): kept ",
+		kept_windows.size(), "/", _window_sunlight_data.size(), " windows, ",
+		kept_doors.size(), "/", _door_hole_data.size(), " door openings. Normalization: window /",
+		snappedf(window_norm, 0.01), " door /", snappedf(door_norm, 0.01))
+	for i in range(kept_windows.size()):
+		var win = kept_windows[i]
 		var win_center = win["center"] as Vector3
 		var inner_dir = win["inner_dir"] as Vector3
 
@@ -4539,14 +4765,25 @@ func _create_window_portal_lights() -> void:
 		portal_spot.position = portal_pos
 
 		# Windows get slightly higher energy than doors (direct sky view)
-		portal_spot.light_energy = 0.4
+		portal_spot.light_energy = 0.5 / window_norm
 		portal_spot.light_color = Color(1.0, 0.835, 0.50) # 10AM warm golden sky
 
 		# 89 degree cone: near-hemispherical so every corner falls inside it
 		portal_spot.spot_angle = 89.0
-		# 0.1 attenuation: nearly flat brightness across the whole cone
+		# ── Angular falloff ──────────────────────────────────────────────────
+		# CAREFUL, this parameter is INVERTED before it reaches the shader:
+		#   light_storage.cpp -> inv_spot_attenuation = 1.0 / spot_angle_attenuation
+		#   shader            -> atten = 1.0 - pow(spot_rim, inv_spot_attenuation)
+		# where spot_rim is 0 on the cone axis and 1 at its edge. So a SMALL value
+		# here is a LARGE exponent, i.e. a flatter cone — the opposite of what the
+		# name suggests. Measured brightness at 0.1/0.25/0.5/0.75/0.9 of the way to
+		# the rim:
+		#   0.1 -> 1.00 1.00 1.00 0.94 0.65   (a flood: no gradient, kills contrast)
+		#   1.0 -> 0.90 0.75 0.50 0.25 0.10   (linear falloff from axis to rim)
+		# Do not lower this back toward 0 expecting a softer light — that makes it
+		# flatter and brighter.
 		portal_spot.spot_angle_attenuation = 0.1
-		portal_spot.spot_range = 20.0
+		portal_spot.spot_range = _active_room_light_range(portal_pos, active_polys)
 		portal_spot.spot_attenuation = 0.3
 		portal_spot.light_specular = 0.0
 		portal_spot.shadow_enabled = true
@@ -4554,12 +4791,13 @@ func _create_window_portal_lights() -> void:
 		add_child(portal_spot)
 		# Aim 5 m deep so the cone is centered on the room interior
 		portal_spot.look_at(win_center + inner_dir * 5.0, Vector3.UP)
-		print("  [PortalSpot] Window ", i, " sky fill spot at ", portal_pos)
+		print("  [PortalSpot] Window ", i, " sky fill spot at ", portal_pos,
+			" energy=", snappedf(portal_spot.light_energy, 0.001))
 
 	# -- Subtle SpotLights for non-window holes (doors, openings) --
 	# Doors allow some light bleed into the room but should not dominate.
-	for j in range(_door_hole_data.size()):
-		var dh = _door_hole_data[j]
+	for j in range(kept_doors.size()):
+		var dh = kept_doors[j]
 		var dh_center = dh["center"] as Vector3
 		var dh_inner = dh["inner_dir"] as Vector3
 		# Place just inside the opening so it doesn't light the door frame itself
@@ -4573,16 +4811,18 @@ func _create_window_portal_lights() -> void:
 
 		# Low energy — doors let in less light than windows (no direct sky view)
 		if dh_is_glass_door:
-			dh_spot.light_energy = 0.4
+			dh_spot.light_energy = 0.5 / door_norm
 		else:
-			dh_spot.light_energy = 0.2
+			dh_spot.light_energy = 0.2 / door_norm
 
 		dh_spot.light_color = Color(1.0, 0.835, 0.50) # warm golden
 
 		# Moderate cone — wide enough to spread into the room but not hemispherical
 		dh_spot.spot_angle = 89.0
+		# Same inverted-parameter falloff as the window portals above (1.0 = linear
+		# axis-to-rim gradient, 0.1 = flat flood). See the portal comment.
 		dh_spot.spot_angle_attenuation = 0.1
-		dh_spot.spot_range = 20.0
+		dh_spot.spot_range = _active_room_light_range(dh_pos, active_polys)
 		dh_spot.spot_attenuation = 0.2
 		dh_spot.light_specular = 0.0
 
@@ -4592,7 +4832,135 @@ func _create_window_portal_lights() -> void:
 		# Aim 3 m into the room from the door opening
 		var dh_target = dh_center + dh_inner * 3.0
 		dh_spot.look_at(dh_target, Vector3.UP)
-		print("  [DoorFill] ", dh["hole_type"], " fill spot at ", dh_pos, " | glass_door=", dh_is_glass_door, " shadow=", dh_is_glass_door)
+		print("  [DoorFill] ", dh["hole_type"], " fill spot at ", dh_pos, " energy=", snappedf(dh_spot.light_energy, 0.001),
+			" | glass_door=", dh_is_glass_door, " shadow=", dh_is_glass_door)
+
+
+# Every camera position along the flythrough, in world metres.
+#
+# WHY THE WHOLE PATH, not just one pose: the image builder resolves ONE camera and
+# gates portals to the single room it stands in. A video camera flies THROUGH rooms,
+# and the scene (portals included) is built once on frame 1 and reused for every
+# frame afterwards. Gating on _extract_camera_pose alone would therefore keep only
+# the portals of whichever room keyframe 0 happens to start in and leave every other
+# room the camera visits unlit for the entire clip.
+#
+# _camera_cm_to_m is only a cm->m scale; unlike the image builder's camera path this
+# one never applies the plan rotation, so it is applied here to put the samples in
+# the same frame as the area polygons.
+func _collect_camera_path_samples(data: Dictionary) -> Array:
+	var samples: Array = []
+	if typeof(data) == TYPE_DICTIONARY and data.has("video_animation") and data["video_animation"] != null:
+		var anim = data["video_animation"]
+		if typeof(anim) == TYPE_DICTIONARY:
+			var keyframes = anim.get("keyframes", [])
+			if typeof(keyframes) == TYPE_ARRAY:
+				for kf in keyframes:
+					if typeof(kf) != TYPE_DICTIONARY:
+						continue
+					var tjs = kf.get("threejs_camera_data", null)
+					if typeof(tjs) != TYPE_DICTIONARY or not tjs.has("position"):
+						continue
+					var p = tjs["position"]
+					if typeof(p) != TYPE_DICTIONARY:
+						continue
+					var world_p = _camera_cm_to_m(Vector3(
+						float(p.get("x", 0)), float(p.get("y", 0)), float(p.get("z", 0))))
+					samples.append(_transform_plan_point_meters(world_p))
+
+	# No keyframes (single-shot video payload): fall back to the resolved pose.
+	if samples.is_empty():
+		var pose = _frozen_camera_pose if _frozen_camera_pose != null else _extract_camera_pose(data)
+		if typeof(pose) == TYPE_DICTIONARY and pose.has("position"):
+			samples.append(pose["position"])
+
+	print("[PortalGate] Camera path samples: ", samples.size())
+	return samples
+
+# Polygons (world XZ, metres) of every area the camera path passes through.
+# The image builder's single-room version is the degenerate case of this with one
+# sample. Returns [] when the path is inside no area at all (facade / exterior
+# flythrough), which callers read as "cannot resolve, do not gate".
+func _resolve_active_area_polygons() -> Array:
+	var work = _floor_plan_root_data
+	if typeof(work) != TYPE_DICTIONARY or work.is_empty() or _camera_path_samples.is_empty():
+		return []
+
+	if work.has("layers") and typeof(work["layers"]) == TYPE_DICTIONARY:
+		var selected = str(work.get("selectedLayer", ""))
+		var layers = work["layers"]
+		if selected != "" and layers.has(selected):
+			work = layers[selected]
+		elif layers.size() > 0:
+			work = layers[layers.keys()[0]]
+
+	if typeof(work) != TYPE_DICTIONARY or not work.has("areas") or not work.has("vertices"):
+		return []
+	var areas = work["areas"]
+	var vertices = work["vertices"]
+	if typeof(areas) != TYPE_DICTIONARY or typeof(vertices) != TYPE_DICTIONARY:
+		return []
+
+	var out: Array = []
+	for aid in areas:
+		var area = areas[aid]
+		if typeof(area) != TYPE_DICTIONARY or not area.has("vertices"):
+			continue
+		var poly: Array = []
+		for vid in area["vertices"]:
+			var key = str(vid)
+			if vertices.has(key):
+				var v = vertices[key]
+				poly.append(_plan_point_2d(float(v.get("x", 0.0)), float(v.get("y", 0.0))) * _scene_unit_scale)
+		if poly.size() < 3:
+			continue
+		for s in _camera_path_samples:
+			if _is_point_in_polygon(Vector2(s.x, s.z), poly):
+				out.append(poly)
+				print("[PortalGate] Camera path enters area '", str(area.get("name", aid)), "' (", aid, ")")
+				break
+
+	if out.is_empty():
+		print("[PortalGate] Camera path is inside no area — portal gating disabled.")
+	return out
+
+# True when a fill light placed here would light one of the rooms the camera visits.
+# No resolvable rooms means keep every light, so exterior flythroughs are unaffected.
+func _light_pos_serves_active_room(light_pos: Vector3, active_polys: Array) -> bool:
+	if active_polys.is_empty():
+		return true
+	var p = Vector2(light_pos.x, light_pos.z)
+	for poly in active_polys:
+		if _is_point_in_polygon(p, poly):
+			return true
+	return false
+
+# Portal reach: the diagonal of the room this particular light sits in, plus padding,
+# so a portal cannot spill far past the room it serves. Per-light rather than
+# scene-wide, because a flythrough legitimately serves rooms of different sizes.
+# The previous flat 20 m stays the ceiling and 6 m the floor.
+func _active_room_light_range(light_pos: Vector3, active_polys: Array) -> float:
+	if active_polys.is_empty():
+		return 20.0
+	var p = Vector2(light_pos.x, light_pos.z)
+	var chosen: Array = []
+	for poly in active_polys:
+		if _is_point_in_polygon(p, poly):
+			chosen = poly
+			break
+	if chosen.is_empty():
+		return 20.0
+	var min_x = 1e20
+	var max_x = -1e20
+	var min_z = 1e20
+	var max_z = -1e20
+	for q in chosen:
+		min_x = min(min_x, q.x)
+		max_x = max(max_x, q.x)
+		min_z = min(min_z, q.y)
+		max_z = max(max_z, q.y)
+	var diag = Vector2(max_x - min_x, max_z - min_z).length()
+	return clamp(diag * 1.25 + 1.0, 6.0, 20.0)
 
 
 func _has_fixture_lights(geom_data: Dictionary) -> bool:
@@ -4632,9 +5000,14 @@ func _has_authored_lights(geom_data: Dictionary) -> bool:
 	_collect_custom_lights_from_source(geom_data, custom_lights)
 	return not custom_lights.is_empty()
 
+var _ies_profiles: Dictionary = {}
+
 func _build_custom_lights(geom_data: Dictionary) -> void:
 	var custom_lights: Dictionary = {}
 	_collect_custom_lights_from_source(geom_data, custom_lights)
+	# Profile table for lights that carry only an id (Python normally stamps the
+	# resolved path onto the light as "iesFile"; this is the fallback path).
+	_ies_profiles = geom_data.get("iesProfiles", {}) if typeof(geom_data.get("iesProfiles")) == TYPE_DICTIONARY else {}
 	
 	if custom_lights.is_empty():
 		return
@@ -4647,9 +5020,24 @@ func _build_custom_lights(geom_data: Dictionary) -> void:
 			
 		var light: Light3D
 		var ltype = str(light_data.get("lightKind", light_data.get("lightType", "point"))).to_lower()
-		if ltype == "spot":
+		# An IES profile already encodes the beam shape, so the fixture is built as an
+		# omni and the photometry does all the shaping. A SpotLight3D would fight it:
+		# the PT shader early-outs on the spot cone BEFORE the IES lookup, and
+		# spot_angle caps at 90 deg, so any profile with output past 90 deg (an uplight,
+		# or a double-emitting fixture) would have that lobe clipped away entirely.
+		var ies_path := _ies_path_for_light(light_data)
+		if ies_path != "":
+			light = OmniLight3D.new()
+			light.omni_range = 15.0
+		elif ltype == "spot":
 			light = SpotLight3D.new()
 			light.spot_angle = float(light_data.get("coneAngle", 45.0))
+			light.spot_range = 15.0
+		elif ltype == "rect" or ltype == "area" or ltype == "area_rect":
+			light = SpotLight3D.new()
+			light.spot_angle = 180.0 # special flag for rect light
+			light.light_size = float(light_data.get("width", 1.0)) * 0.5 * _scene_unit_scale # mapped to half-width in meters
+			light.spot_angle_attenuation = float(light_data.get("height", 1.0)) * 0.5 * _scene_unit_scale # mapped to half-height in meters
 			light.spot_range = 15.0
 		else:
 			light = OmniLight3D.new()
@@ -4659,8 +5047,13 @@ func _build_custom_lights(geom_data: Dictionary) -> void:
 		# Crucial: mark as authored so video_render.gd doesn't overwrite its color with the global fill tint
 		light.set_meta("authored_custom_light", true)
 		
-		var color_hex = light_data.get("color", "#ffffff")
-		var base_color = Color(color_hex)
+		# Prefer colorTemp (Kelvin) when the fixture carries one; fall back to hex.
+		var base_color: Color
+		var color_temp_k = float(light_data.get("colorTemp", 0))
+		if color_temp_k > 0.0:
+			base_color = _kelvin_to_rgb(color_temp_k)
+		else:
+			base_color = Color(light_data.get("color", "#ffffff"))
 		var energy_mult = 1.0
 		if light_data.has("intensityMultiplier"):
 			energy_mult = float(light_data["intensityMultiplier"])
@@ -4673,10 +5066,25 @@ func _build_custom_lights(geom_data: Dictionary) -> void:
 		if not day_render:
 			base_e = 15.0
 			
-		if ltype == "spot":
+		# The x4 is a SpotLight3D-vs-OmniLight3D falloff compensation. An IES fixture is
+		# built as an omni and its profile already carries absolute candela, so applying
+		# the spot compensation there would overdrive it by 4x.
+		if ltype == "spot" and ies_path == "":
 			base_e *= 4.0 # Boost spot lights so their apparent intensity matches omni lights
 			
 		light.light_energy = energy_mult * base_e * _lighting_illumination_scale
+
+		if ies_path != "":
+			# IES fixtures need their own energy scale. ies_lookup returns absolute
+			# candela converted to watts (x 4PI/177.83 = 0.0707, matching Cycles), so the
+			# profile itself already carries a physically large per-watt value. The
+			# base_e of 5-20 is tuned for the rasterizer's isotropic lights and blows
+			# the fixture out when stacked on top of that. These constants are the
+			# values validated on the engine side - do not re-tune them against base_e.
+			light.light_energy = energy_mult * _lighting_illumination_scale * 0.3
+			# ies_strength multiplies the profile's own candela, so per-fixture dimming
+			# from intensityMultiplier applies on top of the photometry.
+			light.ies_strength = clamp(energy_mult, 0.01, 1000000.0)
 		
 		if bool(light_data.get("castShadow", false)):
 			light.shadow_enabled = true
@@ -4699,12 +5107,20 @@ func _build_custom_lights(geom_data: Dictionary) -> void:
 		
 		light.position = world_pos
 		
-		if ltype == "spot":
+		if ies_path != "":
+			# Omni + IES: the engine rotates the profile by -90 deg X itself so vertical
+			# angle 0 (nadir) lands on world -Y. Applying the -PI/2 here as well would
+			# double it and flip the fixture upside down.
+			light.rotation.y = float(light_data.get("rotationY", 0.0))
+			light.rotation.x = deg_to_rad(float(light_data.get("tiltAngle", 0.0)))
+		elif ltype == "spot" or ltype == "rect" or ltype == "area" or ltype == "area_rect":
 			var rot_y = float(light_data.get("rotationY", 0.0))
 			var tilt = float(light_data.get("tiltAngle", 0.0))
 			light.rotation.y = rot_y
-			light.rotation.x = - deg_to_rad(tilt) if tilt != 0.0 else -PI / 2
-			
+			light.rotation.x = deg_to_rad(tilt) - PI / 2
+
+		_apply_ies_profile(light, light_data, ies_path)
+
 		add_child(light)
 
 func _collect_custom_lights_from_source(source: Dictionary, out_lights: Dictionary) -> void:
@@ -5207,3 +5623,90 @@ func _paving_chevron(bmin: Vector2, bmax: Vector2, tw: float, th: float) -> Arra
 		row += 1
 		y += h
 	return tiles
+
+# Resolve the .ies file for a scene light and hand it to the engine.
+#
+# Python (_localize_ies_profiles in main.py) downloads the profile and stamps the
+# absolute path onto the light as "iesFile". The id lookup below is a fallback for
+# payloads that were not put through that step.
+func _resolve_ies_filepath(light_data: Dictionary) -> String:
+	var direct = str(light_data.get("iesFile", "")).strip_edges()
+	if direct != "":
+		return direct
+
+	if typeof(_ies_profiles) != TYPE_DICTIONARY or _ies_profiles.is_empty():
+		return ""
+
+	var pid := ""
+	for key in ["iesProfileId", "iesId"]:
+		if light_data.has(key):
+			var raw = str(light_data[key]).strip_edges()
+			if raw != "":
+				pid = raw
+				break
+	if pid == "":
+		return ""
+
+	var profile = _ies_profiles.get(pid)
+	if typeof(profile) != TYPE_DICTIONARY:
+		return ""
+	return str(profile.get("local_path", "")).strip_edges()
+
+
+# Returns the usable .ies path for a light, or "" when it is not an IES fixture
+# or the profile could not be resolved. Checked before the light node is created
+# because an IES fixture is built as an omni rather than a spot.
+func _ies_path_for_light(light_data: Dictionary) -> String:
+	if str(light_data.get("photometricType", "")).strip_edges().to_lower() != "ies":
+		return ""
+	var path := _resolve_ies_filepath(light_data)
+	if path == "" or not FileAccess.file_exists(path):
+		return ""
+	return path
+
+
+func _apply_ies_profile(light: Light3D, light_data: Dictionary, path: String) -> void:
+	var label = str(light_data.get("name", light_data.get("id", "?")))
+	if path == "":
+		if str(light_data.get("photometricType", "")).strip_edges().to_lower() == "ies":
+			var unresolved := _resolve_ies_filepath(light_data)
+			if unresolved == "":
+				print("[IES] '%s': photometricType=ies but no profile file resolved - using plain %s falloff" % [label, light_data.get("lightKind", "point")])
+			else:
+				print("[IES] '%s': profile file missing on disk: %s" % [label, unresolved])
+		return
+
+	# EXTERNAL reads the file from an absolute OS path; set the mode first so the
+	# filepath setter pushes it straight to the rendering server.
+	light.ies_mode = Light3D.IES_MODE_EXTERNAL
+	light.ies_filepath = path
+	print("[IES] '%s': applied %s | energy=%s ies_strength=%s (omni - profile defines the beam)" % [label, path.get_file(), snappedf(light.light_energy, 0.001), light.ies_strength])
+
+
+func _kelvin_to_rgb(kelvin: float) -> Color:
+	var temp = kelvin / 100.0
+	var r: float
+	var g: float
+	var b: float
+
+	if temp <= 66:
+		r = 255
+		g = temp
+		g = 99.4708025861 * log(g) - 161.1195681661
+		if temp <= 19:
+			b = 0
+		else:
+			b = temp - 10
+			b = 138.5177312231 * log(b) - 305.0447927307
+	else:
+		r = temp - 60
+		r = 329.698727446 * pow(r, -0.1332047592)
+		g = temp - 60
+		g = 288.1221695283 * pow(g, -0.0755148492)
+		b = 255
+
+	return Color(
+		clamp(r / 255.0, 0.0, 1.0),
+		clamp(g / 255.0, 0.0, 1.0),
+		clamp(b / 255.0, 0.0, 1.0)
+	)

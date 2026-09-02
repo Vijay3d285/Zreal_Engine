@@ -1,9 +1,11 @@
 extends RefCounted
 
 var main_script: Object
+var custom_shape_gen: Object
 
 func _init(p_main_script: Object):
 	main_script = p_main_script
+	custom_shape_gen = preload("res://custom_shape.gd").new(main_script)
 
 func _resolve_structure_material(structure: Dictionary, structure_type: String) -> Dictionary:
 	var mats = {}
@@ -43,6 +45,27 @@ func _resolve_structure_material(structure: Dictionary, structure_type: String) 
 			return mat
 
 	return {"color": Color(0.78, 0.78, 0.78), "is_structure": true}
+
+func _add_custom_shape_structure(parent: Node3D, structure: Dictionary, scale_factor: float) -> void:
+	var props = {}
+	if structure.has("properties") and typeof(structure["properties"]) == TYPE_DICTIONARY:
+		props = structure["properties"]
+
+	var shapes_json_str = ""
+	if structure.has("shapesJson"):
+		shapes_json_str = str(structure["shapesJson"])
+	elif props.has("shapesJson"):
+		shapes_json_str = str(props["shapesJson"])
+	elif props.has("customShapeData"):
+		shapes_json_str = str(props["customShapeData"])
+	elif props.has("custom_shape_data"):
+		shapes_json_str = str(props["custom_shape_data"])
+
+	if shapes_json_str != "" and shapes_json_str != "null":
+		var tw = float(props.get("width", {}).get("length", -1.0)) * scale_factor if props.has("width") else -1.0
+		var th = float(props.get("height", {}).get("length", -1.0)) * scale_factor if props.has("height") else -1.0
+		var td = float(props.get("depth", {}).get("length", -1.0)) * scale_factor if props.has("depth") else -1.0
+		custom_shape_gen.generate_shapes(parent, shapes_json_str, scale_factor, Vector3(tw, th, td))
 
 func _add_sunshade_structure(parent: Node3D, structure: Dictionary, width: float, depth: float, height: float, mat_data: Dictionary, render_mode: String = "INTERIOR") -> void:
 	var w = max(width, 0.05)

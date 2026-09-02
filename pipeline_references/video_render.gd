@@ -742,6 +742,21 @@ func setup_fixed_fill_lights():
 	var placed = 0
 	var lighting_scale = _resolve_illumination_scale(_render_data)
 	var mood_fill_color = _get_color_mood_light_color("fill")
+
+	# ── Automation colour-aware fill boost ──────────────────────────────────
+	# The fills built here are video-only — image_glb_creation.gd has no
+	# equivalent of this grid/ceiling/corner system. But the image path DOES
+	# scale its own fills by _automationAmbientBoost, so without this the video
+	# fills would be the one light group in the pipeline that ignores the
+	# automation pass, and a boosted scene would come out darker as video than
+	# as a still. Same key and same clamp as both *_glb_creation.gd builders.
+	# _render_data is the root input JSON, which is where the pass writes.
+	var _auto_ambient_boost: float = 1.0
+	if typeof(_render_data) == TYPE_DICTIONARY and _render_data.has("_automationAmbientBoost"):
+		_auto_ambient_boost = clampf(float(_render_data["_automationAmbientBoost"]), 0.5, 2.5)
+		if _auto_ambient_boost != 1.0:
+			_log_console("[AUTO-LIGHTING] Fill lights scaled by ambientBoost=%.2f" % _auto_ambient_boost)
+
 	var energy_multiplier = 1.0
 	var fixture_count = get_tree().get_nodes_in_group("fixture_lights").size()
 	if day_render:
@@ -757,6 +772,12 @@ func setup_fixed_fill_lights():
 	elif not _has_authored_lights_cache:
 		energy_multiplier = 1.75
 		_log_console("[VideoRender] No authored lights detected. Boosting automated room fill lights (1.75x).")
+
+	# Fold the automation boost into the fill multiplier. Applied here rather
+	# than at each light so the grid, floor and room fills all pick it up from
+	# one place; ceil_energy_base is the one exception and applies it directly,
+	# because it does not read energy_multiplier.
+	energy_multiplier *= _auto_ambient_boost
 
 	# ── 1. Try floor-plan area data (preferred — one light per room) ──
 	var areas = _get_floor_plan_areas()
@@ -940,7 +961,9 @@ func setup_fixed_fill_lights():
 				var ceil_fill_y = clamp(ceil_h * 0.55, 1.2, ceil_h - 0.6)
 				ceil_fill.position = Vector3(cx, ceil_fill_y, cz)
 				# Moderate energy — SSIL carries most ceiling bounce; this ensures base luminance.
-				var ceil_energy_base = clamp(energy * 1.26 * lighting_scale, 0.72, 2.16)
+				# Automation boost applied inside the clamp so it can lift a dark
+				# room without pushing the ceiling fill past its tuned ceiling.
+				var ceil_energy_base = clamp(energy * 1.26 * lighting_scale * _auto_ambient_boost, 0.72, 2.16)
 				ceil_fill.light_energy = ceil_energy_base
 				ceil_fill.omni_range = clamp(omni_range * 1.8 + 3.0, 12.0, 26.0)
 				ceil_fill.omni_attenuation = 1.5 # Gentler falloff for softer spread

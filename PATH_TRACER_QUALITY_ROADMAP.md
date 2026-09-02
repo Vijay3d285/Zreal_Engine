@@ -3547,3 +3547,110 @@ What remains under the E2 heading:
   measurement, and orthogonal to every layer E2 added.
 - **The coat's 0.705pp grazing-incidence loss** (§7.11.9 item 2) — open against
   E2d, invisible to `pt_coat_gate` by construction.
+
+### 7.12 E2 render-time regression — measured, and mostly NOT where it looked
+
+Reported symptom: production job `urbantestdark168` (HEAD `3baa902b4`) took
+1050.8s against `urbantestdark167`'s 762.6s (`28bb89cad`) on what the operator
+correctly identified as a visually indistinguishable render.
+
+**The comparison is clean.** The two Godot logs are identical except three
+lines — engine version and the input/output paths. Same 144 assets (141 unique
+names, zero difference either way), same `[PT] spp=6, max_bounces=12`, same
+128-frame DLSS-RR drive. The uncommitted `USE_TRANSMISSIVE_GLASS` bounce change
+in `image_glb_creation.gd` was already present in *both* runs. Run 166, which
+looks like same-scene variance at 437s, is a different view (906 differing log
+lines, different plan pivot) and is not evidence about variance.
+
+#### What was measured
+
+Five renders of the same input JSON, same machine, `tests=yes` on every arm
+except P0. Startup is separated from the 128-frame loop by timestamping the
+`Driving 128 frames` log line.
+
+| Arm | Engine | startup | **loop** | total |
+|---|---|---|---|---|
+| BASE | `28bb89cad` worktree build | 79s | **639s** | 718s |
+| E2B | `fcc482b0a2` (E2b end) worktree build | 85s | **747s** | 832s |
+| P2 | HEAD, coat+sheen **and** registry arrays out | 82s | **826s** | 908s |
+| P1 | HEAD, coat+sheen compiled out | 83s | **825s** | 908s |
+| P0c | HEAD, control | 78s | **912s** | 990s |
+| P0 | HEAD, no `tests=yes`, warm cache | — | — | 993s |
+
+**Startup is 79s vs 78s — the regression is entirely in the render loop:
+639s → 912s, +273s, +42.7%.**
+
+#### Attribution
+
+| Component | Cost | How established |
+|---|---|---|
+| E2b anisotropic GGX | **108s (40%)** | E2B − BASE, both worktree builds |
+| E2d/E2e residual infrastructure | **78s (29%)** | P1 − E2B |
+| Coat + sheen lobes | **87s (32%)** | P0c − P1, clean same-flags pair |
+| E2c registry arrays | **0s** | P2 − P1 = 1s, inside noise |
+
+108 + 78 + 0 + 87 = 273s. The decomposition closes on the measured total; no
+term is a residual.
+
+**E2b's 108s is not its arithmetic.** Every material in this scene has
+`anisotropy == 0`, so `anisoActive` is already false at runtime and the
+anisotropic branches never execute. A variant forcing `anisoActive = false`
+would therefore have recovered 0s *by construction* — an experiment that cannot
+fail, and it was not run for that reason. What is left to charge the 108s to is
+the widened `BrdfData` (ax, ay, anisoPhi, anisoActive) threaded through every
+sampling and pdf signature, i.e. register pressure and the occupancy that
+follows.
+
+The 78s bucket is what P1's `#if` guards did *not* remove: the coat/sheen SSBO
+bindings, the widened material struct, and the `coatMass`/`sheenMass` setup that
+still runs before the guarded lobes.
+
+#### Three hypotheses that were wrong
+
+Recorded because each looked convincing before it was tested:
+
+1. **Cold driver shader cache.** Run 168 ran 8 minutes after a fresh build and
+   the NVIDIA GLCache took a 559 MB write two minutes into it. Refuted: P0
+   re-ran that binary warm and still took 993s. Worth at most ~58s, and P1
+   later ran cold with a *faster* startup than P0, so even that is variance.
+2. **The coat and sheen lobes dominate.** They are a third of it. A
+   specialization constant on layer presence — the fix this diagnosis first
+   pointed at — would have recovered 87s of 273s.
+3. **The registry's dynamically-indexed local arrays force scratch memory.**
+   Exactly zero. P2 is pixel-identical to P1 (rmse 0.000000), so the scalar
+   rewrite is equivalent, and it bought one second.
+
+#### The shape of the result
+
+The cost is **diffuse**: 108s / 87s / 78s across three separate mechanisms, with
+no dominant term, and 0s from the one structure (the registry) that looked most
+suspicious. Two of the three buckets — E2b's 108s and the 78s of scaffolding —
+are paid by a scene that uses none of the features they belong to, which is the
+signature of register pressure rather than executed work.
+
+Consequence for any fix: **targeting one feature underdelivers.** Compiling out
+coat and sheen bought 87s of 273s. Getting back to 639s means gating all three
+groups — anisotropy, coat, sheen — on what the scene actually contains.
+
+#### What the time bought, on this scene
+
+BASE vs HEAD: **6.03% of pixels differ**, rmse 0.1464, max 31/255, means equal
+to four decimals. The operator's "no visible difference" is accurate. The coat
+and sheen paths are reached — via glTF-imported materials, not the scene
+scripts, whose `ReflectionAssist` and `Photorealism` passes never fire in this
+job — but at an amplitude no viewer would call worth +42.7%.
+
+#### Open
+
+- **No fix is implemented.** The full 273s is attributed; the recoverable
+  target is all of it, via feature gating. The specialization-constant
+  mechanism already exists
+  (`RT_FLAGS`, `raytracing_common_inc.glsl:12`, used this way at
+  `scene_shader_raytracing.cpp:680` to compile out the NEE block).
+- **`anisoActive` gates E2b's math at all six hot sites** (`brdf_inc.glsl:1232`,
+  `:1269`, `:1374`, `:1421`, `:2913`, `:3198`), and `prepareBRDFData:1725-1748`
+  only sets it when `anisotropy != 0`. If the 186s is E2b, the cost is
+  therefore *not* the gated arithmetic — it is the widened `BrdfData` and the
+  occupancy that follows, which is a different fix.
+- `pipeline_references/` was never modified by this investigation; renders were
+  driven directly against the stage-copy project with outputs to scratch.
