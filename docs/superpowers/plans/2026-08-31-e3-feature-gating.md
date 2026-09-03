@@ -10,11 +10,30 @@
 
 ## Global Constraints
 
-- **NEVER stage, commit, revert, checkout over, or stash anything under `pipeline_references/`.** Six `.gd` files there are the user's uncommitted work, plus untracked `custom_shape.gd`. Every `git add` uses **explicit paths only** — never `-A`, never `.`.
+- **NEVER stage, commit, revert, checkout over, or stash any `pipeline_references/*.gd` file** — those are the user's own work. **The single exception, ruled by the user:** NEW files you create under `pipeline_references/tests/` may be created and staged, matching how `pt_coat_gate.gd` and `pt_sheen_gate.gd` were handled in E2d/E2e. Every `git add` uses **explicit paths only** — never `-A`, never `.`.
 - Build: `python -m SCons platform=windows target=editor tests=yes -j8`. Bare `scons` is NOT on PATH. A `.glsl` edit requires a full scons run so the `.glsl.gen.h` files regenerate.
 - Never hand-edit any `*.glsl.gen.h`.
 - C++ `RT_FLAG_*` values and their GLSL `#define` twins are hand-mirrored and must agree.
-- Enabled behaviour must be **bit-identical** to today. Every acceptance criterion is a rendered image comparison, not an assertion.
+- **ERRATUM (measured during Task 3, supersedes the original criterion).** The
+  original constraint read "Enabled behaviour must be bit-identical to today.
+  Every acceptance criterion is a rendered image comparison." **The production
+  scene cannot serve as a correctness gate.** Two consecutive runs of the SAME
+  binary differ by rmse 0.1406 / 5.58% of pixels — and removing coat+sheen
+  entirely produced rmse 0.1455. The noise floor is as large as the effect, so
+  no threshold on that scene can separate "correctly gated" from "wrongly
+  removed". Roadmap §7.12's "6.03% of pixels, therefore the scene uses coat and
+  sheen" is unsupported for the same reason.
+  Revised acceptance:
+  1. **Correctness** is proven on the E2d/E2e dedicated gate scenes
+     (`pipeline_references/tests/pt_coat_gate.gd`, `pt_sheen_gate.gd`), where
+     the features contribute far above the noise floor and measured baselines
+     already exist.
+  2. **Timing** is measured on the production scene — robust, and the reason
+     the phase exists.
+  3. **Detection** is proven by making the detector report both 0 and 1.
+  An exact `rmse=0.000000` remains meaningful POSITIVE evidence when it occurs
+  (Tasks 1 and 2 both achieved it); a nonzero result on the production scene is
+  simply inconclusive rather than a failure.
 - Commit incrementally — at minimum at each task's final step.
 
 ## Reference artefacts
@@ -533,24 +552,43 @@ Expected log: `[E3] scene feature mask: aniso=0 coat=1 sheen=1`.
 
 Compare `e3_task4.png` against the HEAD reference.
 
-**Expected: `rmse=0.000000 maxabs=0.0`.** Coat and sheen stayed on; anisotropy was
-compiled out and the scene does not use it, so the image must not move at all.
+**REVISED (measured during Task 3 — the original text here was wrong on both counts).**
+The original step expected `aniso=0 coat=1 sheen=1` and `rmse=0.000000`. Neither holds:
 
-A nonzero difference means either detection is wrong or Task 2's anisotropy gating
-was not behaviour-neutral. **Do not accept a small rmse as "close enough"** — the
-criterion is identity, and this project has previously shipped a mean-preserving
-error that every rendered gate passed.
+- The detector, proven falsifiable, reports **all three ABSENT** on this scene.
+  So the expected log is `aniso=0 coat=0 sheen=0` (which, with the Task 3
+  print-on-change diagnostic, means NO `[E3]` line is printed at all).
+- **Bit-identity is not a valid gate on this scene.** Two runs of the same binary
+  differ by rmse 0.1406 / 5.58% of pixels. Record the rmse as a diagnostic, but a
+  nonzero value here is INCONCLUSIVE, not a failure. Correctness is proven on the
+  dedicated gate scenes in Task 5.
+
+**The real check at this step is that the render SUCCEEDS AT ALL.** This is the
+first time the all-three-off shader variant reaches a real GLSL compiler — Task 2
+could only verify it at preprocessor level, because `glsl_builders.py` performs no
+GLSL validation. A semantic GLSL error surfaces here as a black image, missing
+geometry, or a crash. Check the log for shader/pipeline errors explicitly.
 
 - [ ] **Step 5: Record the loop time**
 
 Time the render; separate startup from the loop using the `Driving 128 frames` line.
 
-Expected: **loop ≈804s**, i.e. 912s − 108s, against HEAD's 912s.
+**REVISED.** The original expectation of ≈804s assumed only anisotropy would be
+compiled out. Since the detector reports all three features absent, all three are
+compiled out, so the target is the full recovery:
 
-If the loop is still ≈912s, the `#ifdef` did not remove what a hard removal
-removes — most likely the parameters were left in the signatures (Task 2 Step 1).
-Report the number either way: this is the measurement the phase exists to produce,
-and §7.12 warns that spec-constant-style folding may fall short of the P1 ceiling.
+Expected: **loop ≈639s**, matching the `28bb89cad` baseline, against HEAD's 912s.
+
+Interpret the number honestly rather than rounding toward the target:
+- ≈639s → full recovery, the phase's thesis confirmed.
+- ≈804s → only the anisotropy removal took effect; coat/sheen `#ifdef`s are not
+  reaching the compiler.
+- ≈912s → nothing took effect; most likely the parameters were left in the
+  signatures (Task 2 Step 1) or the flags are still being forced on.
+
+Report the measured loop time whatever it is. §7.12 warns that `#ifdef` removal
+may fall short of the hard-removal ceiling, and that gap is a finding, not a
+failure to hide.
 
 - [ ] **Step 6: Commit**
 
@@ -561,88 +599,102 @@ git commit -m "feat(pt): E3 two-pass build_tlas, detection drives the feature fl
 
 ---
 
-### Task 5: Acceptance, the feature-free measurement, and closeout
+### Task 5: Acceptance on the gate scenes, and closeout
 
 **Files:**
-- Create: `pipeline_references/tests/pt_e3_featurefree_scene.tscn`, `pipeline_references/tests/pt_e3_gate.gd`
 - Modify: `PATH_TRACER_QUALITY_ROADMAP.md` (new §7.13)
-- Modify: `servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp` (retire the Task 3 diagnostic)
+- Modify: `servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp` (retire the `[E3]` diagnostic)
 
 **Interfaces:**
 - Consumes: everything above.
 
-- [ ] **Step 1: Restate acceptance criterion 2**
+**READ THIS FIRST — this task was rewritten after measurement invalidated its
+original design.** The original Task 5 asked you to build a feature-free scene
+and compare production-scene pixels. Both are obsolete:
 
-Already measured in Task 4: production scene, `aniso=0 coat=1 sheen=1`, image
-bit-identical to HEAD, loop time recorded. Carry the numbers forward.
+- **The production scene IS the feature-free case.** The detector reports
+  `aniso=0 coat=0 sheen=0` on it, and Task 4 already measured the all-off path:
+  **loop 643s vs HEAD's 912s and the pre-regression baseline's 639s, zero
+  shader errors, image mean 159.3341 matching the reference exactly.**
+  Acceptance criterion 1 is therefore ALREADY SATISFIED — do not rebuild it.
+- **Pixel comparison on the production scene proves nothing.** Two runs of the
+  same binary differ by rmse 0.1406 / 5.58% of pixels, and removing coat+sheen
+  entirely produced rmse 0.1455. The floor is as large as the effect.
 
-- [ ] **Step 2: Acceptance criterion 1 — a feature-free scene**
+What is still unproven is the **opposite** case: that when a scene DOES use a
+feature, the flag turns on and the feature still renders correctly. E3 has only
+ever been measured with all three features compiled OUT.
 
-The production scene uses coat and sheen, so it **cannot** exercise the all-off
-path — the one this whole phase exists for. Build a scene that uses none.
+- [ ] **Step 1: Run the three existing feature gate scenes**
 
-Model it on `pipeline_references/tests/pt_coat_gate_scene.tscn`, with
-`clearcoat = 0`, no `sheen_color`, `anisotropy = 0`. Carry over the traps that
-have silently broken sibling gates:
+`pipeline_references/tests/` already holds `pt_anisotropy_gate.gd`,
+`pt_coat_gate.gd` and `pt_sheen_gate.gd` from E2b/E2d/E2e. Each drives a scene
+where its feature contributes far above the noise floor, and each carries its
+own assertions and measured baselines. They are the correctness instrument this
+phase needs; pixel diffing the production scene is not.
 
-```gdscript
-sky.process_mode = Sky.PROCESS_MODE_QUALITY   # REALTIME force-clamps to 256
-env.background_mode = Environment.BG_SKY      # BG_COLOR renders pure black to the PT
-mat.albedo_color = Color(A, A, A).linear_to_srgb()   # render_raytracing.cpp:1542 decodes it back
-```
+Run each one. For each, record two things:
 
-Render it on this branch and on HEAD (use the worktree — `git stash` is NOT
-available, the working tree carries the user's files).
+1. **The `[E3]` line it produces.** The anisotropy gate must report `aniso=1`,
+   the coat gate `coat=1`, the sheen gate `sheen=1`. A gate scene whose own
+   feature is NOT detected would mean E3 compiles that feature out of a scene
+   that needs it — the exact silent failure this phase risks.
+2. **Whether the gate passes its own assertions**, unchanged from before E3.
 
-Expected: images bit-identical, log reports `aniso=0 coat=0 sheen=0`, and the E3
-build is measurably faster.
+- [ ] **Step 2: Report the results honestly, including any regression**
 
-**Do not skip this because criterion 2 passed.** Criterion 2 only exercises
-`coat=1 sheen=1`.
+If a gate fails, say so with its numbers and do NOT proceed to closeout. A gate
+that passed before E3 and fails now is a real regression in the enabled path,
+and it is the only way this phase's `#ifdef` restructuring could have broken
+something that the all-off production render cannot see.
 
-- [ ] **Step 3: Acceptance criterion 3 — prove the gate can fail**
+If a gate cannot run for an unrelated pre-existing reason, say that plainly and
+distinguish it from a genuine failure.
 
-On the feature-free scene, set `clearcoat = 0.5` on one material.
+- [ ] **Step 3: Note that criterion 3 is already satisfied**
 
-Expected: the log flips to `coat=1`, **the image changes**, and the loop time rises.
+Detection was proven falsifiable during Task 3: with `mat.clearcoat`,
+`mat.sheen_color[0]` and `mat.anisotropy` temporarily forced nonzero, the
+detector printed `aniso=1 coat=1 sheen=1`; the probe was reverted. The gate
+scenes in Step 1 are a second, natural demonstration of the same thing.
 
-If the image does not change, the coat was never actually compiled out and
-criterion 1 was passing for the wrong reason.
+- [ ] **Step 4: Write §7.13 in `PATH_TRACER_QUALITY_ROADMAP.md`**
 
-- [ ] **Step 4: Regenerate the BASE comparison if needed**
+In §7.12's style. It must record:
 
-To state recovery against `28bb89cad`, the worktree at
-`C:/Users/aiadmin/Desktop/Engine_Build_test/zreal_baseline_wt` holds that commit
-(BASE loop 639s). It needs `thirdparty/oidn/lib/*.lib` and `thirdparty/streamline/`
-copied in from the main repo — both are gitignored, and without them the link
-fails with `LNK1181: cannot open input file 'OpenImageDenoise.lib'`.
+- The headline: **loop 912s → 643s against a 639s pre-regression baseline —
+  269 of 273s recovered (98.5%)**, on a scene that uses none of the three
+  features.
+- The gate-scene results from Step 1.
+- **The correction to §7.12.** That section claims "removing coat and sheen
+  changes 6.03% of pixels, therefore this scene uses them." That is wrong: the
+  render is nondeterministic at rmse 0.1406 between runs of the same binary, so
+  the 6.03% was noise. Say so plainly and mark the claim superseded, rather than
+  quietly leaving it to mislead the next reader.
+- **The nondeterminism itself**, as an open item: characterised as uniform
+  low-amplitude dither (4-8% of pixels in every grid cell, mean magnitude
+  1.04/255, mean luminance unchanged). Two candidate causes were REFUTED by
+  measurement — the free-running `frame_counter` RNG seed (instrumented; the
+  sequence is identical across runs) and float atomics (none exist in the RT
+  GLSL). Remaining candidates: DLSS-RR's own execution, and the async
+  pipeline-build race that drops instances via `is_hg_ready_in_bundle`.
+- **That `glsl_builders.py` performs no GLSL validation**, so "scons exit 0"
+  is near-zero evidence about shader correctness — a trap for the next phase.
 
-- [ ] **Step 5: Write §7.13**
+- [ ] **Step 5: Retire the `[E3]` diagnostic**
 
-In §7.12's style: the three acceptance results with their rmse figures, the loop
-times, and what fraction of the 273s was recovered. If the anisotropy gating fell
-short of the 108s, **say so with the number** rather than rounding it away.
+Delete the per-frame `print_line` in `build_tlas`, or put it behind
+`if (OS::get_singleton()->is_stdout_verbose())`. It currently prints ~128 times
+per capture.
 
-State plainly what this phase did **not** recover: the 165s of coat/sheen on
-scenes that use them. That was a deliberate scope decision — auto-detect only,
-zero quality change — not an oversight.
-
-- [ ] **Step 6: Retire the temporary diagnostic**
-
-Delete the per-frame `[E3]` `print_line` added in Task 4 Step 1, or put it behind
-`if (OS::get_singleton()->is_stdout_verbose())`. Confirm Task 3's
-`e3_debug_seen_mask` member and its `print_line` are already gone — Task 4 Step 1
-removes them; if they survived, delete them here.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git status --porcelain
-git add PATH_TRACER_QUALITY_ROADMAP.md servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp pipeline_references/tests/pt_e3_featurefree_scene.tscn pipeline_references/tests/pt_e3_gate.gd
-git commit -m "docs(pt): E3 closeout - measured recovery and acceptance"
+git add PATH_TRACER_QUALITY_ROADMAP.md servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp
+git commit -m "docs(pt): E3 closeout - 269 of 273s recovered, measured"
 ```
 
-**On that `git add`:** `pipeline_references/tests/` holds the only paths under
-`pipeline_references/` this plan may stage, and only the two new files it creates.
-The six modified `pipeline_references/*.gd` files and untracked `custom_shape.gd`
-must never be staged. Run `git status --porcelain` first and confirm.
+Stage nothing else. The six modified `pipeline_references/*.gd` files and
+untracked `custom_shape.gd` are the user's own work and must never be staged;
+run `git status --porcelain` first and confirm.

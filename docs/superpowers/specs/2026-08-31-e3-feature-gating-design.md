@@ -35,9 +35,17 @@ use them, driven by three new `RT_FLAGS` specialization bits.
 
 **Out — explicitly:**
 
-- **No quality/perf tradeoff.** A feature the scene uses stays enabled. The
+- **No quality/perf tradeoff.** A feature the scene uses stays enabled.
+
+  **ERRATUM (measured during Task 3).** This section originally read: "The
   measured scene *does* use coat and sheen (removing them changes 6.03% of
-  pixels), so this phase recovers anisotropy's 108s there and nothing more.
+  pixels), so this phase recovers anisotropy's 108s there and nothing more."
+  **Both halves are wrong.** The render is nondeterministic — two runs of the
+  same binary differ by rmse 0.1406 / 5.58% of pixels — so the 6.03% was noise,
+  not evidence of feature use. The Task 3 detector, proven falsifiable by
+  forcing the features on and watching it report `aniso=1 coat=1 sheen=1`,
+  reports **all three absent** on the production scene. Expected recovery there
+  is therefore the FULL 273s, not 108s.
   Recovering the other 165s would mean disabling features in use; that was
   considered and rejected.
 - **No operator override and no contribution threshold.** Both were considered;
