@@ -754,7 +754,10 @@ void debug_visualize(
 		bool dbg_wrong_hemisphere;
 		bool dbg_ok = sampleTransmissiveLobe(V, dbg_N, geometry_normal, dbg_alpha, dbg_alpha * dbg_alpha,
 				dbg_specularF0, dbg_mat.eta, dbg_mat.transmissivness, dbg_material.thickness == 0.0,
-				dbg_transData.ax, dbg_transData.ay, dbg_transData.anisoPhi, dbg_transData.anisoActive, dbg_u3,
+#ifdef RT_ANISOTROPY_ENABLED
+				dbg_transData.ax, dbg_transData.ay, dbg_transData.anisoPhi, dbg_transData.anisoActive,
+#endif
+				dbg_u3,
 				dbg_next_dir, dbg_weight, dbg_is_transmit, dbg_wrong_hemisphere);
 		// Fix round 2 self-review: the thin-walled override this defect
 		// reorders around ONLY applies when isTransmit is true (`if
@@ -893,13 +896,26 @@ void debug_visualize(
 
 		vec3 dbg_weight35;
 		vec3 dbg_Llocal35 = sampleSpecularMicrofacet(dbg_Vlocal35, dbg_alpha35, dbg_alpha35 * dbg_alpha35,
-				dbg_specularF0_35, dbg_data35.ax, dbg_data35.ay, dbg_data35.anisoPhi, dbg_data35.anisoActive,
+				dbg_specularF0_35,
+#ifdef RT_ANISOTROPY_ENABLED
+				dbg_data35.ax, dbg_data35.ay, dbg_data35.anisoPhi, dbg_data35.anisoActive,
+#endif
 				dbg_u35, dbg_weight35);
 
 		// Reflection symmetry recovers the half-vector the sampler drew without
 		// re-deriving it any other way: Llocal == reflect(-Vlocal, Hlocal) for
 		// ANY Hlocal implies Hlocal == normalize(Vlocal + Llocal).
 		vec3 dbg_Hlocal35 = normalize(dbg_Vlocal35 + dbg_Llocal35);
+		// E3 Task 2. This probe's R channel mirrors combinedPdf's specular
+		// density, so it has to take the SAME arm combinedPdf takes: the
+		// anisotropic VNDF pdf when the anisotropy state is compiled in, and
+		// specularPdf (combinedPdf's own `else`) when it is not. Leaving the
+		// anisotropic call here with the state removed would not compile; leaving
+		// it while combinedPdf took the isotropic branch would make R and G
+		// disagree by construction and turn a correct build into a failing gate.
+		// The mode's REAL instrument, dbg_self_norm35, reads combinedPdf alone and
+		// is unaffected either way.
+#ifdef RT_ANISOTROPY_ENABLED
 		vec3 dbg_Vaniso35 = rotateAboutZ(dbg_Vlocal35, -dbg_data35.anisoPhi);
 		vec3 dbg_Haniso35 = rotateAboutZ(dbg_Hlocal35, -dbg_data35.anisoPhi);
 		// Matches combinedPdf's own VdotH clamp (brdf_inc.glsl:1846) so R and G
@@ -908,6 +924,11 @@ void debug_visualize(
 
 		float dbg_sampler_pdf = sampleGGXVNDFReflectionPdfAniso(dbg_Vaniso35, dbg_Haniso35,
 				dbg_data35.ax, dbg_data35.ay, dbg_VdotH35);
+#else
+		float dbg_sampler_pdf = specularPdf(dbg_alpha35, dbg_alpha35 * dbg_alpha35,
+				max(0.00001, dbg_Hlocal35.z), max(0.00001, dbg_Vlocal35.z),
+				max(0.00001, dot(dbg_Llocal35, dbg_Hlocal35)));
+#endif
 
 		vec3 dbg_dir35 = normalize(rotatePoint(invertRotation(dbg_qToZ35), dbg_Llocal35));
 
@@ -1116,7 +1137,15 @@ void debug_visualize(
 		// -- data.NdotV is floored at 1e-5 and would silently desync the two.
 		float dbg_cosNI40 = dot(dbg_N40, V);
 
+		// E3 Task 2: mirrors shade_and_bounce's own gating exactly -- a compiled-out
+		// layer's mass is a literal 0.0f, so this probe's copy of the split stays
+		// textually identical to production's in every combination, which is the
+		// property the comment above says makes the comparison meaningful.
+#ifdef RT_COAT_ENABLED
 		float dbg_coatMass40 = coatLobeWeight(dbg_mat40, dbg_cosNI40);
+#else
+		float dbg_coatMass40 = 0.0;
+#endif
 		float dbg_pSpec40 = lobeWeight(dbg_mat40);
 		// E2e Task 4. The array is sized by LOBE_COUNT, which is now 4 -- leaving
 		// the fourth entry unwritten would hand selectLobe an undefined weight,
@@ -1124,24 +1153,41 @@ void debug_visualize(
 		// split mirrors shade_and_bounce's exactly (sheen off the top, then coat
 		// from what remains); at sheenColor == 0 dbg_afterSheen40 is exactly 1.0f
 		// and every entry is bit-identical to the E2d form.
+#ifdef RT_SHEEN_ENABLED
 		float dbg_sheenMass40 = sheenLobeWeight(dbg_mat40, dbg_N40, V);
+#else
+		float dbg_sheenMass40 = 0.0;
+#endif
 		float dbg_afterSheen40 = 1.0 - dbg_sheenMass40;
 		float dbg_baseShare40 = dbg_afterSheen40 * (1.0 - dbg_coatMass40);
 		float dbg_w40[LOBE_COUNT];
 		dbg_w40[LOBE_SPECULAR] = dbg_baseShare40 * dbg_pSpec40;
 		dbg_w40[LOBE_DIFFUSE] = dbg_baseShare40 * (1.0 - dbg_pSpec40);
+#ifdef RT_COAT_ENABLED
 		dbg_w40[LOBE_COAT] = dbg_afterSheen40 * dbg_coatMass40;
+#endif
+#ifdef RT_SHEEN_ENABLED
 		dbg_w40[LOBE_SHEEN] = dbg_sheenMass40;
+#endif
 
 		RNGState dbg_rng40 = rng_unpack(ps.rng_packed, gl_LaunchIDEXT.xy);
 		int dbg_lobe40 = selectLobe(rng_1d(dbg_rng40, RT_PRNG_LOBE), dbg_w40);
 		int dbg_brdfType40 = SPECULAR_TYPE;
-		if (dbg_lobe40 == LOBE_COAT) {
+		// E3 Task 2: the DIFFUSE arm is hoisted to the head of the chain so the
+		// two conditional arms can be #ifdef'd off the tail without leaving a
+		// dangling `else if`. All three tests are equality against the SAME
+		// integer and are therefore mutually exclusive, so reordering them is
+		// exactly equivalent -- no dead placeholder branch is introduced.
+		if (dbg_lobe40 == LOBE_DIFFUSE) {
+			dbg_brdfType40 = DIFFUSE_TYPE;
+#ifdef RT_COAT_ENABLED
+		} else if (dbg_lobe40 == LOBE_COAT) {
 			dbg_brdfType40 = COAT_TYPE;
+#endif
+#ifdef RT_SHEEN_ENABLED
 		} else if (dbg_lobe40 == LOBE_SHEEN) {
 			dbg_brdfType40 = SHEEN_TYPE;
-		} else if (dbg_lobe40 == LOBE_DIFFUSE) {
-			dbg_brdfType40 = DIFFUSE_TYPE;
+#endif
 		}
 
 		vec2 dbg_u40 = rng_2d(dbg_rng40, RT_PRNG_SURFACE_BSDF);
@@ -1747,6 +1793,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// same expression from the same N and V -- the two splits have to agree
 	// direction by direction or MIS partitions one integrand while the estimator
 	// evaluates another (the B2 defect class).
+	// E3 Task 2: cosNI exists only to feed coatLobeWeight, so it is gated with
+	// it. A compiled-out layer's mass becomes a literal 0.0f, which makes every
+	// downstream expression an IEEE identity on the surviving terms rather than a
+	// restructured formula -- see combinedPdf's matching note, and note that the
+	// two must stay textually parallel or the split desyncs.
+#ifdef RT_COAT_ENABLED
 	float cosNI = dot(N, V);
 	// coatMass is the CLAMPED selection probability. Fix round 1 (E2d) also
 	// needed the RAW throughput withdrawal, coatLayerAlbedo, here; E2e moved
@@ -1756,12 +1808,19 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// above coatLayerAlbedo in brdf_inc.glsl for the energy error the clamped
 	// one caused when it was used for both roles.
 	float coatMass = coatLobeWeight(brdf_mat, cosNI);
+#else
+	float coatMass = 0.0;
+#endif
 	// E2e. Sheen's selection mass, on the SAME world-space N and V combinedPdf
 	// feeds sheenLobeWeight -- the two splits have to agree direction by
 	// direction for the same reason cosNI above does. sheenLobeWeight takes N and
 	// V rather than cosNI because sheenSetup derives cosNI = dot(N, V) itself,
 	// which keeps the invalid-LTC test at one site; see its doc comment.
+#ifdef RT_SHEEN_ENABLED
 	float sheenMass = sheenLobeWeight(brdf_mat, N, V);
+#else
+	float sheenMass = 0.0;
+#endif
 
 	int brdfType;
 	// E2e: the lobe actually selected, in every branch including the two fast
@@ -1844,8 +1903,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		float weights[LOBE_COUNT];
 		weights[LOBE_SPECULAR] = baseShare * pSpec;
 		weights[LOBE_DIFFUSE] = baseShare * (1.0 - pSpec);
+#ifdef RT_COAT_ENABLED
 		weights[LOBE_COAT] = afterSheen * coatMass;
+#endif
+#ifdef RT_SHEEN_ENABLED
 		weights[LOBE_SHEEN] = sheenMass;
+#endif
 
 		// STILL exactly one draw, consumed once, unremapped and unrescaled. A
 		// second draw or a remap here shifts every subsequent sample in the path --
@@ -1853,7 +1916,18 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// gate. E2e did NOT add a second draw for sheen: the fourth weight joins
 		// the same CDF this one draw walks.
 		lobe = selectLobe(rng_1d(rng, RT_PRNG_LOBE), weights);
-		if (lobe == LOBE_SHEEN) {
+		// E3 Task 2: the SPECULAR arm is hoisted to the head of the chain so the
+		// two layer arms can be #ifdef'd off the middle without leaving a
+		// dangling `else if`. Every test is equality against the same integer
+		// `lobe` and the trailing `else` was already the catch-all for DIFFUSE,
+		// so the mapping is unchanged for every value selectLobe can return --
+		// this is a reordering of mutually exclusive tests, not a behaviour
+		// change, and it introduces no dead placeholder branch.
+		if (lobe == LOBE_SPECULAR) {
+			brdfType = SPECULAR_TYPE;
+			ps.throughput /= weights[LOBE_SPECULAR];
+#ifdef RT_SHEEN_ENABLED
+		} else if (lobe == LOBE_SHEEN) {
 			brdfType = SHEEN_TYPE;
 			// Divide by the selection probability ALONE, like specular and
 			// diffuse and unlike the coat. The coat needs an extra `coatWeight *`
@@ -1862,6 +1936,8 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			// weight (sheenColor * ltcAlbedo), so applying a second factor here
 			// would double it -- the mirror image of the E2d fix-round-1 bug.
 			ps.throughput /= weights[LOBE_SHEEN];
+#endif
+#ifdef RT_COAT_ENABLED
 		} else if (lobe == LOBE_COAT) {
 			brdfType = COAT_TYPE;
 			// Fix round 1: `coatWeight /`, not a bare `1 /`. The other two lobes
@@ -1878,9 +1954,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			// as though coatWeight were 1, so the two halves of the layer did not
 			// balance.
 			ps.throughput *= brdf_mat.coatWeight / weights[LOBE_COAT];
-		} else if (lobe == LOBE_SPECULAR) {
-			brdfType = SPECULAR_TYPE;
-			ps.throughput /= weights[LOBE_SPECULAR];
+#endif
 		} else {
 			brdfType = DIFFUSE_TYPE;
 			ps.throughput /= weights[LOBE_DIFFUSE];
@@ -1909,7 +1983,19 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// evalCombinedBRDFSeparate withdrew it on the NEE side -- two strategies,
 	// two integrands. Same defect the coat's own guard would have had if E2d had
 	// written it as `if (clearcoat_roughness > 0)`.
+	//
+	// E3 Task 2: each disjunct is compiled out with its layer, and with neither
+	// compiled in the whole block goes. That is correct, not merely an
+	// optimisation: layerTransmittanceAbove returns exactly float3(1,1,1) with no
+	// layers, so `ps.throughput *=` it would be the IEEE multiplicative identity.
+#if defined(RT_COAT_ENABLED) || defined(RT_SHEEN_ENABLED)
+#if defined(RT_COAT_ENABLED) && defined(RT_SHEEN_ENABLED)
 	if (brdf_mat.coatWeight > 0.00001 || sheenMaxTint(brdf_mat) > 0.00001) {
+#elif defined(RT_COAT_ENABLED)
+	if (brdf_mat.coatWeight > 0.00001) {
+#else
+	if (sheenMaxTint(brdf_mat) > 0.00001) {
+#endif
 		// THIS IS A THROUGHPUT FACTOR, NOT A SELECTION PROBABILITY. It must not be
 		// folded into weights[] above -- see the selection-vs-throughput block at
 		// the top of brdf_inc.glsl's registry section. Folding it in and
@@ -1934,6 +2020,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// above it.
 		ps.throughput *= layerTransmittanceAbove(brdf_mat, N, V, lobe);
 	}
+#endif // RT_COAT_ENABLED || RT_SHEEN_ENABLED
 
 	vec2 u = rng_2d(rng, RT_PRNG_SURFACE_BSDF);
 	vec3 next_dir;
@@ -1948,7 +2035,13 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// E2b: ax/ay/anisoPhi for THIS hit's N, via prepareBRDFData -- the same
 		// tangent-projection formula every other consumer uses (V is a dummy L,
 		// unused for these three fields).
+		// E3 Task 2: this whole BrdfData exists only to supply the four aniso
+		// arguments below, so it is gated with them -- otherwise the transmissive
+		// path would still pay a full prepareBRDFData per bounce for a struct
+		// nothing reads.
+#ifdef RT_ANISOTROPY_ENABLED
 		BrdfData transData = prepareBRDFData(N, V, V, brdf_mat);
+#endif
 		// Fix round 2: calls sampleTransmissiveLobe (brdf_inc.glsl), which
 		// encapsulates sampling, the hemisphere-consistency guard, and the
 		// thin-walled override IN THE ORDER fix round 1's I1 established --
@@ -1959,7 +2052,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		bool wrongHemisphere;
 		if (sampleTransmissiveLobe(V, N, h.geometry_normal, alpha, alpha * alpha, specularF0,
 					brdf_mat.eta, brdf_mat.transmissivness, m.thickness == 0.0,
-					transData.ax, transData.ay, transData.anisoPhi, transData.anisoActive, u3,
+#ifdef RT_ANISOTROPY_ENABLED
+					transData.ax, transData.ay, transData.anisoPhi, transData.anisoActive,
+#endif
+					u3,
 					next_dir, brdf_weight, isTransmit, wrongHemisphere)) {
 			transmissive_sample_ok = !wrongHemisphere;
 			took_transmissive_lobe = isTransmit;

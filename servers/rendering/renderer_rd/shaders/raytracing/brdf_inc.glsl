@@ -378,6 +378,14 @@ struct BrdfData {
 	// angle here, computed once in prepareBRDFData, is what stops the sampler and
 	// the pdf deriving the frame differently -- that desync is mean-preserving
 	// and no rendered image can catch it (spec section 4.4).
+	//
+	// E3 Task 2: gated out entirely when RT_ANISOTROPY_ENABLED is absent. This
+	// struct is constructed in the hottest loops in the tree, so the four fields
+	// are what E2b's measured 108s is charged to -- NOT the anisotropic maths,
+	// which anisoActive already skipped on every material in the production
+	// scene. Removing the branches while leaving the state in place recovers
+	// nothing; see the E3 spec.
+#ifdef RT_ANISOTROPY_ENABLED
 	float ax;
 	float ay;
 	float anisoPhi;
@@ -387,6 +395,7 @@ struct BrdfData {
 	// would silently shift every polished material and break the no-pixel-change
 	// guarantee.
 	bool anisoActive;
+#endif
 };
 
 // -------------------------------------------------------------------------
@@ -1223,18 +1232,24 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 //
 // The extraction is operation-for-operation and order-for-order what this
 // function used to do inline, so the base specular path is unchanged.
-float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared, float ax, float ay, float anisoPhi, bool anisoActive, float2 u, OUT_PARAMETER(float) outHdotL, OUT_PARAMETER(float) outNdotV, OUT_PARAMETER(float) outWeightRatio) {
+float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared,
+#ifdef RT_ANISOTROPY_ENABLED
+		float ax, float ay, float anisoPhi, bool anisoActive,
+#endif
+		float2 u, OUT_PARAMETER(float) outHdotL, OUT_PARAMETER(float) outNdotV, OUT_PARAMETER(float) outWeightRatio) {
 	// Sample a microfacet normal (H) in local space
 	float3 Hlocal;
 	if (alpha == 0.0f) {
 		// Fast path for zero roughness (perfect reflection), also prevents NaNs appearing due to divisions by zeroes
 		Hlocal = float3(0.0f, 0.0f, 1.0f);
+#ifdef RT_ANISOTROPY_ENABLED
 	} else if (anisoActive) {
 		// Rotate into the anisotropy frame, sample with the elliptical
 		// roughnesses, rotate the result back out.
 		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
 		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(ax, ay), u);
 		Hlocal = rotateAboutZ(Haniso, anisoPhi);
+#endif
 	} else {
 		// Fix round (Minor #2): previously this branch always ran the
 		// rotate -> sample -> rotate-back path and relied on ax==ay==alpha
@@ -1266,11 +1281,14 @@ float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared,
 	// isotropic path (ax == ay == alpha, anisoPhi == 0) stays bit-identical to
 	// pre-E2b -- exactly the same shape as evalMicrofacet's D/G2 branch.
 	float weightRatio;
+#ifdef RT_ANISOTROPY_ENABLED
 	if (anisoActive) {
 		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
 		float3 Laniso = rotateAboutZ(Llocal, -anisoPhi);
 		weightRatio = specularSampleWeightGGXVNDFAniso(Vaniso, Laniso, ax, ay);
-	} else {
+	} else
+#endif
+	{
 		weightRatio = specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
 	}
 
@@ -1280,11 +1298,19 @@ float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared,
 	return Llocal;
 }
 
-float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float ax, float ay, float anisoPhi, bool anisoActive, float2 u, OUT_PARAMETER(float3) weight) {
+float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0,
+#ifdef RT_ANISOTROPY_ENABLED
+		float ax, float ay, float anisoPhi, bool anisoActive,
+#endif
+		float2 u, OUT_PARAMETER(float3) weight) {
 	float HdotL;
 	float NdotV;
 	float weightRatio;
-	float3 Llocal = sampleMicrofacetDirection(Vlocal, alpha, alphaSquared, ax, ay, anisoPhi, anisoActive, u, HdotL, NdotV, weightRatio);
+	float3 Llocal = sampleMicrofacetDirection(Vlocal, alpha, alphaSquared,
+#ifdef RT_ANISOTROPY_ENABLED
+			ax, ay, anisoPhi, anisoActive,
+#endif
+			u, HdotL, NdotV, weightRatio);
 
 	float3 F = evalFresnel(specularF0, shadowedF90(specularF0), HdotL);
 
@@ -1363,7 +1389,11 @@ float dielectricFresnelSplit(float HdotV, float eta, float3 F0, float transmissi
 // anisoActive branch needed for the SAMPLING step itself. The WEIGHT
 // computations below DO need one (I1 fix, Task 3 review) -- same reasoning as
 // sampleSpecularMicrofacet's own weight branch.
-bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission, float ax, float ay, float anisoPhi, bool anisoActive, float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit) {
+bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 F0, float eta, float transmission,
+#ifdef RT_ANISOTROPY_ENABLED
+		float ax, float ay, float anisoPhi, bool anisoActive,
+#endif
+		float3 u, OUT_PARAMETER(float3) Llocal, OUT_PARAMETER(float3) weight, OUT_PARAMETER(bool) isTransmit) {
 	const float3 Nlocal = float3(0.0f, 0.0f, 1.0f);
 
 	float3 Hlocal;
@@ -1371,10 +1401,12 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		// Fast path for zero roughness, and it also prevents the NaNs a
 		// division by zero would produce inside VNDF sampling.
 		Hlocal = float3(0.0f, 0.0f, 1.0f);
+#ifdef RT_ANISOTROPY_ENABLED
 	} else if (anisoActive) {
 		float3 Vaniso = rotateAboutZ(Vlocal, -anisoPhi);
 		float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(ax, ay), u.xy);
 		Hlocal = rotateAboutZ(Haniso, anisoPhi);
+#endif
 	} else {
 		// Fix round (Minor #2): same structural fix as sampleSpecularMicrofacet
 		// above -- no rotation on the isotropic path, not an algebraic no-op.
@@ -1418,11 +1450,14 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		// squared, so it naturally matches the abs(NdotL) the isotropic branch
 		// takes explicitly -- no extra sign-handling needed.
 		float weightRatioT;
+#ifdef RT_ANISOTROPY_ENABLED
 		if (anisoActive) {
 			float3 VanisoT = rotateAboutZ(Vlocal, -anisoPhi);
 			float3 LanisoT = rotateAboutZ(Llocal, -anisoPhi);
 			weightRatioT = specularSampleWeightGGXVNDFAniso(VanisoT, LanisoT, ax, ay);
-		} else {
+		} else
+#endif
+		{
 			weightRatioT = specularSampleWeight(alpha, alphaSquared, abs(NdotL), NdotV, HdotL, NdotH);
 		}
 		weight = transmittance / denom_t * weightRatioT;
@@ -1439,11 +1474,14 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 #endif
 		// I1 fix: same anisoActive branch as the transmit case above.
 		float weightRatioR;
+#ifdef RT_ANISOTROPY_ENABLED
 		if (anisoActive) {
 			float3 VanisoR = rotateAboutZ(Vlocal, -anisoPhi);
 			float3 LanisoR = rotateAboutZ(Llocal, -anisoPhi);
 			weightRatioR = specularSampleWeightGGXVNDFAniso(VanisoR, LanisoR, ax, ay);
-		} else {
+		} else
+#endif
+		{
 			weightRatioR = specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
 		}
 		weight = ms * (reflectance / pdf_reflect) * weightRatioR;
@@ -1482,7 +1520,11 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 // anisoActive (I1 fix, Task 3 review) passes through the same way, gating that
 // function's sample-weight computation.
 bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float alpha, float alphaSquared,
-		float3 specularF0, float eta, float transmissivness, bool thin_walled, float ax, float ay, float anisoPhi, bool anisoActive, float3 u3,
+		float3 specularF0, float eta, float transmissivness, bool thin_walled,
+#ifdef RT_ANISOTROPY_ENABLED
+		float ax, float ay, float anisoPhi, bool anisoActive,
+#endif
+		float3 u3,
 		OUT_PARAMETER(float3) r_next_dir, OUT_PARAMETER(float3) r_weight, OUT_PARAMETER(bool) r_is_transmit,
 		OUT_PARAMETER(bool) r_wrong_hemisphere) {
 	float4 qRotationToZ = getRotationToZAxis(N);
@@ -1519,7 +1561,11 @@ bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float al
 	// and the validation mean all passed through this regression untouched
 	// -- only this gate's probe 6 caught it, because it was the only check
 	// exercising the transmissive lobe's rendered output directly.
-	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness, ax, ay, anisoPhi, anisoActive, u3, Llocal, r_weight, r_is_transmit)) {
+	if (!sampleDielectricMicrofacet(Vlocal, alpha, alphaSquared, specularF0, eta, transmissivness,
+#ifdef RT_ANISOTROPY_ENABLED
+				ax, ay, anisoPhi, anisoActive,
+#endif
+				u3, Llocal, r_weight, r_is_transmit)) {
 		return false;
 	}
 
@@ -1558,6 +1604,7 @@ bool sampleTransmissiveLobe(float3 V, float3 N, float3 geometry_normal, float al
 // to the tangent) is what makes Ha/Va/La comparable to anisoPhi at all.
 float3 evalMicrofacet(const BrdfData data) {
 	float D, G2;
+#ifdef RT_ANISOTROPY_ENABLED
 	if (data.anisoActive) {
 		float4 qToZ = getRotationToZAxis(data.N);
 		float3 Hlocal = rotatePoint(qToZ, data.H);
@@ -1582,7 +1629,9 @@ float3 evalMicrofacet(const BrdfData data) {
 #if G2_DIVIDED_BY_DENOMINATOR
 		G2 /= 4.0f * max(0.00001f, data.NdotL) * max(0.00001f, data.NdotV);
 #endif
-	} else {
+	} else
+#endif // RT_ANISOTROPY_ENABLED
+	{
 		D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
 		G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
 	}
@@ -1719,6 +1768,12 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	// Defaults are the exact isotropic values, so a material with anisotropy 0
 	// or no usable tangent is bit-identical to pre-E2b: anisoAspect(0) is
 	// exactly 1.0, so ax == ay == alpha.
+	//
+	// E3 Task 2: the whole producer is gated. With RT_ANISOTROPY_ENABLED absent
+	// the fields do not exist, so neither the tangent normalize, the quaternion
+	// build, nor the rotatePoint below is emitted -- this block is the producer
+	// half of the state the struct gating removes.
+#ifdef RT_ANISOTROPY_ENABLED
 	data.ax = data.alpha;
 	data.ay = data.alpha;
 	data.anisoPhi = 0.0f;
@@ -1752,6 +1807,7 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 			data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;
 		}
 	}
+#endif // RT_ANISOTROPY_ENABLED
 
 	// Pre-calculate some more BRDF terms
 	data.F = evalFresnel(data.specularF0, shadowedF90(data.specularF0), data.LdotH);
@@ -1793,13 +1849,39 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 // E2d. APPENDS -- it does not displace specular from index 0, which E2c made a
 // contract. The coat is physically outermost, but layering happens through the
 // throughput scale, not through registry position.
+//
+// E3 Task 2. LOBE_SPECULAR 0 and LOBE_DIFFUSE 1 are FIXED; coat and sheen are
+// now conditional and SLIDE. When the coat is compiled out, sheen moves from 3
+// to 2 -- without that the array would be over-indexed at LOBE_COUNT 3.
+//
+// The slide preserves the ordering layerTransmittanceAbove depends on. That
+// walk needs sheen's index to EXCEED the coat's (sheen is outermost, Cycles
+// svm/closure.h:115 vs :146), and in every combination it still does: 3 > 2 with
+// both present, and with only one present the other's comparison is compiled
+// away entirely rather than left pointing at a stale index. See the analysis in
+// layerTransmittanceAbove's own comment below.
+#ifdef RT_COAT_ENABLED
 #define LOBE_COAT 2
+#endif
 // E2e. APPENDS, exactly as the coat did. Registry position is not physical
 // position -- but see layerTransmittanceAbove: for the two LAYERS this registry
 // carries, index order and Cycles' layering order happen to COINCIDE, and that
 // coincidence is what makes the walk's single `<` comparison correct for both.
+#ifdef RT_SHEEN_ENABLED
+#ifdef RT_COAT_ENABLED
 #define LOBE_SHEEN 3
+#else
+#define LOBE_SHEEN 2
+#endif
+#endif
+
+#if defined(RT_COAT_ENABLED) && defined(RT_SHEEN_ENABLED)
 #define LOBE_COUNT 4
+#elif defined(RT_COAT_ENABLED) || defined(RT_SHEEN_ENABLED)
+#define LOBE_COUNT 3
+#else
+#define LOBE_COUNT 2
+#endif
 
 // ---------------------------------------------------------------------------
 // SELECTION WEIGHT vs THROUGHPUT SCALE (E2d).
@@ -2328,7 +2410,11 @@ float3 sampleCoatMicrofacet(float3 Vlocal, float alpha, float alphaSquared, floa
 	float HdotL;
 	float NdotV;
 	float weightRatio;
-	float3 Llocal = sampleMicrofacetDirection(Vlocal, alpha, alphaSquared, alpha, alpha, 0.0f, false, u, HdotL, NdotV, weightRatio);
+	float3 Llocal = sampleMicrofacetDirection(Vlocal, alpha, alphaSquared,
+#ifdef RT_ANISOTROPY_ENABLED
+			alpha, alpha, 0.0f, false,
+#endif
+			u, HdotL, NdotV, weightRatio);
 
 	float cosThetaT;
 	float F = fresnel_dielectric(HdotL, ior, cosThetaT);
@@ -2687,15 +2773,50 @@ float3 evalSheen(float3 N, float3 L, float3 V, MaterialProperties material) {
 // the IEEE multiplicative identity. What remains is E2e Task 2's body, on the
 // same lobes, with cosNI recomputed from the same N and V the caller used to
 // compute it -- the identical expression, hence the identical float.
+//
+// E3 TASK 2 -- THE INDEX ORDER, RE-DERIVED FOR ALL FOUR COMBINATIONS. The
+// paragraph above says the ordering must be CHECKED, not assumed, and gating the
+// two layers is exactly the change that can break it. Each surviving comparison,
+// with the indices Step 2's #defines actually produce:
+//
+//   coat + sheen: LOBE_COAT 2, LOBE_SHEEN 3, LOBE_COUNT 4. Unchanged.
+//                 `i < 3` attenuates {spec 0, diffuse 1, coat 2}; `i < 2`
+//                 attenuates {spec 0, diffuse 1}. Sheen outermost, coat under
+//                 it, neither attenuates itself.
+//   coat only:    LOBE_COAT 2, LOBE_COUNT 3. The sheen clause is compiled out
+//                 (not left comparing against a stale 3), so `i < 2` attenuates
+//                 {spec, diffuse} and the coat is the only, outermost layer.
+//   sheen only:   LOBE_SHEEN 2, LOBE_COUNT 3. The coat clause is compiled out.
+//                 `i < 2` attenuates {spec, diffuse} -- sheen is outermost and
+//                 there is nothing between it and the base. THE SLIDE FROM 3 TO
+//                 2 IS REQUIRED HERE: at a stale 3 the comparison would still be
+//                 arithmetically true for both base lobes, but weights[3] would
+//                 be written past the end of a 3-entry array.
+//   neither:      LOBE_COUNT 2. Both clauses compiled out; the function returns
+//                 float3(1,1,1), the IEEE multiplicative identity, and every
+//                 caller's `t *=` is a no-op. Callers are themselves gated on
+//                 coatWeight/sheenMaxTint, so this is reachable only through the
+//                 unguarded evalCombinedBRDFSeparate path, where it is correct.
+//
+// The invariant that makes all four correct is the same one E2e stated: sheen's
+// index must EXCEED the coat's whenever both exist. It does (3 > 2), and when
+// only one exists there is no ordering left to get wrong.
+//
+// cosNI is declared inside the coat's guard because it is the coat's input
+// alone; sheenLayerAlbedo takes N and V and derives its own.
 float3 layerTransmittanceAbove(MaterialProperties material, float3 N, float3 V, int lobeIndex) {
-	float cosNI = dot(N, V);
 	float3 t = float3(1.0f, 1.0f, 1.0f);
+#ifdef RT_SHEEN_ENABLED
 	if (lobeIndex < LOBE_SHEEN) {
 		t *= sheenLayeringTransmittance(material, sheenLayerAlbedo(material, N, V));
 	}
+#endif
+#ifdef RT_COAT_ENABLED
+	float cosNI = dot(N, V);
 	if (lobeIndex < LOBE_COAT) {
 		t *= coatLayeringTransmittance(material, cosNI, coatLayerAlbedo(material, cosNI));
 	}
+#endif
 	return t;
 }
 
@@ -2836,8 +2957,15 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// would NOT show up as a sampler/pdf MIS desync, but the indirect specular
 	// highlight's orientation would disagree with the direct-light NEE one
 	// (evalMicrofacet correctly rotates by the REAL N, not this dummy one).
+	//
+	// E3 Task 2: this rotation exists ONLY to feed prepareBRDFData's anisotropy
+	// block, so it is gated with it. materialLocal itself stays unconditional --
+	// with the rotation gated out it is a plain copy of `material` and every call
+	// below reads the identical values, so nothing else in this function changes.
 	MaterialProperties materialLocal = material;
+#ifdef RT_ANISOTROPY_ENABLED
 	materialLocal.tangent = rotatePoint(qRotationToZ, material.tangent);
+#endif
 	const BrdfData data = prepareBRDFData(float3(0.0f, 0.0f, 1.0f), Llocal, Vlocal, materialLocal);
 
 	// V ~= -L (near-mirror-degenerate incident/outgoing pair) leaves no stable
@@ -2894,11 +3022,13 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float specularContribution;
 	if (material.roughness < RT_MIS_DELTA_ROUGHNESS) {
 		specularContribution = 0.0f;
+#ifdef RT_ANISOTROPY_ENABLED
 	} else if (data.anisoActive) {
 		float3 Vaniso = rotateAboutZ(Vlocal, -data.anisoPhi);
 		float3 Haniso = rotateAboutZ(Hlocal, -data.anisoPhi);
 		float VdotH = max(0.00001f, dot(Vlocal, Hlocal));
 		specularContribution = sampleGGXVNDFReflectionPdfAniso(Vaniso, Haniso, data.ax, data.ay, VdotH);
+#endif
 	} else {
 		specularContribution = specularPdf(data.alpha, data.alphaSquared, NdotH, NdotV, LdotH);
 	}
@@ -2961,13 +3091,30 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// two. cosNI is dot(N, V) unclamped, the SAME expression the sampler feeds
 	// coatLobeWeight; using data.NdotV (floored at 1e-5 and capped at 1) here
 	// would silently desync the two on backfacing V.
+	//
+	// E3 Task 2: when a layer is compiled out its mass becomes a literal 0.0f
+	// rather than the arithmetic being restructured. That is deliberate and it is
+	// what makes the enabled path bit-identical: `afterSheen * (1.0f - 0.0f)` and
+	// `1.0f - 0.0f` are IEEE identities, so the surviving weights are the exact
+	// floats the all-on build computes on a material that happens to have no
+	// layer -- the SAME argument E2d and E2e each made for their own phase
+	// invariant, now made at compile time instead of at run time. The compiler
+	// constant-folds them away, so nothing is paid for the shape.
+#ifdef RT_COAT_ENABLED
 	float cosNI = dot(N, V);
 	float coatMass = coatLobeWeight(material, cosNI);
+#else
+	float coatMass = 0.0f;
+#endif
 	// E2e: sheen's selection mass, on the SAME world-space N and V the sampler
 	// hands sheenLobeWeight. Absolute, i.e. taken off the top before the coat --
 	// mirroring the withdrawal order, where sheen is outermost (svm/closure.h:115
 	// vs :146). See layerTransmittanceAbove.
+#ifdef RT_SHEEN_ENABLED
 	float sheenMass = sheenLobeWeight(material, N, V);
+#else
+	float sheenMass = 0.0f;
+#endif
 	float afterSheen = 1.0f - sheenMass;
 	// At coatMass == 0 baseShare is exactly 1.0f, so weights[LOBE_SPECULAR] is
 	// 1.0f * pSpec == pSpec and weights[LOBE_DIFFUSE] is 1.0f * (1.0f - pSpec)
@@ -2992,6 +3139,7 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// same value to *pdf and to the returned spectrum), so this is deliberately
 	// the bare eval with neither the LTC albedo nor the tint -- both belong to
 	// the closure WEIGHT, which evalSheen carries and the density must not.
+#ifdef RT_SHEEN_ENABLED
 	float sheenPdfValue = 0.0f;
 	if (sheenMass > 0.0f) {
 		SheenData sheenData = sheenSetup(N, V, material.sheenRoughness);
@@ -3000,18 +3148,27 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 		// calls are separate evaluations and the cost is a branch.
 		sheenPdfValue = sheenData.valid ? sheenEval(sheenData, L) : 0.0f;
 	}
+#endif
 
 	float weights[LOBE_COUNT];
 	weights[LOBE_SPECULAR] = baseShare * pSpec;
 	weights[LOBE_DIFFUSE] = baseShare * (1.0f - pSpec);
+#ifdef RT_COAT_ENABLED
 	weights[LOBE_COAT] = coatShare;
+#endif
+#ifdef RT_SHEEN_ENABLED
 	weights[LOBE_SHEEN] = sheenMass;
+#endif
 
 	float pdfs[LOBE_COUNT];
 	pdfs[LOBE_SPECULAR] = specularContribution * transmitScale;
 	pdfs[LOBE_DIFFUSE] = pdfDiffuse;
+#ifdef RT_COAT_ENABLED
 	pdfs[LOBE_COAT] = coatPdf(material.coatRoughness, NdotH, NdotV, LdotH);
+#endif
+#ifdef RT_SHEEN_ENABLED
 	pdfs[LOBE_SHEEN] = sheenPdfValue;
+#endif
 
 	return combineLobePdf(weights, pdfs);
 }
@@ -3116,18 +3273,36 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// cosNI is no longer computed here: layerTransmittanceAbove now takes N and V
 	// and derives dot(N, V) itself, from the same two vectors, so the coat still
 	// sees the identical unclamped expression it saw when this line fed it.
+	//
+	// E3 Task 2: a compiled-out layer's `has*` predicate becomes a literal false,
+	// so the whole block folds to the pre-E2d two-output form when neither layer
+	// is compiled in. outCoat/outSheen stay in the signature and stay at their
+	// float3(0) initialisers, so the five NEE call sites that add them need no
+	// gating of their own -- they add exactly zero.
+#ifdef RT_COAT_ENABLED
 	bool hasCoat = material.coatWeight > 0.00001f;
+#else
+	bool hasCoat = false;
+#endif
+#ifdef RT_SHEEN_ENABLED
 	bool hasSheen = sheenMaxTint(material) > 0.00001f;
+#else
+	bool hasSheen = false;
+#endif
 	if (hasCoat || hasSheen) {
 		float3 baseTransmittance = layerTransmittanceAbove(material, N, V, LOBE_SPECULAR);
 		outDiffuse *= baseTransmittance;
 		outSpecular *= baseTransmittance;
+#ifdef RT_COAT_ENABLED
 		if (hasCoat) {
 			outCoat = evalCoat(N, L, V, material) * layerTransmittanceAbove(material, N, V, LOBE_COAT);
 		}
+#endif
+#ifdef RT_SHEEN_ENABLED
 		if (hasSheen) {
 			outSheen = evalSheen(N, L, V, material);
 		}
+#endif
 	}
 }
 
@@ -3149,8 +3324,13 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	// tangent by the SAME qRotationToZ applied to V/L above first, so it lands
 	// in the identical local frame -- matching evalMicrofacet's world-to-local
 	// transform (which uses the real shadingNormal directly instead).
+	//
+	// E3 Task 2: gated with the anisotropy state it exists to feed -- same
+	// reasoning as combinedPdf's copy of this pattern.
 	MaterialProperties materialLocal = material;
+#ifdef RT_ANISOTROPY_ENABLED
 	materialLocal.tangent = rotatePoint(qRotationToZ, material.tangent);
+#endif
 
 	float3 rayDirectionLocal = float3(0.0f, 0.0f, 0.0f);
 
@@ -3171,11 +3351,14 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// already in the local frame here, so unlike evalMicrofacet no extra
 		// world-to-local transform is needed.
 		float3 Hspecular;
+#ifdef RT_ANISOTROPY_ENABLED
 		if (data.anisoActive) {
 			float3 Vaniso = rotateAboutZ(Vlocal, -data.anisoPhi);
 			float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(data.ax, data.ay), u);
 			Hspecular = rotateAboutZ(Haniso, data.anisoPhi);
-		} else {
+		} else
+#endif
+		{
 			// Fix round (Minor #2): same structural fix as sampleSpecularMicrofacet
 			// -- no rotation on the isotropic path.
 			Hspecular = sampleSpecularHalfVector(Vlocal, float2(data.alpha, data.alpha), u);
@@ -3188,7 +3371,12 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 
 	} else if (brdfType == SPECULAR_TYPE) {
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, materialLocal);
-		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, data.ax, data.ay, data.anisoPhi, data.anisoActive, u, sampleWeight);
+		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0,
+#ifdef RT_ANISOTROPY_ENABLED
+				data.ax, data.ay, data.anisoPhi, data.anisoActive,
+#endif
+				u, sampleWeight);
+#ifdef RT_COAT_ENABLED
 	} else if (brdfType == COAT_TYPE) {
 		// E2d. The coat is an isotropic GGX with alpha = sqr(coat_roughness) and a
 		// dielectric F0 from coat_ior, reusing the EXISTING isotropic specular path
@@ -3215,6 +3403,8 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// dielectric Fresnel, not from F0).
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, coatMaterial(materialLocal));
 		rayDirectionLocal = sampleCoatMicrofacet(Vlocal, data.alpha, data.alphaSquared, materialLocal.coatRoughness, materialLocal.coatIor, u, sampleWeight);
+#endif // RT_COAT_ENABLED
+#ifdef RT_SHEEN_ENABLED
 	} else if (brdfType == SHEEN_TYPE) {
 		// E2e. Zeltner LTC, sampled in THIS function's local frame (Nlocal is
 		// +Z, Vlocal is the rotated view vector) exactly as the specular and coat
@@ -3259,6 +3449,7 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 			// Defence for direct callers, matching evalCoat's Lbackfacing note.
 			sampleWeight = float3(0.0f, 0.0f, 0.0f);
 		}
+#endif // RT_SHEEN_ENABLED
 	}
 
 	// Transform sampled direction Llocal back to V vector space.
