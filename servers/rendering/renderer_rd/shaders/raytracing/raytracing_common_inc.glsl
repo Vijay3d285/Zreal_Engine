@@ -4,8 +4,13 @@
 
 // Specialization constant. Bits 0-3: feature flags, 4-8: Russian Roulette
 // min_bounce (roadmap B4), 9: emissive-mesh NEE (C1), 10-14: transmission
-// enable + bounce cap (roadmap E1), 15-19: free, 20-27: sample count, 28-31:
-// max bounces.
+// enable + bounce cap (roadmap E1), 15-17: per-material feature gating
+// (roadmap E3: anisotropy, coat, sheen -- see the defines at the bottom of this
+// header), 18-19: free, 20-27: sample count, 28-31: max bounces.
+//
+// GLSL has no static_assert, so this map is the ONLY bit-allocation record on
+// the shader side; its C++ twin is the RaytracingFlags comment in
+// scene_shader_raytracing.h. Claim a bit here AND there, in the same commit.
 // Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
 // 16; sample count's shift moved down by one to make room without touching
 // its own 8-bit width (the feature-flags region only ever used bits 0-3).

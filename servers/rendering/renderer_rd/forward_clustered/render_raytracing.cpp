@@ -3929,6 +3929,24 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 					need_reset = true;
 				}
 			}
+			// E3: a shader-variant change also invalidates it. build_tlas() has
+			// already run for this frame (render_forward_clustered.cpp calls it
+			// immediately before update_uniform_set), so settled_rt_flags is this
+			// frame's value, not last frame's. It is `compute_rt_flags(env, fog) |
+			// scene_mask`: the first term is a pure function of the Environment
+			// params and project settings, so it only moves when the user changes
+			// one; the second is the OR of the detected feature bits of the
+			// materials that survived culling, so it moves when the visible set
+			// gains or loses an anisotropy/coat/sheen material. Neither varies with
+			// the frame counter, so a static camera on a static scene compares equal
+			// every frame and this cannot fire spuriously. When it does move, the
+			// newly-selected variant's bundle may still be compiling its hit groups,
+			// and those instances are absent from the TLAS for the frames until it
+			// lands -- exactly the frames that must not enter the average.
+			if (p_state->accum_last_rt_flags != p_state->settled_rt_flags) {
+				p_state->accum_last_rt_flags = p_state->settled_rt_flags;
+				need_reset = true;
+			}
 			if (need_reset) {
 				p_state->accum_frame = 0;
 				p_state->accum_reset_pending = true;

@@ -385,12 +385,25 @@ struct RTViewportState {
 
 	// Phase A accumulation state (per-viewport). The accumulator blends 1-SPP
 	// renders across frames for still-image convergence. It must reset (clear
-	// the accum buffer + sample count) when the camera moves or the viewport
-	// is resized; otherwise the running average would smear the old view.
+	// the accum buffer + sample count) when the camera moves, the viewport is
+	// resized, or the settled shader variant changes (E3); otherwise the running
+	// average would smear the old view, or absorb the geometry holes of a variant
+	// whose hit groups have not finished compiling.
 	bool accum_enabled = false;          // mirrors env PT_PARAM_ACCUM_FLAG this viewport.
 	uint32_t accum_frame = 0;            // 0-based accumulation frame for the current view.
 	Transform3D accum_last_cam_transform; // last camera transform seen; mismatch => reset.
 	Size2i accum_last_size;              // last internal render size; mismatch => reset (resize).
+	// E3: last settled_rt_flags seen; mismatch => reset. rt_instances is
+	// frustum/AABB/LOD-culled, so scene_mask -- and therefore settled_rt_flags --
+	// can change from camera motion alone in a mixed-feature scene. A variant
+	// reached for the first time starts with only hit-group slot 0 ready and
+	// drops every custom-hit-group instance from the TLAS until its HGs finish
+	// compiling asynchronously, so without this the geometry holes of that first
+	// frame would be taken into the running average wholesale at accum_frame 0.
+	// 0 is not a reachable settled value (rt_flags always carries a sample count),
+	// so the initializer forces one reset on the first accumulating frame, which
+	// the "accumulation just switched on" branch already performs anyway.
+	uint32_t accum_last_rt_flags = 0;
 	bool accum_reset_pending = true;     // clear accum/accum_n to 0 before the next trace.
 	// Phase F: one-shot OIDN final-denoise bookkeeping. Set true once a converged OIDN
 	// denoise has been applied this accumulation cycle so it does not re-fire every frame

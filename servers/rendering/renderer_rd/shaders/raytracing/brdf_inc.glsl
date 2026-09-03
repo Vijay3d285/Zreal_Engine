@@ -111,8 +111,11 @@ V mul(const M &m, const V &v) {
 // COAT_TYPE` mapping (raytracing_closest_hit_common_inc.glsl).
 #define COAT_TYPE 3
 // E2e. The sheen (Zeltner LTC) lobe's own sampler tag. Same two-namespace rule
-// as COAT_TYPE above: this is 4 while LOBE_SHEEN is 3, and the only bridge is
-// the sampler's `if (lobe == LOBE_SHEEN) brdfType = SHEEN_TYPE` mapping.
+// as COAT_TYPE above: this 4 is a BRDF-type tag and has no relation to the value
+// of LOBE_SHEEN, and the only bridge is the sampler's `if (lobe == LOBE_SHEEN)
+// brdfType = SHEEN_TYPE` mapping. E3 makes the independence load-bearing rather
+// than incidental: LOBE_SHEEN is 3 with the coat compiled in and 2 without it
+// (:1870-1876), while these tags are fixed constants that no variant changes.
 #define SHEEN_TYPE 4
 
 // PIs
@@ -379,12 +382,22 @@ struct BrdfData {
 	// the pdf deriving the frame differently -- that desync is mean-preserving
 	// and no rendered image can catch it (spec section 4.4).
 	//
-	// E3 Task 2: gated out entirely when RT_ANISOTROPY_ENABLED is absent. This
-	// struct is constructed in the hottest loops in the tree, so the four fields
-	// are what E2b's measured 108s is charged to -- NOT the anisotropic maths,
-	// which anisoActive already skipped on every material in the production
-	// scene. Removing the branches while leaving the state in place recovers
-	// nothing; see the E3 spec.
+	// E3 Task 2: gated out entirely when RT_ANISOTROPY_ENABLED is absent.
+	//
+	// The HYPOTHESIS behind that gating -- the E3 plan's, not a measurement --
+	// is that E2b's measured 108s regression is charged mostly to these four
+	// fields rather than to the anisotropic maths, because this struct is
+	// constructed in the hottest loops in the tree while anisoActive already
+	// skipped the maths on every material in the production scene. It follows
+	// from that hypothesis, and is the reason the state is removed rather than
+	// merely branched around, that removing the branches while leaving the
+	// fields in place would recover nothing.
+	//
+	// It is NOT confirmed per feature. E3 Task 4 measured 269s recovered with
+	// anisotropy, coat and sheen all compiled out SIMULTANEOUSLY, and that
+	// single number cannot be decomposed into a per-feature share. Isolating
+	// anisotropy's own contribution would need a run with only this gate
+	// applied. See the E3 spec.
 #ifdef RT_ANISOTROPY_ENABLED
 	float ax;
 	float ay;
@@ -2823,8 +2836,13 @@ float3 layerTransmittanceAbove(MaterialProperties material, float3 N, float3 V, 
 // CDF walk. At N == 2 this must pick LOBE_SPECULAR on exactly the inputs for
 // which today's `u < brdfProbability` picks SPECULAR_TYPE.
 //
-// E2d: LOBE_COUNT is now 3 and the trailing `return LOBE_COUNT - 1` returns the
-// COAT. On an uncoated material weights[LOBE_COAT] is 0.0 and the sampler
+// E2d, when LOBE_COUNT was fixed at 3: the body was a partial CDF walk whose
+// trailing `return LOBE_COUNT - 1` fell through to the LAST registry entry
+// without testing it -- the coat, at that count. (E3 makes LOBE_COUNT 2, 3 or 4
+// depending on which of coat and sheen are compiled in, and which lobe sits last
+// varies with it; the argument below is about the last entry as such, whichever
+// that is in the variant being compiled.) On an uncoated material
+// weights[LOBE_COAT] is 0.0 and the sampler
 // divides throughput by the selected weight -- so it LOOKS like this needs a
 // zero-division guard. It does not, and adding one would hide the real
 // invariant: with coatMass == 0 the caller's baseShare is exactly 1.0f, so the
