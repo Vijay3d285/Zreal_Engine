@@ -387,18 +387,34 @@ After `mat.anisotropy` is read (`render_raytracing.cpp:1875-1885`):
 	}
 ```
 
-- [ ] **Step 3: Log the scene-wide mask once per render**
+- [ ] **Step 3: Log the accumulated mask once per render**
 
-Temporary diagnostic at the end of `build_tlas`, ORing `feature_bits` across the
-materials it processed:
+There is no scene-wide traversal to hang this on yet — the detect pass is Task 4's
+deliverable. So accumulate into a member and log it when it changes, which needs
+no new traversal and still answers "what does this scene contain".
+
+In `render_raytracing.h`, beside the other `RenderRaytracing` members:
 
 ```cpp
-	print_line(vformat("[E3] scene feature mask: aniso=%d coat=%d sheen=%d (materials=%d)",
-			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
-			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
-			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0),
-			material_count));
+	// E3 Task 3 diagnostic, retired in Task 5 Step 6. Monotonic OR across every
+	// material processed so far, logged on change.
+	uint32_t e3_debug_seen_mask = 0;
 ```
+
+At the end of the `feature_bits` assignment in Step 2:
+
+```cpp
+	if ((e3_debug_seen_mask | mat_data->feature_bits) != e3_debug_seen_mask) {
+		e3_debug_seen_mask |= mat_data->feature_bits;
+		print_line(vformat("[E3] features seen so far: aniso=%d coat=%d sheen=%d",
+				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
+				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
+				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0)));
+	}
+```
+
+The last `[E3]` line printed is the scene's full mask. Task 4 replaces this with
+the real per-frame `scene_mask` from the detect pass.
 
 - [ ] **Step 4: Build, render, read the log**
 
@@ -473,6 +489,14 @@ Before any call to `ensure_pipeline_bundle` or `is_hg_ready_in_bundle`:
 		scene_mask |= mat_data->feature_bits;
 	}
 	const uint32_t final_flags = p_rt_flags | scene_mask;
+
+	// Replaces Task 3's monotonic e3_debug_seen_mask diagnostic, which should be
+	// deleted along with its member in this step. This one is per-frame and is
+	// what the Task 5 acceptance steps read.
+	print_line(vformat("[E3] scene feature mask: aniso=%d coat=%d sheen=%d",
+			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
+			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
+			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0)));
 ```
 
 Then replace **every** remaining use of `p_rt_flags` in the function with
@@ -605,8 +629,10 @@ zero quality change — not an oversight.
 
 - [ ] **Step 6: Retire the temporary diagnostic**
 
-Either delete the `[E3]` `print_line` or put it behind
-`if (OS::get_singleton()->is_stdout_verbose())`.
+Delete the per-frame `[E3]` `print_line` added in Task 4 Step 1, or put it behind
+`if (OS::get_singleton()->is_stdout_verbose())`. Confirm Task 3's
+`e3_debug_seen_mask` member and its `print_line` are already gone — Task 4 Step 1
+removes them; if they survived, delete them here.
 
 - [ ] **Step 7: Commit**
 
