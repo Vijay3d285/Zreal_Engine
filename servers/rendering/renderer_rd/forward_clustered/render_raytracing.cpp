@@ -2483,20 +2483,63 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// loss in. Hence: NO pipeline, SBT, BLAS or instance work may happen here.
 	//
 	// process_material() is cached and idempotent (RID+invalidation-counter keyed),
-	// so the pass-2 call on the same material costs one hash lookup. Its only side
+	// so the pass-2 call on the same material costs one hash lookup. Its one side
 	// effect is register_custom_shader(), an append-only slot-table insert that is
-	// independent of the bundle and safe to run before it is built.
+	// independent of the bundle and safe to run before it is built -- but NOT safe to
+	// run before the procedural registration of the same shader source. See sub-sweep
+	// 1a below; that ordering constraint is the reason this pass has two sweeps.
 	//
 	// This walk is deliberately a SUPERSET of pass 2's: it omits pass 2's skips that
 	// depend on the flags (is_hg_ready_in_bundle), on state this pass must not build
-	// (an invalid BLAS from process_surface), or on MultiMesh viability
-	// (transform-format / instance-count). Over-detecting only enables a feature the
-	// final image does not need -- correct but slightly slower. UNDER-detecting would
-	// compile a feature out of a material that uses it, so every material pass 2 can
-	// reach must be reachable here.
+	// (an invalid BLAS from process_surface, a procedural ps->blas), or on MultiMesh
+	// viability (transform-format / instance-count). Over-detecting only enables a
+	// feature the final image does not need -- correct but slightly slower.
+	// UNDER-detecting would compile a feature out of a material that uses it, so every
+	// material pass 2 can reach must be reachable here. The procedural branch's
+	// registration guards are the one place this pass DOES mirror pass 2's skips
+	// exactly, because there they are a correctness requirement rather than an
+	// optimisation -- the comment there explains why.
 	uint32_t scene_mask = 0;
 	{
 		const PagedArray<RenderGeometryInstance *> &detect_instances = *p_render_data->rt_instances;
+
+		// Sub-sweep 1a: PROCEDURAL REGISTRATION FIRST. Order is load-bearing.
+		//
+		// SceneShaderRaytracing::_register_slot() keys `source_hash_to_slot` on the
+		// shader SOURCE HASH alone and is first-write-wins, but it bakes
+		// `entry.is_procedural` from whichever caller creates the slot -- and
+		// _preprocess_shader() only registers the `intersection` entry-point stage
+		// when that flag is true. process_material() calls register_custom_shader()
+		// (p_is_procedural=false) for any ShaderMaterial, and a procedural instance's
+		// material_override IS a ShaderMaterial. So if the detection walk reached such
+		// a material before anything registered it as procedural, the slot would be
+		// created WITHOUT an intersection stage and the later
+		// register_procedural_shader() would find the hash and hand back that same
+		// intersection-less slot. Pass 2 got this right only by accident of ordering:
+		// its procedural branch registers before it processes the material.
+		//
+		// Doing every procedural registration up front makes the invariant hold
+		// globally rather than by traversal order -- which also closes the same
+		// hazard between a triangle instance and a LATER procedural instance sharing
+		// one shader source, a case pass 2's single interleaved loop never handled.
+		for (uint32_t i = 0; i < (uint32_t)detect_instances.size(); i++) {
+			const RenderForwardClustered::GeometryInstanceForwardClustered *inst =
+					static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(detect_instances[i]);
+			if (!inst || !inst->data || !inst->rt_procedural) {
+				continue;
+			}
+			RID proc_material_rid = inst->data->material_override;
+			if (!proc_material_rid.is_valid()) {
+				continue;
+			}
+			uint32_t proc_shader_id = material_storage->material_get_shader_id(proc_material_rid);
+			if (proc_shader_id == 0) {
+				continue;
+			}
+			rt_shader_singleton->register_procedural_shader(proc_shader_id, proc_material_rid);
+		}
+
+		// Sub-sweep 1b: the feature walk.
 		for (uint32_t i = 0; i < (uint32_t)detect_instances.size(); i++) {
 			const RenderForwardClustered::GeometryInstanceForwardClustered *inst =
 					static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(detect_instances[i]);
@@ -2508,8 +2551,21 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (inst->rt_procedural) {
 				RID proc_material_rid = inst->data->material_override;
 				if (proc_material_rid.is_valid()) {
-					uint16_t proc_mat_counter = material_storage->material_get_rt_invalidation_counter(proc_material_rid);
-					scene_mask |= process_material(proc_material_rid, proc_mat_counter)->feature_bits;
+					// Repeat of 1a's guarded registration. After 1a this is a hash-map
+					// hit, so it costs a lookup -- but it is ALSO the gate, and that is
+					// why it is not simply assumed to have succeeded. When registration
+					// yields 0 the slot was NOT inserted (_register_slot returns early
+					// for empty intersection code), so calling process_material() here
+					// would insert a non-procedural slot for a procedural material and
+					// re-create exactly the bug 1a exists to prevent. Pass 2 `continue`s
+					// on this same condition and never processes the material either, so
+					// skipping costs no detection coverage.
+					uint32_t proc_shader_id = material_storage->material_get_shader_id(proc_material_rid);
+					if (proc_shader_id != 0 &&
+							rt_shader_singleton->register_procedural_shader(proc_shader_id, proc_material_rid) != 0) {
+						uint16_t proc_mat_counter = material_storage->material_get_rt_invalidation_counter(proc_material_rid);
+						scene_mask |= process_material(proc_material_rid, proc_mat_counter)->feature_bits;
+					}
 				}
 				continue;
 			}
