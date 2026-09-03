@@ -3676,6 +3676,13 @@ loop went 912s → 643s against a 639s pre-regression baseline (`28bb89cad`) —
 production scene, same machine, same 128-frame DLSS-RR drive; image mean
 159.3341, matching the reference exactly.
 
+**Re-measured after the final-review fix wave (`6d5ec7a489`), which added the
+accumulation reset on a variant change: loop 639s, total 720s — landing exactly
+on the pre-regression baseline, i.e. the full 273s.** The 643s above and this
+639s differ by less than the run-to-run noise on timing; both are reported
+rather than picking the better one. Mask still `aniso=0 coat=0 sheen=0`, zero
+shader/pipeline errors, image mean 159.3341.
+
 **That condition is the result, not a footnote on it.** E3 removes cost a scene
 does not use; it removes nothing from a scene that does. 98.5% is this
 mechanism's *ceiling*, reached at the all-features-absent end of the range, and
