@@ -3634,11 +3634,21 @@ groups — anisotropy, coat, sheen — on what the scene actually contains.
 
 #### What the time bought, on this scene
 
+> **SUPERSEDED by §7.13 — the second paragraph of this subsection is wrong.**
+> The conclusion "the coat and sheen paths are reached" was inferred from a
+> pixel delta that is **entirely inside this render's own noise floor**. Two
+> runs of the *same binary* differ at rmse 0.1406 / 5.58% of pixels. The 6.03%
+> / rmse 0.1464 below is that floor, not an effect. E3's detector settles the
+> question directly: this scene reports `aniso=0 coat=0 sheen=0` — it uses
+> **none** of the three features. The timing numbers in this section are
+> unaffected; only the pixel-difference inference is retracted.
+
 BASE vs HEAD: **6.03% of pixels differ**, rmse 0.1464, max 31/255, means equal
-to four decimals. The operator's "no visible difference" is accurate. The coat
+to four decimals. The operator's "no visible difference" is accurate. ~~The coat
 and sheen paths are reached — via glTF-imported materials, not the scene
 scripts, whose `ReflectionAssist` and `Photorealism` passes never fire in this
-job — but at an amplitude no viewer would call worth +42.7%.
+job — but at an amplitude no viewer would call worth +42.7%.~~ (Retracted; see
+the note above.)
 
 #### Open
 
@@ -3654,3 +3664,135 @@ job — but at an amplitude no viewer would call worth +42.7%.
   occupancy that follows, which is a different fix.
 - `pipeline_references/` was never modified by this investigation; renders were
   driven directly against the stage-copy project with outputs to scratch.
+
+### 7.13 E3 — per-scene feature gating, and the recovery it measured
+
+E3 is the fix §7.12 asked for and did not implement: compile anisotropy, coat
+and sheen out of the raygen pipeline when the scene does not contain them.
+
+**Headline: the render loop went 912s → 643s against a 639s pre-regression
+baseline (`28bb89cad`). 269 of the 273s regression recovered — 98.5%.** Totals
+724s vs 990s. Same production scene, same machine, same 128-frame DLSS-RR
+drive; image mean 159.3341, matching the reference exactly.
+
+#### The mechanism
+
+Three flag bits — `RT_FLAG_ANISOTROPY_ENABLED` (1<<15),
+`RT_FLAG_COAT_ENABLED` (1<<16), `RT_FLAG_SHEEN_ENABLED` (1<<17),
+`scene_shader_raytracing.h:96-98` — are appended to `RAYGEN_SHADER_OPTIONS`
+(`scene_shader_raytracing.cpp:70-72`), where each set bit injects a `#define`
+into the raygen preamble: `RT_ANISOTROPY_ENABLED`, `RT_COAT_ENABLED`,
+`RT_SHEEN_ENABLED`. Under those `#ifdef`s the anisotropy state (`ax`, `ay`,
+`anisoPhi`, `anisoActive`) leaves `BrdfData` and every sampling/pdf signature
+that threaded it, and `LOBE_COUNT` collapses 4 → 3 → 2 with `LOBE_SHEEN`
+sliding 3 → 2 when coat is absent (`brdf_inc.glsl:1872-1883`). That is the
+occupancy fix §7.12's attribution pointed at, not a gate on arithmetic that
+was already runtime-disabled.
+
+Detection is per material — `RTMaterialData::feature_bits`, set in
+`process_material()` (`render_raytracing.cpp:1885-1898`) from the same
+predicates the shader guards use. `build_tlas` runs a **two-pass** structure:
+pass 1a registers procedural hit-group shaders, pass 1b walks every material
+and ORs the mask, and only then does `final_flags = p_rt_flags | scene_mask`
+settle — before any pipeline build, SBT write, or instance record. Nothing
+downstream reads `p_rt_flags` again. The ordering is load-bearing: the detect
+walk must see procedural materials, which is why 1a exists at all.
+
+#### Acceptance — the feature-PRESENT path
+
+The all-off path was measured first, and it is the production scene: the
+detector reports `aniso=0 coat=0 sheen=0` there, and that variant's first real
+GLSL compile produced **zero shader or pipeline errors**. What that cannot
+prove is the opposite case — that a scene which *does* use a feature still
+gets it, and still renders it correctly. E2b/E2d/E2e already left the right
+instrument for that: three gate scenes in `pipeline_references/tests/`, each
+driving its feature far above the noise floor and carrying its own assertions
+and baselines.
+
+| Gate | `[E3] scene feature mask` | Result | Exit |
+|---|---|---|---|
+| `pt_anisotropy_gate_scene.tscn` | `aniso=1 coat=0 sheen=0` | **PASS** — anisotropic GGX gate green | 0 |
+| `pt_coat_gate_scene.tscn` | `aniso=0 coat=1 sheen=0` | **PASS** — coat gate green | 0 |
+| `pt_sheen_gate_scene.tscn` | `aniso=0 coat=0 sheen=1` | **PASS** — sheen gate green | 0 |
+
+Every probe held to its pre-E3 baseline. Anisotropy: probe 1 white furnace
+max|R−G| = 9.5e-7, probe 2 self-normalisation E[1/G] = 6.284324, ratio vs 2π =
+1.000181 over n=53361. Coat: probe E's directional reflectance tracked analytic
+Fresnel to ratio 0.9995–1.0073 across five cosines × three IORs, probe D's
+three-lobe pdf self-normalised to 1.0010–1.0013 at clearcoat 0/0.5/1.0, probe G
+found `clearcoat_ior == 1.0` inert at rmse 0.000793 against a 0.000862 floor.
+Sheen: probe B measured 0.567553 against the predicted `tint*ltcAlbedo`
+0.567582 (ratio 0.9999), probe D's four-lobe pdf gave E[1/G] = 6.278383 (ratio
+0.999236), and probe E2's frame-orientation ratio came in at 1.199353 against a
+CPU-mirror prediction of 1.199338 — a quantity that reads 0.8338 with rT/rB
+swapped. The only error in any of the three logs is `res://icon.svg` missing at
+startup, which is pre-existing and unrelated.
+
+**Five distinct pipeline variants compiled and ran clean across these four
+renders**, because the gates flip materials mid-run and the detector follows:
+`000` (production and every gate's control arm), `100`, `010`, `001` and `011`.
+That exercises `LOBE_COUNT` at 2, 3 and 4, and `LOBE_SHEEN` at both 2 (sheen
+without coat — the slide) and 3.
+
+Detection is falsifiable, and was shown so twice. During implementation,
+temporarily forcing `mat.clearcoat`, `mat.sheen_color[0]` and `mat.anisotropy`
+nonzero made the detector print `aniso=1 coat=1 sheen=1` on the production
+scene; the probe was reverted. The gate scenes are the natural second
+demonstration — each turns on exactly its own bit and no other.
+
+#### The correction to §7.12
+
+§7.12 concluded, from a 6.03% pixel delta between BASE and HEAD, that "the coat
+and sheen paths are reached" on the production scene. **That inference is
+withdrawn.** The scene reports `aniso=0 coat=0 sheen=0`; it uses none of the
+three. The 6.03% was noise — see below. §7.12's *timing* numbers and its
+attribution table are unaffected, and E3's 98.5% recovery is in fact the
+strongest confirmation of that attribution: the 273s really was diffuse
+register-pressure cost paid by a scene that executes none of the features.
+
+#### Open: the render is nondeterministic
+
+**Two runs of the same binary on the same scene differ at rmse 0.1406, with
+5.58% of pixels differing.** This was discovered while trying to pixel-diff
+E3, and it invalidates that whole class of measurement on this scene: removing
+coat and sheen *entirely* produced rmse 0.1455. The effect and the floor are
+the same size.
+
+Characterised: **uniform low-amplitude dither.** 4–8% of pixels differ in
+*every* cell of a 6×8 grid — no spatial locality, no hot region. Mean magnitude
+1.04/255. Mean luminance where pixels differ is 160.4 against 159.3 where they
+agree, i.e. the differing pixels are not systematically brighter or darker.
+
+Two candidate causes were **refuted by measurement**, not by argument:
+
+1. **The free-running `frame_counter` RNG seed.** Instrumented directly; the
+   sequence is identical across runs.
+2. **Float atomics in the RT GLSL.** There are none.
+
+Remaining candidates, untested: DLSS-RR's own execution, and the async
+pipeline-build race that drops instances via `is_hg_ready_in_bundle`. The
+second is the more troubling of the two, because it would mean frames
+occasionally render with a different instance set.
+
+Until this is closed, **any acceptance argument on this scene that rests on
+pixel equality is invalid.** Use the gate scenes, which assert on converged
+statistics with declared tolerances, or use image mean.
+
+#### Open: `scons` exit 0 says almost nothing about shaders
+
+`glsl_builders.py` performs **no GLSL validation whatsoever** — it embeds the
+shader text into a `.gen.h` and nothing more. A syntactically broken or
+semantically invalid `#ifdef` branch builds cleanly and fails at pipeline
+creation, at runtime, in whichever variant happens to select it. This is
+exactly the trap E3's `#ifdef` restructuring could have fallen into: the
+production scene only ever compiles the `000` variant, so four of the five
+variants above were unexercised by any amount of building or production
+rendering. **Running a scene that selects the variant is the only evidence.**
+
+#### Housekeeping
+
+The `[E3] scene feature mask` line fires once per `build_tlas` — ~128 times per
+capture. It is now behind `OS::get_singleton()->is_stdout_verbose()` rather
+than deleted, since it is the only external read of what the detect pass
+concluded and is how the acceptance above was measured. Re-arm it with
+`--verbose`.
