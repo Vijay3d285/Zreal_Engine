@@ -1880,6 +1880,31 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.anisotropy = CLAMP((float)anisotropy_var, -1.0f, 1.0f);
 	}
 
+	// E3 detection. Each predicate mirrors the shader guard cited beside it.
+	mat_data->feature_bits = 0;
+	if (mat.anisotropy != 0.0f) {
+		// brdf_inc.glsl:1783, prepareBRDFData's anisoActive gate.
+		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED;
+	}
+	if (mat.clearcoat > 0.00001f) {
+		// brdf_inc.glsl:3283 hasCoat, raytracing_closest_hit_common_inc.glsl:1525
+		// (coatWeight = max(clearcoat, 0.0) -- the max() does not move the
+		// threshold, so the CPU check on raw clearcoat is equivalent).
+		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_COAT_ENABLED;
+	}
+	if (MAX(mat.sheen_color[0], MAX(mat.sheen_color[1], mat.sheen_color[2])) > 0.00001f) {
+		// brdf_inc.glsl:2631 sheenMaxTint.
+		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED;
+	}
+
+	if ((e3_debug_seen_mask | mat_data->feature_bits) != e3_debug_seen_mask) {
+		e3_debug_seen_mask |= mat_data->feature_bits;
+		print_line(vformat("[E3] features seen so far: aniso=%d coat=%d sheen=%d",
+				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
+				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
+				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0)));
+	}
+
 	Variant emission_var = material_storage->material_get_param(p_material_rid, "emission");
 	if (emission_var.get_type() == Variant::COLOR) {
 		Color c = ((Color)emission_var).srgb_to_linear();

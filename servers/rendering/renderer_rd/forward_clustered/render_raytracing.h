@@ -273,6 +273,12 @@ struct RTMaterialData {
 	RID normal_texture_rd;
 	RID orm_texture_rd;
 	RID emission_texture_rd;
+
+	// E3. OR of RT_FLAG_ANISOTROPY_ENABLED / _COAT_ / _SHEEN_ for this material.
+	// The predicates that set it mirror the shader's own guards -- see the fill
+	// site in render_raytracing.cpp. Drift between the two silently compiles a
+	// feature out of a scene that uses it.
+	uint32_t feature_bits = 0;
 };
 
 struct RTCacheEntry {
@@ -411,6 +417,10 @@ class RenderRaytracing {
 	BindlessBlock *bindless_block = nullptr;
 
 	RID bindless_uniform_set;
+
+	// E3 Task 3 diagnostic, retired in Task 5 Step 6. Monotonic OR across every
+	// material processed so far, logged on change.
+	uint32_t e3_debug_seen_mask = 0;
 
 	// Caching (chunked sparse caches indexed by RID low bits / 256).
 	Vector<RTCacheEntry *> surface_chunks;
