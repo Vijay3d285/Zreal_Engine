@@ -3670,10 +3670,27 @@ the note above.)
 E3 is the fix §7.12 asked for and did not implement: compile anisotropy, coat
 and sheen out of the raygen pipeline when the scene does not contain them.
 
-**Headline: the render loop went 912s → 643s against a 639s pre-regression
-baseline (`28bb89cad`). 269 of the 273s regression recovered — 98.5%.** Totals
-724s vs 990s. Same production scene, same machine, same 128-frame DLSS-RR
-drive; image mean 159.3341, matching the reference exactly.
+**Headline: on a scene that uses none of the three gated features, the render
+loop went 912s → 643s against a 639s pre-regression baseline (`28bb89cad`) —
+269 of the 273s regression recovered, 98.5%.** Totals 724s vs 990s. Same
+production scene, same machine, same 128-frame DLSS-RR drive; image mean
+159.3341, matching the reference exactly.
+
+**That condition is the result, not a footnote on it.** E3 removes cost a scene
+does not use; it removes nothing from a scene that does. 98.5% is this
+mechanism's *ceiling*, reached at the all-features-absent end of the range, and
+the floor at the other end is 0% — a scene using all three compiles the same
+pipeline HEAD did and pays the full 273s. The production scene sits at the
+ceiling only because it reports `aniso=0 coat=0 sheen=0`.
+
+**Only those two endpoints are measured.** Nothing in between has been: no
+render was timed on a scene using exactly one or two of the features. §7.12's
+per-component attribution (anisotropy 108s, coat+sheen 87s, 78s of shared
+scaffolding) makes it plausible that a one-feature scene recovers roughly the
+other two's share, but that is an inference from a different experiment on a
+different set of builds — it is not a measurement of E3, and it should not be
+quoted as one. Do not carry "98.5%" into any context that does not carry the
+feature condition with it.
 
 #### The mechanism
 
@@ -3733,6 +3750,13 @@ renders**, because the gates flip materials mid-run and the detector follows:
 `000` (production and every gate's control arm), `100`, `010`, `001` and `011`.
 That exercises `LOBE_COUNT` at 2, 3 and 4, and `LOBE_SHEEN` at both 2 (sheen
 without coat — the slide) and 3.
+
+**Four of those five had never been compiled before these three runs.** The
+production scene selects `000` and only `000`, so every hour of building and
+every production render up to this point had exercised exactly one variant of
+the five E3 creates. The gate scenes are what covered the other four, and
+given the `glsl_builders.py` finding below they are the only thing that could
+have.
 
 Detection is falsifiable, and was shown so twice. During implementation,
 temporarily forcing `mat.clearcoat`, `mat.sheen_color[0]` and `mat.anisotropy`
