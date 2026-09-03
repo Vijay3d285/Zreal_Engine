@@ -722,10 +722,11 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		max_transmission_bounce = (uint32_t)CLAMP(raw, 1, 15);
 	}
 
-	// E3 Task 1: unconditionally ON. Detection lands in Task 3 and starts driving
-	// these in Task 4. Until then this is a no-op that must render bit-identically
-	// -- which is exactly what makes Tasks 1 and 2 independently verifiable.
-	flags |= RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED;
+	// E3: RT_FLAG_ANISOTROPY/COAT/SHEEN are deliberately NOT set here. They are not
+	// environment-derived -- they are per-scene, and RenderRaytracing::build_tlas()
+	// ORs them in from its material detection pass before it touches the pipeline
+	// bundle. The Task 1 unconditional force that used to sit here is gone; anything
+	// re-adding it would pin every scene to the all-features-on variant again.
 
 	return rt_flags_pack(flags, sample_count, max_bounces, min_bounce, max_transmission_bounce);
 }

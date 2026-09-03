@@ -1897,13 +1897,11 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED;
 	}
 
-	if ((e3_debug_seen_mask | mat_data->feature_bits) != e3_debug_seen_mask) {
-		e3_debug_seen_mask |= mat_data->feature_bits;
-		print_line(vformat("[E3] features seen so far: aniso=%d coat=%d sheen=%d",
-				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
-				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
-				(int)((e3_debug_seen_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0)));
-	}
+	// The Task 3 monotonic "features seen so far" print lived here. It is replaced
+	// by the per-frame scene_mask log in build_tlas()'s detection pass: that one
+	// reports what THIS frame's flags were actually settled from, which is what the
+	// Task 5 acceptance steps read. A monotonic mask could not fall back to 0 and so
+	// could never show a feature leaving the scene.
 
 	Variant emission_var = material_storage->material_get_param(p_material_rid, "emission");
 	if (emission_var.get_type() == Variant::COLOR) {
@@ -2468,12 +2466,100 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	prepare_frame();
 
-	// Builds bundle if needed; live_ready_mask drives TLAS inclusion below.
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
-	rt_shader_singleton->ensure_pipeline_bundle(p_rt_flags);
-
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+
+	// -----------------------------------------------------------------------
+	// E3 pass 1: DETECT ONLY.
+	//
+	// The per-material feature bits (anisotropy/coat/sheen) decide which shader
+	// variant this frame compiles against, so they must be fully known BEFORE the
+	// first call that consumes the flags. `ensure_pipeline_bundle()` and every
+	// `is_hg_ready_in_bundle()` below are flag-consumers, and a hit group that is
+	// not ready for the flags in hand makes its instance `continue` -- dropped from
+	// the TLAS entirely. If this pass and the build pass disagreed on the flags,
+	// geometry would silently vanish and the 128-frame accumulation would bake the
+	// loss in. Hence: NO pipeline, SBT, BLAS or instance work may happen here.
+	//
+	// process_material() is cached and idempotent (RID+invalidation-counter keyed),
+	// so the pass-2 call on the same material costs one hash lookup. Its only side
+	// effect is register_custom_shader(), an append-only slot-table insert that is
+	// independent of the bundle and safe to run before it is built.
+	//
+	// This walk is deliberately a SUPERSET of pass 2's: it omits pass 2's skips that
+	// depend on the flags (is_hg_ready_in_bundle), on state this pass must not build
+	// (an invalid BLAS from process_surface), or on MultiMesh viability
+	// (transform-format / instance-count). Over-detecting only enables a feature the
+	// final image does not need -- correct but slightly slower. UNDER-detecting would
+	// compile a feature out of a material that uses it, so every material pass 2 can
+	// reach must be reachable here.
+	uint32_t scene_mask = 0;
+	{
+		const PagedArray<RenderGeometryInstance *> &detect_instances = *p_render_data->rt_instances;
+		for (uint32_t i = 0; i < (uint32_t)detect_instances.size(); i++) {
+			const RenderForwardClustered::GeometryInstanceForwardClustered *inst =
+					static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(detect_instances[i]);
+			if (!inst || !inst->data) {
+				continue;
+			}
+
+			// Procedural instances take their material from material_override only.
+			if (inst->rt_procedural) {
+				RID proc_material_rid = inst->data->material_override;
+				if (proc_material_rid.is_valid()) {
+					uint16_t proc_mat_counter = material_storage->material_get_rt_invalidation_counter(proc_material_rid);
+					scene_mask |= process_material(proc_material_rid, proc_mat_counter)->feature_bits;
+				}
+				continue;
+			}
+
+			// Triangle + MultiMesh instances share the same surface-cache walk and
+			// the same override > surface_materials > mesh material resolution; only
+			// the mesh they fall back to differs.
+			const bool is_multimesh = (inst->data->base_type == RSE::INSTANCE_MULTIMESH);
+			for (const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches; surf; surf = surf->next) {
+				if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+					continue;
+				}
+				RID material_rid;
+				if (surf->owner->data->material_override.is_valid()) {
+					material_rid = surf->owner->data->material_override;
+				} else if (surf->surface_index < surf->owner->data->surface_materials.size() &&
+						surf->owner->data->surface_materials[surf->surface_index].is_valid()) {
+					material_rid = surf->owner->data->surface_materials[surf->surface_index];
+				} else {
+					RID mesh_rid = is_multimesh ? mesh_storage->multimesh_get_mesh(inst->data->base) : surf->owner->data->base;
+					if (mesh_rid.is_valid() && mesh_storage->owns_mesh(mesh_rid)) {
+						material_rid = mesh_storage->mesh_surface_get_material(mesh_rid, surf->surface_index);
+					}
+				}
+				// An invalid RID resolves to the static default material, whose
+				// feature_bits are 0 -- no special case needed.
+				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
+				scene_mask |= process_material(material_rid, material_counter)->feature_bits;
+			}
+		}
+	}
+
+	// The one settled value. Every flag-consumer from here down uses this and
+	// nothing else; `p_rt_flags` must not appear again in this function.
+	// feature_bits only ever carries bits 15-17, which rt_flags_pack() leaves
+	// untouched, so OR-ing into the packed word cannot corrupt the sample-count,
+	// bounce or transmission-cap fields.
+	const uint32_t final_flags = p_rt_flags | scene_mask;
+	state->settled_rt_flags = final_flags;
+
+	print_line(vformat("[E3] scene feature mask: aniso=%d coat=%d sheen=%d",
+			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
+			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
+			(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0)));
+
+	// -----------------------------------------------------------------------
+	// E3 pass 2: the real build. Builds bundle if needed; live_ready_mask drives
+	// TLAS inclusion below.
+	rt_shader_singleton->ensure_pipeline_bundle(final_flags);
+
 	LocalVector<RID> dirty_blas_list;
 	LocalVector<RID> dirty_blas_update_list;
 
@@ -2540,7 +2626,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (hg_index == 0) {
 				continue;
 			}
-			if (!rt_shader->is_hg_ready_in_bundle(hg_index, p_rt_flags)) {
+			if (!rt_shader->is_hg_ready_in_bundle(hg_index, final_flags)) {
 				continue;
 			}
 
@@ -2641,7 +2727,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				RTMaterialData *mat_data = process_material(material_rid, material_counter);
 
 				if (mat_data->rt_sbt_offset > 0 &&
-						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, final_flags)) {
 					mm_surf = mm_surf->next;
 					continue;
 				}
@@ -2758,7 +2844,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			RTMaterialData *mat_data = process_material(material_rid, material_counter);
 
 			if (mat_data->rt_sbt_offset > 0 &&
-					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, final_flags)) {
 				surf = surf->next;
 				continue;
 			}

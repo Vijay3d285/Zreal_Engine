@@ -2471,6 +2471,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
+			// E3: build_tlas() settles the per-scene material feature bits
+			// (anisotropy/coat/sheen, bits 15-17) from its detection pass and picks
+			// the pipeline bundle, the SBT slots and TLAS instance inclusion with the
+			// settled value. Overwrite the local here so update_uniform_set() and the
+			// trace-dispatch block below (get_raytracing_pipeline / get_hit_sbt) all
+			// read the same word. Assigning back into `rt_flags` rather than adding a
+			// second local is deliberate: it makes it impossible for a downstream
+			// reader to pick up the unsettled value by accident. A mismatch would not
+			// crash -- it would bind a shader variant the hit groups were never
+			// checked against and silently drop geometry from the image.
+			rt_flags = rt_state->settled_rt_flags;
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
 		}
 	} else if (rb_data.is_valid() && rb_data->dlss_rr_has_buffers()) {
@@ -2858,8 +2869,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		} else {
 		RENDER_TIMESTAMP("Pathtracer");
 
-		// rt_flags was computed at TLAS-build time above and matches what
-		// update_uniform_set used, so pipeline + uniform set stay in sync.
+		// rt_flags was computed at TLAS-build time above and then overwritten with
+		// build_tlas()'s SETTLED value (E3 feature bits folded in), so the pipeline,
+		// the hit SBT, the uniform set and the TLAS all agree on one variant.
 		RID rt_pipeline = raytracing->get_shader()->get_raytracing_pipeline(rt_flags);
 		if (!rt_pipeline.is_valid()) {
 			ERR_PRINT_ONCE_ED("Failed to get raytracing pipeline. Aborting render.");

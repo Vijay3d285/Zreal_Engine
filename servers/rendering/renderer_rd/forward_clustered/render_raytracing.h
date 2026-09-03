@@ -407,6 +407,18 @@ struct RTViewportState {
 	// on the same events that clear the accumulator so each convergence cycle re-warms.
 	int dlss_rr_warmup_left = 0;
 	bool dlss_rr_final_done = false;
+
+	// E3: the packed rt_flags this frame's TLAS was actually built against --
+	// `p_rt_flags | scene_mask`, where scene_mask is the OR of every material's
+	// detected feature bits (anisotropy/coat/sheen, bits 15-17). build_tlas picks
+	// the pipeline bundle and decides TLAS instance inclusion with this value, so
+	// the dispatch MUST bind get_raytracing_pipeline()/get_hit_sbt() with the SAME
+	// value. Binding the unsettled caller-side flags instead does not crash: it
+	// binds a different shader variant than the hit groups were checked against,
+	// and geometry silently disappears from the image.
+	// Written on every successful build_tlas() return; the caller only reads it
+	// when build_tlas returned non-null, so a stale value is unreachable.
+	uint32_t settled_rt_flags = 0;
 };
 
 class RenderRaytracing {
@@ -417,10 +429,6 @@ class RenderRaytracing {
 	BindlessBlock *bindless_block = nullptr;
 
 	RID bindless_uniform_set;
-
-	// E3 Task 3 diagnostic, retired in Task 5 Step 6. Monotonic OR across every
-	// material processed so far, logged on change.
-	uint32_t e3_debug_seen_mask = 0;
 
 	// Caching (chunked sparse caches indexed by RID low bits / 256).
 	Vector<RTCacheEntry *> surface_chunks;
