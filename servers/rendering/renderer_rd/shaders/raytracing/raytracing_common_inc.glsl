@@ -62,6 +62,19 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_MAX_TRANSMISSION_BOUNCE_MASK 0xFu
 #define RT_GET_MAX_TRANSMISSION_BOUNCE() ((RT_FLAGS >> RT_MAX_TRANSMISSION_BOUNCE_SHIFT) & RT_MAX_TRANSMISSION_BOUNCE_MASK)
 
+// E3. Bits 15-17. MUST match RT_FLAG_ANISOTROPY_ENABLED / RT_FLAG_COAT_ENABLED /
+// RT_FLAG_SHEEN_ENABLED in scene_shader_raytracing.h. These bits ALSO drive
+// #define injection via RAYGEN_SHADER_OPTIONS, and that is what the gating
+// actually uses: the accessors below are diagnostics only. A specialization
+// constant can fold a branch but cannot remove a struct field or size an array,
+// which is what this phase needs -- see the spec's section 3.1.
+#define RT_FLAG_ANISOTROPY_ENABLED 32768u // 1 << 15
+#define RT_FLAG_COAT_ENABLED 65536u // 1 << 16
+#define RT_FLAG_SHEEN_ENABLED 131072u // 1 << 17
+#define RT_GET_ANISOTROPY_ENABLED() ((RT_FLAGS & RT_FLAG_ANISOTROPY_ENABLED) != 0u)
+#define RT_GET_COAT_ENABLED() ((RT_FLAGS & RT_FLAG_COAT_ENABLED) != 0u)
+#define RT_GET_SHEEN_ENABLED() ((RT_FLAGS & RT_FLAG_SHEEN_ENABLED) != 0u)
+
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
 

@@ -63,6 +63,13 @@ struct RaygenShaderOption {
 static constexpr RaygenShaderOption RAYGEN_SHADER_OPTIONS[] = {
 	{ SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED, "#define DLSS_RR_ENABLED\n" },
 	{ SceneShaderRaytracing::RT_FLAG_SER_ENABLED, "#define USE_SER\n" },
+	// E3. This array is 2^N in its entry count (see the comment above it): five
+	// entries is 32 reachable raygen permutations, up from four. Variants compile
+	// lazily and one render requests one, so the growth is latent -- but each new
+	// combination pays a first-use compile.
+	{ SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED, "#define RT_ANISOTROPY_ENABLED\n" },
+	{ SceneShaderRaytracing::RT_FLAG_COAT_ENABLED, "#define RT_COAT_ENABLED\n" },
+	{ SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED, "#define RT_SHEEN_ENABLED\n" },
 };
 
 static constexpr uint32_t RAYGEN_SHADER_OPTION_COUNT = sizeof(RAYGEN_SHADER_OPTIONS) / sizeof(RAYGEN_SHADER_OPTIONS[0]);
@@ -714,6 +721,11 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		const int raw = raw_variant.is_num() ? (int)raw_variant : 12;
 		max_transmission_bounce = (uint32_t)CLAMP(raw, 1, 15);
 	}
+
+	// E3 Task 1: unconditionally ON. Detection lands in Task 3 and starts driving
+	// these in Task 4. Until then this is a no-op that must render bit-identically
+	// -- which is exactly what makes Tasks 1 and 2 independently verifiable.
+	flags |= RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED;
 
 	return rt_flags_pack(flags, sample_count, max_bounces, min_bounce, max_transmission_bounce);
 }

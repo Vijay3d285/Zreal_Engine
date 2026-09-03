@@ -73,7 +73,8 @@ public:
 	// Bits 4-8:   Russian Roulette min_bounce (roadmap B4, biased +1; see RT_MIN_BOUNCE_SHIFT)
 	// Bit 9:      Emissive-mesh NEE (roadmap C1)
 	// Bits 10-14: Transmission enable + bounce cap (roadmap E1)
-	// Bits 15-19: Free
+	// Bits 15-17: Material feature gating (roadmap E3: anisotropy, coat, sheen)
+	// Bits 18-19: Free
 	// Bits 20-27: Sample count
 	// Bits 28-31: Max bounce count (offset by 1: 0=1 bounce, 15=16 bounces)
 	// Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
@@ -88,6 +89,13 @@ public:
 		// Bits 4-8 belong to RT_MIN_BOUNCE (below), so the next feature flag is 9.
 		RT_FLAG_EMISSIVE_LIGHTS_ENABLED = (1 << 9),
 		RT_FLAG_TRANSMISSION_ENABLED = (1 << 10),
+		// E3. Bits 15-17, from the free range documented above. NOT 11-14 --
+		// those are RT_MAX_TRANSMISSION_BOUNCE (E1), and the collision would
+		// corrupt that field's readback while leaving the render merely
+		// plausible instead of visibly wrong.
+		RT_FLAG_ANISOTROPY_ENABLED = (1 << 15),
+		RT_FLAG_COAT_ENABLED = (1 << 16),
+		RT_FLAG_SHEEN_ENABLED = (1 << 17),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
@@ -119,7 +127,7 @@ public:
 	// alias the Russian Roulette min_bounce field, corrupt the readback, and leave
 	// the rendered image merely plausible instead of visibly wrong. Keep this in
 	// sync whenever RT_FLAG_* gains a member.
-	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
+	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED | RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
 			"RT_FLAG_* bit overlaps the Russian Roulette min_bounce field (bits 4-8)");
 
 	// The transmission cap field must miss every neighbouring field. A collision
@@ -130,7 +138,10 @@ public:
 								  (RT_SAMPLE_COUNT_MASK << RT_SAMPLE_COUNT_SHIFT) |
 								  (RT_MAX_BOUNCES_MASK << RT_MAX_BOUNCES_SHIFT) |
 								  RT_FLAG_EMISSIVE_LIGHTS_ENABLED |
-								  RT_FLAG_TRANSMISSION_ENABLED)) == 0,
+								  RT_FLAG_TRANSMISSION_ENABLED |
+								  RT_FLAG_ANISOTROPY_ENABLED |
+								  RT_FLAG_COAT_ENABLED |
+								  RT_FLAG_SHEEN_ENABLED)) == 0,
 			"RT_MAX_TRANSMISSION_BOUNCE field (bits 11-14) overlaps another RT_FLAGS field");
 
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).
