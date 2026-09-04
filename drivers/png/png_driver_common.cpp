@@ -30,11 +30,15 @@
 
 #include "png_driver_common.h"
 
+#include "core/math/math_funcs.h"
+
 #ifdef TOOLS_ENABLED
 #include "core/config/engine.h"
 #endif
 
 #include <png.h>
+
+#include <string.h>
 
 namespace PNGDriverCommon {
 
@@ -200,6 +204,189 @@ Error image_to_png(const Ref<Image> &p_image, Vector<uint8_t> &p_buffer) {
 
 	// trim buffer size to content
 	Error err = p_buffer.resize(buffer_offset + compressed_size);
+	ERR_FAIL_COND_V(err, err);
+
+	return OK;
+}
+
+// --- 16-bit PNG writer -------------------------------------------------------
+//
+// image_to_png() above goes through libpng's *simplified* API, whose `default:`
+// branch converts any float or half image down to RGB8/RGBA8 before a single
+// byte is written. The quantisation happens before the file exists, so no
+// encoder option can recover it. This writer drives the full libpng API instead
+// (png_create_write_struct / png_set_IHDR / png_write_row) so it can emit
+// PNG_COLOR_TYPE_RGB or PNG_COLOR_TYPE_RGB_ALPHA at bit depth 16 — matching
+// Blender's default still output.
+
+namespace {
+
+// Growing memory sink for png_set_write_fn(). libpng emits in ~8 KiB chunks, so
+// a Vector::resize() per chunk would be O(n^2) — thousands of full-buffer copies
+// on a 50 MB file. Capacity doubles instead, and the buffer is trimmed once at
+// the end.
+struct PNG16Sink {
+	Vector<uint8_t> *buffer = nullptr;
+	size_t base = 0; // Bytes already present in *buffer when we started appending.
+	size_t size = 0; // Bytes written past `base`.
+	size_t capacity = 0; // Bytes reserved past `base`.
+	bool failed = false;
+};
+
+void PNGCBAPI _png16_write(png_structp p_png, png_bytep p_data, png_size_t p_length) {
+	PNG16Sink *sink = static_cast<PNG16Sink *>(png_get_io_ptr(p_png));
+	if (sink == nullptr || sink->failed) {
+		return;
+	}
+	if (sink->size + p_length > sink->capacity) {
+		size_t new_capacity = sink->capacity > 0 ? sink->capacity : (size_t)65536;
+		while (new_capacity < sink->size + p_length) {
+			new_capacity *= 2;
+		}
+		if (sink->buffer->resize(sink->base + new_capacity) != OK) {
+			sink->failed = true;
+			return;
+		}
+		sink->capacity = new_capacity;
+	}
+	memcpy(sink->buffer->ptrw() + sink->base + sink->size, p_data, p_length);
+	sink->size += p_length;
+}
+
+void PNGCBAPI _png16_flush(png_structp p_png) {
+	// Nothing to flush: the sink is memory.
+	(void)p_png;
+}
+
+} // namespace
+
+Error image_to_png16(const Ref<Image> &p_image, Vector<uint8_t> &p_buffer, int p_compression_level, bool p_srgb_encode) {
+	ERR_FAIL_COND_V(p_image.is_null(), ERR_INVALID_PARAMETER);
+	ERR_FAIL_COND_V(p_image->is_empty(), ERR_INVALID_PARAMETER);
+
+	Ref<Image> source_image = p_image->duplicate();
+	if (source_image->is_compressed()) {
+		source_image->decompress();
+	}
+	ERR_FAIL_COND_V(source_image->is_compressed(), FAILED);
+
+	// Alpha comes from the FORMAT, not detect_alpha(): an HDR viewport readback is
+	// FORMAT_RGBH, which has no alpha channel at all, and detect_alpha() would walk
+	// every one of 8.3 M pixels only to reach the same conclusion.
+	const bool has_alpha = (Image::get_format_component_mask(source_image->get_format()) & 8) != 0;
+	const Image::Format work_format = has_alpha ? Image::FORMAT_RGBAF : Image::FORMAT_RGBF;
+
+	// Convert to full float first. Converting to an 8-bit format would discard
+	// exactly the precision this function exists to preserve. RGBH -> RGBF crosses
+	// _are_formats_compatible()'s group boundary, so convert() takes its generic
+	// per-pixel path: slower, but unclamped.
+	source_image->convert(work_format);
+	ERR_FAIL_COND_V(source_image->get_format() != work_format, FAILED);
+
+	const int width = source_image->get_width();
+	const int height = source_image->get_height();
+	const int components = has_alpha ? 4 : 3;
+	ERR_FAIL_COND_V(width <= 0 || height <= 0, ERR_INVALID_PARAMETER);
+
+	const Vector<uint8_t> src_data = source_image->get_data();
+	ERR_FAIL_COND_V((int64_t)src_data.size() < (int64_t)width * height * components * 4, FAILED);
+	const float *src = (const float *)src_data.ptr();
+
+	// Everything non-trivial is declared BEFORE setjmp(): a local written between
+	// setjmp() and longjmp() has an indeterminate value in the error path.
+	const int buffer_offset = p_buffer.size();
+
+	PNG16Sink sink;
+	sink.buffer = &p_buffer;
+	sink.base = (size_t)buffer_offset;
+
+	Vector<uint8_t> row;
+	{
+		Error row_err = row.resize((int64_t)width * components * 2);
+		ERR_FAIL_COND_V(row_err, row_err);
+	}
+	uint8_t *row_ptr = row.ptrw();
+
+	png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+	ERR_FAIL_NULL_V(png, FAILED);
+
+	png_infop info = png_create_info_struct(png);
+	if (info == nullptr) {
+		png_destroy_write_struct(&png, nullptr);
+		ERR_FAIL_V(FAILED);
+	}
+
+	if (setjmp(png_jmpbuf(png))) {
+		png_destroy_write_struct(&png, &info);
+		p_buffer.resize(buffer_offset);
+		ERR_FAIL_V_MSG(FAILED, "libpng failed while writing a 16-bit PNG.");
+	}
+
+	png_set_write_fn(png, &sink, _png16_write, _png16_flush);
+	png_set_compression_level(png, CLAMP(p_compression_level, 0, 9));
+	if (p_compression_level <= 0) {
+		// Nothing is being deflated, so per-row filtering only scrambles the bytes
+		// and costs an extra pass over ~50 MB. This is the "Compression 0%" case.
+		png_set_filter(png, 0, PNG_FILTER_NONE);
+	}
+
+	png_set_IHDR(png, info, (png_uint_32)width, (png_uint_32)height, 16,
+			has_alpha ? PNG_COLOR_TYPE_RGB_ALPHA : PNG_COLOR_TYPE_RGB,
+			PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+
+	if (p_srgb_encode) {
+		// Tag the colour space so viewers do not second-guess the transfer function.
+		png_set_sRGB_gAMA_and_cHRM(png, info, PNG_sRGB_INTENT_PERCEPTUAL);
+	}
+
+	png_write_info(png, info);
+
+	for (int y = 0; y < height; y++) {
+		const float *src_row = src + (int64_t)y * width * components;
+		uint8_t *dst = row_ptr;
+
+		for (int x = 0; x < width; x++) {
+			for (int c = 0; c < components; c++) {
+				float v = src_row[x * components + c];
+
+				// Written as "not greater than" so NaN lands on 0 too.
+				if (!(v > 0.0f)) {
+					v = 0.0f;
+				}
+
+				// Alpha is never sRGB-encoded — it is coverage, not colour.
+				if (p_srgb_encode && c < 3) {
+					v = v <= 0.0031308f ? v * 12.92f : 1.055f * Math::pow(v, 1.0f / 2.4f) - 0.055f;
+				}
+
+				// Anything above SDR white clips exactly as an 8-bit save would. The
+				// gain here is precision *below* white, not extra range.
+				if (v > 1.0f) {
+					v = 1.0f;
+				}
+
+				const uint32_t q = (uint32_t)(v * 65535.0f + 0.5f);
+
+				// Big-endian by hand, per the PNG spec. No png_set_swap(), so the
+				// result does not depend on host endianness.
+				*dst++ = (uint8_t)(q >> 8);
+				*dst++ = (uint8_t)(q & 0xFF);
+			}
+		}
+
+		png_write_row(png, (png_const_bytep)row_ptr);
+	}
+
+	png_write_end(png, info);
+	png_destroy_write_struct(&png, &info);
+
+	if (sink.failed) {
+		p_buffer.resize(buffer_offset);
+		ERR_FAIL_V_MSG(ERR_OUT_OF_MEMORY, "Out of memory while writing a 16-bit PNG.");
+	}
+
+	// Trim the doubled capacity down to what was actually written.
+	Error err = p_buffer.resize(buffer_offset + (int)sink.size);
 	ERR_FAIL_COND_V(err, err);
 
 	return OK;

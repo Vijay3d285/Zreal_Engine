@@ -40,6 +40,11 @@ public:
 	static Error save_image(const String &p_path, const Ref<Image> &p_img);
 	static Vector<uint8_t> save_image_to_buffer(const Ref<Image> &p_img);
 
+	// 16-bit-per-channel variants. p_compression is the zlib level (0 = store),
+	// p_srgb applies the sRGB OETF -- true for LINEAR (use_hdr_2d) sources.
+	static Error save_image_16(const String &p_path, const Ref<Image> &p_img, int p_compression, bool p_srgb);
+	static Vector<uint8_t> save_image_16_to_buffer(const Ref<Image> &p_img, int p_compression, bool p_srgb);
+
 	virtual Error save(const Ref<Resource> &p_resource, const String &p_path, uint32_t p_flags = 0) override;
 	virtual bool recognize(const Ref<Resource> &p_resource) const override;
 	virtual void get_recognized_extensions(const Ref<Resource> &p_resource, List<String> *p_extensions) const override;

@@ -72,6 +72,30 @@ Vector<uint8_t> ResourceSaverPNG::save_image_to_buffer(const Ref<Image> &p_img) 
 	return buffer;
 }
 
+Error ResourceSaverPNG::save_image_16(const String &p_path, const Ref<Image> &p_img, int p_compression, bool p_srgb) {
+	Vector<uint8_t> buffer;
+	Error err = PNGDriverCommon::image_to_png16(p_img, buffer, p_compression, p_srgb);
+	ERR_FAIL_COND_V_MSG(err, err, "Can't convert image to 16-bit PNG.");
+	Ref<FileAccess> file = FileAccess::open(p_path, FileAccess::WRITE, &err);
+	ERR_FAIL_COND_V_MSG(err, err, vformat("Can't save 16-bit PNG at path: '%s'.", p_path));
+
+	const uint8_t *reader = buffer.ptr();
+
+	file->store_buffer(reader, buffer.size());
+	if (file->get_error() != OK && file->get_error() != ERR_FILE_EOF) {
+		return ERR_CANT_CREATE;
+	}
+
+	return OK;
+}
+
+Vector<uint8_t> ResourceSaverPNG::save_image_16_to_buffer(const Ref<Image> &p_img, int p_compression, bool p_srgb) {
+	Vector<uint8_t> buffer;
+	Error err = PNGDriverCommon::image_to_png16(p_img, buffer, p_compression, p_srgb);
+	ERR_FAIL_COND_V_MSG(err, Vector<uint8_t>(), "Can't convert image to 16-bit PNG.");
+	return buffer;
+}
+
 bool ResourceSaverPNG::recognize(const Ref<Resource> &p_resource) const {
 	return (p_resource.is_valid() && p_resource->is_class("ImageTexture"));
 }
@@ -85,4 +109,6 @@ void ResourceSaverPNG::get_recognized_extensions(const Ref<Resource> &p_resource
 ResourceSaverPNG::ResourceSaverPNG() {
 	Image::save_png_func = &save_image;
 	Image::save_png_buffer_func = &save_image_to_buffer;
+	Image::save_png16_func = &save_image_16;
+	Image::save_png16_buffer_func = &save_image_16_to_buffer;
 }

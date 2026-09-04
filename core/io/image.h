@@ -46,6 +46,11 @@ class Image;
 typedef Error (*SavePNGFunc)(const String &p_path, const Ref<Image> &p_img);
 typedef Vector<uint8_t> (*SavePNGBufferFunc)(const Ref<Image> &p_img);
 
+// 16-bit-per-channel PNG. p_compression is the zlib level (0 = store), p_srgb applies
+// the sRGB OETF and must be true for LINEAR sources such as an HDR viewport readback.
+typedef Error (*SavePNG16Func)(const String &p_path, const Ref<Image> &p_img, int p_compression, bool p_srgb);
+typedef Vector<uint8_t> (*SavePNG16BufferFunc)(const Ref<Image> &p_img, int p_compression, bool p_srgb);
+
 typedef Error (*SaveJPGFunc)(const String &p_path, const Ref<Image> &p_img, float p_quality);
 typedef Vector<uint8_t> (*SaveJPGBufferFunc)(const Ref<Image> &p_img, float p_quality);
 
@@ -198,11 +203,13 @@ public:
 	// External saver function pointers.
 
 	static inline SavePNGFunc save_png_func = nullptr;
+	static inline SavePNG16Func save_png16_func = nullptr;
 	static inline SaveJPGFunc save_jpg_func = nullptr;
 	static inline SaveEXRFunc save_exr_func = nullptr;
 	static inline SaveWebPFunc save_webp_func = nullptr;
 	static inline SaveDDSFunc save_dds_func = nullptr;
 	static inline SavePNGBufferFunc save_png_buffer_func = nullptr;
+	static inline SavePNG16BufferFunc save_png16_buffer_func = nullptr;
 	static inline SaveEXRBufferFunc save_exr_buffer_func = nullptr;
 	static inline SaveJPGBufferFunc save_jpg_buffer_func = nullptr;
 	static inline SaveWebPBufferFunc save_webp_buffer_func = nullptr;
@@ -363,9 +370,11 @@ public:
 	Error load(const String &p_path);
 	static Ref<Image> load_from_file(const String &p_path);
 	Error save_png(const String &p_path) const;
+	Error save_png16(const String &p_path, int p_compression = 6, bool p_srgb_encode = true) const;
 	Error save_jpg(const String &p_path, float p_quality = 0.75) const;
 	Error save_dds(const String &p_path) const;
 	Vector<uint8_t> save_png_to_buffer() const;
+	Vector<uint8_t> save_png16_to_buffer(int p_compression = 6, bool p_srgb_encode = true) const;
 	Vector<uint8_t> save_jpg_to_buffer(float p_quality = 0.75) const;
 	Vector<uint8_t> save_exr_to_buffer(bool p_grayscale = false, bool p_color_image = false, float p_max_value = -1.0f) const;
 	Vector<uint8_t> save_dds_to_buffer() const;

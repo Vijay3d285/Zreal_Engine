@@ -9,6 +9,11 @@ var _render_data = {}
 var _has_fixture_lights_cache: bool = false
 var _has_authored_lights_cache: bool = false
 
+# zlib deflate level for the 16-bit still PNG. 0 = "store", which is what Blender's
+# "Compression 0%" writes. 16-bit data barely compresses at any level anyway (the low
+# byte of each channel is near-random), so the levels above cost time and save little.
+const PNG16_COMPRESSION: int = 0
+
 func _ready():
 	print("Godot Renderer Started (Split Architecture)")
 	
@@ -133,7 +138,26 @@ func set_resolution(data):
 	get_viewport().msaa_3d = Viewport.MSAA_DISABLED
 	get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
 	get_viewport().use_taa = false # DLSS RR handles temporal stability; TAA auto-disabled anyway
-	get_viewport().use_debanding = true
+	# ── 16-bit output requires an HDR framebuffer ─────────────────────────────
+	# The engine's save_png16() writer is worthless on its own: without this the
+	# render target stays RGBA8, get_image() returns FORMAT_RGB8, and the 16-bit
+	# writer faithfully stores 256 distinct levels padded out to 16 bits — a 50 MB
+	# file carrying 8 bits of information. The precision must exist BEFORE the save.
+	#
+	# use_hdr_2d makes the render target R16G16B16A16_SFLOAT
+	# (texture_storage.cpp, render_target_get_color_format).
+	#
+	# Stills only: video frames are encoded to mp4 downstream, which throws the extra
+	# precision away, so that path stays on the 8-bit pipeline it was tuned for.
+	var want_hdr_output: bool = _image_render_only
+	get_viewport().use_hdr_2d = want_hdr_output
+
+	# Debanding is dither that exists ONLY to mask 8-bit quantisation banding. At 16
+	# bits there is no banding to mask, so it would only inject noise — which also
+	# inflates the PNG, making the file size look better while the image looks worse.
+	get_viewport().use_debanding = not want_hdr_output
+	print("[Render] HDR 2D framebuffer: %s (16-bit PNG output: %s, debanding: %s)" %
+			[want_hdr_output, want_hdr_output, not want_hdr_output])
 	get_viewport().mesh_lod_threshold = 0.0
 
 	# ── DLSS scaling mode: required for Ray Reconstruction to execute ──────────
@@ -478,9 +502,32 @@ func render_image(data, output_path):
 		get_tree().quit(1)
 		return
 
-	var _save_err: int = img.save_png(output_path)
+	# ── Write the still ───────────────────────────────────────────────────────
+	# THE COLOUR-SPACE CONTRACT. renderer_scene_render_rd.cpp sets
+	#     tonemap.convert_to_srgb = !using_hdr;
+	# so with use_hdr_2d ON the RGBA16F buffer holds LINEAR values and the writer must
+	# apply the sRGB OETF itself (srgb_encode = true). With it OFF the RGBA8 buffer is
+	# already sRGB-encoded and plain save_png() is correct. Getting this backwards fails
+	# silently: srgb_encode=false on the HDR path gives a very dark image, and
+	# srgb_encode=true on an already-encoded buffer gives a washed-out double-encode.
+	var _save_err: int = FAILED
+	var _used_16bit: bool = false
+	if get_viewport().use_hdr_2d and img.has_method("save_png16"):
+		_save_err = img.call("save_png16", output_path, PNG16_COMPRESSION, true)
+		_used_16bit = (_save_err == OK)
+		if _used_16bit:
+			print("[Render] Wrote 16-bit RGB PNG (zlib level %d, sRGB-encoded from the linear HDR buffer)." % PNG16_COMPRESSION)
+		else:
+			printerr("[Render] save_png16 failed with error %d — falling back to 8-bit." % _save_err)
+	if not _used_16bit:
+		# Either the binary predates save_png16, the HDR path is off, or the 16-bit
+		# write failed. Either way the fallback must respect the same contract.
+		var out_img: Image = img
+		if get_viewport().use_hdr_2d:
+			out_img = _linear_image_to_srgb8(out_img)
+		_save_err = out_img.save_png(output_path)
 	if _save_err != OK:
-		printerr("[Render] FATAL: save_png failed with error %d for: %s" % [_save_err, output_path])
+		printerr("[Render] FATAL: PNG save failed with error %d for: %s" % [_save_err, output_path])
 		printerr("[Render] FATAL: check the directory exists and is writable, and that the disk is not full.")
 		save_logs(data, output_path)
 		get_tree().quit(1)
@@ -490,7 +537,7 @@ func render_image(data, output_path):
 	# symptom the caller sees, so name it here rather than letting the caller
 	# rediscover it as a missing-file mystery.
 	if not FileAccess.file_exists(output_path):
-		printerr("[Render] FATAL: save_png reported OK but no file exists at: %s" % output_path)
+		printerr("[Render] FATAL: PNG save reported OK but no file exists at: %s" % output_path)
 		save_logs(data, output_path)
 		get_tree().quit(1)
 		return
@@ -499,9 +546,9 @@ func render_image(data, output_path):
 	_save_thumbnail_webp(img, output_path)
 	if accumulate_enabled:
 		# The .png above is the deliverable — it is the converged, anti-aliased,
-		# tonemapped result, and it is lossless. Note Godot's PNG writer is 8-bit
-		# only (drivers/png/png_driver_common.cpp converts anything else to
-		# RGB8/RGBA8), which matches Blender's default PNG output.
+		# tonemapped result, and it is lossless. It is now written 16-bit via
+		# PNGDriverCommon::image_to_png16(), matching Blender's default still output;
+		# the legacy image_to_png() path is 8-bit only.
 		#
 		# The linear EXR is an OPTIONAL extra for grading or for verifying that
 		# highlights above 1.0 survived. It is off by default; set ZR_PT_EXR=1 to
@@ -1132,15 +1179,59 @@ func get_cardinal_direction(dir: Vector3) -> String:
 	if deg >= -67.5 and deg < -22.5: return "North-East"
 	return "Unknown"
 
+# Convert a LINEAR image (an HDR use_hdr_2d viewport readback) to an sRGB-encoded
+# RGB8 image. Returns non-linear inputs unchanged.
+#
+# Image.convert(FORMAT_RGB8) is a raw clamp with NO sRGB encode, so a linear buffer
+# put through it comes out badly darkened. Image.linear_to_srgb() does apply the
+# transfer function, but it requires RGB8/RGBA8 input and uses a 256-entry LUT — it
+# has to quantise first and is badly wrong in the darks (the LUT jumps 0 -> 12).
+#
+# Preferred route: encode to a 16-bit PNG in memory, where the C++ writer applies the
+# exact OETF to full-precision floats, then load it straight back. The PNG *loader*
+# masks out PNG_FORMAT_FLAG_LINEAR, so libpng does the 16 -> 8 down-convert natively.
+func _linear_image_to_srgb8(source: Image) -> Image:
+	if source == null or source.is_empty():
+		return source
+	var fmt: int = source.get_format()
+	var is_linear_float: bool = fmt in [
+		Image.FORMAT_RF, Image.FORMAT_RGF, Image.FORMAT_RGBF, Image.FORMAT_RGBAF,
+		Image.FORMAT_RH, Image.FORMAT_RGH, Image.FORMAT_RGBH, Image.FORMAT_RGBAH,
+		Image.FORMAT_RGBE9995,
+	]
+	if not is_linear_float:
+		return source
+
+	if source.has_method("save_png16_to_buffer"):
+		var buf: PackedByteArray = source.call("save_png16_to_buffer", PNG16_COMPRESSION, true)
+		if buf.size() > 0:
+			var decoded := Image.new()
+			if decoded.load_png_from_buffer(buf) == OK and not decoded.is_empty():
+				return decoded
+
+	# Fallback for a binary without the 16-bit writer: quantise, then use the
+	# engine's LUT-based conversion. Approximate, but not darkened.
+	var work: Image = source.duplicate() as Image
+	work.convert(Image.FORMAT_RGB8)
+	work.linear_to_srgb()
+	return work
+
 func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 	if source_image == null or source_image.is_empty(): return
 	var thumb_path = output_path.get_base_dir().path_join(output_path.get_file().get_basename() + "_thumb.webp")
-	var thumb = source_image.duplicate()
+	var thumb: Image = source_image.duplicate() as Image
 	var max_dim = 480
 	var w = thumb.get_width(); var h = thumb.get_height()
 	if w > max_dim or h > max_dim:
 		if w >= h: thumb.resize(max_dim, int(float(h) * max_dim / w), Image.INTERPOLATE_LANCZOS)
 		else: thumb.resize(int(float(w) * max_dim / h), max_dim, Image.INTERPOLATE_LANCZOS)
+	# Downsample BEFORE the colour conversion. The still path hands us a LINEAR RGBH
+	# readback, which Image.resize() handles natively (only RGB565/RGBA4444/RGBE9995
+	# need converting first), so the Lanczos filter runs in linear light — which is
+	# where averaging is actually correct — and the sRGB encode then runs on 480px
+	# instead of on 8.3 M. save_webp needs 8-bit anyway, and feeding it the linear
+	# buffer directly would come out badly darkened. No-op on the 8-bit video path.
+	thumb = _linear_image_to_srgb8(thumb)
 	thumb.save_webp(thumb_path, true, 0.75)
 
 func _wait_frames(count: int) -> void:

@@ -400,3 +400,7 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+
+# json and png ignore
+*.json
+*.png
