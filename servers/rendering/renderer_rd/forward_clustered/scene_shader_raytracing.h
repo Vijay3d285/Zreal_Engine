@@ -96,6 +96,14 @@ public:
 		RT_FLAG_ANISOTROPY_ENABLED = (1 << 15),
 		RT_FLAG_COAT_ENABLED = (1 << 16),
 		RT_FLAG_SHEEN_ENABLED = (1 << 17),
+		// Transparent shadows. Bit 18, next free after E3 took 15-17. NOT 11-14 --
+		// those are RT_MAX_TRANSMISSION_BOUNCE and a collision would corrupt that
+		// field's readback while leaving the render merely plausible.
+		//
+		// Unlike RT_FLAG_TRANSMISSION_ENABLED (an Environment toggle), this bit is
+		// set from SCENE CONTENT: any material with transmission > 0. It exists so
+		// a scene with no glass folds the pass-B loop away at specialization.
+		RT_FLAG_TRANSMISSIVE_GEOMETRY = (1 << 18),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
@@ -123,11 +131,23 @@ public:
 	constexpr static uint32_t RT_MAX_TRANSMISSION_BOUNCE_SHIFT = 11;
 	constexpr static uint32_t RT_MAX_TRANSMISSION_BOUNCE_MASK = 0xF;
 
+	// TLAS instance cull masks. Every instance was pushed as 0xFF before
+	// transparent shadows, so all eight bits were free; two are claimed here so the
+	// shadow query can address opaque and transmissive geometry separately.
+	// MIRRORED IN raytracing_common_inc.glsl -- change both together.
+	constexpr static uint32_t RT_INSTANCE_MASK_OPAQUE = 0x01;
+	constexpr static uint32_t RT_INSTANCE_MASK_TRANSMISSIVE = 0x02;
+	// Primary, indirect and DLSS-RR probe rays keep seeing everything.
+	constexpr static uint32_t RT_INSTANCE_MASK_ALL = 0xFF;
+	static_assert((RT_INSTANCE_MASK_OPAQUE & RT_INSTANCE_MASK_TRANSMISSIVE) == 0,
+			"Opaque and transmissive instance masks must be disjoint, or pass A would "
+			"see glass and occlude behind it while pass B attenuates it a second time");
+
 	// Compile-time guard: a new RT_FLAG_* added at (1 << 4) or above would silently
 	// alias the Russian Roulette min_bounce field, corrupt the readback, and leave
 	// the rendered image merely plausible instead of visibly wrong. Keep this in
 	// sync whenever RT_FLAG_* gains a member.
-	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED | RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
+	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED | RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED | RT_FLAG_TRANSMISSIVE_GEOMETRY) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
 			"RT_FLAG_* bit overlaps the Russian Roulette min_bounce field (bits 4-8)");
 
 	// The transmission cap field must miss every neighbouring field. A collision
@@ -137,6 +157,7 @@ public:
 						  ((RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT) |
 								  (RT_SAMPLE_COUNT_MASK << RT_SAMPLE_COUNT_SHIFT) |
 								  (RT_MAX_BOUNCES_MASK << RT_MAX_BOUNCES_SHIFT) |
+								  RT_FLAG_TRANSMISSIVE_GEOMETRY |
 								  RT_FLAG_EMISSIVE_LIGHTS_ENABLED |
 								  RT_FLAG_TRANSMISSION_ENABLED |
 								  RT_FLAG_ANISOTROPY_ENABLED |
