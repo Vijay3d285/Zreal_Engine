@@ -132,8 +132,12 @@ func _measure_ratio(p_tilt_deg: float) -> float:
 	add_child(light)
 
 	var cam := Camera3D.new()
-	cam.position = Vector3(0, 0.5, 4)
-	cam.look_at(Vector3(0, -1, 0))
+	var cam_pos := Vector3(0, 0.5, 4)
+	# look_at_from_position(), not position + look_at(): look_at() requires the
+	# node to already be inside the scene tree (it needs a global transform to
+	# rebase against), which it is not until add_child() runs. Matches the
+	# established pattern in pt_transmission_gate.gd:1020-1031/1463-1481.
+	cam.look_at_from_position(cam_pos, Vector3(0, -1, 0), Vector3.UP)
 	cam.fov = 30.0
 	add_child(cam)
 	cam.make_current()
