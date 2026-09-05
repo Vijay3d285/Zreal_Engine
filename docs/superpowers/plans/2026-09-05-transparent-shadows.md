@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **`git add` uses explicit paths only.** Never `-A`, never `.`.
-- **The six `pipeline_references/*.gd` files are the user's own work.** Never stage, commit, revert, checkout over, or stash them: `compositor_effect.gd`, `custom_shape.gd`, `image_glb_creation.gd`, `image_render_script.gd`, `render.gd`, `structure.gd`, `video_glb_creation.gd`, `video_render.gd`, `mo_image.gd`, `mo_video.gd`, `renderer.gd`. **NEW** files under `pipeline_references/tests/` may be created and staged.
+- **Every `.gd` file directly under `pipeline_references/` is the user's own work.** Never stage, commit, revert, checkout over, or stash any of them — no exceptions, and do not enumerate a subset and assume the rest are fair game. Three of them (`image_glb_creation.gd`, `render.gd`, `video_glb_creation.gd`) currently carry uncommitted user changes that must survive this work untouched; `git status` must still show them modified-but-unstaged when each task ends. **NEW** files under `pipeline_references/tests/` may be created and staged — that subdirectory is the only writable area, and it is how `pt_coat_gate.gd` and `pt_sheen_gate.gd` were added in earlier phases.
 - **Build:** `python -m SCons platform=windows target=editor tests=yes -j8`. Bare `scons` is not on PATH and its failure exits 0 under Bash.
 - **Any `.glsl` edit requires a build** so `*.glsl.gen.h` regenerates. A `.glsl`-only incremental build is ~1 minute; a full rebuild ~20 minutes.
 - **`glsl_builders.py` performs no GLSL validation.** It only embeds text. A clean `scons` exit is near-zero evidence about shader correctness — only a render proves a shader compiles and runs.
