@@ -17,7 +17,7 @@
 - **Build:** `python -m SCons platform=windows target=editor tests=yes -j8`. Bare `scons` is not on PATH and its failure exits 0 under Bash.
 - **Any `.glsl` edit requires a build** so `*.glsl.gen.h` regenerates. A `.glsl`-only incremental build is ~1 minute; a full rebuild ~20 minutes.
 - **`glsl_builders.py` performs no GLSL validation.** It only embeds text. A clean `scons` exit is near-zero evidence about shader correctness — only a render proves a shader compiles and runs.
-- **Renders are not bit-reproducible.** Two runs of the same binary differ by rmse ~0.1406 on ~5.58% of pixels. Never write an acceptance criterion that assumes equality between renders.
+- **Renders on this build ARE bit-reproducible — measured 2026-09-05, correcting an earlier claim in this document.** Two runs of `urbantestdark180_fishtank` through the live project on this binary came back byte-identical: rmse `0.000000`, `0.00%` of pixels differing, max channel delta `0`. An earlier revision of this line asserted a noise floor of rmse ~0.1406 across ~5.58% of pixels and forbade equality-based acceptance criteria on that basis; that figure is stale (it predates this branch and the E3-era nondeterminism investigation left DLSS-RR and an async pipeline race as unresolved suspects). Exact comparison IS therefore a valid acceptance criterion here. Two cautions before relying on it: compare renders from the SAME project directory — a cross-project comparison in this very plan produced a 20.39% pixel delta that was entirely the project difference, not the engine — and re-establish the floor with a two-run control if the configuration changes.
 - **C++/GLSL struct and constant parity is enforced by hand.** Any constant mirrored between `scene_shader_raytracing.h` and `raytracing_common_inc.glsl` must be changed in both, in the same commit.
 - **`gl_ObjectToWorldEXT` does not exist inside a ray query.** Use `rayQueryGetIntersectionObjectToWorldEXT(rq, true)`.
 - **Non-goal: caustics.** Light crosses panes without bending. Do not add refraction to the shadow path.
@@ -226,15 +226,32 @@ float rt_max_component(vec3 v) {
 }
 ```
 
-- [ ] **Step 3: Change the signature and narrow pass A's mask**
+- [ ] **Step 3: Change the signature only — do NOT narrow the mask yet**
 
-Replace `lights_trace_shadow_ray`'s signature and both `0xFF` cull masks (the `USE_SER` `hitObjectTraceRayEXT` and the `traceRayEXT`) with `RT_INSTANCE_MASK_OPAQUE`, and return a vec3:
+**AMENDED 2026-09-05 after measurement.** An earlier revision of this step also
+narrowed both cull masks to `RT_INSTANCE_MASK_OPAQUE` here. That is wrong, and it
+was measured wrong rather than reasoned wrong: Task 2 tags transmissive instances
+`0x02`, so narrowing the shadow query to `0x01` culls glass out of the shadow test
+entirely (`0x02 & 0x01 == 0`). Between this task and Task 5, glass would then cast
+no shadow at all — passing light with NO attenuation instead of the intended
+Fresnel-weighted ~0.92 — and Task 4's gate could not fail at `0.0000` as designed,
+because its precondition (glass blocks shadow rays) would no longer hold. Three
+per-task reviews passed this; the defect lives in the seam between tasks, which
+per-task review cannot see. **The narrowing now belongs to Task 5, landing in the
+same commit as the pass B that compensates for it.**
+
+Replace only the signature and the two return statements. Both `0xFF` literals
+become the named constant `RT_INSTANCE_MASK_ALL` (same value, `0xFF`) so the
+intent is explicit and Task 5's change is a one-token edit:
 
 ```glsl
 /// Returns per-channel light transmittance along the shadow ray.
 ///   vec3(0.0) = fully occluded, vec3(1.0) = clear.
-/// PASS A only for now -- opaque occlusion, unchanged logic. The cull mask
-/// narrows from 0xFF so Task 5's pass B can own transmissive geometry.
+/// PASS A only for now -- opaque occlusion, unchanged logic, and STILL TRACED
+/// AGAINST EVERY INSTANCE. The narrowing to RT_INSTANCE_MASK_OPAQUE lands in
+/// Task 5 together with pass B: narrowing it here would cull glass out of the
+/// shadow test with nothing yet in place to attenuate it, so glass would cast
+/// no shadow at all in the interval.
 vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 ```
 
@@ -573,7 +590,19 @@ Above `lights_trace_shadow_ray`:
 #define RT_SHADOW_ATTEN_EPSILON 1e-4
 ```
 
-- [ ] **Step 2: Append pass B**
+- [ ] **Step 2: Narrow pass A's cull mask (moved here from Task 3)**
+
+In BOTH branches of `lights_trace_shadow_ray` — the `USE_SER` `hitObjectTraceRayEXT`
+and the `#else` `traceRayEXT` — change the cull mask argument from
+`RT_INSTANCE_MASK_ALL` to `RT_INSTANCE_MASK_OPAQUE`, and update the docstring to
+drop the "STILL TRACED AGAINST EVERY INSTANCE" note.
+
+This step and Step 3 must land in the SAME commit. Narrowing without pass B makes
+glass cast no shadow at all; pass B without narrowing double-counts every pane —
+pass A occludes on it, and pass B attenuates through it. Neither half is correct
+alone, which is why Task 3 no longer owns this edit.
+
+- [ ] **Step 3: Append pass B**
 
 After pass A's `return visible ? vec3(1.0) : vec3(0.0);` becomes a fallthrough, add:
 
@@ -651,12 +680,12 @@ After pass A's `return visible ? vec3(1.0) : vec3(0.0);` becomes a fallthrough, 
 
 Note `gl_RayFlagsOpaqueEXT` is passed so the query commits transmissive hits directly without an any-hit candidate step — these instances carry `FORCE_OPAQUE` and we want each crossing reported, not alpha-tested.
 
-- [ ] **Step 3: Build**
+- [ ] **Step 4: Build**
 
 Run: `python -m SCons platform=windows target=editor tests=yes -j8`
 Expected: exit 0. Again, this says nothing about shader correctness.
 
-- [ ] **Step 4: Run the gate and confirm it now PASSES**
+- [ ] **Step 5: Run the gate and confirm it now PASSES**
 
 Run:
 ```bash
@@ -664,18 +693,18 @@ Run:
 ```
 Expected: **PASS**, both probes. Probe 1's ratio lands in `[0.85, 1.00]` — the same probe that printed `0.0000` in Task 4, so it failed before and passes after. Probe 2's grazing ratio lands below `0.80`.
 
-- [ ] **Step 5: Prove probe 2 can actually fail**
+- [ ] **Step 6: Prove probe 2 can actually fail**
 
 Probe 2 is the only check distinguishing Fresnel weighting from a flat factor, so it needs to be shown capable of failing. Temporarily change `atten *= mat.transmission * (1.0 - F);` to `atten *= mat.transmission;`, rebuild, and re-run.
 
 Expected: probe 1 still passes (its ratio rises toward ~1.00) but **probe 2 FAILS**, because with no angular term the grazing ratio stays near the near-normal value instead of dropping below 0.80. If probe 2 still passes here, it is not testing Fresnel and its threshold needs tightening before proceeding. Restore the line afterwards and re-run to confirm both probes pass again.
 
-- [ ] **Step 6: Run the full test suite**
+- [ ] **Step 7: Run the full test suite**
 
 Run: `./bin/godot.windows.editor.x86_64.console.exe --test`
 Expected: no new failures against the pre-task baseline.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add servers/rendering/renderer_rd/shaders/raytracing/raytracing_lights_inc.glsl
