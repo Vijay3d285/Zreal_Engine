@@ -74,7 +74,7 @@ public:
 	// Bit 9:      Emissive-mesh NEE (roadmap C1)
 	// Bits 10-14: Transmission enable + bounce cap (roadmap E1)
 	// Bits 15-17: Material feature gating (roadmap E3: anisotropy, coat, sheen)
-	// Bits 18-19: Free
+	// Bit 18: Transmissive geometry; Bit 19: Free
 	// Bits 20-27: Sample count
 	// Bits 28-31: Max bounce count (offset by 1: 0=1 bounce, 15=16 bounces)
 	// Bounces widened from 3 to 4 bits (Task 4, B3) to lift the ceiling from 8 to
