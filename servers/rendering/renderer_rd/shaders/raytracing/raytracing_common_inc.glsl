@@ -91,6 +91,8 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // MIRRORS scene_shader_raytracing.h RT_INSTANCE_MASK_* -- change both together.
 #define RT_INSTANCE_MASK_OPAQUE 0x01u
 #define RT_INSTANCE_MASK_TRANSMISSIVE 0x02u
+// Primary, indirect and DLSS-RR probe rays keep seeing everything.
+#define RT_INSTANCE_MASK_ALL 0xFFu
 
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT

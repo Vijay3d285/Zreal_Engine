@@ -266,8 +266,11 @@ float rt_max_component(vec3 v) {
 
 /// Returns per-channel light transmittance along the shadow ray.
 ///   vec3(0.0) = fully occluded, vec3(1.0) = clear.
-/// PASS A only for now -- opaque occlusion, unchanged logic. The cull mask
-/// narrows from 0xFF so Task 5's pass B can own transmissive geometry.
+/// PASS A only for now -- opaque occlusion, unchanged logic, and STILL TRACED
+/// AGAINST EVERY INSTANCE. The narrowing to RT_INSTANCE_MASK_OPAQUE lands in
+/// Task 5 together with pass B: narrowing it here would cull glass out of the
+/// shadow test with nothing yet in place to attenuate it, so glass would cast
+/// no shadow at all in the interval.
 /// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
 vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
@@ -275,7 +278,7 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			RT_INSTANCE_MASK_OPAQUE, 0, 0, 0,
+			RT_INSTANCE_MASK_ALL, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	return hitObjectIsHitEXT(hitObject) ? vec3(0.0) : vec3(1.0);
@@ -298,7 +301,7 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			RT_INSTANCE_MASK_OPAQUE, 0, 0, 0,
+			RT_INSTANCE_MASK_ALL, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).
