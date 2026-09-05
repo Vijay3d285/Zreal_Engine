@@ -260,18 +260,25 @@ bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_b
 // Shadow Ray (traceRayEXT pipeline)
 // ============================================================================
 
-/// Returns true if light is visible.
+float rt_max_component(vec3 v) {
+	return max(v.x, max(v.y, v.z));
+}
+
+/// Returns per-channel light transmittance along the shadow ray.
+///   vec3(0.0) = fully occluded, vec3(1.0) = clear.
+/// PASS A only for now -- opaque occlusion, unchanged logic. The cull mask
+/// narrows from 0xFF so Task 5's pass B can own transmissive geometry.
 /// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
-bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
+vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 #ifdef USE_SER
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_INSTANCE_MASK_OPAQUE, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
-	return !(hitObjectIsHitEXT(hitObject));
+	return hitObjectIsHitEXT(hitObject) ? vec3(0.0) : vec3(1.0);
 #else
 	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
 	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
@@ -291,7 +298,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_INSTANCE_MASK_OPAQUE, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).
@@ -300,7 +307,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 
 	payload = saved_payload;
 
-	return visible;
+	return visible ? vec3(1.0) : vec3(0.0);
 #endif
 }
 
@@ -354,8 +361,12 @@ vec3 lights_eval_rect_light(
 	}
 
 	// 7. Shadow ray
-	if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, dist)) {
-		return vec3(0.0);
+	vec3 shadow_atten = vec3(1.0);
+	if (light.shadow_enabled > 0.5) {
+		shadow_atten = lights_trace_shadow_ray(hit_pos, L, dist);
+		if (rt_max_component(shadow_atten) <= 0.0) {
+			return vec3(0.0);
+		}
 	}
 
 	// 8. Attenuation (inverse-square + windowed)
@@ -406,7 +417,7 @@ vec3 lights_eval_rect_light(
 	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 	vec3 radiance = light.emission / max(area, 1e-5);
 	vec3 contribution = brdf_value * radiance * atten * indirect_mul;
-	return contribution / max(light_select_pdf * solid_ang_pdf, 1e-10);
+	return contribution * shadow_atten / max(light_select_pdf * solid_ang_pdf, 1e-10);
 }
 
 // ============================================================================
@@ -563,8 +574,12 @@ vec3 lights_evaluate_direct_lighting(
 		// Shadow test — skipped entirely when shadow_enabled == 0.0 (shadowless fill light).
 		// This matches Blender Cycles behaviour: light contributes full radiance with
 		// no occlusion ray, casting no shadows while still illuminating the scene.
-		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, shadow_dist)) {
-			return vec3(0.0);
+		vec3 shadow_atten = vec3(1.0);
+		if (light.shadow_enabled > 0.5) {
+			shadow_atten = lights_trace_shadow_ray(hit_pos, L, shadow_dist);
+			if (rt_max_component(shadow_atten) <= 0.0) {
+				return vec3(0.0);
+			}
 		}
 
 		// Evaluate BRDF (diffuse + specular + coat separately for specular_amount
@@ -595,7 +610,7 @@ vec3 lights_evaluate_direct_lighting(
 
 		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
 		vec3 contribution = brdf_value * light.emission * atten * indirect_mul * ies_factor;
-		return contribution / max(light_select_pdf, 1e-10);
+		return contribution * shadow_atten / max(light_select_pdf, 1e-10);
 	}
 	// === RECT LIGHT PATH ===
 	else if (light.type == RT_LIGHT_TYPE_RECT) {
@@ -615,8 +630,12 @@ vec3 lights_evaluate_direct_lighting(
 		}
 
 		// Shadow test for directional light — skipped when shadow_enabled == 0.0.
-		if (light.shadow_enabled > 0.5 && !lights_trace_shadow_ray(hit_pos, L, ls.max_distance)) {
-			return vec3(0.0);
+		vec3 shadow_atten = vec3(1.0);
+		if (light.shadow_enabled > 0.5) {
+			shadow_atten = lights_trace_shadow_ray(hit_pos, L, ls.max_distance);
+			if (rt_max_component(shadow_atten) <= 0.0) {
+				return vec3(0.0);
+			}
 		}
 
 		// E2d fix round 1: see THE ANALYTIC-LIGHT RULE in lights_eval_rect_light.
@@ -631,6 +650,6 @@ vec3 lights_evaluate_direct_lighting(
 		// No IES modulation here: a photometric distribution has no meaning for a
 		// light at infinite distance, so gather_lights() forces ies_slot = -1 for
 		// every directional light (render_raytracing.cpp).
-		return brdf_value * light.emission * indirect_mul / max(light_select_pdf, 1e-10);
+		return brdf_value * light.emission * indirect_mul * shadow_atten / max(light_select_pdf, 1e-10);
 	}
 }

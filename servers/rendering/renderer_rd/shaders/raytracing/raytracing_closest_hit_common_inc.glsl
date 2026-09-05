@@ -1640,10 +1640,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// sampling header warns about.
 		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && dot(env_dir, N) > 0.0) {
 			vec3 env_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
-			if (lights_trace_shadow_ray(env_origin, env_dir, 10000.0)) {
+			vec3 env_shadow_atten = lights_trace_shadow_ray(env_origin, env_dir, 10000.0);
+			if (rt_max_component(env_shadow_atten) > 0.0) {
 				// Same fetch the miss stage performs for this direction: bordered
 				// octmap lookup after the shared world -> sky rotation.
-				vec3 sky_rad = env_sky_radiance(env_dir);
+				vec3 sky_rad = env_sky_radiance(env_dir) * env_shadow_atten;
 
 				// The BRDF VALUE and the BRDF DENSITY must describe the same set
 				// of lobes, or the MIS weights partition one integrand while the

@@ -457,7 +457,8 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 		return false;
 	}
 
-	if (!lights_trace_shadow_ray(p_hit_pos, L, dist)) {
+	vec3 shadow_atten = lights_trace_shadow_ray(p_hit_pos, L, dist);
+	if (rt_max_component(shadow_atten) <= 0.0) {
 		return false;
 	}
 
@@ -519,6 +520,6 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 	vec3 radiance = emissive_radiance(emat, emissive_uv);
 
 	float w = power_heuristic(pdf_omega, combinedPdf(p_N, L, p_V, p_mat));
-	r_contribution = bsdf_val * radiance * (w / pdf_omega);
+	r_contribution = bsdf_val * radiance * shadow_atten * (w / pdf_omega);
 	return true;
 }

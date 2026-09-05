@@ -80,6 +80,18 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_GET_COAT_ENABLED() ((RT_FLAGS & RT_FLAG_COAT_ENABLED) != 0u)
 #define RT_GET_SHEEN_ENABLED() ((RT_FLAGS & RT_FLAG_SHEEN_ENABLED) != 0u)
 
+// Transparent shadows (transmissive-shadows spec). Bit 18. MUST match
+// RT_FLAG_TRANSMISSIVE_GEOMETRY in scene_shader_raytracing.h.
+#define RT_FLAG_TRANSMISSIVE_GEOMETRY 262144u // 1 << 18
+
+// Scene CONTENT, not an Environment toggle: true when any material in the scene
+// has transmission > 0. Folds the pass-B loop away entirely when false.
+#define RT_GET_TRANSMISSIVE_GEOMETRY() ((RT_FLAGS & RT_FLAG_TRANSMISSIVE_GEOMETRY) != 0u)
+
+// MIRRORS scene_shader_raytracing.h RT_INSTANCE_MASK_* -- change both together.
+#define RT_INSTANCE_MASK_OPAQUE 0x01u
+#define RT_INSTANCE_MASK_TRANSMISSIVE 0x02u
+
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
 
