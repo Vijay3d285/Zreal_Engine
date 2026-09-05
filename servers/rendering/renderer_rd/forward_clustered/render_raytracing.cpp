@@ -1897,6 +1897,14 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		// brdf_inc.glsl:2631 sheenMaxTint.
 		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED;
 	}
+	if (mat.transmission > 0.0f) {
+		// The SAME predicate the shadow loop's per-hit attenuation uses
+		// (raytracing_lights_inc.glsl pass B, `atten *= mat.transmission * (1 - F)`).
+		// Deriving the instance mask and the scene-level skip from this one bit is
+		// what stops them desyncing: a scene can never enable pass B while its glass
+		// sits outside the transmissive mask, or vice versa.
+		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY;
+	}
 
 	// The Task 3 monotonic "features seen so far" print lived here. It is replaced
 	// by the per-frame scene_mask log in build_tlas()'s detection pass: that one
@@ -2446,6 +2454,16 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 
+// Chooses a TLAS instance cull mask from a material's detected feature bits.
+// Takes the bits rather than the RTMaterialData so all four TLAS push sites --
+// which hold `mat_data`, `proc_mat_data` and `pending.mat_data` respectively --
+// can share one function.
+static _FORCE_INLINE_ uint32_t rt_instance_mask_from_features(uint32_t p_feature_bits) {
+	return (p_feature_bits & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY)
+			? SceneShaderRaytracing::RT_INSTANCE_MASK_TRANSMISSIVE
+			: SceneShaderRaytracing::RT_INSTANCE_MASK_OPAQUE;
+}
+
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	// This frame's read of the emissive-mesh feature flag, taken BEFORE any early
 	// return. update_uniform_set() picks the emissive bindings from it (see the
@@ -2601,7 +2619,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	// The one settled value. Every flag-consumer from here down uses this and
 	// nothing else; `p_rt_flags` must not appear again in this function.
-	// feature_bits only ever carries bits 15-17, which rt_flags_pack() leaves
+	// feature_bits only ever carries bits 15-18, which rt_flags_pack() leaves
 	// untouched, so OR-ing into the packed word cannot corrupt the sample-count,
 	// bounce or transmission-cap fields.
 	const uint32_t final_flags = p_rt_flags | scene_mask;
@@ -2736,7 +2754,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(rt_instance_mask_from_features(proc_mat_data->feature_bits));
 			}
 			continue;
 		}
@@ -2993,7 +3011,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(rt_instance_mask_from_features(mat_data->feature_bits));
 
 			surf = surf->next;
 		}
@@ -3037,7 +3055,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(0xFF);
+			instance_masks.push_back(rt_instance_mask_from_features(pending.mat_data->feature_bits));
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -3109,7 +3127,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				instance_flags.push_back(pending.inst_flags);
-				instance_masks.push_back(0xFF);
+				instance_masks.push_back(rt_instance_mask_from_features(pending.mat_data->feature_bits));
 			}
 
 #ifdef TOOLS_ENABLED
