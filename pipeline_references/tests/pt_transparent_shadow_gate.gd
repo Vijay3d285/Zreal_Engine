@@ -34,10 +34,12 @@ const FRAMES := 128
 const P1_RATIO_MIN := 0.85
 const P1_RATIO_MAX := 1.00
 
-# The pane tilted so the shadow ray crosses it at ~80 degrees from its normal.
+# The light (not the pane -- see _measure_ratio's geometry note) tilted to
+# 80deg incidence from the horizontal pane's normal.
 # Dielectric Fresnel at ior 1.5 reflects ~0.40 there, so the ratio must fall well
 # below the near-normal case. A flat (non-Fresnel) attenuation leaves it unchanged
 # at ~0.92, so this bound is what distinguishes the two.
+const P2_INCIDENCE_DEG := 80.0
 const P2_GRAZING_MAX := 0.80
 
 var _failures: Array[String] = []
@@ -80,9 +82,9 @@ func _probe1_interior_lit() -> void:
 
 
 func _probe2_grazing_darkens() -> void:
-	var ratio := await _measure_ratio(80.0)
-	print("  ratio at 80deg incidence = %.6f (must be < %.2f)"
-			% [ratio, P2_GRAZING_MAX])
+	var ratio := await _measure_ratio(P2_INCIDENCE_DEG)
+	print("  incidence = %.1fdeg, ratio = %.6f (must be < %.2f)"
+			% [P2_INCIDENCE_DEG, ratio, P2_GRAZING_MAX])
 	_checks += 1
 	if ratio >= P2_GRAZING_MAX:
 		_failures.append(("probe2 grazing: ratio %.6f is not below %.2f -- Fresnel is "
@@ -90,8 +92,15 @@ func _probe2_grazing_darkens() -> void:
 				% [ratio, P2_GRAZING_MAX])
 
 
-## p_tilt_deg rotates the pane about X so the shadow ray crosses it off-normal.
-func _measure_ratio(p_tilt_deg: float) -> float:
+## p_incidence_deg is the DirectionalLight3D's incidence angle from the
+## horizontal pane's +Y normal (0 = straight down / near-normal, larger =
+## grazing). The pane itself is ALWAYS flat and unrotated -- grazing is
+## achieved by tilting the light, not the pane, so the pane never stands up
+## into the camera's line of sight edge-on (that was the round-2 defect: a
+## rotated pane at 80deg is nearly vertical and the camera ends up looking
+## through its edge, contaminating the measurement with something other than
+## shadow-ray transmittance).
+func _measure_ratio(p_incidence_deg: float) -> float:
 	for c in get_children():
 		c.queue_free()
 
@@ -107,13 +116,42 @@ func _measure_ratio(p_tilt_deg: float) -> float:
 	floor_mi.material_override = floor_mat
 	add_child(floor_mi)
 
-	# Matches _apply_glb_transmissive_glass in image_glb_creation.gd.
+	# Matches _apply_glb_transmissive_glass in image_glb_creation.gd (size
+	# only -- the Y position below is specific to this gate's geometry).
+	#
+	# GEOMETRY: for a directional light at incidence angle theta from this
+	# horizontal pane's normal, a ray reaching a floor point at height
+	# y_floor crosses the pane's plane (height y_pane) offset in Z by
+	# separation * tan(theta), where separation = y_pane - y_floor. (Proof:
+	# the light's local -Z direction at rotation_degrees.x = -(90-theta) is
+	# d = (0, -cos(theta), -sin(theta)); tracing a floor hit backward along
+	# -d by t = separation / cos(theta) to reach y_pane shifts z by
+	# t * sin(theta) = separation * tan(theta).)
+	#
+	# The measured crop's floor footprint is x in [-0.78, 0.78],
+	# z in [-1.246, 0.805] (corner rays of the 0.35-0.65 crop through this
+	# camera, computed in the task-4 report). At the old pane position
+	# (y=1, separation=2 from the floor at y=-1) the probe-2 offset at
+	# theta=80deg was 2 * tan(80deg) = 11.34 units -- far outside this
+	# pane's +/-4 half-extent, so the pane was not in the light path at all
+	# and probe 2 measured nothing (that was the round-1-era bug, compounded
+	# by the round-2 bug of rotating the pane on top of it).
+	#
+	# Fix: move the pane down to separation = 0.4 (y = -1 + 0.4 = -0.6) and
+	# keep its horizontal 8x8 size. At theta=80deg the offset is
+	# 0.4 * tan(80deg) = 2.2685 units, so the crop's floor-Z range maps to a
+	# pane-crossing-Z range of [-1.246+2.2685, 0.805+2.2685] =
+	# [1.0225, 3.0735] -- entirely inside the pane's [-4, 4] half-extent,
+	# with 0.9265 units of margin at the near edge. x is unaffected (the
+	# light only rotates about X), so [-0.78, 0.78] stays comfortably inside
+	# [-4, 4] too. Every ray reaching the measured crop therefore passes
+	# through the pane at every incidence angle this gate uses, including
+	# theta=0 (probe 1, offset 0, trivially satisfied).
 	var pane := MeshInstance3D.new()
 	var pane_mesh := BoxMesh.new()
 	pane_mesh.size = Vector3(8, 0.05, 8)
 	pane.mesh = pane_mesh
-	pane.position = Vector3(0, 1, 0)
-	pane.rotation_degrees = Vector3(p_tilt_deg, 0, 0)
+	pane.position = Vector3(0, -0.6, 0)
 	var glass_mat := StandardMaterial3D.new()
 	glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
 	glass_mat.transmission = 1.0
@@ -126,7 +164,10 @@ func _measure_ratio(p_tilt_deg: float) -> float:
 	add_child(pane)
 
 	var light := DirectionalLight3D.new()
-	light.rotation_degrees = Vector3(-90, 0, 0) # straight down
+	# rotation_degrees = (-90, 0, 0) points straight down, which is 0deg from
+	# the horizontal pane's +Y normal. For incidence angle p_incidence_deg
+	# from that normal the rotation is -(90 - p_incidence_deg).
+	light.rotation_degrees = Vector3(-(90.0 - p_incidence_deg), 0, 0)
 	light.light_energy = 1.0
 	light.shadow_enabled = true
 	add_child(light)
