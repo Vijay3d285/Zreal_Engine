@@ -2629,10 +2629,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// pass concluded, and it is how E3's acceptance was measured. It fires once
 	// per build_tlas -- ~128 times per capture -- so it lives behind --verbose.
 	if (OS::get_singleton()->is_stdout_verbose()) {
-		print_line(vformat("[E3] scene feature mask: aniso=%d coat=%d sheen=%d",
+		print_line(vformat("[E3] scene feature mask: aniso=%d coat=%d sheen=%d trans=%d",
 				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
 				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
-				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0)));
+				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0),
+				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) != 0)));
 	}
 
 	// -----------------------------------------------------------------------
