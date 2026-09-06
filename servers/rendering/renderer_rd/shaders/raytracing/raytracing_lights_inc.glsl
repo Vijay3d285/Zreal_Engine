@@ -264,24 +264,37 @@ float rt_max_component(vec3 v) {
 	return max(v.x, max(v.y, v.z));
 }
 
+// Below this the ray is treated as blocked. Deliberately small: the returned
+// value multiplies a light contribution that may be thousands of nits for a sun,
+// so an aggressive epsilon clips real light rather than pruning a dead ray.
+#define RT_SHADOW_ATTEN_EPSILON 1e-4
+
 /// Returns per-channel light transmittance along the shadow ray.
-///   vec3(0.0) = fully occluded, vec3(1.0) = clear.
-/// PASS A only for now -- opaque occlusion, unchanged logic, and STILL TRACED
-/// AGAINST EVERY INSTANCE. The narrowing to RT_INSTANCE_MASK_OPAQUE lands in
-/// Task 5 together with pass B: narrowing it here would cull glass out of the
-/// shadow test with nothing yet in place to attenuate it, so glass would cast
-/// no shadow at all in the interval.
-/// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
-/// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
+///   vec3(0.0) = fully occluded, vec3(1.0) = clear, anything between = the
+///   product of `transmission * (1 - F)` over every transmissive crossing.
+///
+/// PASS A traces only RT_INSTANCE_MASK_OPAQUE and answers the binary
+/// occlusion question. Uses SkipClosestHitShader so only any_hit (alpha test)
+/// and miss are invoked; TerminateOnFirstHit exits on the first confirmed
+/// opaque hit.
+///
+/// PASS B then walks the transmissive instances that pass A deliberately no
+/// longer sees and multiplies their Fresnel-weighted transmittance together.
+/// The two halves are one unit: narrowing pass A without pass B culls glass
+/// out of the shadow test entirely (glass casts no shadow), and pass B without
+/// the narrowing double-counts every pane -- pass A occludes on it AND pass B
+/// attenuates through it.
 vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 #ifdef USE_SER
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			RT_INSTANCE_MASK_ALL, 0, 0, 0,
+			RT_INSTANCE_MASK_OPAQUE, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
-	return hitObjectIsHitEXT(hitObject) ? vec3(0.0) : vec3(1.0);
+	if (hitObjectIsHitEXT(hitObject)) {
+		return vec3(0.0);
+	}
 #else
 	/// The miss shader writes radiance = vec3(1.0) for shadow rays (visible).
 	/// If an opaque hit occurs, miss is never called and radiance stays vec3(0.0).
@@ -301,7 +314,7 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			RT_INSTANCE_MASK_ALL, 0, 0, 0,
+			RT_INSTANCE_MASK_OPAQUE, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).
@@ -310,8 +323,95 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 
 	payload = saved_payload;
 
-	return visible ? vec3(1.0) : vec3(0.0);
+	if (!visible) {
+		return vec3(0.0);
+	}
 #endif
+
+	// PASS B -- transmissive accumulation. Runs only when pass A found no opaque
+	// occluder AND the scene actually contains transmissive geometry (a
+	// specialization constant, so this whole block folds away otherwise).
+	//
+	// This is an inline ray query rather than any-hit accumulation on purpose.
+	// Any-hit would require clearing FORCE_OPAQUE on transmissive instances
+	// (render_raytracing.cpp:2991), and that bit is shared with the primary and
+	// indirect rays -- every ray in the scene would start invoking any-hit on all
+	// glass to pay for a shadow-path fix.
+	if (!RT_GET_TRANSMISSIVE_GEOMETRY()) {
+		return vec3(1.0);
+	}
+
+	vec3 atten = vec3(1.0);
+	float t_min = 0.001;
+	uint max_crossings = max(1u, RT_GET_MAX_TRANSMISSION_BOUNCE());
+
+	float t_max = max_dist - 0.001;
+
+	for (uint i = 0u; i < max_crossings; i++) {
+		// The advance below can push t_min past the light for a pane sitting almost
+		// exactly at max_dist. rayQueryInitializeEXT requires tMin <= tMax, so stop
+		// rather than issue an out-of-spec query. Behaviourally a no-op -- an empty
+		// interval could not have produced a hit anyway.
+		if (t_min > t_max) {
+			break;
+		}
+
+		rayQueryEXT rq;
+		// gl_RayFlagsOpaqueEXT so the query commits transmissive hits directly
+		// without an any-hit candidate step -- these instances carry FORCE_OPAQUE
+		// and we want each crossing reported, not alpha-tested. Note RT_RAY_FLAGS
+		// (back-face culling) is deliberately NOT used: the exit face of a pane is
+		// a back face and it is exactly the second crossing we need to count.
+		rayQueryInitializeEXT(rq, tlas,
+				gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+				RT_INSTANCE_MASK_TRANSMISSIVE,
+				origin, t_min, direction, t_max);
+		while (rayQueryProceedEXT(rq)) {
+		}
+		if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+			break;
+		}
+
+		uint geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+		uint prim_id = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+		vec2 cb = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+		float hit_t = rayQueryGetIntersectionTEXT(rq, true);
+		bool front = rayQueryGetIntersectionFrontFaceEXT(rq, true);
+
+		GeometryData geom = geometries[geometry_idx];
+		MaterialData mat = materials[geometry_idx];
+		uint i0, i1, i2;
+		get_triangle_indices_ex(geom, prim_id, i0, i1, i2);
+		vec3 bary = vec3(1.0 - cb.x - cb.y, cb.x, cb.y);
+
+		// gl_ObjectToWorldEXT does NOT exist inside a ray query -- every use of it
+		// in this codebase is in a hit shader. This is the ray-query form.
+		mat3 m3 = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true));
+		mat3 nrm_mat = mat3(normalize(m3[0]), normalize(m3[1]), normalize(m3[2]));
+		vec3 N = normalize(nrm_mat * fetch_tbn(geom, i0, i1, i2, bary).normal);
+
+		// eta must flip on the exit face or the accumulated product is wrong on
+		// every pane -- the same flip the BSDF performs at
+		// raytracing_closest_hit_common_inc.glsl:1504. Guarded on ior > 0 because
+		// ior == 0.0 is legal glTF and fresnel_dielectric's caller contract
+		// (brdf_inc.glsl:478-481) forbids an eager reciprocal.
+		float eta = front ? mat.ior : ((mat.ior > 0.0) ? (1.0 / mat.ior) : mat.ior);
+		float cos_t;
+		float F = fresnel_dielectric(dot(direction, N), eta, cos_t);
+
+		atten *= mat.transmission * (1.0 - F);
+		if (rt_max_component(atten) < RT_SHADOW_ATTEN_EPSILON) {
+			return vec3(0.0);
+		}
+
+		// Scale-relative advance. A fixed epsilon is swallowed by float precision
+		// at large t and the loop would re-hit the same pane until the cap.
+		t_min = hit_t * (1.0 + 1e-4) + 1e-4;
+	}
+
+	// Cap reached with attenuation left: return what accumulated, so deep glass
+	// dims rather than going black.
+	return atten;
 }
 
 // ============================================================================
