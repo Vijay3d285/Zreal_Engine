@@ -116,42 +116,78 @@ func _measure_ratio(p_incidence_deg: float) -> float:
 	floor_mi.material_override = floor_mat
 	add_child(floor_mi)
 
-	# Matches _apply_glb_transmissive_glass in image_glb_creation.gd (size
-	# only -- the Y position below is specific to this gate's geometry).
+	# Round-2 defect (fixed here, round 3): the pane was moved down to
+	# y=-0.6 to shorten the light path so the 8x8 pane stayed under the
+	# probe-2 light crossing. But y=-0.6 sits BETWEEN the camera (y=0.5) and
+	# the floor (y=-1), so every camera ray in the measured crop -- which
+	# travels downward from the camera toward the floor -- now punches
+	# through the pane before reaching the floor. Combined with
+	# max_bounces=1 (RT_PARAM_FRAME_INDEX aside, `max_total == 1`), the
+	# camera ray's bounce budget is consumed hitting the pane (hit 0: total
+	# 0 < 1, proceeds, samples the transmissive lobe, total becomes 1), so
+	# the floor hit (hit 1: total 1 >= 1) terminates BEFORE next-event
+	# estimation ever runs -- see shade_and_bounce() in
+	# raytracing_closest_hit_common_inc.glsl and inc_transmission_bounce in
+	# raytracing_inc.glsl:175-177 (`packed + 0x08000001u`, incrementing both
+	# the transmission and total-bounce counters together). The near-zero
+	# through-glass reading that produced is a camera-ray bounce-budget
+	# artifact, not a measurement of lights_trace_shadow_ray at all.
 	#
-	# GEOMETRY: for a directional light at incidence angle theta from this
-	# horizontal pane's normal, a ray reaching a floor point at height
-	# y_floor crosses the pane's plane (height y_pane) offset in Z by
-	# separation * tan(theta), where separation = y_pane - y_floor. (Proof:
-	# the light's local -Z direction at rotation_degrees.x = -(90-theta) is
+	# Fix (round 3): restore the pane to y=1, strictly ABOVE the camera's
+	# y=0.5, so it is geometrically impossible for a downward-traveling
+	# camera ray to reach it (see axis-(b) proof below) -- and ENLARGE the
+	# pane instead of moving it, to keep the light's grazing crossing inside
+	# its footprint at the restored separation.
+	#
+	# GEOMETRY (light axis, unchanged derivation from round 2): for a
+	# directional light at incidence angle theta from this horizontal
+	# pane's normal, a ray reaching a floor point at height y_floor crosses
+	# the pane's plane (height y_pane) offset in Z by separation *
+	# tan(theta), where separation = y_pane - y_floor. (Proof: the light's
+	# local -Z direction at rotation_degrees.x = -(90-theta) is
 	# d = (0, -cos(theta), -sin(theta)); tracing a floor hit backward along
 	# -d by t = separation / cos(theta) to reach y_pane shifts z by
 	# t * sin(theta) = separation * tan(theta).)
 	#
 	# The measured crop's floor footprint is x in [-0.78, 0.78],
 	# z in [-1.246, 0.805] (corner rays of the 0.35-0.65 crop through this
-	# camera, computed in the task-4 report). At the old pane position
-	# (y=1, separation=2 from the floor at y=-1) the probe-2 offset at
-	# theta=80deg was 2 * tan(80deg) = 11.34 units -- far outside this
-	# pane's +/-4 half-extent, so the pane was not in the light path at all
-	# and probe 2 measured nothing (that was the round-1-era bug, compounded
-	# by the round-2 bug of rotating the pane on top of it).
+	# camera, computed in the task-4 report and unaffected by pane
+	# geometry). With the pane back at y=1 (separation = 1 - (-1) = 2 from
+	# the floor at y=-1), the probe-2 (theta=80deg) offset is
+	# 2 * tan(80deg) = 2 * 5.67128182 = 11.34256364 units, so the
+	# pane-crossing Z range is
+	# [-1.246 + 11.34256364, 0.805 + 11.34256364] =
+	# [10.09656364, 12.14756364].
 	#
-	# Fix: move the pane down to separation = 0.4 (y = -1 + 0.4 = -0.6) and
-	# keep its horizontal 8x8 size. At theta=80deg the offset is
-	# 0.4 * tan(80deg) = 2.2685 units, so the crop's floor-Z range maps to a
-	# pane-crossing-Z range of [-1.246+2.2685, 0.805+2.2685] =
-	# [1.0225, 3.0735] -- entirely inside the pane's [-4, 4] half-extent,
-	# with 0.9265 units of margin at the near edge. x is unaffected (the
-	# light only rotates about X), so [-0.78, 0.78] stays comfortably inside
-	# [-4, 4] too. Every ray reaching the measured crop therefore passes
-	# through the pane at every incidence angle this gate uses, including
-	# theta=0 (probe 1, offset 0, trivially satisfied).
+	# AXIS (a) -- light-vs-pane: the old 8x8 pane's +/-4 half-extent is far
+	# too small for that range (this is exactly why round 2 moved the pane
+	# in the first place). Fix: enlarge the pane to 30x0.05x30 (Z/X
+	# half-extent 15) instead of moving it. Both ends of
+	# [10.09656364, 12.14756364] are inside [-15, 15], with
+	# 15 - 12.14756364 = 2.85243636 units of margin at the far (near-edge)
+	# end. X is unaffected by the light's X-axis-only rotation, so
+	# [-0.78, 0.78] sits inside [-15, 15] with 14.22 units of margin. At
+	# theta=0 (probe 1) the offset is 0, so the crop's own
+	# [-1.246, 0.805] range is trivially inside [-15, 15] too.
+	#
+	# AXIS (b) -- camera-vs-pane (the axis round 2 changed and never
+	# re-checked): the camera sits at y=0.5 and every corner ray of the
+	# measured crop has a strictly negative Y-direction component (computed
+	# in the task-4 report's round-1 framing check: dir.y in
+	# [-0.426, -0.276] across all four corners). A ray's height is
+	# y(t) = 0.5 + t*dir.y for t >= 0 (t=0 is the camera itself); since
+	# dir.y < 0, y(t) is strictly decreasing from 0.5 and can never rise to
+	# y=1 -- reaching y=1 would require t < 0, i.e. a point BEHIND the
+	# camera, not anywhere along the ray it actually casts. So no camera
+	# ray in the measured crop can intersect a pane at y=1, regardless of
+	# the pane's horizontal size. This holds for probe 1 and probe 2
+	# identically because the pane's position and the camera are unchanged
+	# by p_incidence_deg -- only the light rotates.
 	var pane := MeshInstance3D.new()
 	var pane_mesh := BoxMesh.new()
-	pane_mesh.size = Vector3(8, 0.05, 8)
+	pane_mesh.size = Vector3(30, 0.05, 30)
 	pane.mesh = pane_mesh
-	pane.position = Vector3(0, -0.6, 0)
+	pane.position = Vector3(0, 1, 0)
 	var glass_mat := StandardMaterial3D.new()
 	glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
 	glass_mat.transmission = 1.0
