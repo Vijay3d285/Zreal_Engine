@@ -654,12 +654,26 @@ After pass A's `return visible ? vec3(1.0) : vec3(0.0);` becomes a fallthrough, 
 		mat3 nrm_mat = mat3(normalize(m3[0]), normalize(m3[1]), normalize(m3[2]));
 		vec3 N = normalize(nrm_mat * fetch_tbn(geom, i0, i1, i2, bary).normal);
 
-		// eta must flip on the exit face or the accumulated product is wrong on
-		// every pane -- the same flip the BSDF performs at
-		// raytracing_closest_hit_common_inc.glsl:1504. Guarded on ior > 0 because
-		// ior == 0.0 is legal glTF and fresnel_dielectric's caller contract
-		// (brdf_inc.glsl:478-481) forbids an eager reciprocal.
-		float eta = front ? mat.ior : ((mat.ior > 0.0) ? (1.0 / mat.ior) : mat.ior);
+		// CORRECTED 2026-09-06 BY MEASUREMENT. Do NOT flip eta on the back face.
+		// An earlier revision of this plan mandated mirroring the BSDF's flip at
+		// raytracing_closest_hit_common_inc.glsl:1504. That is wrong here: the BSDF
+		// flips because it REFRACTS the ray and evaluates the exit interface at the
+		// INTERNAL angle. Pass B deliberately does not bend the ray (the no-caustics
+		// decision), so at the back face it still holds the EXTERNAL angle.
+		// eta = 1/ior against an external 80 deg gives eta^2 - sin^2(theta) = -0.525,
+		// which fresnel_dielectric reports as total internal reflection: F = 1.0,
+		// attenuation zero, glass black at grazing angles. Measured: probe 2 read
+		// 0.000000 where theory says 0.3749.
+		//
+		// Using ior at BOTH crossings is exact, not an approximation: by Fresnel
+		// reciprocity R(theta_internal, 1/n) == R(theta_external, n), so the unbent
+		// two-crossing product (1-F)^2 IS the thin-slab transmittance -- 0.9216 at
+		// normal incidence, 0.3749 at 80 deg for ior 1.5.
+		//
+		// The flip is harmless at normal incidence (both forms give F = 0.04), which
+		// is why probe 1 read a perfect 0.9216 while probe 2 read zero. A
+		// normal-incidence probe alone cannot catch this.
+		float eta = mat.ior;
 		float cos_t;
 		float F = fresnel_dielectric(dot(direction, N), eta, cos_t);
 

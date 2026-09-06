@@ -132,9 +132,10 @@ for i in 0 .. RT_GET_MAX_TRANSMISSION_BOUNCE() - 1:
     N_obj = fetch_tbn(geom, i0, i1, i2, bary).normal
     M     = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true))
     N     = normalize(mat3(normalize(M[0]), normalize(M[1]), normalize(M[2])) * N_obj)
-    -- eta must flip on the exit face, exactly as the BSDF does
-    front = rayQueryGetIntersectionFrontFaceEXT(rq, true)
-    eta   = front ? mat.ior : ((mat.ior > 0.0) ? (1.0 / mat.ior) : mat.ior)
+    -- eta is NOT flipped on the exit face. See "Exit face" below: pass B does
+    -- not bend the ray, so it still holds the EXTERNAL angle at the back face,
+    -- and the flipped eta there yields spurious total internal reflection.
+    eta   = mat.ior
     F     = fresnel_dielectric(dot(direction, N), eta, cos_t)
     atten *= mat.transmission * (1.0 - F)
     if max_component(atten) < RT_SHADOW_ATTEN_EPSILON: return vec3(0.0)
@@ -254,7 +255,7 @@ already makes at `raytracing_closest_hit_common_inc.glsl:2124`.
 |---|---|
 | Total internal reflection | `fresnel_dielectric` returns `1.0`, so `atten *= 0` and the ray is occluded. Correct: a grazing pane blocks. |
 | `ior == 0.0` | Legal glTF (`KHR_materials_ior` signal value). `fresnel_dielectric`'s caller contract (`brdf_inc.glsl:478-481`) forbids computing `1.0 / eta` before it returns, since an eager reciprocal is already an infinity. The exit-face flip above is guarded on `mat.ior > 0.0` for exactly this reason. |
-| Exit face | A shadow ray crossing a pane hits the front face (air to glass, `eta = ior`) and then the back face (glass to air, `eta = 1/ior`). Both crossings must use the correct `eta` or the accumulated product is wrong on every pane. This mirrors what the BSDF already does at `raytracing_closest_hit_common_inc.glsl:1504`. |
+| Exit face | **Do NOT flip `eta` on the back face.** An earlier revision of this spec mandated mirroring the BSDF's flip at `raytracing_closest_hit_common_inc.glsl:1504`; that was measured wrong. The BSDF flips because it REFRACTS the ray and evaluates the exit interface at the internal angle. Pass B deliberately does not bend the ray (the no-caustics decision), so at the back face it still holds the EXTERNAL angle. Feeding `eta = 1/ior` together with an external 80 deg gives `eta^2 - sin^2(theta) = -0.525`, which `fresnel_dielectric` reports as total internal reflection: `F = 1.0`, attenuation zero, and glass turns black at grazing angles. Use `eta = ior` at BOTH crossings. That is not an approximation — by Fresnel reciprocity `R(theta_internal, 1/n) == R(theta_external, n)`, so the unbent two-crossing product `(1 - F)^2` is exactly the thin-slab transmittance (0.9216 at normal incidence, 0.3749 at 80 deg for ior 1.5). The flip is harmless at normal incidence, which is why a normal-incidence probe alone cannot catch this. |
 | Self-intersection on `tmin` advance | `tmin = hit_t * (1.0 + 1e-4) + 1e-4`. Scale-relative, because a fixed epsilon is swallowed by float precision at large `t` and the loop would re-hit the same pane until the cap. No existing helper covers this. |
 | More panes than the cap | Loop bounded by `RT_GET_MAX_TRANSMISSION_BOUNCE()`; on exhaustion return the accumulated attenuation rather than zero, so deep glass dims instead of going black. |
 | Alpha-cutout surfaces | Unchanged. They stay on the opaque mask and the existing any-hit test. |
