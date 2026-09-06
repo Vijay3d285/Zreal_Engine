@@ -1409,8 +1409,14 @@ measurements attached where relevant:**
   reads the exit hit's own material and `gl_HitTEXT` as path length, which is
   exact for one closed mesh and wrong for interpenetrating transmissive
   volumes.
-- Shadow rays are still blocked by glass, so there are no caustics (§6.2) —
-  matches Cycles without its caustics path.
+- Shadow rays passed through glass as of the transparent-shadows work (section 8):
+  a transmissive surface now attenuates a shadow ray by `transmission * (1 - F)`
+  per crossing instead of blocking it. Caustics remain absent and unscheduled --
+  light crosses the pane without bending. The previous revision of this line
+  claimed being blocked "matches Cycles"; that is true only of Cycles' Glass BSDF.
+  Cycles' transparent-shadow path (`shade_shadow.h:183`) fires for Transparent BSDF
+  closures, which is what alpha-authored glass assets actually produce, so the
+  reference renders were never taking the path this line described.
 - ~~`resolveDielectricF0`'s `eta` re-derivation is gated on Godot's native
   `specular` only, not `specular_factor`/`specular_tint`~~ **FIXED by the E1
   final fix wave (F3) — see §7.5.** This was not, on inspection, a legitimate
@@ -3827,3 +3833,225 @@ capture. It is now behind `OS::get_singleton()->is_stdout_verbose()` rather
 than deleted, since it is the only external read of what the detect pass
 concluded and is how the acceptance above was measured. Re-arm it with
 `--verbose`.
+
+## 8. Transparent shadows closeout — glass no longer blocks direct light
+
+**Complete.** Shadow rays now attenuate through transmissive surfaces instead
+of stopping at them. Before this work, a light source occluded by any glass
+pane — a fish tank, a vitrine, a window — received zero direct light behind
+it, full stop, regardless of the glass's `transmission`/`alpha` authoring;
+`:1412` above used to (wrongly) call that behaviour a match for Cycles. It
+never was, for the alpha-authored `alphaMode: BLEND` GLBs this engine
+actually renders (base-colour alpha 0.098) — Cycles' own transparent-shadow
+path (`shade_shadow.h:183`, gated on `SR_TRANSPARENT` via
+`surface_shader_transparency`, `surface_shader.h:1053`) passes ~90% of the
+light through exactly that closure. This phase closes that gap for direct
+lighting only; it does not touch caustics, which stay out of scope (§6.2), and
+it does not touch indirect/multi-bounce light, which is unaffected by shadow
+rays entirely.
+
+### 8.1 The defect and its code anchors
+
+The shadow-ray function is `lights_trace_shadow_ray()`,
+`servers/rendering/renderer_rd/shaders/raytracing/raytracing_lights_inc.glsl:289-478`.
+Before this work it was a single opaque-occlusion trace: any hit, transmissive
+or not, returned `vec3(0.0)`. Transmissive instances are identified by a
+per-material flag bit set from `mat.transmission > 0.0f`
+(`RT_FLAG_TRANSMISSIVE_GEOMETRY = 1 << 18`,
+`scene_shader_raytracing.h:106`), OR'd into a per-scene mask the same way E3's
+feature bits are, and turned into a per-instance TLAS cull mask
+(`rt_instance_mask_from_features`, `render_raytracing.cpp:2461`) split across
+two disjoint bits: `RT_INSTANCE_MASK_OPAQUE = 0x01`,
+`RT_INSTANCE_MASK_TRANSMISSIVE = 0x02`, `RT_INSTANCE_MASK_ALL = 0xFF`
+(`scene_shader_raytracing.h:138-141`).
+
+### 8.2 The two-pass design, and why pass B is a re-trace loop, not any-hit accumulation
+
+**Pass A** (`raytracing_lights_inc.glsl:289-331`) is byte-for-byte the old hot
+path, narrowed to `RT_INSTANCE_MASK_OPAQUE`: `TerminateOnFirstHit` +
+`SkipClosestHitShader`, answering the binary occlusion question against
+opaque geometry only. **Pass B** (`:333-478`) runs only if A found no opaque
+occluder, and only when the scene actually contains transmissive geometry —
+`RT_GET_TRANSMISSIVE_GEOMETRY()` is a specialization constant, so the whole
+block folds away in a glassless scene, which is what makes Step 3's
+no-regression claim structural rather than measured-and-hoped. It walks an
+inline `rayQueryEXT` forward from the origin, at each iteration finding the
+nearest transmissive hit in `[t_min, t_max]`, multiplying an accumulator by
+`transmission * (1 - F)` for that crossing, advancing `t_min` past it, and
+repeating up to `RT_GET_MAX_TRANSMISSION_BOUNCE()` (default 12) times or until
+the accumulator underflows an epsilon and the ray is called fully occluded.
+
+The two halves are one unit, not two independent features: narrowing pass A's
+mask without pass B culls glass out of the shadow test entirely (every pane
+casts no shadow at all — this was measured and caught mid-implementation, see
+§8.6); pass B without the narrowing double-counts every pane, since pass A
+would already occlude on the same hit pass B is attenuating through.
+
+**Why pass B is a re-trace loop and not any-hit accumulation on the primary
+ray.** The cheaper-looking design is to give transmissive instances an
+any-hit shader and let a single trace accumulate attenuation as it goes. That
+requires clearing `FORCE_OPAQUE` on transmissive instances
+(`render_raytracing.cpp:2991`) — and that bit is not scoped to shadow rays. It
+is a per-instance property shared by every ray that can hit that instance:
+primary rays and indirect bounce rays as well as shadow rays. Clearing it to
+fix the shadow path would force every primary and indirect ray in the scene
+to start invoking any-hit on all glass, paying a cost proportional to total
+ray traffic to fix a cost that is actually proportional to shadow-ray traffic
+against transmissive geometry specifically. The re-trace loop keeps the fix
+scoped to the rays that need it, at the cost described in §8.5.3.
+
+### 8.3 Gate results, default config (`pipeline_references/tests/pt_transparent_shadow_gate.gd`)
+
+All four probes PASS, each matching closed-form Fresnel theory to at least
+five significant figures:
+
+| Probe | Configuration | Measured | Theory | Band |
+|---|---|---|---|---|
+| 1 | One pane, normal incidence | 0.921600 | 0.921600 (= 0.96², ior 1.5, F0 = 0.04) | admits ceiling 1.0 |
+| 2 | One pane, 80° incidence | 0.374911 | 0.374905 | [0.365, 0.385] |
+| 3 | Two panes / four crossings | 0.849346 | 0.849346 (= 0.96⁴) | crossing-count probe |
+| 4 | One pane, `transmission = 0.5` | 0.230400 | 0.230400 (= (0.5·0.96)²) | closes the untested-factor hole |
+
+Probe 3 is the evidence the re-trace ordering is right, not just the
+per-crossing arithmetic: one pane and two panes are indistinguishable to
+probe 1 alone (0.9216 and 0.96 both sit inside a loose band), so without
+probe 3 a shader that silently skipped a crossing could still read green.
+Probe 4 closes a hole found during review: with `mat.transmission` held at
+1.0 in probes 1-3, deleting that factor from the accumulation entirely still
+passed all three to the last digit — probe 4 varies it and would catch that
+regression.
+
+**Falsification, run against this same gate:** removing the `(1.0 - F)` term
+from the accumulation made probes 1, 2 and 3 all read exactly `1.000000`, and
+all three FAILED. The fix was restored byte-exact and the gate returned to
+green at the numbers above. The gate can fail; this is not a tautology that
+only ever reports success.
+
+**Disabled-configuration check** (`rendering/pathtracer/transmission_enabled =
+false`): all four probes read through-glass `0.000000` against their lit
+controls and all four FAILED — i.e. with the Environment toggle off, glass is
+a full occluder, matching what the BSDF itself draws for the same pane
+(`raytracing_closest_hit_common_inc.glsl:1468` forces `transmissivness` to
+0.0 in that config). The toggle is honoured inside the accumulation loop
+rather than as an early return before it — an earlier revision that gated the
+early return on the toggle made glass cast no shadow at all in the *default*
+(enabled) config, because the TLAS cull mask is derived from the material
+alone and does not vary with the toggle; see the inline comment at
+`raytracing_lights_inc.glsl:348-362` for the full argument.
+
+**Full doctest suite:** 1550 passed, 0 failed, 3 skipped, 2,068,020 assertions.
+
+### 8.4 Production scenes — the two originally reported
+
+Both scenes re-rendered end to end (not gate probes) against the reported
+baselines, with an unrelated region of each image carried as a control to
+show the change is localized rather than a global exposure shift:
+
+| Scene | Region | Before | After | Delta |
+|---|---|---|---|---|
+| `urbantestdark191_glass` (front) | tank interior | 40.5, 47.4, 10.7 | 47.0, 55.4, 14.3 | mean luminance 32.9 → 38.9, **+18%** |
+| `urbantestdark191_glass` (front) | room-wall control | 193.9, 180.2, 170.6 | 193.9, 180.2, 170.6 | **bit-identical** |
+| `urbantestdark190_glass` (side) | tank | 84.4, 79.1, 74.8 | 86.7, 83.5, 79.5 | **+5%** |
+| `urbantestdark190_glass` (side) | room-wall control | 146.8, 126.9, 114.9 | 147.1, 127.3, 115.2 | +0.3 (noise) |
+
+The bit-identical control on 191 is the load-bearing number here, more than
+either tank delta: it is direct evidence that the change is localized to
+glass-occluded geometry rather than a shift in overall scene exposure that
+happens to correlate with the tank getting brighter.
+
+**Timing: INCONCLUSIVE, and reported as such rather than as "no cost."** Wall
+times were 920s (191) vs. 921s originally, and 997s (190) vs. 960s originally.
+Asset loading dominates the total — roughly 916s of the original 921s on
+scene 191 — so at one sample per scene the render-loop cost cannot be
+separated from ordinary load-time variance. This is the same shape of gap
+§7.2 hit with frame-timing noise bands: a real single-digit-percent loop cost
+would be invisible at this sample size, and nothing here rules it out. See
+§8.5.3 for why a real cost is in fact expected on this feature specifically.
+
+### 8.5 What this does not fix — three honest limits
+
+**8.5.1 The side-view blackout is not fixed, and was never a shadow
+problem.** `urbantestdark190`'s tank still reads as a grey mirror. The cause
+is grazing-angle Fresnel/TIR dominating the panel's reflectance — at a steep
+viewing angle the glass itself becomes near-total-reflective, so the camera
+sees mostly the environment mirrored off the front face regardless of how
+well the interior is lit. Fixing the shadow path cannot help when a
+near-mirror sits in front of the thing being lit; this needs reflectance work
+on the panel BSDF, a different problem than this phase addressed.
+
+**8.5.2 The +18% is scene-bounded, not a general expectation.** The 191 tank
+sits against an interior wall. Its *direct* light budget — the portion a
+shadow ray carries — is small to begin with; most of its illumination is
+multi-bounce indirect light, which shadow rays do not touch at all. Scene
+lighting here is sun through two window openings, SKY ambient from an EXR
+panorama, and three custom lights (one IES profile at energy 0.004). A tank
+placed near a window, or a vitrine lit by a direct spot, would show a
+substantially larger recovery than +18% — and a scene with no direct light on
+the enclosed geometry at all would show none. Do not carry "+18%" into a
+context that does not carry this scene's lighting layout with it.
+
+**8.5.3 An unmeasured performance cost.** §8.2 explains why pass B is a
+re-trace rather than an any-hit accumulation; the corollary is that pass B
+dropped `gl_RayFlagsTerminateOnFirstHitEXT`, which pass A still uses. That
+flag commits whichever hit *traversal* reaches first, not the nearest one —
+fine for a boolean occlusion question, wrong for a march that needs the
+genuine nearest crossing at each step (committing a far hit first would
+silently discard every closer crossing, undercounting attenuation; see the
+inline comment at `raytracing_lights_inc.glsl:389-398`). Dropping the flag
+was the correct fix — probe 3's four-crossing result depends on it — but the
+consequence is that pass B is now up to `max_transmission_bounce` (default
+12) **full TLAS traversals per shadow ray**, in a scene doing NEE over
+several lights. §8.4's timing measurement could not resolve this against
+load-time noise. Correctness-first was the right call to make once the two
+were in tension, but this cost is real, unmeasured, and recorded here as an
+open item for whoever next touches shadow-ray performance.
+
+### 8.6 Four defects that originated in the plan, not the implementation
+
+Four separate defects in this phase traced back to the plan/spec rather than
+to an implementer's execution of it — the same pattern §7's E1 closeout
+flagged as the headline finding worth carrying forward, repeating here on a
+smaller feature:
+
+1. **Premature cull-mask narrowing.** The plan originally placed the
+   `RT_INSTANCE_MASK_OPAQUE` narrowing in an earlier task than the pass B
+   accumulation that depends on it. Measured effect: with the mask narrowed
+   and no pass B yet, glass stopped blocking shadow rays at all (ratio
+   1.000000, no attenuation) — worse than either the pre-fix or post-fix
+   behaviour. The plan was amended to require both halves land in the same
+   commit.
+2. **A `USE_SER` branch that would have skipped pass B entirely in that build
+   config.** The plan's own snippet converted only the non-SER branch's early
+   `return` into a fallthrough into pass B; the SER branch had its own
+   `return` and was left untouched. A build compiled with `USE_SER` would
+   have taken the old opaque-only path and glass would still have blocked
+   every shadow ray, silently, only in that configuration. Caught and fixed
+   in the same commit as the main pass B implementation, not by the plan.
+3. **The `TerminateOnFirstHit` ordering flaw** described in §8.5.3 — the
+   plan's own code for pass B specified the flag pass A uses, which is
+   correctness-incompatible with a march that must find genuine nearest hits.
+   No gate probe with a single pane could have caught it (one crossing and
+   two crossings both look plausible against a loose band); it took adding
+   probe 3's two-pane/four-crossing case to expose it.
+4. **An exit-face `eta` flip that caused spurious total internal reflection
+   at grazing angles**, turning glass fully black past some incidence angle
+   while a normal-incidence probe read a perfect `0.921600`. The plan
+   mandated mirroring the BSDF's own eta flip (`raytracing_closest_hit_common_inc.glsl:1504`)
+   at the shadow-ray exit face. That flip is correct for the BSDF, which
+   bends the ray and evaluates the exit interface at the internal refraction
+   angle — but pass B deliberately does not bend the ray (the no-caustics
+   decision), so at the exit face it still holds the *external* angle. Using
+   the internal eta against an external 80° incidence drove
+   `fresnel_dielectric`'s TIR test negative, reporting total internal
+   reflection where none should occur. Removed; by Fresnel reciprocity
+   `R(θ_internal, 1/n) == R(θ_external, n)`, using the same `ior` at both
+   crossings is exact, not an approximation — see the inline derivation at
+   `raytracing_lights_inc.glsl:426-451`.
+
+**The eta flip is the most reusable lesson of the four.** It is invisible to
+any single-angle probe: normal incidence gives the same Fresnel factor either
+way, so probe 1 read a perfect 0.9216 with the bug present and in place. Only
+probe 2, at a different angle, could distinguish a correct implementation
+from a wrong one — a general argument for why an angle-dependent physical
+quantity needs more than one incidence angle in its test coverage, not
+specific to glass or to this codebase.
