@@ -337,7 +337,16 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 	// (render_raytracing.cpp:2991), and that bit is shared with the primary and
 	// indirect rays -- every ray in the scene would start invoking any-hit on all
 	// glass to pay for a shadow-path fix.
-	if (!RT_GET_TRANSMISSIVE_GEOMETRY()) {
+	//
+	// BOTH gates are required, not just the geometry one. RT_GET_TRANSMISSIVE_GEOMETRY()
+	// is scene content ("a transmissive instance exists"); RT_GET_TRANSMISSION_ENABLED()
+	// is the Environment toggle that decides whether the BSDF transmits at all. With
+	// the toggle OFF the closest-hit path renders every pane as an opaque surface, so
+	// letting pass B keep attenuating through it would make the same pane opaque to
+	// the eye and translucent to shadows -- a surface that blocks light it visibly
+	// absorbs. Gating on both keeps the shadow path and the BSDF describing one
+	// material.
+	if (!RT_GET_TRANSMISSIVE_GEOMETRY() || !RT_GET_TRANSMISSION_ENABLED()) {
 		return vec3(1.0);
 	}
 
@@ -362,8 +371,19 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 		// and we want each crossing reported, not alpha-tested. Note RT_RAY_FLAGS
 		// (back-face culling) is deliberately NOT used: the exit face of a pane is
 		// a back face and it is exactly the second crossing we need to count.
+		//
+		// gl_RayFlagsTerminateOnFirstHitEXT is deliberately ABSENT, unlike pass A.
+		// That flag commits whichever intersection in [t_min, t_max] traversal
+		// happens to reach first -- BVH order, implementation-defined -- not the
+		// nearest one. Pass A can use it because it asks a boolean question where
+		// any hit is the answer. This loop instead marches t_min past each hit's t,
+		// so committing a far hit silently DISCARDS every crossing between the old
+		// t_min and it, under-counting panes and over-brightening the shadow. Without
+		// the flag the query runs to completion and commits the genuine closest hit,
+		// which is exactly the semantics this march needs; the cost is a full
+		// traversal per crossing instead of an early-out.
 		rayQueryInitializeEXT(rq, tlas,
-				gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+				gl_RayFlagsOpaqueEXT,
 				RT_INSTANCE_MASK_TRANSMISSIVE,
 				origin, t_min, direction, t_max);
 		while (rayQueryProceedEXT(rq)) {
@@ -376,7 +396,6 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 		uint prim_id = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
 		vec2 cb = rayQueryGetIntersectionBarycentricsEXT(rq, true);
 		float hit_t = rayQueryGetIntersectionTEXT(rq, true);
-		bool front = rayQueryGetIntersectionFrontFaceEXT(rq, true);
 
 		GeometryData geom = geometries[geometry_idx];
 		MaterialData mat = materials[geometry_idx];
@@ -390,12 +409,32 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 		mat3 nrm_mat = mat3(normalize(m3[0]), normalize(m3[1]), normalize(m3[2]));
 		vec3 N = normalize(nrm_mat * fetch_tbn(geom, i0, i1, i2, bary).normal);
 
-		// eta must flip on the exit face or the accumulated product is wrong on
-		// every pane -- the same flip the BSDF performs at
-		// raytracing_closest_hit_common_inc.glsl:1504. Guarded on ior > 0 because
-		// ior == 0.0 is legal glTF and fresnel_dielectric's caller contract
-		// (brdf_inc.glsl:478-481) forbids an eager reciprocal.
-		float eta = front ? mat.ior : ((mat.ior > 0.0) ? (1.0 / mat.ior) : mat.ior);
+		// CORRECTED 2026-09-06 BY MEASUREMENT. Do NOT flip eta on the back face.
+		// An earlier revision of this code mirrored the BSDF's flip at
+		// raytracing_closest_hit_common_inc.glsl:1504. That is wrong here: the BSDF
+		// flips because it REFRACTS the ray and evaluates the exit interface at the
+		// INTERNAL angle (41 deg for an 80 deg external ray). Pass B deliberately
+		// does not bend the ray (the no-caustics decision), so at the back face it
+		// still holds the EXTERNAL angle. fresnel_dielectric's TIR test is
+		// eta^2 - sin^2(theta) <= 0; eta = 1/ior against an external 80 deg gives
+		// -0.525, reported as total internal reflection: F = 1.0, attenuation zero,
+		// glass black at grazing angles. Measured: probe 2 read 0.000000 where
+		// theory says 0.3749.
+		//
+		// Using ior at BOTH crossings is EXACT, not an approximation: by Fresnel
+		// reciprocity R(theta_internal, 1/n) == R(theta_external, n), so the unbent
+		// two-crossing product (1-F)^2 IS the thin-slab transmittance -- 0.9216 at
+		// normal incidence, 0.3749 at 80 deg for ior 1.5.
+		//
+		// The flip is harmless at normal incidence (both forms give F = 0.04), which
+		// is why probe 1 read a perfect 0.9216 while probe 2 read zero. A
+		// normal-incidence probe alone cannot catch this.
+		//
+		// No ior > 0 guard is needed now that the reciprocal is gone: ior == 0.0 is
+		// legal glTF and passing it through unchanged makes fresnel_dielectric take
+		// its TIR branch and return exactly 1.0 -- a fully reflective pane, the same
+		// answer resolveDielectricF0 gives for ior == 0.
+		float eta = mat.ior;
 		float cos_t;
 		float F = fresnel_dielectric(dot(direction, N), eta, cos_t);
 
