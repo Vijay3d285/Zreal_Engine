@@ -22,8 +22,14 @@ extends "res://tests/pt_validation.gd"
 ## resolves to vec3(0.0) or vec3(1.0) -- the fractional Fresnel transmittance
 ## this gate measures does not exist yet. Probe 1 is the one that carries the
 ## gate before that fix: the pre-fix ratio is ~0.0 and cannot satisfy
-## [P1_RATIO_MIN, P1_RATIO_MAX] under any tolerance. Probes 2 and 3 are two-sided
-## bands, so the pre-fix 0.0 fails them as well.
+## [P1_RATIO_MIN, P1_RATIO_MAX] under any tolerance. Probes 2, 3 and 4 are
+## two-sided bands, so the pre-fix 0.0 fails them as well.
+##
+## The four probes measure four different things and none of them is redundant:
+##   1 -- the fractional transmittance exists at all (pre-fix reads 0.0)
+##   2 -- the Fresnel term is the EXACT dielectric form, at grazing incidence
+##   3 -- every crossing is counted (the t_min march's traversal order)
+##   4 -- the mat.transmission factor is applied, not just (1 - F)
 
 const FRAMES := 128
 
@@ -54,12 +60,22 @@ const P1_RATIO_MAX := 1.00
 #   r_p = -0.486637 -> r_p^2 = 0.236816
 #   F   = (r_s^2 + r_p^2)/2 = 0.387705
 #   (1 - F)^2 = 0.612295^2 = 0.374905
-# The band is +/- ~0.045 around that, wide enough for MC noise and the crop's
-# spread of incidence angles, narrow enough that 0.0 and the flat-attenuation
-# answer (~0.92) both land outside.
+#
+# The band is +/- 0.01 around that. It was +/- 0.045; measurement then came back
+# at 0.374911, agreeing with theory to five decimal places, and at the wider width
+# Schlick's approximation would have passed too:
+#   F_schlick = 0.04 + 0.96 * (1 - cos_i)^5 = 0.04 + 0.96 * 0.826352^5 = 0.409911
+#   (1 - F_schlick)^2 = 0.590089^2 = 0.348205
+# 0.348205 sits inside [0.33, 0.42] and OUTSIDE [0.365, 0.385], so the old band did
+# not pin the exact-Fresnel form the shader actually uses and this one does.
+#
+# There is NO spread of incidence angles to widen this for (an earlier revision of
+# this comment claimed one). The light is directional and the pane is flat and
+# unrotated, so every crossing in the crop is at exactly P2_INCIDENCE_DEG; the
+# measured five-decimal agreement is itself the evidence.
 const P2_INCIDENCE_DEG := 80.0
-const P2_RATIO_MIN := 0.33
-const P2_RATIO_MAX := 0.42
+const P2_RATIO_MIN := 0.365
+const P2_RATIO_MAX := 0.385
 
 # PROBE 3. TWO stacked panes at normal incidence = FOUR crossings, so the ratio
 # is 0.96^4 = 0.849346. This is the crossing COUNTER: the band is tight enough
@@ -77,6 +93,22 @@ const P2_RATIO_MAX := 0.42
 const P3_RATIO_MIN := 0.82
 const P3_RATIO_MAX := 0.88
 
+# PROBE 4. The TRANSMISSION-FACTOR probe. Probes 1-3 all render glass with
+# transmission = 1.0, which makes `mat.transmission` an invisible multiply-by-one:
+# deleting it from the shader's accumulation outright, leaving
+# `atten *= (1.0 - F)`, satisfies all three of them to the last digit. So without
+# this probe half of the accumulation expression is unmeasured.
+#
+# One pane at normal incidence, exactly probe 1's layout, but transmission = 0.5:
+#   per crossing  = 0.5 * (1 - 0.04) = 0.5 * 0.96 = 0.48
+#   two crossings = 0.48^2           = 0.2304
+# The band is +/- 0.01 around that. Probe 1's own reading, 0.921600, is the answer
+# a shader that ignores mat.transmission would produce here -- more than 30 band
+# widths away.
+const P4_TRANSMISSION := 0.5
+const P4_RATIO_MIN := 0.2204
+const P4_RATIO_MAX := 0.2404
+
 var _failures: Array[String] = []
 var _checks: int = 0
 
@@ -89,6 +121,9 @@ func _ready() -> void:
 
 	print("\n=== PROBE 3: two panes = four crossings ===")
 	await _probe3_two_panes()
+
+	print("\n=== PROBE 4: partial transmission scales the attenuation ===")
+	await _probe4_partial_transmission()
 
 	print("")
 	if _failures.is_empty():
@@ -121,18 +156,20 @@ func _probe1_interior_lit() -> void:
 
 func _probe2_grazing_darkens() -> void:
 	var ratio := await _measure_ratio(P2_INCIDENCE_DEG)
-	print("  incidence = %.1fdeg, ratio = %.6f (band %.2f - %.2f, theory 0.374905)"
+	print("  incidence = %.1fdeg, ratio = %.6f (band %.3f - %.3f, theory 0.374905)"
 			% [P2_INCIDENCE_DEG, ratio, P2_RATIO_MIN, P2_RATIO_MAX])
 	_checks += 1
 	if ratio < P2_RATIO_MIN:
 		# The failure that a bare ceiling let through: 0.0 is "below 0.80".
-		_failures.append(("probe2 grazing: ratio %.6f is BELOW %.2f -- the glass went "
-				+ "darker than Fresnel allows. At exactly 0.0 the likely cause is a "
-				+ "spurious total-internal-reflection branch (eta flipped to 1/ior on "
-				+ "the exit face while the ray still carries the external angle)")
+		_failures.append(("probe2 grazing: ratio %.6f is BELOW %.3f -- the glass went "
+				+ "darker than exact Fresnel allows. At exactly 0.0 the likely cause is "
+				+ "a spurious total-internal-reflection branch (eta flipped to 1/ior on "
+				+ "the exit face while the ray still carries the external angle). Near "
+				+ "0.3482 the cause is Schlick's approximation replacing the exact "
+				+ "dielectric Fresnel")
 				% [ratio, P2_RATIO_MIN])
 	elif ratio > P2_RATIO_MAX:
-		_failures.append(("probe2 grazing: ratio %.6f is ABOVE %.2f -- Fresnel is not "
+		_failures.append(("probe2 grazing: ratio %.6f is ABOVE %.3f -- Fresnel is not "
 				+ "reaching the accumulation, or a flat factor is being applied")
 				% [ratio, P2_RATIO_MAX])
 
@@ -154,6 +191,39 @@ func _probe3_two_panes() -> void:
 				% [ratio, P3_RATIO_MIN, P3_RATIO_MAX])
 
 
+## The transmission-factor probe. Probes 1-3 all use transmission = 1.0, so
+## mat.transmission multiplies by one in every one of them and the shader could
+## drop it entirely without moving any of their readings. Halving it must halve
+## each crossing: (0.5 * 0.96)^2 = 0.2304 instead of 0.9216.
+##
+## Geometry is probe 1's exactly -- ONE pane at y = 1, normal incidence -- so both
+## constraints are inherited unchanged rather than re-derived from scratch:
+##   AXIS (a), light-vs-pane: at theta = 0deg the crossing offset
+##     separation * tan(0) is 0.0, so the pane-crossing region IS the crop's floor
+##     footprint, x in [-0.78, 0.78] and z in [-1.246, 0.805]. Both are inside the
+##     pane's +/-15 half-extents, tightest margin 15 - 1.246 = 13.754 units.
+##   AXIS (b), camera-vs-pane: the pane spans y in [0.975, 1.025] and every crop
+##     ray has y(t) = 0.5 + t*dir.y with dir.y <= -0.276 < 0, strictly decreasing
+##     from 0.5, so no crop camera ray reaches y > 0.5 let alone 0.975. No camera
+##     ray touches the pane; the reading is shadow-ray transmittance alone.
+## Neither constraint depends on the material, so changing transmission cannot
+## disturb either one.
+func _probe4_partial_transmission() -> void:
+	var ratio := await _measure_ratio(0.0, false, P4_TRANSMISSION)
+	print("  transmission = %.2f, ratio = %.6f (band %.4f - %.4f, theory 0.230400)"
+			% [P4_TRANSMISSION, ratio, P4_RATIO_MIN, P4_RATIO_MAX])
+	_checks += 1
+	if ratio < P4_RATIO_MIN or ratio > P4_RATIO_MAX:
+		_failures.append(("probe4 partial transmission: ratio %.6f outside "
+				+ "[%.4f, %.4f] -- with transmission = %.2f each of the two crossings "
+				+ "must pass %.2f * 0.96 = %.2f, so the pair must read "
+				+ "%.2f^2 = 0.230400. A ratio near 0.9216 means the mat.transmission "
+				+ "factor is being IGNORED and only the Fresnel term (1 - F) is "
+				+ "reaching the accumulation")
+				% [ratio, P4_RATIO_MIN, P4_RATIO_MAX, P4_TRANSMISSION,
+				P4_TRANSMISSION, P4_TRANSMISSION * 0.96, P4_TRANSMISSION * 0.96])
+
+
 ## p_incidence_deg is the DirectionalLight3D's incidence angle from the
 ## horizontal pane's +Y normal (0 = straight down / near-normal, larger =
 ## grazing). The pane itself is ALWAYS flat and unrotated -- grazing is
@@ -166,7 +236,15 @@ func _probe3_two_panes() -> void:
 ## p_second_pane adds an identical pane at y = 2, giving four crossings
 ## instead of two (probe 3). It is toggled with the first pane, so both arms of
 ## the ratio still differ by nothing except the glass.
-func _measure_ratio(p_incidence_deg: float, p_second_pane: bool = false) -> float:
+##
+## p_transmission is the panes' StandardMaterial3D.transmission (probe 4). It
+## defaults to 1.0, which is the value probes 1-3 have always used, so they are
+## bit-identical to before this parameter existed. Any value > 0.0 still sets
+## RT_FLAG_TRANSMISSIVE_GEOMETRY on the material -- the C++ predicate is
+## `mat.transmission > 0.0f` (render_raytracing.cpp:1900) -- so the pane still
+## lands in RT_INSTANCE_MASK_TRANSMISSIVE and pass B still walks it.
+func _measure_ratio(p_incidence_deg: float, p_second_pane: bool = false,
+		p_transmission: float = 1.0) -> float:
 	for c in get_children():
 		c.queue_free()
 
@@ -288,7 +366,7 @@ func _measure_ratio(p_incidence_deg: float, p_second_pane: bool = false) -> floa
 	# crossing is stepped over and none is double-counted.
 	var glass_mat := StandardMaterial3D.new()
 	glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
-	glass_mat.transmission = 1.0
+	glass_mat.transmission = p_transmission
 	glass_mat.thickness = 0.0
 	glass_mat.roughness = 0.0
 	glass_mat.metallic = 0.0

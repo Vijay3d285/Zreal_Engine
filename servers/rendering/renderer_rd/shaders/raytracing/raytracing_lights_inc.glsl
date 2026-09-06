@@ -283,7 +283,9 @@ float rt_max_component(vec3 v) {
 /// The two halves are one unit: narrowing pass A without pass B culls glass
 /// out of the shadow test entirely (glass casts no shadow), and pass B without
 /// the narrowing double-counts every pane -- pass A occludes on it AND pass B
-/// attenuates through it.
+/// attenuates through it. For the same reason pass B must keep running when the
+/// Environment transmission toggle is OFF: the TLAS mask is a material property,
+/// so pass A still cannot see the pane, and only pass B is left to occlude it.
 vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 #ifdef USE_SER
 	hitObjectEXT hitObject;
@@ -338,15 +340,27 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 	// indirect rays -- every ray in the scene would start invoking any-hit on all
 	// glass to pay for a shadow-path fix.
 	//
-	// BOTH gates are required, not just the geometry one. RT_GET_TRANSMISSIVE_GEOMETRY()
-	// is scene content ("a transmissive instance exists"); RT_GET_TRANSMISSION_ENABLED()
-	// is the Environment toggle that decides whether the BSDF transmits at all. With
-	// the toggle OFF the closest-hit path renders every pane as an opaque surface, so
-	// letting pass B keep attenuating through it would make the same pane opaque to
-	// the eye and translucent to shadows -- a surface that blocks light it visibly
-	// absorbs. Gating on both keeps the shadow path and the BSDF describing one
-	// material.
-	if (!RT_GET_TRANSMISSIVE_GEOMETRY() || !RT_GET_TRANSMISSION_ENABLED()) {
+	// ONLY the geometry gate belongs here. RT_GET_TRANSMISSIVE_GEOMETRY() is scene
+	// content ("a transmissive instance exists"); when it is false there is nothing
+	// in RT_INSTANCE_MASK_TRANSMISSIVE for the loop to find, so returning vec3(1.0)
+	// is exactly right -- pass A already answered for every instance in the scene.
+	//
+	// RT_GET_TRANSMISSION_ENABLED() (the Environment toggle) MUST NOT gate this
+	// early return, and a previous revision that added it here made glass cast NO
+	// shadow at all. The reason is that the TLAS cull mask does not depend on the
+	// toggle: rt_instance_mask_from_features (render_raytracing.cpp:2461) derives
+	// the mask from RT_FLAG_TRANSMISSIVE_GEOMETRY alone, which is set per material
+	// from `mat.transmission > 0.0f` (render_raytracing.cpp:1900). So a pane is
+	// masked TRANSMISSIVE whatever the toggle says, and pass A -- culled to
+	// RT_INSTANCE_MASK_OPAQUE -- cannot see it. Early-returning vec3(1.0) here left
+	// nothing occluding it in either pass, while the BSDF was drawing that same pane
+	// as fully opaque (raytracing_closest_hit_common_inc.glsl:1468,
+	// `transmissivness = RT_GET_TRANSMISSION_ENABLED() ? m.transmission : 0.0`).
+	//
+	// The toggle is honoured in the accumulation below instead: with it OFF the
+	// first transmissive crossing drives atten to zero and the epsilon early-out
+	// returns vec3(0.0) -- a FULL occluder, which is what the BSDF is drawing.
+	if (!RT_GET_TRANSMISSIVE_GEOMETRY()) {
 		return vec3(1.0);
 	}
 
@@ -438,7 +452,17 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 		float cos_t;
 		float F = fresnel_dielectric(dot(direction, N), eta, cos_t);
 
-		atten *= mat.transmission * (1.0 - F);
+		// The Environment toggle is applied HERE, not at the early return above.
+		// RT_GET_TRANSMISSION_ENABLED() is a specialization constant, so in a build
+		// with transmission disabled this whole expression folds to the constant 0.0:
+		// the first committed crossing sets atten to zero, rt_max_component(atten)
+		// is 0.0 < RT_SHADOW_ATTEN_EPSILON, and the ray returns vec3(0.0) -- a full
+		// occluder. That matches what the BSDF draws with the toggle off
+		// (raytracing_closest_hit_common_inc.glsl:1468 forces transmissivness to 0.0),
+		// so the pane blocks exactly the light it visibly absorbs. Pass A cannot do
+		// this job instead: its RT_INSTANCE_MASK_OPAQUE cull never sees a transmissive
+		// instance, and that mask is derived from the material, not from the toggle.
+		atten *= RT_GET_TRANSMISSION_ENABLED() ? (mat.transmission * (1.0 - F)) : 0.0;
 		if (rt_max_component(atten) < RT_SHADOW_ATTEN_EPSILON) {
 			return vec3(0.0);
 		}
