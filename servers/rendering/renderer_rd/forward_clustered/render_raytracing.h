@@ -215,7 +215,10 @@ enum {
 	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
 	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
 	RT_MAT_FLAG_POINT_FILTER = 4u,
-	// Bit 3: the material BLENDS (glTF alphaMode BLEND -> uses_blend_alpha).
+	// Bit 3: the material uses alpha blending (glTF alphaMode BLEND).
+	// Set from ShaderData::rt_uses_alpha_blending(), NOT from uses_blend_alpha --
+	// that flag is false for BLEND_MODE_MIX (material_storage.cpp:718), which is
+	// what alphaMode BLEND produces, and measured 0 of 55 materials in testing.
 	// Keyed on the shader flag, NOT on albedo alpha < 1: alpha-SCISSOR materials
 	// are already in the TLAS and their base-colour alpha can sit above the
 	// scissor threshold but below 1.0, so an alpha-value test would silently turn
