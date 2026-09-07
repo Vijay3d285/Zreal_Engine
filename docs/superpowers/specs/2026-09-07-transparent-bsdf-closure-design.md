@@ -72,8 +72,8 @@ diffuse/glossy/total budget. We cannot copy that directly — see Bounce account
 
 ## Architecture: a stochastic transparent branch
 
-At a hit, draw `u = rng_1d(rng, RT_PRNG_TRANSPARENT)`. If `u < (1.0 - m.alpha)`, take
-the transparent branch:
+At a hit on a material that **blends**, draw `u = rng_1d(rng, RT_PRNG_TRANSPARENT)`.
+If `u < (1.0 - m.alpha)`, take the transparent branch:
 
 - `ps.next_ray_dir` = the incoming direction, unchanged (`gl_WorldRayDirectionEXT`)
 - `ps.offset_normal = -h.geometry_normal`, so `offset_ray_origin` in the raygen loop
@@ -94,6 +94,23 @@ attenuate-and-continue formulation cannot reproduce.
 
 `RT_PRNG_TRANSPARENT = 10u` (1D). Slot 10 is free — `raytracing_inc.glsl:322` states
 "Slots 10, 12-15 are free."
+
+### The branch must be gated on a BLEND flag, not on `alpha < 1`
+
+**Added during plan-writing; the first draft of this section was wrong.** Keying the
+branch on `m.alpha < 1.0` alone is unsafe. Alpha-SCISSOR materials (glTF `MASK`) are
+*already* in the TLAS today, and their base-colour alpha can sit above the scissor
+threshold while remaining below 1.0 — a leaf texel at alpha 0.7 passes the cutout test
+and is meant to render solid. An alpha-value test would silently turn every cutout
+partially translucent across every existing scene.
+
+The gate is `RT_MATERIAL_FLAG_BLEND = (1 << 2)`, a per-material bit set from the
+shader's `uses_blend_alpha` and carried in the existing `MaterialData.flags` word (`raytracing_data_inc.glsl:136`, currently
+documenting bit 0 has_normal_map and bit 1 has_emission — **bit 2 is free**, and the
+field is a `uint`, so this costs no change to the struct's asserted 192-byte size).
+
+The same gate applies to the shadow mix in Component 6: its `(1 - alpha)` term must be
+taken only for blending materials, for the identical reason.
 
 ## Components
 
