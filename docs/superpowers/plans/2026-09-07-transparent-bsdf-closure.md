@@ -117,15 +117,40 @@ The surface's shader flags are not available inside `process_material`, which ta
 
 **Do not write the bit into `mat_data->data`.** `mat_data` is the `process_material()` cache, keyed by material RID and shared across every surface that uses it; mutating it leaks the flag to unrelated surfaces. OR the bit into a local copy of `RT_MaterialData` at each `material_data.push_back` site instead.
 
-**Use the RT-side classification, not the raster one.** `surf->shader->uses_blend_alpha` is the *raster* field. The RT pass classification at `render_forward_clustered.cpp:5224` calls `rt_uses_alpha_pass()`, which reads `rt->uses_blend_alpha` whenever the shader has an `RTClassification` and only falls back to the raster field when it does not (`scene_shader_forward_clustered.h:316-327`). A shader with `#if defined(RT)` divergence can differ between the two. Mirror that fallback exactly — add an accessor beside `rt_uses_alpha_pass()` following its shape:
+**`uses_blend_alpha` is NOT the signal. It does not mean what its name suggests.**
+`blend_mode_uses_blend_alpha` (`material_storage.cpp:718`) returns **false for
+`BLEND_MODE_MIX`** and true only for ADD / SUB / MUL / PREMULTIPLIED. It means "this
+blend mode reads the destination", not "this material is alpha-blended". glTF
+`alphaMode: BLEND` produces MIX. An earlier draft of this plan keyed on it and measured
+**zero of 55 materials** on the aquarium scene — a gate that can never fire for the
+surfaces this whole feature is about.
+
+The signal is the `has_alpha` term inside `rt_uses_alpha_pass()`
+(`scene_shader_forward_clustered.h:316-327`). Add an accessor beside it, mirroring its
+`rt ? rt->… : …` fallback exactly — the RT classification exists only when a shader has
+`#if defined(RT)` divergence, and reading the raster fields directly is wrong for those:
 
 ```cpp
-		_FORCE_INLINE_ bool rt_uses_blend_alpha() const {
-			return rt ? rt->uses_blend_alpha : uses_blend_alpha;
+		// The "this material is genuinely translucent" half of rt_uses_alpha_pass().
+		// Deliberately EXCLUDES that function's no_depth_draw / no_depth_test terms:
+		// a material with depth writes disabled but alpha 1.0 is opaque and must not
+		// receive the Transparent BSDF.
+		//
+		// Alpha-SCISSOR is already excluded by the !uses_alpha_clip term -- a pure
+		// cutout never enters the alpha pass -- so this needs no separate guard.
+		_FORCE_INLINE_ bool rt_uses_alpha_blending() const {
+			if (!rt) {
+				bool has_read_screen_alpha = uses_screen_texture || uses_depth_texture || uses_normal_texture;
+				bool has_base_alpha = (uses_alpha && (!uses_alpha_clip || uses_alpha_antialiasing)) || has_read_screen_alpha;
+				return has_base_alpha || uses_blend_alpha;
+			}
+			bool has_read_screen_alpha = rt->uses_screen_texture || rt->uses_depth_texture || rt->uses_normal_texture;
+			bool has_base_alpha = (rt->uses_alpha && (!rt->uses_alpha_clip || rt->uses_alpha_antialiasing)) || has_read_screen_alpha;
+			return has_base_alpha || rt->uses_blend_alpha;
 		}
 ```
 
-and call it at every site where you derive the bit. Getting this wrong is invisible in a render — the flag is simply absent or spurious on divergent shaders.
+Call it at every site where you derive the bit. Getting this wrong is invisible in a render — the flag is simply absent, and every alpha surface silently keeps the old behaviour.
 
 - [ ] **Step 4: Build**
 
@@ -138,7 +163,7 @@ Expected: `SCONS_EXIT=0`.
 
 So instrument the signal at the point it is *available*, which is the skip site. Add two temporary counters in `build_tlas`:
 
-- `blend_skipped` — incremented inside the `FLAG_PASS_ALPHA` skip block when the RT blend accessor from Step 3 returns true for that surface.
+- `blend_skipped` — incremented inside the `FLAG_PASS_ALPHA` skip block when `rt_uses_alpha_blending()` returns true for that surface.
 - `blend_pushed` — how many entries in `material_data` carry `RT_MAT_FLAG_BLEND`.
 
 Print both. Then render two scenes:
@@ -162,7 +187,7 @@ Expected:
 
 **Both directions are required — a detector that cannot report absence is not a detector.** The negative control must also show a non-zero *denominator* (materials were pushed, and none of them blended); a zero-out-of-zero reading proves only that the counter never ran. The measured denominator for that scene is 1.
 
-If `blend_skipped` is zero on the aquarium, the signal is wrong — stop and report it rather than proceeding. Remove both temporary counters before committing.
+If `blend_skipped` is zero on the aquarium, the signal is wrong — stop and report it rather than proceeding. This has already happened once, with `uses_blend_alpha` as the signal; that is why Step 3 now specifies `rt_uses_alpha_blending()`. Remove both temporary counters before committing.
 
 The end-to-end claim — that the flag actually arrives in `MaterialData` on the GPU — is not observable until the skip is gone, and is Task 3 Step 10a's acceptance.
 

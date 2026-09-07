@@ -24,9 +24,8 @@ Transparent BSDF.
 ## Background: the defect
 
 `gltf_document.cpp:3556` maps `alphaMode: BLEND` to
-`TRANSPARENCY_ALPHA_DEPTH_PRE_PASS`. That produces a shader with
-`uses_blend_alpha`, so `rt_uses_alpha_pass()`
-(`scene_shader_forward_clustered.h:316`) is true, the surface gets
+`TRANSPARENCY_ALPHA_DEPTH_PRE_PASS`. That makes `rt_uses_alpha_pass()`
+(`scene_shader_forward_clustered.h:316`) true, the surface gets
 `FLAG_PASS_ALPHA` (`render_forward_clustered.cpp:5225`), and `build_tlas` drops it:
 
 ```cpp
@@ -104,8 +103,36 @@ threshold while remaining below 1.0 — a leaf texel at alpha 0.7 passes the cut
 and is meant to render solid. An alpha-value test would silently turn every cutout
 partially translucent across every existing scene.
 
-The gate is `RT_MAT_FLAG_BLEND = (1 << 3)`, a per-material bit set from the
-shader's `uses_blend_alpha` and carried in the existing `MaterialData.flags` word.
+The gate is `RT_MAT_FLAG_BLEND = (1 << 3)`, a per-material bit carried in the existing
+`MaterialData.flags` word, set from the shader's **`has_alpha`** term.
+
+**Erratum, corrected at execution time: this section first said `uses_blend_alpha`, and
+that flag does not mean what its name suggests.** `blend_mode_uses_blend_alpha`
+(`material_storage.cpp:718`) returns **false for `BLEND_MODE_MIX`** and true only for
+ADD / SUB / MUL / PREMULTIPLIED. It means "this blend mode reads the destination", not
+"this material is alpha-blended". glTF `alphaMode: BLEND` produces MIX, so a gate keyed
+on `uses_blend_alpha` can never fire for the surfaces this whole design is about.
+Measured on the aquarium scene: zero of 55 materials matched.
+
+The correct signal is the `has_alpha` term inside `rt_uses_alpha_pass()` itself:
+
+```cpp
+bool has_read_screen_alpha = rt->uses_screen_texture || rt->uses_depth_texture || rt->uses_normal_texture;
+bool has_base_alpha = (rt->uses_alpha && (!rt->uses_alpha_clip || rt->uses_alpha_antialiasing)) || has_read_screen_alpha;
+bool has_alpha = has_base_alpha || rt->uses_blend_alpha;
+```
+
+Two properties make this the right predicate rather than a workaround:
+
+- **It already excludes alpha-scissor**, which was this section's whole concern. A pure
+  cutout has `uses_alpha_clip` true and `uses_alpha_antialiasing` false, so
+  `has_base_alpha` is false and it never enters the alpha pass at all. The exclusion
+  comes from the same expression the renderer already uses to make that decision,
+  rather than from a second predicate that could drift away from it.
+- **It is narrower than `rt_uses_alpha_pass()`**, which also returns true for
+  `no_depth_draw` and `no_depth_test`. A material with depth writes disabled but alpha
+  1.0 is opaque and must not receive the Transparent BSDF, so those two terms are
+  deliberately excluded.
 
 **Erratum, corrected at execution time: this section first said bit 2, and bit 2 is
 taken.** The claim came from the comment at `raytracing_data_inc.glsl:136`, which
@@ -135,7 +162,8 @@ They take the **transmissive** instance mask, not the opaque one — see Compone
 The mask predicate in `rt_instance_mask_from_features` therefore widens from
 "transmission > 0" to "transmission > 0 **or** the material blends", so the shadow
 query can attenuate through them instead of treating them as walls. The CPU-side
-signal for the second half is `surf->shader->uses_blend_alpha`, available at the
+signal for the second half is the `has_alpha` term above, exposed as a
+`rt_uses_alpha_blending()` accessor beside `rt_uses_alpha_pass()` and available at the
 triangle-surface site; the procedural (`:2756`) and multimesh (`:2837`, `:2843`)
 sites need the equivalent and must be checked individually rather than assumed — a
 prior phase in this project shipped a bug by assuming four such push sites were
