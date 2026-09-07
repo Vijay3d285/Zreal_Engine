@@ -104,10 +104,22 @@ threshold while remaining below 1.0 — a leaf texel at alpha 0.7 passes the cut
 and is meant to render solid. An alpha-value test would silently turn every cutout
 partially translucent across every existing scene.
 
-The gate is `RT_MATERIAL_FLAG_BLEND = (1 << 2)`, a per-material bit set from the
-shader's `uses_blend_alpha` and carried in the existing `MaterialData.flags` word (`raytracing_data_inc.glsl:136`, currently
-documenting bit 0 has_normal_map and bit 1 has_emission — **bit 2 is free**, and the
-field is a `uint`, so this costs no change to the struct's asserted 192-byte size).
+The gate is `RT_MAT_FLAG_BLEND = (1 << 3)`, a per-material bit set from the
+shader's `uses_blend_alpha` and carried in the existing `MaterialData.flags` word.
+
+**Erratum, corrected at execution time: this section first said bit 2, and bit 2 is
+taken.** The claim came from the comment at `raytracing_data_inc.glsl:136`, which
+documents only "Bit 0: has_normal_map, Bit 1: has_emission" and was never updated when
+point filtering was added. The authority is the C++ enum at `render_raytracing.h:213-218`,
+which holds `RT_MAT_FLAG_HAS_NORMAL_MAP = 1u`, `RT_MAT_FLAG_HAS_EMISSION_TEX = 2u` and
+`RT_MAT_FLAG_POINT_FILTER = 4u`; bit 2 is read in GLSL at
+`raytracing_closest_hit_common_inc.glsl:98` to select nearest-neighbour texture sampling.
+Shipping bit 2 would have made every blended material sample its textures unfiltered and
+every pixel-art material partially transparent — two plausible-looking renders, no error.
+Bit 3 (`8u`) is unreferenced in both languages. The name also changes to `RT_MAT_FLAG_BLEND`
+to match the existing enum's convention. The field is a `uint`, so this costs no change to
+the struct's asserted 192-byte size, and the stale `:136` comment is corrected to list all
+four bits.
 
 The same gate applies to the shadow mix in Component 6: its `(1 - alpha)` term must be
 taken only for blending materials, for the identical reason.

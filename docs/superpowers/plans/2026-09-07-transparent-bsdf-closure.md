@@ -26,7 +26,7 @@
 
 | File | Responsibility | Tasks |
 |---|---|---|
-| `servers/rendering/renderer_rd/forward_clustered/render_raytracing.h` | `RT_MATERIAL_FLAG_BLEND` bit on the material flags word | 1 |
+| `servers/rendering/renderer_rd/forward_clustered/render_raytracing.h` | `RT_MAT_FLAG_BLEND` bit on the material flags word | 1 |
 | `servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp` | Set that flag from `uses_blend_alpha`; stop dropping `FLAG_PASS_ALPHA` from the TLAS; widen the instance-mask predicate | 1, 3 |
 | `servers/rendering/renderer_rd/shaders/raytracing/raytracing_data_inc.glsl` | GLSL mirror of the flag bit | 1 |
 | `servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl` | `RT_PRNG_TRANSPARENT` dimension slot | 3 |
@@ -51,30 +51,65 @@ Alpha-scissor materials are already in the TLAS and their base-colour alpha can 
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `RT_MATERIAL_FLAG_BLEND` = `(1 << 2)` on `RT_MaterialData::flags`, mirrored in GLSL as `RT_MATERIAL_FLAG_BLEND 4u`.
+- Produces: `RT_MAT_FLAG_BLEND` = `8u` (bit 3) on the material flags word, mirrored in GLSL as `RT_MAT_FLAG_BLEND 8u`.
 
-- [ ] **Step 1: Find the existing flag constants**
+- [ ] **Step 1: Read the existing flag constants — do not trust the GLSL comment**
 
-`MaterialData.flags` is documented in `raytracing_data_inc.glsl:136` as `// Bit 0: has_normal_map, Bit 1: has_emission`. Locate the C++ constants that set bits 0 and 1 in `render_raytracing.cpp`/`.h` and follow their naming exactly.
-
-- [ ] **Step 2: Add the flag on both sides**
-
-C++, beside the existing bit-0/bit-1 constants:
+The authority for this bit layout is the C++ enum at `render_raytracing.h:213-218`:
 
 ```cpp
-// Bit 2: the material BLENDS (glTF alphaMode BLEND -> uses_blend_alpha).
-// Keyed on the shader flag, NOT on albedo alpha < 1: alpha-SCISSOR materials
-// are already in the TLAS and their base-colour alpha can sit above the
-// scissor threshold but below 1.0, so an alpha-value test would silently turn
-// every cutout translucent. MIRRORED IN raytracing_data_inc.glsl.
-static constexpr uint32_t RT_MATERIAL_FLAG_BLEND = (1 << 2);
+// Material flags for RT (matches GLSL mat_flags bit layout).
+enum {
+	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
+	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
+	RT_MAT_FLAG_POINT_FILTER = 4u,
+};
 ```
 
-GLSL, beside the existing mirrors:
+**Bits 0, 1 and 2 are all taken. Bit 3 (`8u`) is the first free one** — verified
+unreferenced in both languages. The comment at `raytracing_data_inc.glsl:136` says only
+`// Bit 0: has_normal_map, Bit 1: has_emission`; it is **stale** and omits bit 2, which is
+read at `raytracing_closest_hit_common_inc.glsl:98` (`if ((mat_flags & 4u) != 0u)`) to
+select nearest-neighbour texture sampling. An earlier draft of this plan trusted that
+comment and assigned bit 2; shipping it would have made every blended material sample its
+textures unfiltered and every pixel-art material partially transparent, with no error and
+two plausible-looking renders.
+
+- [ ] **Step 2: Add the flag on both sides, and correct the stale comment**
+
+C++ — extend the existing enum, following its naming convention (`RT_MAT_FLAG_*`, values
+written as literals, not shifts):
+
+```cpp
+// Material flags for RT (matches GLSL mat_flags bit layout).
+enum {
+	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
+	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
+	RT_MAT_FLAG_POINT_FILTER = 4u,
+	// Bit 3: the material BLENDS (glTF alphaMode BLEND -> uses_blend_alpha).
+	// Keyed on the shader flag, NOT on albedo alpha < 1: alpha-SCISSOR materials
+	// are already in the TLAS and their base-colour alpha can sit above the
+	// scissor threshold but below 1.0, so an alpha-value test would silently turn
+	// every cutout translucent. MIRRORED IN raytracing_data_inc.glsl.
+	RT_MAT_FLAG_BLEND = 8u,
+};
+```
+
+GLSL — `raytracing_data_inc.glsl` has no named mirrors today (bits are tested as bare
+literals, e.g. `& 4u`). Add the one named define for the new bit, beside the struct, and
+fix the stale field comment at `:136` to list all four bits:
 
 ```glsl
-#define RT_MATERIAL_FLAG_BLEND 4u // 1 << 2. MIRRORS render_raytracing.h.
+#define RT_MAT_FLAG_BLEND 8u // Bit 3. MIRRORS RT_MAT_FLAG_BLEND in render_raytracing.h.
 ```
+
+```glsl
+	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission, Bit 2: point_filter, Bit 3: blend
+```
+
+Do not renumber or rename the existing three bits — they are read as bare literals at
+`raytracing_closest_hit_common_inc.glsl:98`, `raytracing_emissive_inc.glsl:110` and
+`scene_raytracing_raygen.glsl:535`, and those literals are outside this task's scope.
 
 - [ ] **Step 3: Set it in `process_material`**
 
@@ -87,7 +122,7 @@ Expected: `SCONS_EXIT=0`.
 
 - [ ] **Step 5: Verify the flag is actually set, and can report absence**
 
-Add a temporary `print_line` reporting how many materials carry `RT_MATERIAL_FLAG_BLEND`, then render the aquarium scene:
+Add a temporary `print_line` reporting how many materials carry `RT_MAT_FLAG_BLEND`, then render the aquarium scene:
 
 ```bash
 ./bin/godot.windows.editor.x86_64.console.exe --verbose --path "C:/Zlendo2026/ZlenderRender_stage_copy/godot_project" res://main.tscn -- "C:/Zlendo2026/ZlenderRender_stage_copy/godot_project/input_json/urbantestdark180_fishtank_render_input.json" /tmp/t1.png 2>&1 | grep -i "blend"
@@ -233,7 +268,7 @@ These four changes are atomic. Routing alpha surfaces into the TLAS without the 
 - Modify: `servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp:1330` (overlay gating)
 
 **Interfaces:**
-- Consumes: `RT_MATERIAL_FLAG_BLEND` from Task 1.
+- Consumes: `RT_MAT_FLAG_BLEND` from Task 1.
 - Produces: alpha-blended surfaces traced; `RT_PRNG_TRANSPARENT = 10u`.
 
 - [ ] **Step 1: Claim the PRNG slot**
@@ -266,7 +301,7 @@ Immediately after `apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);` (
 	// already in the TLAS and their base-colour alpha can exceed the scissor
 	// threshold while remaining below 1.0, so an alpha-value test would turn
 	// every cutout translucent.
-	if ((mat.flags & RT_MATERIAL_FLAG_BLEND) != 0u && m.alpha < 1.0) {
+	if ((mat.flags & RT_MAT_FLAG_BLEND) != 0u && m.alpha < 1.0) {
 		if (transmission_bounces >= max_transmission) {
 			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 			path_pack(payload, ps);
@@ -390,10 +425,16 @@ It never consults alpha. With Task 3 admitting blend surfaces to the transmissiv
 		// alpha == 1.0, and to ~0.90 per pane for alphaMode BLEND glass at
 		// alpha == 0.098 -- the same fraction Cycles passes.
 		float surface_share = RT_GET_TRANSMISSION_ENABLED() ? (mat.transmission * (1.0 - F)) : 0.0;
-		atten *= (1.0 - m_alpha) + m_alpha * surface_share;
+		// The (1 - alpha) pass-through share is taken ONLY for blending materials,
+		// for the same reason the closure's branch is: an alpha-scissor material's
+		// base-colour alpha can sit below 1.0 while the texel is meant to be solid.
+		float pass_through = ((mat.flags & RT_MAT_FLAG_BLEND) != 0u) ? (1.0 - m_alpha) : 0.0;
+		atten *= pass_through + (1.0 - pass_through) * surface_share;
 ```
 
-`m_alpha` is the material's alpha at this hit. `ray_query_alpha_test` in the same file computes `alpha *= mat.albedo_color.a` after sampling the base-colour texture — follow that fetch pattern. Gate the `(1 - m_alpha)` term on the material's BLEND flag so alpha-scissor materials are unaffected.
+`m_alpha` is the material's alpha at this hit. `ray_query_alpha_test` in the same file computes `alpha *= mat.albedo_color.a` after sampling the base-colour texture — follow that fetch pattern.
+
+Note the second term is `(1 - pass_through)`, not `m_alpha`: for a non-blending material `pass_through` is 0 and the line must reduce to **exactly** `atten *= surface_share`, the pre-task behaviour, whatever that material's alpha happens to be. Writing `m_alpha` there would scale every alpha-scissor material's shadow by its own alpha and silently move the four existing probes.
 
 - [ ] **Step 2: Build and confirm the transparent-shadow gate still passes**
 
