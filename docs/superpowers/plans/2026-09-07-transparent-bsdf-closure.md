@@ -111,24 +111,60 @@ Do not renumber or rename the existing three bits — they are read as bare lite
 `raytracing_closest_hit_common_inc.glsl:98`, `raytracing_emissive_inc.glsl:110` and
 `scene_raytracing_raygen.glsl:535`, and those literals are outside this task's scope.
 
-- [ ] **Step 3: Set it in `process_material`**
+- [ ] **Step 3: Set it in `build_tlas`, from the RT-side signal**
 
-The surface's shader flags are not available inside `process_material`, which takes a material RID. Set the bit where the surface is known — in `build_tlas`, alongside the existing per-surface work — or thread `uses_blend_alpha` in. Read the surrounding code and choose whichever matches the file's existing pattern; state which you chose and why in your report.
+The surface's shader flags are not available inside `process_material`, which takes a material RID. Set the bit where the surface is known — in `build_tlas`, alongside the existing per-surface work.
+
+**Do not write the bit into `mat_data->data`.** `mat_data` is the `process_material()` cache, keyed by material RID and shared across every surface that uses it; mutating it leaks the flag to unrelated surfaces. OR the bit into a local copy of `RT_MaterialData` at each `material_data.push_back` site instead.
+
+**Use the RT-side classification, not the raster one.** `surf->shader->uses_blend_alpha` is the *raster* field. The RT pass classification at `render_forward_clustered.cpp:5224` calls `rt_uses_alpha_pass()`, which reads `rt->uses_blend_alpha` whenever the shader has an `RTClassification` and only falls back to the raster field when it does not (`scene_shader_forward_clustered.h:316-327`). A shader with `#if defined(RT)` divergence can differ between the two. Mirror that fallback exactly — add an accessor beside `rt_uses_alpha_pass()` following its shape:
+
+```cpp
+		_FORCE_INLINE_ bool rt_uses_blend_alpha() const {
+			return rt ? rt->uses_blend_alpha : uses_blend_alpha;
+		}
+```
+
+and call it at every site where you derive the bit. Getting this wrong is invisible in a render — the flag is simply absent or spurious on divergent shaders.
 
 - [ ] **Step 4: Build**
 
 Run: `python -m SCons platform=windows target=editor tests=yes -j8`
 Expected: `SCONS_EXIT=0`.
 
-- [ ] **Step 5: Verify the flag is actually set, and can report absence**
+- [ ] **Step 5: Verify the signal discriminates, and can report absence**
 
-Add a temporary `print_line` reporting how many materials carry `RT_MAT_FLAG_BLEND`, then render the aquarium scene:
+**Read this before instrumenting — the obvious check cannot work in this task.** The first draft of this step asked for a non-zero count of materials pushed carrying `RT_MAT_FLAG_BLEND`, and that count is *structurally* pinned at zero until Task 3. The skip at `render_raytracing.cpp:2880-2884` `continue`s every `FLAG_PASS_ALPHA` surface **before** the `material_data.push_back` site where the bit is OR'd in, so no blended surface reaches the push at all. Measured: the aquarium scene reported `0 / 55`. That zero is correct behaviour for this task, not a bug — do not "fix" it by removing the skip, which belongs to Task 3 and is atomic with the branch there.
+
+So instrument the signal at the point it is *available*, which is the skip site. Add two temporary counters in `build_tlas`:
+
+- `blend_skipped` — incremented inside the `FLAG_PASS_ALPHA` skip block when the RT blend accessor from Step 3 returns true for that surface.
+- `blend_pushed` — how many entries in `material_data` carry `RT_MAT_FLAG_BLEND`.
+
+Print both. Then render two scenes:
 
 ```bash
-./bin/godot.windows.editor.x86_64.console.exe --verbose --path "C:/Zlendo2026/ZlenderRender_stage_copy/godot_project" res://main.tscn -- "C:/Zlendo2026/ZlenderRender_stage_copy/godot_project/input_json/urbantestdark180_fishtank_render_input.json" /tmp/t1.png 2>&1 | grep -i "blend"
+# Positive: the aquarium. Write the PNG to your scratchpad, never into the read-only tree.
+./bin/godot.windows.editor.x86_64.console.exe --verbose     --path "C:/Zlendo2026/ZlenderRender_stage_copy/godot_project" res://main.tscn --     "C:/Zlendo2026/ZlenderRender_stage_copy/godot_project/input_json/urbantestdark180_fishtank_render_input.json"     <scratchpad>/t1_positive.png
 ```
 
-Expected: a non-zero count — that scene contains `003_lionfish`, `cgaxis_..._04`, `cgaxis_..._06` and two `Glass`/`Water` pairs, all `alphaMode: BLEND`. Then render a scene with no blend materials and confirm the count is zero. **Both directions are required — a detector that cannot report absence is not a detector.** Remove the temporary print before committing.
+```bash
+# Negative control: an all-opaque gate scene, same binary.
+./bin/godot.windows.editor.x86_64.console.exe --verbose     --path pipeline_references res://tests/pt_energy_gate_scene.tscn
+```
+
+Expected:
+
+| scene | `blend_skipped` | `blend_pushed` |
+|---|---|---|
+| aquarium | **> 0** — `003_lionfish`, `cgaxis_..._04`, `cgaxis_..._06` are `alphaMode: BLEND` | `0` (they are skipped before the push) |
+| energy gate | `0` | `0` |
+
+**Both directions are required — a detector that cannot report absence is not a detector.** The negative control must also show a non-zero *denominator* (materials were pushed, and none of them blended); a zero-out-of-zero reading proves only that the counter never ran. The measured denominator for that scene is 1.
+
+If `blend_skipped` is zero on the aquarium, the signal is wrong — stop and report it rather than proceeding. Remove both temporary counters before committing.
+
+The end-to-end claim — that the flag actually arrives in `MaterialData` on the GPU — is not observable until the skip is gone, and is Task 3 Step 10a's acceptance.
 
 - [ ] **Step 6: Commit**
 
@@ -375,6 +411,14 @@ Expected: `SCONS_EXIT=0`. This proves nothing about the shader — Step 10 is th
 ```
 
 Expected: **PASS**. Probe 1 in `[0.47, 0.53]`, probe 2 in `[0.22, 0.28]`, probe 3 within `0.005` of opaque. This is the same gate that failed in Task 2.
+
+- [ ] **Step 10a: Confirm Task 1's flag now reaches the GPU**
+
+This is the end-to-end check Task 1 could not perform, deferred here because the skip removed in Step 6 was what made it unobservable. Temporarily re-add the `blend_pushed` counter from Task 1 Step 5 (how many entries in `material_data` carry `RT_MAT_FLAG_BLEND`) and render the aquarium scene.
+
+Expected: **non-zero**, and matching the `blend_skipped` count Task 1 recorded on the same scene — the surfaces that used to be skipped are exactly the ones now pushed. Task 1's report holds that number; read it from `.superpowers/sdd/2026-09-07-transparent-bsdf-closure/task-1-report.md` and state both figures in your report. A mismatch means surfaces are being routed somewhere unintended.
+
+Remove the counter again before committing.
 
 - [ ] **Step 11: Prove the gate can still fail**
 
