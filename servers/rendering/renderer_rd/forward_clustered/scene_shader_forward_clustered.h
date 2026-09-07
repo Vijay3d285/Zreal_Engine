@@ -335,6 +335,24 @@ public:
 			return (rt->uses_depth_prepass_alpha || rt->uses_alpha_antialiasing) && !(no_depth_draw || no_depth_test);
 		}
 
+		// The "this material is genuinely translucent" half of rt_uses_alpha_pass().
+		// Deliberately EXCLUDES that function's no_depth_draw / no_depth_test terms:
+		// a material with depth writes disabled but alpha 1.0 is opaque and must not
+		// receive the Transparent BSDF.
+		//
+		// Alpha-SCISSOR is already excluded by the !uses_alpha_clip term -- a pure
+		// cutout never enters the alpha pass -- so this needs no separate guard.
+		_FORCE_INLINE_ bool rt_uses_alpha_blending() const {
+			if (!rt) {
+				bool has_read_screen_alpha = uses_screen_texture || uses_depth_texture || uses_normal_texture;
+				bool has_base_alpha = (uses_alpha && (!uses_alpha_clip || uses_alpha_antialiasing)) || has_read_screen_alpha;
+				return has_base_alpha || uses_blend_alpha;
+			}
+			bool has_read_screen_alpha = rt->uses_screen_texture || rt->uses_depth_texture || rt->uses_normal_texture;
+			bool has_base_alpha = (rt->uses_alpha && (!rt->uses_alpha_clip || rt->uses_alpha_antialiasing)) || has_read_screen_alpha;
+			return has_base_alpha || rt->uses_blend_alpha;
+		}
+
 		_FORCE_INLINE_ RSE::CullMode rt_cull_mode() const {
 			return rt ? rt->cull_mode : cull_mode;
 		}

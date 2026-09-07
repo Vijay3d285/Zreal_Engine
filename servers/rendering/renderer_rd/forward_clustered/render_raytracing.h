@@ -215,6 +215,12 @@ enum {
 	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
 	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
 	RT_MAT_FLAG_POINT_FILTER = 4u,
+	// Bit 3: the material BLENDS (glTF alphaMode BLEND -> uses_blend_alpha).
+	// Keyed on the shader flag, NOT on albedo alpha < 1: alpha-SCISSOR materials
+	// are already in the TLAS and their base-colour alpha can sit above the
+	// scissor threshold but below 1.0, so an alpha-value test would silently turn
+	// every cutout translucent. MIRRORED IN raytracing_data_inc.glsl.
+	RT_MAT_FLAG_BLEND = 8u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

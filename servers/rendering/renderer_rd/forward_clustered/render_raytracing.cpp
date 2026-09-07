@@ -2670,6 +2670,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		bool transform_moved;
 		RTMaterialData *mat_data;
 		uint32_t inst_flags;
+		// Bit-3 RT_MAT_FLAG_BLEND for this surface's material, computed here (Phase 1)
+		// from mm_surf->shader while the shader is still known -- mirrors how
+		// `inst_flags`'s FORCE_OPAQUE bit is derived from the same shader below.
+		// Not folded into mat_data->flags: mat_data is the process_material() cache,
+		// keyed by material RID and shared across every surface using it; the two
+		// Phase 2 push sites OR this into a local copy instead of the cached struct.
+		bool mat_uses_blend;
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -2843,6 +2850,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 					}
 				}
+				bool mat_uses_blend = mm_surf->shader && mm_surf->shader->rt_uses_alpha_blending();
 
 				PendingMMSurface pending;
 				pending.mm_rid = mm_rid;
@@ -2857,6 +2865,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
+				pending.mat_uses_blend = mat_uses_blend;
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -2976,7 +2985,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 #endif
 
 			sbt_offsets.push_back(mat_data->rt_sbt_offset);
-			material_data.push_back(mat_data->data);
+			// RT_MAT_FLAG_BLEND is keyed on the shader flag (glTF alphaMode BLEND ->
+			// uses_blend_alpha), NOT on albedo alpha < 1 -- see render_raytracing.h.
+			// surf->shader is per-surface, mat_data is the process_material() cache
+			// shared across every surface using this material RID, so OR the bit
+			// into a local copy here rather than mutating the cached struct.
+			{
+				RT_MaterialData push_mat_data = mat_data->data;
+				if (surf->shader && surf->shader->rt_uses_alpha_blending()) {
+					push_mat_data.flags |= RT_MAT_FLAG_BLEND;
+				}
+				material_data.push_back(push_mat_data);
+			}
 
 			// Determine per-instance TLAS flags from material properties.
 			uint32_t inst_flags = 0;
@@ -3053,7 +3073,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			blas_transforms.push_back(pending.instance_transform);
 			geometry_data.push_back(merged_sd.geometry);
 			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
-			material_data.push_back(pending.mat_data->data);
+			{
+				RT_MaterialData push_mat_data = pending.mat_data->data;
+				if (pending.mat_uses_blend) {
+					push_mat_data.flags |= RT_MAT_FLAG_BLEND;
+				}
+				material_data.push_back(push_mat_data);
+			}
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
 			instance_masks.push_back(rt_instance_mask_from_features(pending.mat_data->feature_bits));
@@ -3087,6 +3113,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
+			// Same material for every expanded instance below -- compute the pushed
+			// copy once rather than per-instance inside the mi loop.
+			RT_MaterialData push_mat_data = pending.mat_data->data;
+			if (pending.mat_uses_blend) {
+				push_mat_data.flags |= RT_MAT_FLAG_BLEND;
+			}
+
 			for (uint32_t mi = 0; mi < pending.mm_count; mi++) {
 				const float *d = mm_data + (mm_cur_offset + mi) * mm_stride;
 				Transform3D mm_xform;
@@ -3112,7 +3145,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				blas_transforms.push_back(final_transform);
 				geometry_data.push_back(surf_data->geometry);
 				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
-				material_data.push_back(pending.mat_data->data);
+				material_data.push_back(push_mat_data);
 
 				if (pending.transform_moved) {
 					Transform3D prev_final = pending.prev_instance_transform * mm_xform;
