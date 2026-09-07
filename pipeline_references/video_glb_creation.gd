@@ -25,6 +25,72 @@ const ENABLE_PROCEDURAL_WINDOW_GRID_CASTER = false
 #          white corner reflections from SSR + Fresnel at grazing angles.
 # false -> keep raw material values (disable fix)
 const USE_REFLECTION_PROBE_HOTSPOT_FIX = true
+# Post-E3: GLB-INTERNAL GLASS. Assets author their panes as `alphaMode: BLEND`,
+# which Godot imports as TRANSPARENCY_ALPHA_DEPTH_PRE_PASS. Every surface in the
+# alpha family is dropped from the TLAS -- render_raytracing.cpp, "Skip surfaces
+# routed to the raster alpha overlay" -- and drawn instead by the raster
+# transparent pass, whose only reflection sources are the sky cubemap and the
+# reflection probes. The path tracer renders the contents with no tank around
+# them and a flat, sourceless film is composited on top: the "ghost glass" look.
+#
+# _apply_reflection_response_assist() already fixes this, but it keys on the
+# layout JSON's mapUrl and so only ever sees procedurally built wall/floor/item
+# materials. Materials that live INSIDE a loaded GLB never reach it. This does.
+const CONVERT_GLB_ALPHA_GLASS = true
+# Names that mean "this alpha-blended surface is a dielectric pane, trace it as
+# one". Matched against the material name plus the surface name, falling back to
+# the MeshInstance3D name when both are blank.
+const GLB_GLASS_MATERIAL_KEYWORDS = [
+	"glass", "glas", "glaz", "pane", "window", "windshield", "acrylic",
+	"perspex", "plexi", "vitrine", "vitre", "aquarium", "showcase", "tank",
+]
+# Liquid surfaces. Both classes currently refract at the SAME index (see
+# GLB_CONVERTED_*_IOR), so this list no longer changes the physics -- it only
+# labels the [water] entries in the report, and keeps the split available if
+# the two ever need to diverge again. Deliberately has no "aqua" entry: that
+# would swallow "aquarium" and label glass panes as water.
+const GLB_WATER_MATERIAL_KEYWORDS = [
+	"water", "liquid", "fluid", "h2o",
+]
+# Alpha-blended surfaces that must KEEP their alpha. These are billboards, cards
+# and sprays whose coverage is the entire point; converting one to transmission
+# would turn it into a solid pane. Checked BEFORE the two lists above, so a name
+# carrying both wins here.
+const GLB_KEEP_ALPHA_KEYWORDS = [
+	"decal", "sticker", "label", "shadow", "smoke", "fog", "steam",
+	"cloud", "dust", "spray", "bubble", "foam", "caustic", "glow",
+	"screen", "display", "hologram", "flame", "fire", "particle",
+]
+# Refractive index for converted surfaces. DELIBERATELY UNPHYSICAL: soda-lime
+# glass is 1.5 and water is 1.33; both are set to 1.2 here.
+#
+# WHY. A camera ray that has entered a tank or a double-glazed unit strikes the
+# far pane from INSIDE. That is a back-face hit, and
+# raytracing_closest_hit_common_inc.glsl:1504 inverts eta there
+# (`h.is_front_face ? resolved_eta : 1.0 / resolved_eta`), which is the
+# dense-to-thin case. Past the critical angle reflectance is exactly 1.0: the
+# pane becomes a perfect mirror and reflects the interior back at the camera,
+# stretched by the grazing geometry. Real aquarium glass does this. It is absent
+# from the Blender reference only because Blender's alpha path is a constant-
+# weight Transparent BSDF -- no Fresnel, no critical angle, no TIR at any angle.
+#
+# 1.2 moves the critical angle from asin(1/1.5) = 41.8 deg out to
+# asin(1/1.2) = 56.4 deg, so most grazing views stay transmissive and the pane
+# reads clear. Chosen for the reference look, not for correctness.
+#
+# WHAT IT COSTS. Head-on reflectance falls with it: F0 = ((n-1)/(n+1))^2 goes
+# from 0.040 at 1.5 to 0.0083 at 1.2, a ~5x weaker front-surface reflection, and
+# that reflection is much of what makes glass read as glass.
+#
+# MEASURED, not assumed: on urbantestdark180 the converted bedroom window is
+# indistinguishable between 1.5 and 1.2 -- pane mean 193.1/194.0/194.3 vs
+# 193.2/194.1/194.3, detail stddev 47.1 vs 46.9. A ~3% absolute reflectance
+# change simply does not register against a bright exterior at near-normal
+# incidence. NOT yet checked: a window viewed at a steep angle, and night
+# renders, where the reflection is the only cue that a pane is there at all.
+# Raise back toward 1.5 if glazing starts reading as an open hole.
+const GLB_CONVERTED_GLASS_IOR = 1.2
+const GLB_CONVERTED_WATER_IOR = 1.2
 # Multiplier applied to all floor/ceiling UV repeat counts.
 # Values > 1.0 make tiles appear smaller (denser tiling). 2.0 = tiles are 50% smaller.
 # Must match FLOOR_CEIL_TEXTURE_DENSITY_BOOST in image_glb_creation.gd.
@@ -1386,6 +1452,153 @@ func _orient_directional_light_from_windows(dir_light: DirectionalLight3D, cam_p
 # ─────────────────────────────────────────────────────────────────
 # Parse vec3 helper
 # ─────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# GLB-internal alpha glass -> path-traced dielectric
+# See CONVERT_GLB_ALPHA_GLASS for why this exists.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Only glTF "BLEND" is a candidate. TRANSPARENCY_ALPHA_SCISSOR (glTF "MASK") is
+# the foliage/cutout encoding, where the alpha is real coverage and the raster
+# path is the right answer -- converting one would fill in every leaf cutout.
+func _material_is_alpha_blended(mat) -> bool:
+	if mat == null or not (mat is BaseMaterial3D):
+		return false
+	return mat.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA \
+		or mat.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS
+
+# Returns "glass", "water", or "" for leave-alone.
+func _classify_glb_alpha_material(context_text: String) -> String:
+	var t = context_text.to_lower()
+	if t.strip_edges() == "":
+		return ""
+	for kw in GLB_KEEP_ALPHA_KEYWORDS:
+		if kw in t:
+			return ""
+	# Water before glass so "aquarium_water" is labelled water, not glass.
+	for kw in GLB_WATER_MATERIAL_KEYWORDS:
+		if kw in t:
+			return "water"
+	for kw in GLB_GLASS_MATERIAL_KEYWORDS:
+		if kw in t:
+			return "glass"
+	return ""
+
+# Mirrors the glass branch of _apply_reflection_response_assist(). Read the
+# LOAD-BEARING note on metallic_specular there before touching it here.
+func _apply_glb_transmissive_glass(mat: BaseMaterial3D, kind: String) -> void:
+	# TRANSPARENCY_DISABLED is the whole point: it is what keeps the surface in
+	# the TLAS instead of routing it to the raster overlay.
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+	# uses_alpha_pass() also returns true on depth_draw == DISABLED or a depth
+	# test that is not ENABLED, either of which would put the surface straight
+	# back into the alpha queue. Clear both.
+	mat.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_OPAQUE_ONLY
+	mat.no_depth_test = false
+
+	# REQUIRED, not cosmetic. glTF's metallicFactor defaults to 1.0 and these
+	# assets pack metallic = 1 in the metallicRoughness texture's blue channel,
+	# so the panes import as full metal. The generated shader is
+	# METALLIC = metallic_tex * metallic, so the scalar zeroes the texture too.
+	mat.metallic = 0.0
+	mat.transmission = 1.0
+	mat.ior = GLB_CONVERTED_WATER_IOR if kind == "water" else GLB_CONVERTED_GLASS_IOR
+	# LOAD-BEARING -- 0.5 is the no-op that keeps eta == ior. At any other value
+	# the engine re-derives eta from the modified F0.
+	mat.metallic_specular = 0.5
+	# Thin-walled: no bend, no medium, no absorption. The only safe choice on
+	# geometry we have not proven closed, and it matches what Cycles produces
+	# from an alpha mix -- a straight-through ray.
+	mat.thickness = 0.0
+
+	# The base colour texture on an alpha-blended pane is there to carry the
+	# ALPHA channel. Transmission mode ignores alpha, and leaving the texture
+	# bound would tint every transmitted ray by a colour authored as a 10-20%
+	# overlay -- the aquarium water maps are a strong teal, which would put a
+	# green cast over the whole tank interior. Clear it and let IOR drive the
+	# response; Cycles' Transparent BSDF mix is colourless for the same reason.
+	mat.albedo_texture = null
+	mat.albedo_color = Color(1.0, 1.0, 1.0, 1.0)
+
+	# Roughness is left exactly as authored. ROUGHNESS = roughness_tex * roughness
+	# and glTF's roughnessFactor defaults to 1.0, so when a texture is bound it
+	# already carries the artist's value (0.08 on these tanks, the same number
+	# Cycles uses). Clamping the scalar on top would multiply, not clamp, and
+	# drive it to 0.008. Only clamp when there is no texture to read.
+	if mat.roughness_texture == null:
+		mat.roughness = min(mat.roughness, 0.10)
+
+	# An emissive pane would double-count once it starts bouncing.
+	mat.emission_enabled = false
+
+func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
+	# DIVERGENCE FROM image_glb_creation.gd: that copy also requires
+	# USE_TRANSMISSIVE_GLASS. This pipeline has no such constant and no glass
+	# branch in a reflection assist for it to govern -- it never received the E1
+	# work -- so CONVERT_GLB_ALPHA_GLASS is the only switch here. Everything else
+	# in this block is byte-identical to the image copy; keep it that way.
+	if not CONVERT_GLB_ALPHA_GLASS:
+		return
+
+	var converted = []
+	var left_alone = []
+
+	for m in _get_all_meshes(root):
+		if not m.mesh:
+			continue
+		var node_name = str(m.name)
+
+		# A material_override wins over every surface on this instance, so it has
+		# to be handled on its own -- converting the surface materials underneath
+		# it would change nothing visible.
+		if _material_is_alpha_blended(m.material_override):
+			var ov = m.material_override
+			var ov_ctx = str(ov.resource_name)
+			if ov_ctx.strip_edges() == "":
+				ov_ctx = node_name
+			var ov_kind = _classify_glb_alpha_material(ov_ctx)
+			if ov_kind != "":
+				ov = ov.duplicate()
+				m.material_override = ov
+				_apply_glb_transmissive_glass(ov, ov_kind)
+				converted.append("%s [override->%s]" % [ov_ctx.strip_edges(), ov_kind])
+			else:
+				left_alone.append("%s [override]" % ov_ctx.strip_edges())
+			continue
+
+		for i in range(m.mesh.get_surface_count()):
+			var mat = m.get_surface_override_material(i)
+			if mat == null:
+				mat = m.mesh.surface_get_material(i)
+			if not _material_is_alpha_blended(mat):
+				continue
+
+			var ctx = str(mat.resource_name) + " " + str(m.mesh.surface_get_name(i))
+			if ctx.strip_edges() == "":
+				ctx = node_name
+			var kind = _classify_glb_alpha_material(ctx)
+			if kind == "":
+				left_alone.append(ctx.strip_edges())
+				continue
+
+			# Always duplicate before mutating. GLB instances share material
+			# resources -- through _glb_cache node duplicates, and through
+			# surface_get_material() handing back the imported resource itself --
+			# so an in-place edit would reach every other user of that material.
+			var dup = mat.duplicate()
+			_apply_glb_transmissive_glass(dup, kind)
+			m.set_surface_override_material(i, dup)
+			converted.append("%s [%s]" % [ctx.strip_edges(), kind])
+
+	if converted.is_empty() and left_alone.is_empty():
+		return
+	var label = asset_label if asset_label != "" else str(root.name)
+	if not converted.is_empty():
+		print("  [GlassFix] %s -> traced dielectric: %s" % [label, ", ".join(converted)])
+	if not left_alone.is_empty():
+		# Printed on purpose. This is the list to read when a pane still looks
+		# ghosted: add its name to GLB_GLASS_MATERIAL_KEYWORDS and re-render.
+		print("  [GlassFix] %s -> kept raster alpha: %s" % [label, ", ".join(left_alone)])
+
 func parse_vec3(d):
 	if typeof(d) == TYPE_DICTIONARY:
 		return Vector3(d.get("x", 0), d.get("y", 0), d.get("z", 0))
@@ -2530,6 +2743,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 								if asset_node:
 									add_child(asset_node)
 									_sanitize_glb_lights(asset_node)
+									_convert_glb_alpha_glass(asset_node, model_path.get_file())
 
 									var aabb = _get_hierarchy_aabb(asset_node)
 									var dims = aabb.size
@@ -4086,6 +4300,7 @@ func _load_layer_items(items, layer_altitude, layer_id = "root"):
 					_apply_item_materials(node, item)
 
 					_add_light_fixture_effect(node, item, aabb, final_scale)
+					_convert_glb_alpha_glass(node, used_path.get_file())
 
 					print("[VideoGLB] Loaded asset: ", used_path, " final scale: ", final_scale)
 				else:
@@ -4229,6 +4444,11 @@ func _is_glass_mesh(mesh_inst: MeshInstance3D) -> bool:
 			if std_mat.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED:
 				return true
 			if std_mat.albedo_color.a < 0.5:
+				return true
+			# Converted glass is TRANSPARENCY_DISABLED with a dielectric closure
+			# instead (see _convert_glb_alpha_glass), so transparency alone no
+			# longer identifies a pane.
+			if std_mat.transmission > 0.0:
 				return true
 
 	return false

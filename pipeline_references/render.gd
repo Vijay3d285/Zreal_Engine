@@ -326,7 +326,7 @@ func setup_camera(data):
 				# CHANGE 8: Day render warm golden CDL — this is the key to Render 2's look.
 				# Lifts shadows to warm amber, pushes highlights to golden, subtle vignette.
 				elif day_render:
-					post_fx.tonemap_mode = 0 # ACES — punchy, handles sun highlights
+					post_fx.tonemap_mode = 1 # AGX
 					post_fx.exposure = 1.05
 					post_fx.contrast = 1.12
 					post_fx.saturation = 1.08 # slightly richer for warm interior
