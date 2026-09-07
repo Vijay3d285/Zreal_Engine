@@ -3968,7 +3968,7 @@ separated from ordinary load-time variance. This is the same shape of gap
 would be invisible at this sample size, and nothing here rules it out. See
 §8.5.3 for why a real cost is in fact expected on this feature specifically.
 
-### 8.5 What this does not fix — three honest limits
+### 8.5 What this does not fix — four honest limits
 
 **8.5.1 The side-view blackout is not fixed, and was never a shadow
 problem.** `urbantestdark190`'s tank still reads as a grey mirror. The cause
@@ -4005,6 +4005,49 @@ several lights. §8.4's timing measurement could not resolve this against
 load-time noise. Correctness-first was the right call to make once the two
 were in tension, but this cost is real, unmeasured, and recorded here as an
 open item for whoever next touches shadow-ray performance.
+
+**8.5.4 Alpha-cutout + transmissive is routed to the transmissive mask and
+pass B never alpha-tests it.** `rt_instance_mask_from_features`
+(`render_raytracing.cpp:2461`) chooses the TLAS cull mask purely from
+`p_feature_bits & RT_FLAG_TRANSMISSIVE_GEOMETRY`, which is set at
+`render_raytracing.cpp:1900` (`mat.transmission > 0.0f`) with no regard to
+whether the material also uses alpha (`uses_alpha_clip` / `uses_blend_alpha` /
+`uses_alpha`). Pass B's ray query then runs with `gl_RayFlagsOpaqueEXT`
+(`raytracing_lights_inc.glsl:400`), which commits transmissive hits directly
+and never invokes `ray_query_alpha_test` (`raytracing_lights_inc.glsl:243`).
+A material authored with BOTH alpha-cutout AND `transmission > 0` — frosted
+glazing cut to a grille shape, or cutout foliage with a transmissive
+closure — therefore has its shadow attenuation computed over the full
+triangle silhouette rather than the cutout shape, over-occluding through the
+cut-away regions.
+
+Unreachable by any content in this phase's gate or in the two production
+scenes measured (§8.3/§8.4): the pipeline's own glass conversion sets
+`transparency = TRANSPARENCY_DISABLED` alongside `transmission = 1.0`
+(`pipeline_references/image_glb_creation.gd:1973`, `:5989`), so converted
+glass never carries a cutout in current content. Not fixed here because both
+candidate fixes have real cost that nothing has measured, and measurement-first
+says do not pay it for content that does not exist yet:
+
+- Drop `gl_RayFlagsOpaqueEXT` and alpha-test every transmissive candidate hit
+  in pass B, the way pass A already does. Cost: every transmissive crossing
+  now runs a candidate loop plus a material/alpha fetch, stacked on top of
+  the pass-B traversal cost that §8.5.3 already records as unmeasured — two
+  unmeasured costs compounding on the same hot path.
+- Route cutout+transmissive materials back onto the opaque mask (so they keep
+  using the existing any-hit alpha test) and give pass B a second, separate
+  path for that combination. Cost: `rt_instance_mask_from_features` does not
+  currently receive per-surface alpha-usage information — only
+  `p_feature_bits` — so this needs new feature-bit plumbing through the same
+  four TLAS push sites the function's own header comment enumerates, for a
+  combination with no known instance in this codebase's content.
+
+Correctness-first would fix this now; measurement-first defers it. Recorded
+as an open item for whoever next touches the instance-mask helper or adds
+cutout+transmissive content. **This was found by the final whole-branch
+review, not by any per-task review** — no single task in this phase's plan
+had "alpha-cutout" and "transmission" both in scope at once, so no task-level
+review checklist ever put the two side by side.
 
 ### 8.6 Four defects that originated in the plan, not the implementation
 
