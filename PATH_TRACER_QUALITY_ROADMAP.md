@@ -4404,3 +4404,61 @@ name implied, and an invariant comment that had gone stale the moment an
 earlier task widened one side of it without the other. None of the three was
 caught by reading the plan again. All three were caught by a probe reading a
 number that didn't match the number the plan predicted.
+
+### 9.9 Deferred items from the final whole-branch review
+
+The final review approved the branch for merge with no Critical and no Important
+findings. It triaged the items below as acceptable to defer; they are recorded
+here rather than lost, and none of them blocks the feature.
+
+1. **Unconditional `m_alpha` fetch in the shadow march.**
+   `raytracing_lights_inc.glsl:479-482` samples the albedo texture on every
+   pass-B crossing, including for non-BLEND materials where `pass_through` is
+   forced to 0 and the fetched value is provably discarded. A wasted texture
+   sample in a hot loop. Gating the fetch behind `RT_MAT_FLAG_BLEND` is a pure
+   optimisation with no behavioural change. Note that the `+6.7%` render-loop
+   cost recorded in §9.6 was measured **with this waste in place**.
+
+2. **`rt_uses_alpha_blending()` includes `has_read_screen_alpha`.** A material
+   reading SCREEN, DEPTH or NORMAL texture receives `RT_MAT_FLAG_BLEND`. The
+   review verified the mitigation holds on *both* consumers rather than just
+   the shading branch: such a material with base alpha 1.0 has `m.alpha == 1.0`
+   (closure branch inert) and `m_alpha == 1.0` (shadow `pass_through == 0`), so
+   both are neutralised identically.
+
+3. **Custom ShaderMaterial can bypass the any-hit scissor.** A hand-written
+   shader setting *both* `uses_alpha_clip` and `uses_blend_alpha` gets
+   `RT_MAT_FLAG_BLEND`, which makes the any-hit test at
+   `scene_raytracing_raygen.glsl` never fire for it — the cutout is silently
+   replaced by stochastic blending. Unreachable from `BaseMaterial3D`, whose
+   transparency modes are mutually exclusive. A real gap for custom shaders only.
+
+4. **Stranded raster-setup work under RT.** `render_forward_clustered.cpp:1172-1188`
+   still performs GI/lightmap setup for any instance carrying an alpha surface,
+   but under RT that surface's `RENDER_LIST_ALPHA` membership is now suppressed.
+   CPU-side waste mirroring item 1's GPU-side waste — newly stranded by the
+   overlay gating rather than newly introduced. Not confirmed to affect
+   correctness; a second consumer of those flags was not fully ruled out.
+
+5. **Gate hygiene, `pt_transparent_alpha_gate.gd`.** The control-is-black guard
+   double-counts: `_measure_ratio` appends a failure and increments `_checks`,
+   then the caller does the same again with the returned `0.0`. Cosmetic — the
+   guard still correctly fails the gate, so no false pass is possible. Inherited
+   verbatim from the sibling gate. Separately, `BACKDROP_EMISSION*` is reused as
+   a standalone pane's emission in a probe that has no backdrop; name only.
+
+**Open and genuinely unverified**, requiring runs this branch did not make:
+
+- A DLSS-RR-enabled render of an alpha-dense scene, checking for haloing at the
+  transmission-budget-exhaustion edge. The review established that primary-hit
+  depth and velocity writes are gated on `total_bounces == 0` — which the
+  transparent branch never increments — so a later real hit overwrites them, and
+  that the DLSS-RR AOVs proper are written inside `shade_and_bounce` strictly
+  after the transparent branch's early return and are never reached on a
+  pass-through sample. The one case that does **not** self-correct is a ray
+  exhausting the shared transmission budget mid-stack, where depth and velocity
+  then describe the last alpha layer rather than the surface behind it.
+- OIDN `cleanAux` behaviour on blend surfaces, which likely shares the same
+  primary-hit gating but was not traced against OIDN's own path.
+- A foliage-heavy scene's cost. The aquarium carries 3 blend surfaces of 55
+  materials; the worst case remains unmeasured.
