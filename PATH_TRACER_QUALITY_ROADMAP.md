@@ -4098,3 +4098,309 @@ probe 2, at a different angle, could distinguish a correct implementation
 from a wrong one — a general argument for why an angle-dependent physical
 quantity needs more than one incidence angle in its test coverage, not
 specific to glass or to this codebase.
+
+## 9. Transparent BSDF closure closeout — alpha-blended surfaces stay in the tracer
+
+**Complete.** `alphaMode: BLEND` surfaces are now traced, not rasterized.
+Before this work, every alpha-blended surface — fish, sheer curtains, a glass
+partition with books behind it — was dropped from the TLAS entirely and drawn
+by a second, rasterized transparent pass composited on top of the finished
+frame. The offline accumulation capture reads the accumulator, which the
+raster pass never touches, so those surfaces were simply absent from
+path-traced output: not dim, not wrong-shaded, not shadowed incorrectly —
+absent. §8 fixed shadow-ray attenuation through transmissive glass; it did not
+touch this, which is a separate defect on a separate code path. Cycles has no
+such split — a `TRANSPARENT` closure is evaluated in the same integrator as
+everything else — and this closeout brings this engine to the same shape.
+
+### 9.1 The defect and its code anchors
+
+Three `FLAG_PASS_ALPHA` skips in `build_tlas()`
+(`servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp`)
+excluded any surface carrying that pass flag from ever reaching a TLAS push:
+the `scene_mask` feature-detection walk, the MultiMesh Phase 1 walk, and the
+triangle-mesh surface walk. All three had to go, not just the one the plan
+named — the first two are upstream of the TLAS push sites and left routing
+plumbing dead even after the third was removed. Excluded surfaces were then
+drawn by `RenderForwardClustered::_fill_render_list`
+(`servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp:1082`),
+whose `FLAG_PASS_ALPHA` branch (`:1330-1344`, pre-fix) rasterizes them as a
+transparent overlay on the finished raster frame. That overlay is invisible
+to the path-traced accumulator by construction: the accumulation buffers
+(`RT_TEX_RAYTRACING_ACCUM` / `RT_TEX_RAYTRACING_ACCUM_N`,
+`render_raytracing.h:48-49`) are written only by the raygen pipeline, and the
+raster overlay runs on a wholly separate pipeline that composites after
+accumulation has already been read out for capture.
+
+### 9.2 The stochastic branch, and why stochastic rather than accumulative
+
+The closure lives in `shade_and_bounce`, gated `if (m.blends && m.alpha <
+1.0)` at `raytracing_closest_hit_common_inc.glsl:1383`. On that branch, a
+single uniform draw —
+`rng_1d(rng, RT_PRNG_TRANSPARENT) < (1.0 - m.alpha)`
+(`RT_PRNG_TRANSPARENT`, slot 10u, `raytracing_inc.glsl:321`) — decides,
+per-sample, whether this hit is skipped (the ray continues unbent, unshaded,
+straight through the surface) or shaded normally as an opaque hit. Throughput
+is left at 1.0 on both branches; the probability of taking each branch already
+carries the weight. In expectation this is unbiased:
+`E[contribution] = (1 - alpha)·behind + alpha·shaded`, and stacked layers
+compose multiplicatively, `(1 - alpha)^n`, exactly like independent Fresnel
+crossings.
+
+The alternative is accumulative: blend the surface's own radiance with
+whatever is behind it in a single deterministic evaluation, the way a raster
+alpha-over does. That was rejected for two reasons, both load-bearing for a
+path tracer with an accumulation buffer rather than a single raster
+composite:
+
+- **Order independence.** An accumulative blend has to know, at the point it
+  shades the surface, what is behind it — which means either a second trace
+  (a re-trace loop, as §8.2's shadow-ray pass B is) or deferred compositing
+  after the fact. The stochastic branch needs neither: it is resolved with
+  the ray already in flight, using the same trace that would have continued
+  anyway. Stacked panes at different depths compose correctly with zero extra
+  traces, because each one runs the identical branch independently when the
+  ray reaches it.
+- **Each layer contributes at its own weight, across samples, not within
+  one.** An accumulative blend produces one image per frame in which every
+  layer's contribution is baked into a single evaluation with a fixed
+  formula. The stochastic branch instead lets convergence do the compositing:
+  across `SPP` samples, roughly `alpha` of them shade the surface and roughly
+  `(1 - alpha)` of them pass through, and the accumulator sums both
+  populations. This is the same convergence machinery every other stochastic
+  choice in this integrator already relies on (light selection, lobe
+  selection, Russian Roulette) — the transparent branch is one more sampled
+  decision, not a new kind of machinery bolted on beside it.
+
+### 9.3 Gate results
+
+Both gates PASS at `ec9489e113`:
+
+| Gate | Result | Measured | Theory |
+|---|---|---|---|
+| `pt_transparent_alpha_gate` probe 1 (one pane, alpha 0.5) | PASS | 0.500002 | 0.5 |
+| `pt_transparent_alpha_gate` probe 2 (two stacked panes, alpha 0.5 each) | PASS | 0.250027 | 0.25 (= 0.5²) |
+| `pt_transparent_alpha_gate` probe 3 (alpha 1.0 vs. truly opaque) | PASS | delta 0 | indistinguishable |
+| `pt_transparent_shadow_gate` probe 1 (one pane, normal incidence) | PASS | 0.921600 | 0.921600 |
+| `pt_transparent_shadow_gate` probe 2 (one pane, 80° incidence) | PASS | 0.374911 | 0.374905 |
+| `pt_transparent_shadow_gate` probe 3 (two panes / four crossings) | PASS | 0.849346 | 0.849346 |
+| `pt_transparent_shadow_gate` probe 4 (one pane, transmission = 0.5) | PASS | 0.230400 | 0.230400 |
+| `pt_transparent_shadow_gate` probe 5 (BLEND pane, alpha 0.5, two crossings) | PASS | 0.250000 | 0.25 |
+
+Probe 2 is the one that matters most here, for the same reason
+`pt_transparent_shadow_gate` probe 3 mattered in §8.3: a single-pane probe
+cannot distinguish "one layer applied" from "one layer applied twice," so
+without it a branch that silently double-counted or dropped a layer could
+still read green on probe 1 alone. `pt_transparent_shadow_gate` probe 5 is
+this closeout's, not §8's — it was added in Task 4 specifically to catch the
+scene-level `RT_FLAG_TRANSMISSIVE_GEOMETRY` desync described in §9.7's third
+erratum, and it is what actually caught it (§9.4).
+
+Full doctest suite: **1550 passed, 0 failed, 3 skipped.**
+
+### 9.4 The falsification result — a three-state separation, not a pass/fail
+
+The strongest evidence for this closure is not that the gate is green — it is
+that the gate reads three distinguishable values across three distinguishable
+states of the code, each an opposite failure mode of the correct answer:
+
+| State | probe 1 | probe 2 | Reading |
+|---|---|---|---|
+| Before the closure (surfaces excluded from TLAS) | 1.000000 | 1.000000 | Surface absent — ray never interacts with it at all |
+| Closure branch forcibly disabled, TLAS routing left in place | 0.000000 | 0.000000 | Surface present but fully opaque — every hit shades, none pass through |
+| Closure enabled (shipped state) | 0.500002 | 0.250027 | Surface present and stochastically transparent |
+
+1.0 and 0.0 are not two flavors of "broken" that happen to bracket the
+correct value — they are the two ways this specific mechanism can fail, and
+they fail in opposite directions. A surface missing from the TLAS reads as if
+it were not there (background passes through unattenuated, ratio 1.0); a
+surface present in the TLAS with no stochastic branch reads as if it were
+fully opaque (ratio 0.0, the pre-§8/§9 default for anything the tracer hits
+and does not explicitly pass through). Landing at 0.500002 and 0.250027 —
+between the two failure states, at the values Fresnel-free alpha compositing
+actually predicts — is evidence the mechanism is doing what it claims, not
+merely evidence that some code ran without crashing.
+
+### 9.5 The fish, before and after
+
+`urbantestdark180_fishtank` (front view): previously-missing fish restored.
+The left tank now shows two lionfish and multiple blue tetras that were
+absent before — they were `alphaMode: BLEND` materials, dropped from the TLAS
+under the pre-closure code path, and simply did not exist in the traced
+image. The right tank is unchanged, because its fish were already opaque
+materials and were never subject to the defect. No ghosting, no doubled
+silhouettes, no over-bright outlines — a double-draw (traced once, then
+rasterized again on top) would show as an over-bright silhouette, and none
+was observed, confirming §9.1's fix (removing the TLAS skips) and §9.1's
+raster-overlay gate (`render_forward_clustered.cpp:1343`,
+`rt_traces_alpha = p_alpha_only`) are landing together correctly rather than
+one without the other.
+
+`urbantestdark191_glass` (**side angle** — the specific case the user
+reported as "side-angle blackout, the tank reads as a grey mirror reflecting
+a dim room"): the angled tank now reads as glass. The interior is clearly
+visible through the oblique pane, with two lionfish, several blue tetras,
+plants, rocks, and a starfish all legible. This is the scene §8.5.1 explained
+was *not* fixable by shadow-ray work alone — the grazing-angle Fresnel/TIR
+diagnosis in that section was about reflectance dominating the view, not
+about the fish being missing, and both were true simultaneously. This
+closure fixes the second one.
+
+`urbantestdark190_glass`: the glass partition now shows books through it, and
+the sheer curtains read as translucent rather than as a solid wall.
+
+**Quantified, aquarium scene, Task 1 build vs. Task 3 build, same project and
+input:**
+
+| region | pixels changed >8/255 | rmse |
+|---|---|---|
+| left tank interior (860×500 crop) | 8.02% | 16.32 |
+| wall, contains no alpha geometry | 0.0000% | 0.199 |
+
+The change is localized to where alpha geometry actually is. The wall is
+*not* bit-identical — rmse 0.199, though no pixel there exceeds the 8/255
+threshold — because the widened raygen loop bound (Task 3, §2 of the Task 3
+report) lets some paths take a bounce they were previously cut off at,
+everywhere in the scene, not only through alpha surfaces.
+
+**Not fixed (out of scope, pipeline-side):** the water still lacks its
+authored blue tint. See §9.7.
+
+### 9.6 The cost
+
+Phase split measured externally by timestamping the `Driving 128 frames` log
+line (the log itself carries no timestamps):
+
+| build | load + bake | render loop + save | total |
+|---|---|---|---|
+| pre-closure (`8f5ee320a3`) | 44s | 581s | 625s |
+| with closure (`ec9489e113`) | 41s | 620s | 661s |
+
+**Render-loop delta: +39s, +6.7%.**
+
+This result is notable for what it contradicts, not just for its magnitude.
+§8.4's timing was recorded INCONCLUSIVE because asset loading dominated wall
+time — roughly 916s of a 921s total on that phase's scene. Here the opposite
+holds: load is only ~6% of wall time and the **render loop is 94% of wall
+time**, which is the regime in which a loop-cost delta is actually
+measurable rather than lost in load-time noise. This is not a contradiction
+in the engine's behavior — it reflects warm vs. cold file caching (below) —
+but it means this measurement, unlike §8.4's, is not inconclusive.
+
+Caveats, all load-bearing, none dropped:
+
+- The load figures are warm-file-cache: four renders of this scene preceded
+  these two. A cold first load is much slower and would shrink the render
+  loop's share of the total — the 94%-of-wall-time framing above is a
+  property of this measurement's cache state, not a universal claim about
+  this scene.
+- The aquarium carries only 3 alpha-blend surfaces out of 55 materials. A
+  foliage-heavy scene is the real worst case for this change — alpha
+  surfaces now generate traced hits and any-hit invocations where they
+  previously generated none — and it was **not measured**.
+- The delta includes both the added cost (tracing alpha surfaces, invoking
+  any-hit on them) and the removed cost (no longer rasterizing them as an
+  overlay). It is the honest net total of the change, not the isolated cost
+  of either half.
+- The shadow-march inner loop (`raytracing_lights_inc.glsl:479-482`) fetches
+  `m_alpha` unconditionally on every crossing, including for non-blend
+  materials where the value is computed and then discarded — a known,
+  un-taken optimization, deferred from Task 4's review. This timing was
+  measured with that inefficiency in place; a leaner inner loop would likely
+  show a smaller delta.
+
+### 9.7 The honest limits
+
+- **The transmission bounce budget is shared, not separate.** Both the E1
+  dielectric transmissive closure and this alpha pass-through spend from the
+  same `transmission_bounces` counter (4 bits, max 15, default cap 12) — the
+  packed bounce word (`raytracing_inc.glsl`, bits 0-7 total, 8-15 diffuse,
+  16-23 glossy, 24 SAMPLE_ZERO, 25 SHADOW_RAY, 26 PATH_TERMINATED, 27-30
+  transmission, 31 INSIDE_MEDIUM) has no free bit for a second counter.
+  Cycles keeps `transparent_bounce` fully separate from `bounce`; this engine
+  cannot, without a payload layout change. A scene combining dielectric glass
+  with dense alpha-blend stacking — a glass display case full of
+  alpha-blended foliage, say — exhausts the shared budget faster than either
+  mechanism alone would, and there is currently no way to give one priority
+  over the other.
+- **Shadow behavior changed for every alpha-blended surface in every scene,
+  not only aquariums.** §8/Task 4's shadow mix (`raytracing_lights_inc.glsl`)
+  keys on `RT_MAT_FLAG_BLEND`, which this closure's TLAS routing is what
+  makes reachable at all for a given surface. Any scene with alpha-blended
+  geometry — curtains, foliage, decals, glass with an alpha channel — now
+  casts `(1 - alpha)` shadows instead of the previous behavior (no shadow at
+  all, because the surface was not in the TLAS). This is correct, but it is
+  a behavior change everywhere such geometry exists, not a fish-tank-specific
+  fix.
+- **Any-hit invocations increased.** Blend surfaces do not carry
+  `FORCE_OPAQUE_BIT` (§1.5 of the Task 3 report), so they now invoke any-hit
+  where previously — excluded from the TLAS — they invoked nothing at all.
+  This is necessary for the stochastic branch to work, and it is real added
+  cost on every ray that can reach a blend surface, not only shadow rays.
+- **The shadow-march inner loop fetches `m_alpha` unconditionally**, on every
+  crossing, including for non-blend materials where the value is discarded
+  (`raytracing_lights_inc.glsl:479-482`, deferred minor from Task 4's
+  review). §9.6's timing was measured with this in place.
+- **The water's blue tint is still missing, and this is pipeline-side, not
+  engine-side.** `_apply_glb_transmissive_glass` in
+  `pipeline_references/image_glb_creation.gd` sets `albedo_texture = null`,
+  discarding the authored teal. This is a two-line revert in the user's own
+  pipeline file, not this engine, and out of scope for this closure —
+  `pipeline_references/*.gd` is the user's own work and was not touched here.
+- **A foliage-heavy scene is the real worst case for cost and was not
+  measured.** The aquarium's 3-of-55 alpha-blend surface ratio is a light
+  load for this feature; nothing in this closeout's measurements bounds the
+  cost on a scene where alpha-blended geometry dominates the surface count.
+
+### 9.8 Erratum — this plan's own spec was wrong twice, both caught by measurement
+
+Consistent with §8.6's finding on the previous phase: in this phase too, the
+defects that shipped in the *plan* rather than in its execution were caught
+by running a probe, not by reading the plan more carefully.
+
+1. **The material flag was specified for bit 2, which was already
+   `RT_MAT_FLAG_POINT_FILTER`.** The claim traced to a stale comment at
+   `raytracing_data_inc.glsl:136` (`uint flags; // Bit 0: has_normal_map, Bit
+   1: has_emission`) that documented only bits 0 and 1 and said nothing about
+   bit 2 already being spoken for. Shipping the plan's bit assignment would
+   have collided two unrelated flags into one bit: every blended material
+   would have sampled its textures unfiltered, and every pixel-art material
+   using point filtering would have become partially transparent. Neither
+   failure throws an error or looks obviously wrong in isolation — two
+   plausible-looking renders, both silently incorrect. Corrected to bit 3
+   (`RT_MAT_FLAG_BLEND = 8u`) before any code shipped against the wrong bit.
+2. **The blend gate was keyed on `uses_blend_alpha`, which is false for
+   `BLEND_MODE_MIX`** (`material_storage.cpp:718`,
+   `ShaderData::blend_mode_uses_blend_alpha`). glTF's `alphaMode: BLEND`
+   produces `BLEND_MODE_MIX` on import, not the mode this predicate actually
+   tests true for — measured directly: **0 of 55 materials** on the aquarium
+   scene satisfied `uses_blend_alpha`. The real signal is the `has_alpha`
+   term of `rt_uses_alpha_pass()`, exposed as `rt_uses_alpha_blending()`
+   (`scene_shader_forward_clustered.h:345`). Had this shipped as specified,
+   the entire closure would have been correctly implemented and structurally
+   inert — every gate probe and every production scene would have shown
+   zero surfaces routed, and nothing about the code itself would have looked
+   wrong.
+3. **Task 3 broke the invariant stated at `render_raytracing.cpp:1902`** —
+   that the scene-level `RT_FLAG_TRANSMISSIVE_GEOMETRY` bit and the
+   per-instance TLAS mask predicate must agree on which surfaces are
+   transmissive — by widening the instance-mask predicate
+   (`rt_instance_mask_from_features`) to route blend surfaces onto
+   `RT_INSTANCE_MASK_TRANSMISSIVE` without widening the scene-level bit to
+   match. A blend-only scene (alpha-blended, no material with
+   `transmission > 0`) then had every blend surface's shadow ray culled to
+   pass A (opaque mask, which cannot see it) while pass B never ran at all
+   (`RT_GET_TRANSMISSIVE_GEOMETRY()` false) — neither shadow pass touched it.
+   `pt_transparent_shadow_gate` probe 5, added in Task 4 specifically for
+   this scenario, was the first probe in either gate capable of catching it:
+   it read `1.000000` (no attenuation at all) instead of the expected
+   `0.250000` until the scene-level bit was widened to match, at
+   `render_raytracing.cpp:2629-2647`.
+
+The lesson, stated plainly and without flattery: in all three cases, a
+comment or a flag name was trusted over the code it actually described — a
+stale bit-layout comment, a plausibly-named boolean that didn't mean what its
+name implied, and an invariant comment that had gone stale the moment an
+earlier task widened one side of it without the other. None of the three was
+caught by reading the plan again. All three were caught by a probe reading a
+number that didn't match the number the plan predicted.
