@@ -463,7 +463,32 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 		// so the pane blocks exactly the light it visibly absorbs. Pass A cannot do
 		// this job instead: its RT_INSTANCE_MASK_OPAQUE cull never sees a transmissive
 		// instance, and that mask is derived from the material, not from the toggle.
-		atten *= RT_GET_TRANSMISSION_ENABLED() ? (mat.transmission * (1.0 - F)) : 0.0;
+		// A surface passes light two ways: the Transparent BSDF share (1 - m_alpha)
+		// goes straight through unfiltered, and the remaining m_alpha share is
+		// filtered by the dielectric closure (mat.transmission * (1 - F)), exactly
+		// as raytracing_material_eval_inc.glsl mixes the two BSDFs for BLEND
+		// materials. pass_through is zeroed for non-BLEND materials -- an
+		// alpha-scissor material's base-colour alpha can sit below 1.0 while the
+		// texel is meant to be fully solid, same reason the closure itself branches
+		// on RT_MAT_FLAG_BLEND rather than on alpha directly (raytracing_material_eval_inc.glsl:22).
+		//
+		// Fetch m_alpha with ray_query_alpha_test's exact pattern (this file,
+		// above): sample the albedo texture's alpha at this hit's UV and modulate
+		// by mat.albedo_color.a. i0/i1/i2 and bary are already available from the
+		// get_triangle_indices_ex() / barycentric computation above.
+		vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
+		uv = uv * mat.uv1_scale + mat.uv1_offset;
+		float m_alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+		m_alpha *= mat.albedo_color.a;
+
+		float surface_share = RT_GET_TRANSMISSION_ENABLED() ? (mat.transmission * (1.0 - F)) : 0.0;
+		// The (1 - m_alpha) pass-through share is taken ONLY for BLEND materials.
+		// pass_through == 0 for everything else makes the next line reduce to
+		// EXACTLY the pre-task `atten *= surface_share`, for any alpha that
+		// material happens to carry -- this is what keeps the four alpha==1.0
+		// probes from moving.
+		float pass_through = ((mat.flags & RT_MAT_FLAG_BLEND) != 0u) ? (1.0 - m_alpha) : 0.0;
+		atten *= pass_through + (1.0 - pass_through) * surface_share;
 		if (rt_max_component(atten) < RT_SHADOW_ATTEN_EPSILON) {
 			return vec3(0.0);
 		}

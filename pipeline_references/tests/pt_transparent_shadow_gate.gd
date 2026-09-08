@@ -25,11 +25,13 @@ extends "res://tests/pt_validation.gd"
 ## [P1_RATIO_MIN, P1_RATIO_MAX] under any tolerance. Probes 2, 3 and 4 are
 ## two-sided bands, so the pre-fix 0.0 fails them as well.
 ##
-## The four probes measure four different things and none of them is redundant:
+## The five probes measure five different things and none of them is redundant:
 ##   1 -- the fractional transmittance exists at all (pre-fix reads 0.0)
 ##   2 -- the Fresnel term is the EXACT dielectric form, at grazing incidence
 ##   3 -- every crossing is counted (the t_min march's traversal order)
 ##   4 -- the mat.transmission factor is applied, not just (1 - F)
+##   5 -- (Task 4) a BLEND surface's (1 - alpha) share passes the shadow ray
+##        even with transmission = 0.0 and probes 1-4's dielectric mix absent
 
 const FRAMES := 128
 
@@ -109,6 +111,48 @@ const P4_TRANSMISSION := 0.5
 const P4_RATIO_MIN := 0.2204
 const P4_RATIO_MAX := 0.2404
 
+# PROBE 5. The BLEND-ALPHA pass-through probe -- this is the term Task 4 adds
+# and none of probes 1-4 can see it: they all use transparency = DISABLED
+# (no RT_MAT_FLAG_BLEND), so pass_through is forced to 0 for every one of them
+# and only surface_share (the pre-existing mat.transmission * (1 - F) term)
+# ever reaches atten. Without this probe the new mix in
+# raytracing_lights_inc.glsl could be deleted back to the pre-task
+# `atten *= surface_share` and probes 1-4 would not move a single digit.
+#
+# Pane: TRANSPARENCY_ALPHA_DEPTH_PRE_PASS, albedo_color.a = 0.5,
+# transmission = 0.0. transmission = 0.0 makes surface_share = 0.0
+# regardless of Fresnel or the RT_GET_TRANSMISSION_ENABLED() toggle, so this
+# probe isolates pass_through with nothing else in the mix able to
+# contribute:
+#   m_alpha       = 1.0 (opaque default albedo texture) * 0.5 (albedo_color.a)
+#                 = 0.5
+#   pass_through  = (RT_MAT_FLAG_BLEND set) ? (1 - m_alpha) : 0  =  1 - 0.5 = 0.5
+#   surface_share = 0.0  (mat.transmission == 0.0)
+#   per-crossing factor = pass_through + (1 - pass_through) * surface_share
+#                       =  0.5 + 0.5 * 0.0  =  0.5
+# The pane is the SAME 30x0.05x30 BoxMesh as probes 1/3/4, which pass B walks
+# as TWO crossings (front face then back face) at normal incidence -- exactly
+# why probe 1 reports 0.96^2 = 0.9216 and probe 4 reports 0.48^2 = 0.2304
+# rather than their bare per-crossing factors. This probe is the same
+# geometry, so it inherits the same two-crossing product:
+#   expected ratio = 0.5 * 0.5 = 0.25
+#
+# Band +/-0.02 (8% relative), wider in relative terms than probe 4's +/-0.01
+# on 0.2304 (~4.3%) to allow margin for a still-unmeasured second-order
+# effect this probe's material introduces that probe 4's does not: an
+# ALPHA_DEPTH_PRE_PASS surface, unlike probes 1-4's TRANSPARENCY_DISABLED
+# dielectric, could plausibly interact with the depth pre-pass in a way that
+# perturbs the two-crossing count at the margin; the band stays two-sided and
+# tight enough that a one- or three-crossing misread (0.5 or 0.125) falls
+# clearly outside it. Two-sided per the project's standing rule (a one-sided
+# ceiling let a 0.0 "glass went black" defect read as a pass elsewhere in
+# this file): a reading of 0.0 here would mean pass_through never reached the
+# accumulation (RT_MAT_FLAG_BLEND not observed, or m_alpha fetched as 1.0),
+# and a reading near 1.0 would mean neither crossing attenuated the ray.
+const P5_BLEND_ALPHA := 0.5
+const P5_RATIO_MIN := 0.23
+const P5_RATIO_MAX := 0.27
+
 var _failures: Array[String] = []
 var _checks: int = 0
 
@@ -124,6 +168,9 @@ func _ready() -> void:
 
 	print("\n=== PROBE 4: partial transmission scales the attenuation ===")
 	await _probe4_partial_transmission()
+
+	print("\n=== PROBE 5: blend-alpha pass-through attenuates the shadow ===")
+	await _probe5_blend_alpha_shadow()
 
 	print("")
 	if _failures.is_empty():
@@ -224,6 +271,32 @@ func _probe4_partial_transmission() -> void:
 				P4_TRANSMISSION, P4_TRANSMISSION * 0.96, P4_TRANSMISSION * 0.96])
 
 
+## The blend-alpha probe. Same single-pane, normal-incidence geometry as
+## probe 1 (AXIS (a) and AXIS (b) proofs above apply unchanged -- neither
+## depends on the material, only on pane position/size and light/camera
+## angles, all of which are identical here), but the pane is BLEND-family
+## with albedo_color.a = 0.5 and transmission = 0.0 instead of the
+## dielectric material probes 1-4 use. Per-crossing factor is
+## (1 - alpha) = 0.5; the pane is the same BoxMesh probe 1 uses and is
+## crossed twice (front + back face), so the expected ratio is the SQUARE
+## of the per-crossing factor, 0.5^2 = 0.25 -- see P5_BLEND_ALPHA's block.
+func _probe5_blend_alpha_shadow() -> void:
+	var ratio := await _measure_ratio(0.0, false, 0.0, P5_BLEND_ALPHA)
+	print("  blend alpha = %.2f, transmission = 0.0, ratio = %.6f (band %.2f - %.2f, theory 0.25)"
+			% [P5_BLEND_ALPHA, ratio, P5_RATIO_MIN, P5_RATIO_MAX])
+	_checks += 1
+	if ratio < P5_RATIO_MIN or ratio > P5_RATIO_MAX:
+		_failures.append(("probe5 blend alpha: ratio %.6f outside [%.2f, %.2f] -- with "
+				+ "albedo_color.a = %.2f and transmission = 0.0, each of the pane's two "
+				+ "crossings must pass exactly (1 - alpha) = %.2f of the light through the "
+				+ "shadow ray, so the pair must read %.2f^2 = 0.25. Near 0.0 means "
+				+ "pass_through never reached atten (RT_MAT_FLAG_BLEND not observed, or "
+				+ "m_alpha read as 1.0); near 1.0 means neither crossing attenuated the ray "
+				+ "at all; near 0.5 means only ONE crossing was counted instead of two")
+				% [ratio, P5_RATIO_MIN, P5_RATIO_MAX, P5_BLEND_ALPHA,
+				1.0 - P5_BLEND_ALPHA, 1.0 - P5_BLEND_ALPHA])
+
+
 ## p_incidence_deg is the DirectionalLight3D's incidence angle from the
 ## horizontal pane's +Y normal (0 = straight down / near-normal, larger =
 ## grazing). The pane itself is ALWAYS flat and unrotated -- grazing is
@@ -243,8 +316,15 @@ func _probe4_partial_transmission() -> void:
 ## RT_FLAG_TRANSMISSIVE_GEOMETRY on the material -- the C++ predicate is
 ## `mat.transmission > 0.0f` (render_raytracing.cpp:1900) -- so the pane still
 ## lands in RT_INSTANCE_MASK_TRANSMISSIVE and pass B still walks it.
+##
+## p_blend_alpha (probe 5) defaults to -1.0, a sentinel meaning "leave the
+## dielectric material probes 1-4 build untouched." Any value >= 0.0 instead
+## switches the pane to TRANSPARENCY_ALPHA_DEPTH_PRE_PASS with
+## albedo_color.a = p_blend_alpha, which is what turns on RT_MAT_FLAG_BLEND
+## (ShaderData::rt_uses_alpha_blending()) and is the only value
+## raytracing_lights_inc.glsl's m_alpha fetch reads for this pane.
 func _measure_ratio(p_incidence_deg: float, p_second_pane: bool = false,
-		p_transmission: float = 1.0) -> float:
+		p_transmission: float = 1.0, p_blend_alpha: float = -1.0) -> float:
 	for c in get_children():
 		c.queue_free()
 
@@ -372,6 +452,18 @@ func _measure_ratio(p_incidence_deg: float, p_second_pane: bool = false,
 	glass_mat.metallic = 0.0
 	glass_mat.metallic_specular = 0.5
 	glass_mat.ior = 1.5
+	# PROBE 5 (blend-alpha pass-through) overrides the pane to a BLEND-family
+	# material instead of the dielectric one probes 1-4 use. p_blend_alpha < 0
+	# (the default) leaves every existing probe's material untouched --
+	# TRANSPARENCY_DISABLED, alpha unset (defaults to 1.0) -- so probes 1-4 are
+	# bit-identical to before this parameter existed. Setting it to >= 0.0
+	# switches on RT_MAT_FLAG_BLEND (ShaderData::rt_uses_alpha_blending() keys
+	# off transparency != DISABLED with alpha not scissor-clipped, exactly
+	# TRANSPARENCY_ALPHA_DEPTH_PRE_PASS) and sets albedo_color.a, which is the
+	# only thing raytracing_lights_inc.glsl's new m_alpha fetch reads.
+	if p_blend_alpha >= 0.0:
+		glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS
+		glass_mat.albedo_color = Color(0.5, 0.5, 0.5, p_blend_alpha)
 
 	var panes: Array[MeshInstance3D] = []
 	var pane_heights: Array[float] = [1.0]

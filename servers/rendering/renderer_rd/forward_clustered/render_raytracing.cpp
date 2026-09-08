@@ -1900,9 +1900,24 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	if (mat.transmission > 0.0f) {
 		// The SAME predicate the shadow loop's per-hit attenuation uses
 		// (raytracing_lights_inc.glsl pass B, `atten *= mat.transmission * (1 - F)`).
-		// Deriving the instance mask and the scene-level skip from this one bit is
-		// what stops them desyncing: a scene can never enable pass B while its glass
-		// sits outside the transmissive mask, or vice versa.
+		// This is one of TWO places that OR into the scene-level bit -- the other is
+		// the surface walk in build_tlas()'s detection pass (render_raytracing.cpp,
+		// search rt_uses_alpha_blending), which ORs it in per-surface when the
+		// surface is alpha-blended, transmission or not. Both must run: this one
+		// covers dielectric transmission (readable from the material RID alone,
+		// which is all process_material() ever sees), the other covers plain alpha
+		// blending (a per-surface signal this function cannot see). The invariant
+		// that must hold across both sites: the scene-level bit is set whenever ANY
+		// surface in the scene is routed onto RT_INSTANCE_MASK_TRANSMISSIVE by
+		// rt_instance_mask_from_features() -- a scene can never enable pass B while
+		// its glass sits outside the transmissive mask, or vice versa. Widening the
+		// mask predicate (rt_instance_mask_from_features, ~:2470) to also catch
+		// blend surfaces without widening the scene bit here is exactly the bug that
+		// made probe 5 of pt_transparent_shadow_gate.gd read 1.0 instead of 0.25:
+		// the pane was masked TRANSMISSIVE, pass A (culled to OPAQUE) couldn't see
+		// it, and pass B never ran because this bit alone was still 0. Any future
+		// change to what gets routed onto RT_INSTANCE_MASK_TRANSMISSIVE must be
+		// mirrored at both sites, or re-derived from a single shared predicate.
 		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY;
 	}
 
@@ -2628,6 +2643,24 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				// feature_bits are 0 -- no special case needed.
 				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 				scene_mask |= process_material(material_rid, material_counter)->feature_bits;
+				// rt_instance_mask_from_features() (below) masks a blend surface
+				// TRANSMISSIVE regardless of its material's transmission value --
+				// but process_material() only sets RT_FLAG_TRANSMISSIVE_GEOMETRY from
+				// transmission > 0 (see the E3 detection block above), because it is
+				// keyed on the material RID and cannot see this surface's blend flag.
+				// A scene whose only non-opaque surface is alpha-blended with
+				// transmission == 0 would then mask that surface TRANSMISSIVE while
+				// scene_mask stayed 0 -- pass A (culled to OPAQUE) can't see it and
+				// pass B never runs because RT_GET_TRANSMISSIVE_GEOMETRY() reads 0,
+				// so nothing occludes it. OR in the same per-surface predicate the
+				// mask sites use (surf->shader->rt_uses_alpha_blending(), e.g. :3020)
+				// so the scene bit and the per-instance mask are set from the same
+				// signal, at the granularity (per-surface) that signal actually lives
+				// at. See the invariant note on RT_FLAG_TRANSMISSIVE_GEOMETRY above,
+				// by mat.transmission, for why the two must never desync.
+				if (surf->shader && surf->shader->rt_uses_alpha_blending()) {
+					scene_mask |= SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY;
+				}
 			}
 		}
 	}
