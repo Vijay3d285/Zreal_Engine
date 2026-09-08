@@ -318,8 +318,9 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 #define RT_PRNG_ENV 7u // 2D: direction sample on the environment (C3).
 #define RT_PRNG_EMISSIVE_SELECT 8u // 1D: emissive instance + triangle (C1).
 #define RT_PRNG_EMISSIVE_POINT 9u // 2D: barycentric point on that triangle (C1).
+#define RT_PRNG_TRANSPARENT 10u // 1D: transparent-vs-shade choice (alpha closure).
 #define RT_PRNG_TRANSMIT 11u // 1D: reflect-vs-transmit choice inside the dielectric closure (E1).
-// Slots 10, 12-15 are free. Earlier dimensions are better stratified, so the
+// Slots 12-15 are free. Earlier dimensions are better stratified, so the
 // highest-variance decision (the BSDF direction) keeps 0.
 
 /// Sampler state for one path. `pixel` is the per-pixel Owen scramble seed,

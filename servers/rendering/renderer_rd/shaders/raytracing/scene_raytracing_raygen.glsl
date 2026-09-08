@@ -62,7 +62,23 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
 
-	[[dont_unroll]] for (uint bounce = 0u; bounce <= p_max_bounces; bounce++) {
+	// A transparent pass-through (the alpha closure in shade_and_bounce) returns
+	// BEFORE the per-lobe cap block, so it is the only surface interaction that
+	// can push total_bounces past max_total without the path being terminated --
+	// its own budget is the transmission counter instead. The loop therefore has
+	// to hold BOTH budgets, or the iteration count silently becomes the real cap
+	// and a surface behind a couple of alpha layers goes dark before NEE ever
+	// runs on it.
+	//
+	// The cap is resolved the SAME way shade_and_bounce resolves it
+	// (raytracing_closest_hit_common_inc.glsl) rather than read raw: with the
+	// project setting unset RT_GET_MAX_TRANSMISSION_BOUNCE() is 0, which
+	// resolve_bounce_cap turns into max_total while the raw read would widen
+	// this loop by nothing at all -- reintroducing the exact starvation this
+	// exists to prevent. min(.., 15u) mirrors the 4-bit counter clamp there.
+	const uint iteration_limit = p_max_bounces +
+			min(resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), p_max_bounces), 15u);
+	[[dont_unroll]] for (uint bounce = 0u; bounce <= iteration_limit; bounce++) {
 		path_pack(payload, ps);
 
 		// Roadmap E1: a ray travelling INSIDE a solid must see back faces to find
@@ -500,6 +516,11 @@ void main() {
 	m.attenuation = vec3(0.0);
 	m.specular_tint = vec3(1.0);
 	m.specular_factor = 1.0;
+	// A custom hit group authors its own alpha and its own blending; the
+	// RT_MAT_FLAG_BLEND bit in materials[] describes the StandardMaterial3D this
+	// ShaderMaterial replaced, not this shader. Opaque keeps every custom
+	// ShaderMaterial on the pre-existing path, matching m.transmission above.
+	m.blends = false;
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -585,6 +606,12 @@ void main() {
 	m.attenuation = (vec3(1.0) - mat.attenuation_color) * mat.attenuation_density;
 	m.specular_tint = mat.specular_tint;
 	m.specular_factor = mat.specular_factor;
+	// Transparent BSDF closure. Keyed on the material FLAG (glTF alphaMode BLEND
+	// -> ShaderData::rt_uses_alpha_blending), never on `m.alpha < 1.0`: an
+	// alpha-SCISSOR cutout is also in the TLAS and its base-colour alpha can sit
+	// between the scissor threshold and 1.0, so an alpha-value test would make
+	// every cutout translucent.
+	m.blends = (mat.flags & RT_MAT_FLAG_BLEND) != 0u;
 
 #ifdef RT_DEBUG_ENABLED
 	{
@@ -708,7 +735,21 @@ void main() {
 	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
 	alpha *= mat.albedo_color.a;
 
-	if (alpha < 0.5) {
+	// The 0.5 test is a CUTOUT threshold (alpha scissor), and it is the right
+	// answer for a scissor material -- but it is the wrong one for a BLEND
+	// material, which is now in the TLAS as well. A blend surface at alpha 0.3
+	// must reach closest-hit and be passed through by the Transparent BSDF with
+	// probability 0.7; discarding the intersection here instead makes it pass
+	// through with probability 1.0, i.e. renders it perfectly invisible. That is
+	// precisely the "the fish are missing" symptom this closure exists to fix,
+	// and it would hit exactly the soft-edged foliage and fin textures whose
+	// alpha spends most of its range below 0.5.
+	//
+	// Blend materials therefore commit every intersection and let the closure in
+	// shade_and_bounce weigh them. Scissor materials are unaffected: RT_MAT_FLAG_BLEND
+	// is set from rt_uses_alpha_blending(), whose `!uses_alpha_clip` term excludes
+	// a pure cutout (scene_shader_forward_clustered.h).
+	if (alpha < 0.5 && (mat.flags & RT_MAT_FLAG_BLEND) == 0u) {
 		ignoreIntersectionEXT;
 	}
 #endif

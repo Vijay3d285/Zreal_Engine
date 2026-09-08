@@ -17,6 +17,15 @@ struct MaterialResult {
 	vec3 attenuation; // (1 - attenuation_color) * attenuation_density, extinction per metre.
 	vec3 specular_tint; // glTF specularColorFactor. Tints the DIELECTRIC F0 only.
 	float specular_factor; // glTF specularFactor. Scales the dielectric F0.
+
+	// --- Transparent BSDF closure (glTF alphaMode BLEND). ---
+	// Mirrors RT_MAT_FLAG_BLEND off the MaterialData binding. Carried through
+	// MaterialResult rather than re-read from materials[] in shade_and_bounce
+	// because a CUSTOM HIT GROUP has no MaterialData to speak for it: its alpha
+	// is whatever the user shader wrote, and materials[h.geometry_idx] holds the
+	// StandardMaterial3D record the ShaderMaterial overrode. Reading the flag
+	// there would hand a custom shader a blend classification it never authored.
+	bool blends;
 };
 
 /// Sensible default for a mid-grey diffuse surface.
@@ -38,5 +47,8 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.attenuation = vec3(0.0);
 	r.specular_tint = vec3(1.0);
 	r.specular_factor = 1.0;
+	// Opaque by default, for the same reason transmission is: false keeps every
+	// custom ShaderMaterial on the pre-existing shading path.
+	r.blends = false;
 	return r;
 }

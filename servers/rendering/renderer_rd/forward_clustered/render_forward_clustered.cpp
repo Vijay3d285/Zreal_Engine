@@ -1327,7 +1327,21 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 					rl->add_element(surf);
 				}
 
-				if (force_alpha || (pass_flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
+				// Under RT (p_alpha_only) every FLAG_PASS_ALPHA surface is now IN the
+				// TLAS and shaded by the Transparent BSDF closure, so adding it to
+				// RENDER_LIST_ALPHA as well would draw it twice -- once traced, once
+				// rasterized on top. The skip that used to keep these surfaces out of
+				// the TLAS is removed in the same commit (render_raytracing.cpp); the
+				// two halves are only correct together.
+				//
+				// Scoped to `p_alpha_only` alone, which is the RT path's own flag:
+				// the raster path takes `surf->flags` through the same expression and
+				// is untouched. `force_alpha` is deliberately still honoured under RT
+				// -- it is the distance-fade / overdraw-debug case, driven by
+				// fade_alpha and get_debug_draw_mode() rather than by the material,
+				// and the tracer models neither.
+				const bool rt_traces_alpha = p_alpha_only;
+				if (force_alpha || (!rt_traces_alpha && (pass_flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA))) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_TRANSPARENT;
 					render_list[RENDER_LIST_ALPHA].add_element(surf);
 					if (uses_gi) {

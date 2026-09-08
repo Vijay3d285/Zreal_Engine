@@ -2458,8 +2458,17 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 // Takes the bits rather than the RTMaterialData so all four TLAS push sites --
 // which hold `mat_data`, `proc_mat_data` and `pending.mat_data` respectively --
 // can share one function.
-static _FORCE_INLINE_ uint32_t rt_instance_mask_from_features(uint32_t p_feature_bits) {
-	return (p_feature_bits & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY)
+//
+// `p_uses_blend` is the alpha-blend signal, which is NOT one of the feature bits:
+// it is per-SURFACE (ShaderData::rt_uses_alpha_blending), while feature_bits is
+// per-MATERIAL-RID and shared by every surface using that material, so it is
+// passed separately rather than folded in. A blend surface is masked
+// TRANSMISSIVE so the transparent-shadow march (raytracing_lights_inc.glsl pass
+// B) can find it and attenuate through it, rather than pass A treating it as a
+// solid wall. Pass B's own attenuation for a blend surface is Task 4's; what
+// this decides is only which pass gets to see it.
+static _FORCE_INLINE_ uint32_t rt_instance_mask_from_features(uint32_t p_feature_bits, bool p_uses_blend) {
+	return ((p_feature_bits & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) || p_uses_blend)
 			? SceneShaderRaytracing::RT_INSTANCE_MASK_TRANSMISSIVE
 			: SceneShaderRaytracing::RT_INSTANCE_MASK_OPAQUE;
 }
@@ -2594,9 +2603,15 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// the mesh they fall back to differs.
 			const bool is_multimesh = (inst->data->base_type == RSE::INSTANCE_MULTIMESH);
 			for (const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches; surf; surf = surf->next) {
-				if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
-					continue;
-				}
+				// The FLAG_PASS_ALPHA skip that used to stand here is gone: alpha
+				// surfaces are now traced (the Transparent BSDF closure), so their
+				// materials must contribute to scene_mask like any other. Leaving it
+				// would break them in two ways that only show at render time -- their
+				// feature bits (transmissive geometry, emissive, ...) would not switch
+				// on the specialization constants the closure needs, and a custom
+				// ShaderMaterial on an alpha surface would never be registered here,
+				// so the SBT offset pass 2 pushes for it would name a hit group that
+				// was never built.
 				RID material_rid;
 				if (surf->owner->data->material_override.is_valid()) {
 					material_rid = surf->owner->data->material_override;
@@ -2762,7 +2777,15 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(rt_instance_mask_from_features(proc_mat_data->feature_bits));
+				// Site 1 of 4, the PROCEDURAL path. `false` is not a placeholder for a
+				// signal that was out of scope -- it is the correct value. This site
+				// sets FORCE_OPAQUE unconditionally two lines up and is documented
+				// opaque, and a procedural instance is driven by its material_override
+				// ShaderMaterial through a CUSTOM hit group, whose MaterialResult sets
+				// blends = false regardless. Claiming TRANSMISSIVE here would move it
+				// out of the pass A shadow mask while nothing in the closure ever
+				// treats it as translucent, which would just delete its shadow.
+				instance_masks.push_back(rt_instance_mask_from_features(proc_mat_data->feature_bits, false));
 			}
 			continue;
 		}
@@ -2790,11 +2813,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			const RenderForwardClustered::GeometryInstanceSurfaceDataCache *mm_surf = inst->surface_caches;
 			while (mm_surf) {
-				if (mm_surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
-					mm_surf = mm_surf->next;
-					continue;
-				}
-
+				// FLAG_PASS_ALPHA skip removed alongside the triangle-mesh one below:
+				// a MultiMesh of alpha-blended surfaces (foliage, particles) is traced
+				// too. Without removing this, `mat_uses_blend` computed a few lines
+				// down and consumed at both Phase 2 push sites would be permanently
+				// false, and -- with the raster overlay now gated off under RT -- those
+				// instances would be drawn by neither path.
 				void *mesh_surface = mm_surf->surface;
 				uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
 
@@ -2877,12 +2901,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		bool instance_static = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::NONE;
 		while (surf) {
-			// Skip surfaces routed to the raster alpha overlay
-			if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
-				surf = surf->next;
-				continue;
-			}
-
+			// Alpha surfaces used to be skipped here and drawn by the raster alpha
+			// overlay instead. They are now traced: RT_MAT_FLAG_BLEND is pushed with
+			// the material below and the Transparent BSDF closure in
+			// shade_and_bounce passes the ray through with probability (1 - alpha).
+			// The matching half of this change gates those same surfaces OUT of
+			// RENDER_LIST_ALPHA under RT (render_forward_clustered.cpp) -- removing
+			// this skip without that one draws every alpha surface twice.
 			void *mesh_surface = surf->surface;
 			uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
 
@@ -3032,7 +3057,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(rt_instance_mask_from_features(mat_data->feature_bits));
+			// Site 2 of 4, the triangle-mesh path. `surf` is in scope, so this reads
+			// the SAME per-surface predicate that set RT_MAT_FLAG_BLEND on the pushed
+			// material a few lines above -- the mask and the flag cannot disagree.
+			instance_masks.push_back(rt_instance_mask_from_features(
+					mat_data->feature_bits, surf->shader && surf->shader->rt_uses_alpha_blending()));
 
 			surf = surf->next;
 		}
@@ -3082,7 +3111,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			}
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(rt_instance_mask_from_features(pending.mat_data->feature_bits));
+			// Site 3 of 4, the MERGED MultiMesh BLAS. pending.mat_uses_blend is the
+			// same value pushed into RT_MAT_FLAG_BLEND immediately above, captured in
+			// Phase 1 from mm_surf->shader (which is out of scope here -- this is why
+			// PendingMMSurface carries the bool rather than the surface pointer).
+			instance_masks.push_back(rt_instance_mask_from_features(
+					pending.mat_data->feature_bits, pending.mat_uses_blend));
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -3161,7 +3195,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				instance_flags.push_back(pending.inst_flags);
-				instance_masks.push_back(rt_instance_mask_from_features(pending.mat_data->feature_bits));
+				// Site 4 of 4, the EXPANDED MultiMesh fallback: one TLAS entry per
+				// instance, all sharing `push_mat_data` -- so every entry must carry
+				// the same mask that material's RT_MAT_FLAG_BLEND implies. Same
+				// pending.mat_uses_blend as site 3, hoisted out of this per-instance
+				// loop by the push_mat_data computation above.
+				instance_masks.push_back(rt_instance_mask_from_features(
+						pending.mat_data->feature_bits, pending.mat_uses_blend));
 			}
 
 #ifdef TOOLS_ENABLED

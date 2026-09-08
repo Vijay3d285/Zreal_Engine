@@ -1341,6 +1341,81 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Environment fog for this ray segment (before surface contribution).
 	apply_segment_fog(gl_HitTEXT, ps.radiance, ps.throughput);
 
+	// Overall bounce budget, and the transmission budget the transparent closure
+	// below spends. HOISTED above the transparent branch (they used to live in
+	// the per-lobe cap block further down) because that branch needs them and
+	// must not be reached through the diffuse/glossy caps: a transparent
+	// pass-through takes neither lobe, so terminating it on a lobe budget would
+	// black out whatever is behind an alpha surface for no physical reason. The
+	// cap block below reuses these -- the min(.., 15u) clamp is load-bearing and
+	// exists exactly once.
+	//
+	// min(..., 15u) (fix round 1, M1) is not defensive: the transmission-bounce
+	// counter is only 4 bits (raytracing_inc.glsl) and inc_transmission_bounce
+	// does not itself saturate at 15 -- incrementing past it carries into
+	// INSIDE_MEDIUM_FLAG (bit 31) and can wrap the whole packed word to zero if
+	// that bit was already set, silently clearing every counter and flag.
+	// resolve_bounce_cap alone can return up to max_total (16) when
+	// RT_GET_MAX_TRANSMISSION_BOUNCE() is 0 (a raw RenderingServer with the
+	// setting unset), so this clamp is what actually prevents that. The raygen
+	// loop bound resolves the same cap the same way.
+	const uint max_total = RT_GET_MAX_BOUNCES();
+	const uint max_transmission = min(resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), max_total), 15u);
+	const uint transmission_bounces = get_transmission_bounces(ps.packed_bounces_flags);
+
+	// Transparent BSDF closure (Cycles' CLOSURE_BSDF_TRANSPARENT_ID). A material
+	// that BLENDS passes the ray straight through with probability (1 - alpha);
+	// the complementary alpha share is shaded normally below. Stochastic rather
+	// than accumulative so the choice is order independent and stacked layers
+	// each contribute at their own weight.
+	//
+	// Placed AFTER segment fog -- the ray really did travel gl_HitTEXT of fog to
+	// reach this surface -- but BEFORE the emissive contribution and before NEE:
+	// a ray that passes through contributes no emission and does no direct
+	// lighting at this vertex, because no scattering event happened here.
+	//
+	// Gated on the BLEND flag, not on alpha < 1: alpha-SCISSOR materials are
+	// already in the TLAS and their base-colour alpha can exceed the scissor
+	// threshold while remaining below 1.0, so an alpha-value test would turn
+	// every cutout translucent. The `m.alpha < 1.0` term is the second half of
+	// the gate, not the whole of it -- it is what makes an alpha = 1.0 BLEND
+	// surface shade identically to an opaque one.
+	if (m.blends && m.alpha < 1.0) {
+		if (transmission_bounces >= max_transmission) {
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+		if (rng_1d(rng, RT_PRNG_TRANSPARENT) < (1.0 - m.alpha)) {
+			// Straight through. Throughput is unchanged: the stochastic draw
+			// already carries the (1 - alpha) weight, so the branch weight is 1.
+			ps.packed_bounces_flags = inc_transmission_bounce(ps.packed_bounces_flags);
+			ps.hit_t = gl_HitTEXT;
+			// h.geometry_normal is flipped toward the incoming ray by
+			// compute_hit_data, and raygen offsets the next origin ALONG this
+			// normal (offset_ray_origin, scene_raytracing_raygen.glsl), so it
+			// must be negated to land PAST the surface rather than in front of
+			// it -- the same reason the transmissive lobe negates below.
+			ps.offset_normal = -h.geometry_normal;
+			ps.next_ray_dir = gl_WorldRayDirectionEXT;
+			ps.rng_packed = rng_pack(rng_next_bounce(rng));
+			// INSIDE_MEDIUM_FLAG is deliberately untouched. It means "the ray
+			// about to be traced is inside a solid", and it drives both the
+			// back-face-culling drop in raygen and the Beer-Lambert multiply at
+			// the top of this function. A transparent pass-through is not a
+			// refraction: it enters no medium and travels no path length through
+			// one, so toggling the flag here would either start absorbing over a
+			// distance the ray never spent in glass, or clear it out from under a
+			// ray that is genuinely still inside one.
+			//
+			// mis_ray_pdf is untouched for the same reason: no scattering event
+			// occurred, so the next vertex's MIS weight must still describe the
+			// lobe that produced this ray, at the vertex that produced it.
+			path_pack(payload, ps);
+			return;
+		}
+	}
+
 	// Emissive contribution, MIS-weighted against emissive NEE (roadmap C1).
 	float clamp_limit = (total_bounces == 0u)
 			? get_rt_param(RT_PARAM_CLAMP_DIRECT)
@@ -1406,25 +1481,15 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// taking exceeds its own cap, not when every budget is exhausted
 	// (kernel/integrator/path_state.h:183, :190). This is what replaces the old
 	// hardcoded 2-diffuse-bounce ceiling that flattened interior GI.
-	const uint max_total = RT_GET_MAX_BOUNCES();
+	// max_total, max_transmission and transmission_bounces are hoisted above the
+	// transparent closure earlier in this function -- that branch needs them and
+	// must sit above this block. Roadmap E1: the transmission cap comes from
+	// RT_FLAGS rather than rt_params because all sixteen rt_params slots are
+	// assigned -- the same reason B4's min_bounce and C1's emissive enable are
+	// project settings rather than Environment params
+	// (scene_shader_raytracing.cpp:643-648).
 	const uint max_diffuse = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_DIFFUSE_BOUNCE), max_total);
 	const uint max_glossy = resolve_bounce_cap(get_rt_param(RT_PARAM_MAX_GLOSSY_BOUNCE), max_total);
-	// Roadmap E1. The cap comes from RT_FLAGS rather than rt_params because all
-	// sixteen rt_params slots are assigned -- the same reason B4's min_bounce and
-	// C1's emissive enable are project settings rather than Environment params
-	// (scene_shader_raytracing.cpp:643-648). resolve_bounce_cap is reused because
-	// this field also uses 0-as-unset.
-	//
-	// min(..., 15u) (fix round 1, M1) is load-bearing, not defensive: the
-	// transmission-bounce counter is only 4 bits (raytracing_inc.glsl) and
-	// inc_transmission_bounce does not itself saturate at 15 -- incrementing
-	// past it carries into INSIDE_MEDIUM_FLAG (bit 31) and can wrap the whole
-	// packed word to zero if that bit was already set, silently clearing every
-	// counter and flag. resolve_bounce_cap alone can return up to max_total
-	// (16) when RT_GET_MAX_TRANSMISSION_BOUNCE() is 0 (a raw RenderingServer
-	// with the setting unset), so this clamp is what actually prevents that.
-	const uint max_transmission = min(resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), max_total), 15u);
-	const uint transmission_bounces = get_transmission_bounces(ps.packed_bounces_flags);
 	if (total_bounces >= max_total || diffuse_bounces >= max_diffuse || glossy_bounces >= max_glossy ||
 			transmission_bounces >= max_transmission) {
 		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);

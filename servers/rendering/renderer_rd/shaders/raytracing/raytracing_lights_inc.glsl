@@ -348,9 +348,10 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 	// RT_GET_TRANSMISSION_ENABLED() (the Environment toggle) MUST NOT gate this
 	// early return, and a previous revision that added it here made glass cast NO
 	// shadow at all. The reason is that the TLAS cull mask does not depend on the
-	// toggle: rt_instance_mask_from_features (render_raytracing.cpp:2461) derives
-	// the mask from RT_FLAG_TRANSMISSIVE_GEOMETRY alone, which is set per material
-	// from `mat.transmission > 0.0f` (render_raytracing.cpp:1900). So a pane is
+	// toggle: rt_instance_mask_from_features (render_raytracing.cpp) derives the
+	// mask from RT_FLAG_TRANSMISSIVE_GEOMETRY -- set per material from
+	// `mat.transmission > 0.0f` -- or the per-surface alpha-blend signal, and from
+	// nothing else. Neither term consults the toggle. So a pane is
 	// masked TRANSMISSIVE whatever the toggle says, and pass A -- culled to
 	// RT_INSTANCE_MASK_OPAQUE -- cannot see it. Early-returning vec3(1.0) here left
 	// nothing occluding it in either pass, while the BSDF was drawing that same pane
