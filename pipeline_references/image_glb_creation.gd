@@ -106,6 +106,42 @@ const GLB_KEEP_ALPHA_KEYWORDS = [
 # Raise back toward 1.5 if glazing starts reading as an open hole.
 const GLB_CONVERTED_GLASS_IOR = 1.2
 const GLB_CONVERTED_WATER_IOR = 1.2
+# Water keeps its alphaMode BLEND material instead of being converted to an
+# opaque transmissive one. Set false to restore the old conversion.
+#
+# WHY THIS FLIPPED. The transmission conversion was a WORKAROUND for an engine
+# defect: alpha-blended surfaces were dropped from the ray-tracing acceleration
+# structure and drawn by a separate rasterised pass that the accumulation
+# capture never reads, so they rendered as nothing at all. Converting them to
+# opaque transmissive was the only way to get them traced. That defect is fixed
+# -- the tracer now carries a Cycles-style Transparent BSDF for these surfaces
+# (PATH_TRACER_QUALITY_ROADMAP.md section 9) -- so the workaround is obsolete,
+# and for WATER it is actively harmful.
+#
+# The harm, measured from the assets themselves:
+#
+#   material  base colour        alpha  metallic  roughness
+#   Glass     255,255,255        0.098  1.0       0.082
+#   Water     16,126,181 marine  0.200  1.0       0.0
+#   Water     3,103,118 fresh    0.200  1.0       0.0
+#
+# Glass's base colour is pure WHITE, so clearing it costs nothing and the
+# conversion stays correct for glass. Water's base colour IS the teal, and
+# _apply_glb_transmissive_glass clears albedo to white -- which is exactly why
+# the water reads colourless.
+#
+# Restoring the texture under the conversion would NOT fix it: opaque
+# transmission tints 100% of transmitted rays, so a colour authored as a 20%
+# overlay would put a heavy green cast over the whole tank interior. The
+# authored alpha is what makes it a tint rather than a filter, and only the
+# alpha path carries that. Blender resolves this material as
+# 0.2 * (teal metal) + 0.8 * straight-through; the closure now does the same,
+# which is the "blue reflection in the water" the reference render shows.
+#
+# Glass is deliberately NOT included. Its white base colour means the
+# conversion is lossless for it, and it is what produced the clear panes that
+# replaced the earlier milky-veil look.
+const GLB_WATER_KEEPS_ALPHA = true
 # Post-C1: let emissive fixture geometry BE the light instead of pairing it with a
 # co-located analytic light. Requires the de-duplication in
 # _add_light_fixture_effect() or night renders double-count every fixture.
@@ -1325,6 +1361,37 @@ func _classify_glb_alpha_material(context_text: String) -> String:
 			return "glass"
 	return ""
 
+# Water that KEEPS its alphaMode BLEND material, so the tracer's Transparent
+# BSDF closure resolves it the way Cycles does: the authored alpha share is
+# shaded and the rest passes straight through. See GLB_WATER_KEEPS_ALPHA.
+#
+# Only import damage is repaired here. The albedo texture is deliberately LEFT
+# BOUND -- it carries both the teal and the alpha, and both are load-bearing:
+# the colour is the water's colour, and the alpha is what weighs it.
+func _apply_glb_alpha_water(mat: BaseMaterial3D) -> void:
+	# The same import damage the glass branch repairs, for the same reason.
+	# glTF's metallicFactor defaults to 1.0 and these tanks pack metallic = 1
+	# into the metallicRoughness texture's blue channel -- measured UNIFORM 255
+	# across the whole 4096x4096 map on both aquariums. Water is a dielectric,
+	# so full metal is simply wrong: a metal has no diffuse response, which
+	# leaves the teal visible only in a specular reflection and the body of the
+	# water reading colourless. METALLIC = metallic_tex * metallic, so the
+	# scalar zeroes the texture too.
+	mat.metallic = 0.0
+	# LOAD-BEARING -- 0.5 is the no-op that keeps eta == ior. At any other value
+	# the engine re-derives eta from the modified F0.
+	mat.metallic_specular = 0.5
+	# The marine tank's water declares KHR_materials_ior 1.15; the freshwater
+	# tank declares none. Use the same constant both take when converted.
+	mat.ior = GLB_CONVERTED_WATER_IOR
+	# transparency is deliberately NOT touched. Keeping
+	# TRANSPARENCY_ALPHA_DEPTH_PRE_PASS is the whole point: it is what sets the
+	# engine's per-material blend flag and routes this surface through the
+	# Transparent BSDF closure instead of the dielectric one.
+	#
+	# An emissive water plane would double-count once it starts bouncing.
+	mat.emission_enabled = false
+
 # Mirrors the glass branch of _apply_reflection_response_assist(). Read the
 # LOAD-BEARING note on metallic_specular there before touching it here.
 func _apply_glb_transmissive_glass(mat: BaseMaterial3D, kind: String) -> void:
@@ -1378,6 +1445,7 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 
 	var converted = []
 	var left_alone = []
+	var kept_alpha_water = []
 
 	for m in _get_all_meshes(root):
 		if not m.mesh:
@@ -1396,8 +1464,15 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 			if ov_kind != "":
 				ov = ov.duplicate()
 				m.material_override = ov
-				_apply_glb_transmissive_glass(ov, ov_kind)
-				converted.append("%s [override->%s]" % [ov_ctx.strip_edges(), ov_kind])
+				if ov_kind == "water" and GLB_WATER_KEEPS_ALPHA:
+					# See GLB_WATER_KEEPS_ALPHA. Same rule as the surface loop below;
+					# an override that resolves to water must not be converted either,
+					# or overridden tanks silently lose their colour while the rest keep it.
+					_apply_glb_alpha_water(ov)
+					kept_alpha_water.append("%s [override]" % ov_ctx.strip_edges())
+				else:
+					_apply_glb_transmissive_glass(ov, ov_kind)
+					converted.append("%s [override->%s]" % [ov_ctx.strip_edges(), ov_kind])
 			else:
 				left_alone.append("%s [override]" % ov_ctx.strip_edges())
 			continue
@@ -1416,6 +1491,14 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 			if kind == "":
 				left_alone.append(ctx.strip_edges())
 				continue
+			if kind == "water" and GLB_WATER_KEEPS_ALPHA:
+				# Left for the tracer's Transparent BSDF closure, which weighs the
+				# authored teal by the authored alpha. See GLB_WATER_KEEPS_ALPHA.
+				var wdup = mat.duplicate()
+				_apply_glb_alpha_water(wdup)
+				m.set_surface_override_material(i, wdup)
+				kept_alpha_water.append(ctx.strip_edges())
+				continue
 
 			# Always duplicate before mutating. GLB instances share material
 			# resources -- through _glb_cache node duplicates, and through
@@ -1426,15 +1509,28 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 			m.set_surface_override_material(i, dup)
 			converted.append("%s [%s]" % [ctx.strip_edges(), kind])
 
-	if converted.is_empty() and left_alone.is_empty():
+	if converted.is_empty() and left_alone.is_empty() and kept_alpha_water.is_empty():
 		return
 	var label = asset_label if asset_label != "" else str(root.name)
 	if not converted.is_empty():
 		print("  [GlassFix] %s -> traced dielectric: %s" % [label, ", ".join(converted)])
+	if not kept_alpha_water.is_empty():
+		# Read this line when the water looks colourless: an entry here means the
+		# surface reached the tracer's Transparent BSDF closure with its authored
+		# teal intact, so a colourless result is an ENGINE question, not a
+		# pipeline one. An entry under "traced dielectric" instead means the
+		# conversion still ran and the colour was cleared.
+		print("  [GlassFix] %s -> traced alpha closure (keeps authored colour): %s" % [label, ", ".join(kept_alpha_water)])
 	if not left_alone.is_empty():
 		# Printed on purpose. This is the list to read when a pane still looks
 		# ghosted: add its name to GLB_GLASS_MATERIAL_KEYWORDS and re-render.
-		print("  [GlassFix] %s -> kept raster alpha: %s" % [label, ", ".join(left_alone)])
+		#
+		# Renamed from "kept raster alpha", which is no longer true. These
+		# surfaces are now TRACED by the engine's Transparent BSDF closure
+		# (PATH_TRACER_QUALITY_ROADMAP.md section 9); they are no longer handed
+		# to a separate rasterised pass. The fish in these tanks appear on this
+		# line, and they render correctly.
+		print("  [GlassFix] %s -> left as authored alpha: %s" % [label, ", ".join(left_alone)])
 func parse_vec3(d):
 	if typeof(d) == TYPE_DICTIONARY:
 		return Vector3(d.get("x", 0), d.get("y", 0), d.get("z", 0))
