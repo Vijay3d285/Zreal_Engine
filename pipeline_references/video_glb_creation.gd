@@ -127,6 +127,36 @@ const GLB_CONVERTED_WATER_IOR = 1.2
 # conversion is lossless for it, and it is what produced the clear panes that
 # replaced the earlier milky-veil look.
 const GLB_WATER_KEEPS_ALPHA = true
+# Repair the asset's metallic channel on water. DIVERGES FROM BLENDER -- off by
+# default, and read this before turning it on.
+#
+# These tanks pack metallic = 1.0 into the metallicRoughness texture's blue
+# channel, measured UNIFORM 255 across the whole 4096x4096 map on both
+# aquariums. Water is a dielectric, so that is physically wrong, and it is the
+# same import damage _apply_glb_transmissive_glass repairs for glass.
+#
+# But Blender does NOT repair it. Its glTF importer wires the texture's blue
+# channel straight into Principled BSDF's Metallic
+# (scripts/addons_core/io_scene_gltf2/blender/imp/pbrMetallicRoughness.py, the
+# ShaderNodeSeparateColor block: Blue -> metallic_socket, Green ->
+# roughness_socket). metallicFactor defaults to 1.0, so need_metal_factor is
+# false and no multiply node is even inserted -- the texture value goes in
+# unmodified. KHR_materials_specular, which this water also carries, only feeds
+# Specular IOR Level and never touches Metallic. So Blender renders this water
+# as a teal METAL at 20% alpha, and matching Blender means doing the same.
+#
+# Measured on urbantestdark180, same project, flag-off control, as B - R in the
+# tank interiors (less negative = bluer; the tanks read green-dominant because
+# they are full of plants):
+#
+#   water converted to dielectric (old behaviour)   left -41.55   right -31.58
+#   metallic left as authored  (Blender-faithful)   left -39.63   right -23.20
+#   metallic repaired          (diverges)           left -35.84   right -13.37
+#
+# So the repair is roughly three times the colour shift, and it is visibly
+# bluer. It is also not what Blender does. Turn it on only if the look matters
+# more than fidelity to the asset.
+const GLB_WATER_REPAIR_METALLIC = false
 # Multiplier applied to all floor/ceiling UV repeat counts.
 # Values > 1.0 make tiles appear smaller (denser tiling). 2.0 = tiles are 50% smaller.
 # Must match FLOOR_CEIL_TEXTURE_DENSITY_BOOST in image_glb_creation.gd.
@@ -1525,32 +1555,26 @@ func _classify_glb_alpha_material(context_text: String) -> String:
 # BSDF closure resolves it the way Cycles does: the authored alpha share is
 # shaded and the rest passes straight through. See GLB_WATER_KEEPS_ALPHA.
 #
-# Only import damage is repaired here. The albedo texture is deliberately LEFT
-# BOUND -- it carries both the teal and the alpha, and both are load-bearing:
-# the colour is the water's colour, and the alpha is what weighs it.
+# By default this is a NO-OP, and deliberately so -- see
+# GLB_WATER_REPAIR_METALLIC. The albedo texture is left bound (it carries both
+# the teal and the alpha), ior is left alone (Godot reads KHR_materials_ior,
+# which the marine tank's water declares as 1.15), and metallic is left as the
+# asset authored it.
 func _apply_glb_alpha_water(mat: BaseMaterial3D) -> void:
-	# The same import damage the glass branch repairs, for the same reason.
+	if not GLB_WATER_REPAIR_METALLIC:
+		return
 	# glTF's metallicFactor defaults to 1.0 and these tanks pack metallic = 1
 	# into the metallicRoughness texture's blue channel -- measured UNIFORM 255
 	# across the whole 4096x4096 map on both aquariums. Water is a dielectric,
-	# so full metal is simply wrong: a metal has no diffuse response, which
-	# leaves the teal visible only in a specular reflection and the body of the
-	# water reading colourless. METALLIC = metallic_tex * metallic, so the
-	# scalar zeroes the texture too.
+	# so a metal has no diffuse response and the teal can only appear in a
+	# specular reflection. METALLIC = metallic_tex * metallic, so the scalar
+	# zeroes the texture too.
+	#
+	# THIS DIVERGES FROM BLENDER. Off by default for that reason.
 	mat.metallic = 0.0
 	# LOAD-BEARING -- 0.5 is the no-op that keeps eta == ior. At any other value
 	# the engine re-derives eta from the modified F0.
 	mat.metallic_specular = 0.5
-	# The marine tank's water declares KHR_materials_ior 1.15; the freshwater
-	# tank declares none. Use the same constant both take when converted.
-	mat.ior = GLB_CONVERTED_WATER_IOR
-	# transparency is deliberately NOT touched. Keeping
-	# TRANSPARENCY_ALPHA_DEPTH_PRE_PASS is the whole point: it is what sets the
-	# engine's per-material blend flag and routes this surface through the
-	# Transparent BSDF closure instead of the dielectric one.
-	#
-	# An emissive water plane would double-count once it starts bouncing.
-	mat.emission_enabled = false
 
 func _apply_glb_transmissive_glass(mat: BaseMaterial3D, kind: String) -> void:
 	# TRANSPARENCY_DISABLED is the whole point: it is what keeps the surface in
