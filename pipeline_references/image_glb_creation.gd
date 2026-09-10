@@ -172,6 +172,47 @@ const GLB_WATER_KEEPS_ALPHA = true
 # bluer. It is also not what Blender does. Turn it on only if the look matters
 # more than fidelity to the asset.
 const GLB_WATER_REPAIR_METALLIC = false
+
+# Convert an alpha-blended pane to opaque transmissive ONLY when doing so is
+# lossless. Decided from the values the ASSET authored, never from its name.
+#
+# This is the fix for the real defect. _apply_glb_transmissive_glass overwrites
+# what the file says:
+#
+#     mat.albedo_texture = null
+#     mat.albedo_color = Color(1.0, 1.0, 1.0, 1.0)
+#
+# and _classify_glb_alpha_material picks its victims by keyword. Two panes, both
+# named "Glass", both alphaMode BLEND, measured from the GLBs:
+#
+#   asset                          base colour    effective alpha
+#   MarineDecorativeGlassAquarium  255,255,255    0.098   clear pane
+#   ModernCurvedGlassCoffeeTable   106,106,106    0.804   smoked pane
+#
+# A name cannot tell those apart, so the conversion flattened both to clear
+# colourless glass. On the aquarium that is lossless -- the pane was already
+# white and barely covering -- and it renders better than the alpha mix, because
+# transmission gives real Fresnel where a 10% alpha mix gives almost no
+# reflection at all. On the coffee table the same two lines delete an 80%
+# covering dark grey top, which is why it rendered invisible.
+#
+# So the test is not "is this called glass" but "would converting it throw
+# anything away". A pane converts only when it is essentially colourless AND
+# mostly transparent. Anything tinted or substantially opaque keeps its authored
+# material and goes to the tracer's Transparent BSDF closure, which reproduces
+# what Blender does with it.
+#
+# Blender needs none of this: its importer wires baseColorFactor and the base
+# colour texture straight into Principled BSDF with alpha in the Alpha socket,
+# so the authored values are simply what renders. This gate exists only because
+# we substitute values at all, and it is scoped to never substitute them when
+# that would be visible.
+const GLB_CONVERT_MAX_TINT = 0.90   # min RGB channel must be at least this (1.0 = white)
+const GLB_CONVERT_MAX_ALPHA = 0.35  # effective coverage must be below this
+# Coarse grid used to read the authored texture. 16x16 = 256 taps regardless of
+# map size; these are 4096x4096, so reading every texel would be 16M taps per
+# material for a number two decimal places wide.
+const GLB_ALPHA_PROBE_GRID = 16
 # Post-C1: let emissive fixture geometry BE the light instead of pairing it with a
 # co-located analytic light. Requires the de-duplication in
 # _add_light_fixture_effect() or night renders double-count every fixture.
@@ -1391,6 +1432,68 @@ func _classify_glb_alpha_material(context_text: String) -> String:
 			return "glass"
 	return ""
 
+# Which classified kinds keep their authored alphaMode BLEND material and go to
+# the tracer's Transparent BSDF closure, rather than being converted to an
+# opaque transmissive material. See the two constants for the reasoning.
+func _glb_alpha_kind_keeps_alpha(mat: BaseMaterial3D, kind: String) -> bool:
+	if kind == "water":
+		return GLB_WATER_KEEPS_ALPHA
+	if kind == "glass":
+		# Decided from the authored values, not the name. See GLB_CONVERT_MAX_TINT.
+		return not _glb_alpha_convert_is_lossless(mat)
+	return false
+
+# What did the asset actually author on this pane? Returns the effective base
+# colour and coverage: the albedo texture sampled on a coarse grid, modulated by
+# albedo_color, which is where glTF's baseColorFactor lands.
+#
+# Returns an empty Dictionary when the texture cannot be read. Callers treat
+# that as "do not convert" -- the non-destructive answer, since converting is
+# what loses information.
+func _glb_alpha_surface_stats(mat: BaseMaterial3D) -> Dictionary:
+	var min_rgb := 1.0
+	var alpha := 1.0
+	if mat.albedo_texture != null:
+		var img: Image = mat.albedo_texture.get_image()
+		if img == null:
+			return {}
+		if img.is_compressed():
+			# decompress() edits in place, so work on a copy -- get_image() can
+			# hand back the texture's own Image. It also fails on some formats.
+			img = img.duplicate()
+			if img.decompress() != OK:
+				return {}
+		var w := img.get_width()
+		var h := img.get_height()
+		if w <= 0 or h <= 0:
+			return {}
+		var steps: int = min(GLB_ALPHA_PROBE_GRID, min(w, h))
+		var acc_a := 0.0
+		var count := 0
+		for iy in range(steps):
+			for ix in range(steps):
+				var px: int = int((float(ix) + 0.5) / float(steps) * float(w))
+				var py: int = int((float(iy) + 0.5) / float(steps) * float(h))
+				var c: Color = img.get_pixel(min(px, w - 1), min(py, h - 1))
+				min_rgb = min(min_rgb, min(c.r, min(c.g, c.b)))
+				acc_a += c.a
+				count += 1
+		if count > 0:
+			alpha = acc_a / float(count)
+	# glTF baseColorFactor imports into albedo_color and multiplies the texture.
+	var f := mat.albedo_color
+	min_rgb *= min(f.r, min(f.g, f.b))
+	alpha *= f.a
+	return {"min_rgb": min_rgb, "alpha": alpha}
+
+# True when converting this pane to opaque transmissive throws nothing away.
+# See GLB_CONVERT_MAX_TINT.
+func _glb_alpha_convert_is_lossless(mat: BaseMaterial3D) -> bool:
+	var st := _glb_alpha_surface_stats(mat)
+	if st.is_empty():
+		return false
+	return st["min_rgb"] >= GLB_CONVERT_MAX_TINT and st["alpha"] <= GLB_CONVERT_MAX_ALPHA
+
 # Water that KEEPS its alphaMode BLEND material, so the tracer's Transparent
 # BSDF closure resolves it the way Cycles does: the authored alpha share is
 # shaded and the rest passes straight through. See GLB_WATER_KEEPS_ALPHA.
@@ -1400,8 +1503,8 @@ func _classify_glb_alpha_material(context_text: String) -> String:
 # the teal and the alpha), ior is left alone (Godot reads KHR_materials_ior,
 # which the marine tank's water declares as 1.15), and metallic is left as the
 # asset authored it.
-func _apply_glb_alpha_water(mat: BaseMaterial3D) -> void:
-	if not GLB_WATER_REPAIR_METALLIC:
+func _apply_glb_alpha_surface(mat: BaseMaterial3D, kind: String) -> void:
+	if kind != "water" or not GLB_WATER_REPAIR_METALLIC:
 		return
 	# glTF's metallicFactor defaults to 1.0 and these tanks pack metallic = 1
 	# into the metallicRoughness texture's blue channel -- measured UNIFORM 255
@@ -1488,12 +1591,12 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 			if ov_kind != "":
 				ov = ov.duplicate()
 				m.material_override = ov
-				if ov_kind == "water" and GLB_WATER_KEEPS_ALPHA:
+				if _glb_alpha_kind_keeps_alpha(ov, ov_kind):
 					# See GLB_WATER_KEEPS_ALPHA. Same rule as the surface loop below;
 					# an override that resolves to water must not be converted either,
 					# or overridden tanks silently lose their colour while the rest keep it.
-					_apply_glb_alpha_water(ov)
-					kept_alpha_water.append("%s [override]" % ov_ctx.strip_edges())
+					_apply_glb_alpha_surface(ov, ov_kind)
+					kept_alpha_water.append("%s [override->%s]" % [ov_ctx.strip_edges(), ov_kind])
 				else:
 					_apply_glb_transmissive_glass(ov, ov_kind)
 					converted.append("%s [override->%s]" % [ov_ctx.strip_edges(), ov_kind])
@@ -1515,13 +1618,13 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 			if kind == "":
 				left_alone.append(ctx.strip_edges())
 				continue
-			if kind == "water" and GLB_WATER_KEEPS_ALPHA:
+			if _glb_alpha_kind_keeps_alpha(mat, kind):
 				# Left for the tracer's Transparent BSDF closure, which weighs the
 				# authored teal by the authored alpha. See GLB_WATER_KEEPS_ALPHA.
 				var wdup = mat.duplicate()
-				_apply_glb_alpha_water(wdup)
+				_apply_glb_alpha_surface(wdup, kind)
 				m.set_surface_override_material(i, wdup)
-				kept_alpha_water.append(ctx.strip_edges())
+				kept_alpha_water.append("%s [%s]" % [ctx.strip_edges(), kind])
 				continue
 
 			# Always duplicate before mutating. GLB instances share material
