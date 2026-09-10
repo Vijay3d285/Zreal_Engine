@@ -79,11 +79,13 @@ Ranked by impact on offline still quality.
 | 14 | **fp16 radiance/throughput payload** | `raytracing_inc.glsl:75-87` | fp32 throughout | Medium |
 | 15 | **Biased bump-map mirror recovery** | `brdf_inc.glsl:998-1009` | offset/position normals, no bias | Low-Med |
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
-| 17 | **Multi-scatter energy compensation over-shoot** — `evalEmsApprox`/`evalMultiScatterApproximation` over-corrects true single-scatter energy loss by roughly 3-8pp across the roughness/anisotropy range measured so far (E2b furnace: isotropic `anisotropy=0.0` control +5.95%, full sweep +3.4% to +8.1%; separate Cycles-comparison scene +6.52% raw, of which 5.85pp attributed to this bug). Pre-existing and anisotropy-orthogonal — reproduces with no anisotropic material involved at all, so it is not an E2b defect. Characterized in §7.8; **no fix is proposed here**, carried forward as-is for a future phase. | `brdf_inc.glsl:1156-1168` (`evalEmsApprox`/`evalMultiScatterApproximation`), call sites `:1215`, `:1375`, `raytracing_closest_hit_common_inc.glsl:1270` | approximation is engine-local; no Cycles line identified as its source or as exhibiting the same over-shoot | Low-Med |
+| 17 | **Multi-scatter energy compensation over-shoot** — **FIXED 2026-09-10, see §10.** `evalEmsApprox`/`evalMultiScatterApproximation` over-corrected the true single-scatter GGX energy loss by 3.4–8.1pp. Replaced by `evalMultiScatterEnergy`, a transcription of Cycles' `microfacet_ggx_preserve_energy` reading the `GGX_E`/`GGX_EAVG` tables E2d already ships. The white furnace's isotropic control went **1.059535 → 1.000549**. Two things this did *not* fix are now separate rows: #19 and #20. | `brdf_inc.glsl` (`evalMultiScatterEnergy`, `evalMultiScatterFactor`, `RT_MS_COMPENSATION`), call sites in `brdf_inc.glsl` (sampler), `raytracing_closest_hit_common_inc.glsl` and `raytracing_emissive_inc.glsl` (NEE) | `intern/cycles/kernel/closure/bsdf_microfacet.h:466-485` | **Fixed** |
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
+| 19 | **Anisotropic GGX carries its own energy error, independent of the compensation** — the white furnace sits +1.7pp above the isotropic control at anisotropy −0.9 and −2.4pp below it at +0.9, and **the offset is essentially identical with compensation set to legacy, to Cycles' table, or disabled entirely** (§10.3), so it is not caused by either factor. `GGX_E_TABLE` has no anisotropy axis — it is `(rough, mu)` only, and Cycles feeds it the same geometric-mean roughness we do — so `1/E` cannot cancel an eccentric lobe's albedo. Worst corner measured: roughness 0.9 / anisotropy 0.9 returns **0.547386** uncompensated where the isotropic table predicts ~0.428, a 27.8% over-recovery. **Undetermined whether this is our E2b anisotropic branch or an approximation Cycles shares.** Isolated by Gap #17's three-state sweep; not created by it. | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` (single `rough` for both axes) | Medium |
+| 20 | **The transmissive lobe still uses the fitted multi-scatter approximation** — Gap #17 deliberately left `brdf_inc.glsl`'s transmissive reflection branch on `evalMultiScatterApproximation`, because Cycles compensates glass from a different table set — `ggx_glass_E` (16×16×16), `ggx_glass_Eavg` (16×16) and the `ggx_glass_inv_*` variants for `ior < 1` — none of which this project has transcribed. Pointing it at `ggxE`/`ggxEavg` would swap a measured divergence for an unmeasured one. Needs the four tables, an extended SSBO layout, and its own transmissive furnace study. The transmit branch applies no compensation at all. | `brdf_inc.glsl` (transmissive closure, reflection branch — annotated in place) | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-457` | Medium |
 
 **Not gaps — verified correct, leave alone:**
-- BRDF library (VNDF GGX, height-correlated Smith G2) — Cycles-class. Multi-scatter compensation is present but **over-corrects** — see Gap #17 above; it is no longer an unqualified "leave alone."
+- BRDF library (VNDF GGX, height-correlated Smith G2) — Cycles-class. Multi-scatter compensation over-corrected until 2026-09-10 and now uses Cycles' own tables (Gap #17, §10). Still not an unqualified "leave alone": the **anisotropic** branch carries a separate energy error (Gap #19) and the **transmissive** lobe still uses the old approximation (Gap #20).
 - `alpha = roughness²` (`brdf_inc.glsl:1046`) — matches Cycles/glTF convention exactly.
 - Rect-light area→solid-angle pdf conversion (`lights_inc.glsl:294-297`) — correct.
 - Wächter-Binder ray-origin offset (`raytracing_inc.glsl:182-197`) — correct.
@@ -877,7 +879,7 @@ GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_h
 
 **E2. Anisotropy, clearcoat, sheen** — anisotropy **COMPLETE (E2b)**, clearcoat **COMPLETE (E2d)**, sheen **COMPLETE (E2e, §7.11)**. All three acceptance targets measured against Blender/Cycles; `coat_normal` and transmissive-lobe anisotropy are the named remainders.
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a sheen lobe. **Not Charlie** — Cycles replaced the Charlie/velvet sheen with Zeltner's linearly-transformed-cosine lobe (`bsdf_sheen.h`), and E2e ports that; see §7.11.3.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **Car paint: met (radiometrically) — see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised; the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. Geometrically incomplete, though: `coat_normal` — the coat's own bump/orange-peel normal — is not shipped (§7.10.7 calls it "the one piece of Blender coat parity E2d does not ship"); a reader who only sees this table's "met" would not know a coat-normal texture on a car-paint material still renders identically to a base-normal one. **Velvet: met — see §7.11** — sheen ships as Cycles' Zeltner LTC lobe (`pdf == eval`, so its sample weight is exactly 1), against a byte-exact copy of Cycles' 32×32×3 table, and as a *layer* on the same general N-layer stack the coat uses: sheen at registry index 3 withdraws from coat, specular and diffuse via `closure_layering_weight`, and Cycles' allocation order (`svm/closure.h:115` sheen first, `:146` coat second) makes registry index order and physical layer order agree. Measured against Blender 4.5.3/Cycles on a velvet sphere at **−1.710% raw**, **−2.137%** with Gap #17's pedestal neutralised — *worse* adjusted, because here the pedestal partially masks a base deficit rather than causing an excess (§7.11.2). **The sheen layer's own contribution, isolated by subtracting each engine's un-sheened control, agrees to +0.324%**, and to +0.269% / +0.257% at sheen roughness 0.30 / 0.80; the 0.30:0.50:0.80 roughness ladder reproduces a 169× dynamic range to 1.1e-4. **The raw residual is the dielectric base, not the sheen** — the un-sheened control is the worst arm at −2.062% — which is a new open item (§7.11.2), not a sheen one. Geometrically incomplete for the same reason car paint is: `coat_normal` is still not shipped, and Cycles couples it to the *sheen* normal too (`svm/closure.h:127-129`), so it now blocks both. **This closes E2's original acceptance line: all three of brushed metal, car paint and velvet are measured against Cycles and all three clear the 5% bar raw.** The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), E2d is its first real N=3 (§7.10.5) and E2e its first N=4 (§7.11.4); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) is accounted for. **That pedestal was removed on 2026-09-10 (Gap #17, §10), so the adjusted figure is what the engine now produces — but the raw comparison against Blender has NOT been re-taken**, and the `.blend` scene behind it was never checked into this repo. See §10.5. **Car paint: met (radiometrically) — see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised (that pedestal is gone as of 2026-09-10, §10; the raw comparison has not been re-taken — §10.5); the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. Geometrically incomplete, though: `coat_normal` — the coat's own bump/orange-peel normal — is not shipped (§7.10.7 calls it "the one piece of Blender coat parity E2d does not ship"); a reader who only sees this table's "met" would not know a coat-normal texture on a car-paint material still renders identically to a base-normal one. **Velvet: met — see §7.11** — sheen ships as Cycles' Zeltner LTC lobe (`pdf == eval`, so its sample weight is exactly 1), against a byte-exact copy of Cycles' 32×32×3 table, and as a *layer* on the same general N-layer stack the coat uses: sheen at registry index 3 withdraws from coat, specular and diffuse via `closure_layering_weight`, and Cycles' allocation order (`svm/closure.h:115` sheen first, `:146` coat second) makes registry index order and physical layer order agree. Measured against Blender 4.5.3/Cycles on a velvet sphere at **−1.710% raw**, **−2.137%** with Gap #17's pedestal neutralised (gone as of 2026-09-10, §10; raw not re-taken — §10.5) — *worse* adjusted, because here the pedestal partially masks a base deficit rather than causing an excess (§7.11.2). **The sheen layer's own contribution, isolated by subtracting each engine's un-sheened control, agrees to +0.324%**, and to +0.269% / +0.257% at sheen roughness 0.30 / 0.80; the 0.30:0.50:0.80 roughness ladder reproduces a 169× dynamic range to 1.1e-4. **The raw residual is the dielectric base, not the sheen** — the un-sheened control is the worst arm at −2.062% — which is a new open item (§7.11.2), not a sheen one. Geometrically incomplete for the same reason car paint is: `coat_normal` is still not shipped, and Cycles couples it to the *sheen* normal too (`svm/closure.h:127-129`), so it now blocks both. **This closes E2's original acceptance line: all three of brushed metal, car paint and velvet are measured against Cycles and all three clear the 5% bar raw.** The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), E2d is its first real N=3 (§7.10.5) and E2e its first N=4 (§7.11.4); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -939,7 +941,7 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
-Ordering summary: **A1 → A2/A3/A4 → D → E → F (Phases B, C and D are complete).**
+Ordering summary: **E → F (Phases A, B, C and D are complete).** *(Corrected 2026-09-10: this line still read `A1 → A2/A3/A4 → D → E → F` long after §4 marked Phase A implemented pending GPU verification.)*
 
 **Phase B is complete** — B1, B2, B3, B4 and B5 have all landed. "Complete" here
 means every listed item is implemented and measured; it does **not** mean Phase B
@@ -2286,7 +2288,14 @@ re-verified (doctest 1521/0/3 unchanged; `pt_anisotropy_gate_scene.tscn`'s
 `anisotropy=0.00` control reproduced Task 4's committed `1.059537` to 6
 decimal places) before this closeout was written.
 
-**Open item — pre-existing, NOT caused or fixed by E2b, anisotropy-orthogonal.**
+**RESOLVED 2026-09-10 (Gap #17, see §10). Everything below is kept verbatim as the
+before-state — the measurements are what the fix was verified against, and the
+`ms=1.0` experiment recorded here is what became `RT_MS_COMPENSATION 0`.** One
+claim below did not survive: the isotropic control was correctly diagnosed, but the
+**anisotropic** spread around it turned out to be a second, independent defect that
+removing this one does not touch — now Gap #19.
+
+*Original entry:* **Open item — pre-existing, NOT caused or fixed by E2b, anisotropy-orthogonal.**
 `evalMultiScatterApproximation`/`evalEmsApprox` over-compensates
 single-scattering energy loss by roughly 3-8 percentage points across the
 roughness/anisotropy range exercised here. It reads high on the isotropic
@@ -4653,3 +4662,119 @@ was a hypothesis stated as a finding, and checking `closure.h` — a two-minute
 read of source that was already on disk — refuted it. Recorded because it is the
 third time in this phase that something was asserted from plausibility rather
 than read from the code (see §9.8).
+
+
+---
+
+## 10. Gap #17 closeout — Cycles' multi-scatter energy compensation for the base specular lobe
+
+**Landed 2026-09-10** on `vijay_PTEngine_V18_GAP17`.
+Spec: `docs/superpowers/specs/2026-09-10-ggx-multiscatter-energy-design.md`.
+Plan: `docs/superpowers/plans/2026-09-10-ggx-multiscatter-energy.md`.
+
+### 10.1 What was wrong
+
+`evalMultiScatterApproximation` returned `1 + F0 * Ems`, with
+`Ems = lerp(0.2·r², 0.32·r² + 1.94·r⁴, N·V)` — wrong in two independent ways
+against `microfacet_ggx_preserve_energy`
+(`intern/cycles/kernel/closure/bsdf_microfacet.h:466-485`):
+
+1. a **fitted polynomial** where Cycles uses the true `(1 − E)/E` from a table
+   built by numerical integration of the actual GGX lobe;
+2. **raw `F0`** where Cycles uses the multi-bounce
+   `Fms = Fss·E_avg / (1 − Fss(1 − E_avg))`.
+
+It now returns `1 + Fms·(1 − E)/E`, which is the product `energy_scale × darkening`
+that an engine with no separate closure weight sees — the identical derivation
+E2d already made for the coat (`coatEnergyScale`).
+
+### 10.2 The finding that nearly sent this the wrong way
+
+Cycles gates base-lobe compensation on `preserve_energy = is_multiggx` at all
+three Principled microfacet lobes (`svm/closure.h:346`, `:414`, `:463`), which
+reads as *"Cycles does not compensate the base lobe at all"* — under which the
+correct fix would have been **deletion**. It is not:
+`node_shader_init_principled` sets `node->custom1 = SHD_GLOSSY_MULTI_GGX`
+(`source/blender/nodes/shader/nodes/node_shader_bsdf_principled.cc:330`), so every
+Principled node ever created — including every one Blender's glTF importer builds
+— defaults to Multiscatter GGX, which maps to
+`CLOSURE_BSDF_MICROFACET_MULTI_GGX_GLASS_ID` (`intern/cycles/blender/shader.cpp:732-733`).
+Compensation is the default path. Reading only the gate, and not the node's
+initialiser, would have produced a confident and exactly wrong change.
+
+### 10.3 Measured — the three-state falsification
+
+White furnace, roughness 0.4, `pt_anisotropy_gate.gd` probe 1:
+
+| `RT_MS_COMPENSATION` | a = −0.9 | **a = 0.0** | a = +0.9 |
+|---|---|---|---|
+| `2` legacy `1 + F0·Ems` | 1.077787 | **1.059535** | 1.034011 |
+| `0` no compensation | 0.982335 | **0.965699** | 0.942440 |
+| `1` Cycles table | 1.017784 | **1.000549** | 0.976442 |
+
+State `2` reproduces the committed `BASELINE_INTACT_RATIO` to 0.01pp and the
+isotropic entry **exactly**, so the legacy path is bit-preserved. State `0`
+reproduces the 0.9657 this document had already recorded independently. **The
+isotropic furnace goes +5.95% → +0.05%**, and that is Gap #17 closed.
+
+The acceptance was analytic rather than empirical: the furnace sphere is albedo 1
+/ metallic 1, so `Fss = mix(1,1,1/21) = 1`, hence `Fms = E_avg/E_avg = 1`, hence
+the factor is exactly `1/E` — and a single-scattering lobe of directional albedo
+`E` times `1/E` returns exactly 1. A CPU mirror asserts `E × factor == 1` to 1e-5
+across the roughness/`mu` grid (`tests/servers/rendering/test_pt_ms_energy.cpp`).
+
+**The gate got stronger, not merely re-baselined.** Probe 1's absolute check
+existed and was correct all along, but fix round 2 demoted it to diagnostic-only
+because the over-compensation made every sweep entry fail it *on a correct build*
+— leaving the gate structurally unable to fail on an absolute energy error, which
+is the condition that let this defect stand through two phases. It is asserted
+again, at anisotropy 0.
+
+### 10.4 What the sweep uncovered — now Gap #19
+
+The anisotropic entries still do not read 1.0, and the three-state table above is
+what identifies why. The offset from each state's **own** isotropic control is
++1.66 to +1.83pp at anisotropy −0.9 and −2.33 to −2.55pp at +0.9 — essentially
+identical in all three states **including state `0`, where no compensation is
+applied at all.** It cannot be caused by the factor this work replaced.
+
+`TOLERANCE` was deliberately **not** widened to absorb it. Probe 1's absolute
+check is asserted where the `1/E` derivation applies (isotropic) and left
+diagnostic where it does not, and the residual is filed as Gap #19 with this
+measurement as its evidence.
+
+### 10.5 What this does NOT fix — stated so the closeout cannot overclaim
+
+- **The transmissive lobe** keeps the fitted approximation — Gap #20.
+- **The anisotropic residual** — Gap #19.
+- **The Cycles scene comparisons in §7.8, §7.10 and §7.11 have NOT been
+  re-taken.** Their pedestal-adjusted figures are now what the engine produces,
+  but the raw comparisons against Blender were not re-measured in this work: the
+  `.blend` scenes and scripts behind them were never checked into this repo, only
+  `.superpowers/sdd/2026-08-21-environment-energy-fidelity/cycles-hypothesis-report.md`.
+  Do not read those adjusted numbers as freshly measured.
+- **§7.11.2's unexplained −2.06% dielectric-base residual** may have moved. No
+  claim is made about it without a re-measurement.
+- **Blender parity on the diffuse-under-specular layer** remains open (filed
+  2026-09-09; base specular directional albedo through `layerTransmittanceAbove`).
+
+### 10.6 Regression evidence
+
+`pt_energy_gate.gd`'s five pre-MIS references were **re-captured, not
+overwritten with current renders.** They were taken at `de2ce2c248`, which
+predates environment NEE *and* carries the old factor, so comparing against them
+would have conflated a deliberate BRDF change with the MIS neutrality the gate
+exists to assert. The new values come from a BSDF-only build
+(`RT_ENV_NEE_ENABLED 0`) that also carries the new compensation — with gate 1's
+pass-C std-dev reading exactly **0.000000**, which is what proves it really was
+BSDF-only and not merely dimmer.
+
+Measured neutrality on the MIS-on build: smooth −0.003%, rough +0.03%, rim
+−0.12%, bumpy −0.01%, diffuse +0.02%. Only `rough` moved materially from the old
+reference (1.70870 → 1.63024, −4.6%) — metallic 1 at roughness 0.6, where `F0 = 1`
+made the legacy factor over-shoot hardest. Unmoved as required: gate 1's absolute
+0.49999, the Lambertian plane, and the roughness-0.02 mirror (`E ≈ 1`, so the
+factor is ≈ 1).
+
+Suite 1555 passed / 0 failed / 3 skipped. Anisotropy, coat, sheen and energy
+gates all green.
