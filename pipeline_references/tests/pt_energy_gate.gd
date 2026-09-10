@@ -99,11 +99,38 @@ const TOLERANCE := 0.01 # 1 percent, per the brief.
 # max pixel was exactly 20.0026: a mirror reflecting a radiance-20 sky patch
 # should peak at the patch's own radiance and nothing higher, which is a useful
 # independent sanity check on any future re-capture.
-const REF_SMOOTH := 1.48904
-const REF_DIFFUSE := 0.37311
-const REF_ROUGH := 1.70870 # full disc
-const REF_ROUGH_RIM := 1.22400 # silhouette annulus
-const REF_BUMPY := 1.41451 # normal-mapped rough metal
+# RE-CAPTURED 2026-09-10 for roadmap Gap #17. The previous values were
+#   REF_SMOOTH 1.48904, REF_DIFFUSE 0.37311, REF_ROUGH 1.70870,
+#   REF_ROUGH_RIM 1.22400, REF_BUMPY 1.41451
+# taken at de2ce2c248, which predates environment NEE AND carries the old
+# evalMultiScatterApproximation. Gap #17 replaced that factor with Cycles'
+# table-driven evalMultiScatterEnergy, so those numbers no longer describe a
+# BSDF-only build of THIS tree, and comparing against them would have conflated
+# a deliberate BRDF change with the MIS neutrality this gate exists to assert.
+#
+# THE RE-CAPTURE PRESERVES THE GATE'S MEANING RATHER THAN ERASING IT. These are
+# NOT the current MIS-on renders. They were taken from a BSDF-only build --
+# RT_ENV_NEE_ENABLED 0 in raytracing_inc.glsl, with RT_MS_COMPENSATION at its
+# production value of 1 -- so the gate still asserts that turning MIS on moves
+# no energy. Gate 1's pass-C std-dev read exactly 0.000000 in that build, which
+# is what proves it really was BSDF-only and not merely dimmer.
+#
+# Measured neutrality on the current MIS-on build against these five:
+#   smooth  1.48879 vs 1.48883  (-0.003%)
+#   rough   1.63069 vs 1.63024  (+0.03%)
+#   rim     1.24986 vs 1.25141  (-0.12%)
+#   bumpy   1.41110 vs 1.41124  (-0.01%)
+#   diffuse 0.37290 vs 0.37281  (+0.02%)
+#
+# Only `rough` moved materially from the old reference (1.70870 -> 1.63024,
+# -4.6%): it is metallic 1 at roughness 0.6, where F0 = 1 made the legacy
+# `1 + F0*Ems` over-shoot hardest. `smooth` barely moved (roughness 0.02, so
+# E ~ 1 and the factor is ~1) and `diffuse` has no specular lobe at all.
+const REF_SMOOTH := 1.48883
+const REF_DIFFUSE := 0.37281
+const REF_ROUGH := 1.63024 # full disc
+const REF_ROUGH_RIM := 1.25141 # silhouette annulus
+const REF_BUMPY := 1.41124 # normal-mapped rough metal
 # Rough DIELECTRIC (roughness 0.4, metallic 0), added in Task 5.
 #
 # THIS SURFACE CARRIES THE MEASUREMENT THAT CLOSED THE COMBINE_BRDFS_WITH_FRESNEL
@@ -145,9 +172,14 @@ const REF_BUMPY := 1.41451 # normal-mapped rough metal
 # non-neutrality, and printing them keeps its size visible instead of letting a
 # 2% tolerance absorb a regression back to +2.30%.
 # Run-to-run spread on this surface is ~0.03%.
-const REF_PLASTIC := 0.47107
-const REF_PLASTIC_RIM := 0.42821
-const REF_PLASTIC_BSDF_ONLY := 0.47112
+# Re-taken 2026-09-10 alongside the five above, so the whole reference set comes
+# from one measurement session. This surface barely moved under Gap #17
+# (0.47107 -> 0.47109 MIS-on, 0.00%): it is a dielectric, F0 = 0.04, where the
+# compensation is ~1.004 either way. The B2 neutrality figure it reports is
+# unchanged in character: -0.01% (disc) / +0.13% (rim).
+const REF_PLASTIC := 0.47109
+const REF_PLASTIC_RIM := 0.42832
+const REF_PLASTIC_BSDF_ONLY := 0.47105
 const REF_PLASTIC_RIM_BSDF_ONLY := 0.42776
 const REF_TOLERANCE := 0.02 # 2 percent; gate 2 is a stochastic comparison.
 

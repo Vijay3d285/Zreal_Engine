@@ -124,8 +124,31 @@ const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 # two orders of magnitude below BASELINE_BAND below -- a pure rotation of the
 # tangent frame cannot change how much energy a furnace returns, so
 # collapsing rotation out of the baseline is not throwing away signal). They
-# sit ABOVE 1.0 because of the `ms` over-compensation above, NOT because
-# anything here is broken -- do not "fix" this array to read 1.0.
+# RE-CAPTURED 2026-09-10, after roadmap Gap #17 replaced
+# evalMultiScatterApproximation's fitted `1 + F0*Ems` with Cycles'
+# table-driven `1 + Fms*(1-E)/E` (evalMultiScatterEnergy, brdf_inc.glsl). The
+# previous values were
+#   [1.0777727, 1.0809253, 1.059535, 1.0776337, 1.034110]
+# and carried that over-compensation.
+#
+# THEY STILL DO NOT ALL READ 1.0, AND THAT IS A SEPARATE, PRE-EXISTING DEFECT
+# -- do not "fix" this array to read 1.0. The isotropic entry now reads
+# 1.000549, which is the whole of what Gap #17 was; the anisotropic entries
+# sit +1.7pp (anisotropy -0.9) and -2.4pp (anisotropy +0.9) away from it. That
+# offset is NOT caused by the compensation, and the proof is the
+# RT_MS_COMPENSATION three-state sweep measured the same day:
+#
+#   state                 a=-0.9      a=0.0     a=+0.9   offset vs isotropic
+#   2 (legacy 1+F0*Ems)  1.077787   1.059535   1.034011   +1.83pp / -2.55pp
+#   0 (no compensation)  0.982335   0.965699   0.942440   +1.66pp / -2.33pp
+#   1 (Cycles table)     1.017784   1.000549   0.976442   +1.72pp / -2.41pp
+#
+# The offset is essentially identical in all three states INCLUDING state 0,
+# where no compensation is applied at all. GGX_E_TABLE has no anisotropy axis
+# (it is (rough, mu) only, and Cycles feeds it the same geometric-mean
+# roughness we do), so the isotropic table cannot describe an eccentric lobe.
+# Whether that is our E2b anisotropic branch or Cycles' shared approximation
+# is undetermined and filed as its own roadmap item.
 #
 # The point of asserting a TIGHT band around a number that is itself known to
 # be over 1.0 is regression detection, not correctness measurement: reverting
@@ -135,7 +158,7 @@ const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 # task-4-report.md fix round 1, I6's C1-revert experiment table) -- vastly
 # outside BASELINE_BAND, while ordinary run-to-run Monte Carlo noise (~0.02pp
 # per the per-rotation spread above) stays vastly inside it.
-const BASELINE_INTACT_RATIO := [1.0777727, 1.0809253, 1.059535, 1.0776337, 1.034110] # parallel to ANISOTROPY_VALUES
+const BASELINE_INTACT_RATIO := [1.0177450, 1.0207473, 1.0005490, 1.0176387, 0.9765347] # parallel to ANISOTROPY_VALUES
 const BASELINE_BAND := 0.005 # +/- 0.5 percentage points; see BASELINE_INTACT_RATIO's doc comment.
 
 # Fix round 1: 0.0 added per the coordinator's C2 fix instruction -- the
@@ -160,7 +183,15 @@ const NEE_DOM_FRAMES := 64
 # and NEE_DOM_ROUGHNESS is 0.9 vs probe 1's 0.4), and reverting the C1 fix
 # moves it by +42.6 percentage points (measured, the I6 C1-revert experiment)
 # -- far outside BASELINE_BAND.
-const BASELINE_INTACT_RATIO_NEE_DOM := 1.345900
+# RE-CAPTURED 2026-09-10 (Gap #17); was 1.345900. This probe is the extreme
+# corner of the anisotropic residual documented above -- roughness 0.9 AND
+# anisotropy 0.9, i.e. an ax:ay of about 5.26:1. The three-state sweep:
+# legacy 1.345901, NO compensation 0.547386, Cycles table 1.278307. The
+# UNCOMPENSATED anisotropic lobe returns 54.7% of the sky here, while the
+# isotropic table for the same geometric-mean roughness predicts about 42.8%,
+# so 1/E over-recovers it by the 27.8% seen below. Deliberately still NOT
+# asserted against 1.0 for that reason; the regression band is the live gate.
+const BASELINE_INTACT_RATIO_NEE_DOM := 1.278307
 
 var _sphere: MeshInstance3D
 var _cam: Camera3D
@@ -316,9 +347,10 @@ func _max_abs_rg_diff(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
 func _probe_furnace(p_env: Environment) -> void:
 	print("\n=== PROBE 1: white furnace, anisotropic GGX sweep ===")
 	print("  sky radiance %.5f" % SKY_RADIANCE)
-	print("  [diagnostic-only] absolute vs 1.0, tolerance %.1f%% -- NOT asserted, see BASELINE_INTACT_RATIO doc"
+	print("  [gate] absolute vs 1.0, tolerance %.1f%% -- ASSERTED at anisotropy 0 (Gap #17, 2026-09-10);"
 			% (TOLERANCE * 100.0))
-	print("  [REAL gate] vs measured-intact baseline, band +/-%.1fpp" % (BASELINE_BAND * 100.0))
+	print("         diagnostic-only at other anisotropies, see BASELINE_INTACT_RATIO doc")
+	print("  [gate] vs measured-intact baseline, band +/-%.1fpp" % (BASELINE_BAND * 100.0))
 	var vp_rid := get_viewport().get_viewport_rid()
 	var worst_ratio := 1.0
 	var worst_label := ""
@@ -338,16 +370,42 @@ func _probe_furnace(p_env: Environment) -> void:
 			if absf(ratio - 1.0) > absf(worst_ratio - 1.0):
 				worst_ratio = ratio
 				worst_label = tag
-			# Diagnostic only -- NOT asserted (fix round 2, Important #1). The
-			# absolute deviation from 1.0 is dominated by the pre-existing,
-			# anisotropy-orthogonal `ms` over-compensation (see
-			# BASELINE_INTACT_RATIO's doc comment and task-4-report.md fix
-			# round 1, C5) -- printed as a pointer to that open item, same
-			# demotion pattern probe 2's old R-vs-G check already received.
+			# ASSERTED AT ANISOTROPY 0 ONLY, as of 2026-09-10 (Gap #17).
+			#
+			# This check existed and was correct all along, but fix round 2
+			# demoted it to diagnostic-only because evalMultiScatterApproximation's
+			# over-compensation made EVERY entry fail it on a correct build --
+			# which left the gate structurally unable to fail on an absolute
+			# energy error, the condition that let Gap #17 hide for two phases.
+			#
+			# It is live again for the isotropic case, where a white furnace must
+			# return the sky radiance by DERIVATION: for this material
+			# (albedo 1, metallic 1) Fss = 1, so Fms = 1 and the compensation is
+			# exactly 1/E, which cancels the lobe's directional albedo E. It
+			# reads 1.000549 against a 2% bar.
+			#
+			# It stays diagnostic for the ANISOTROPIC entries because that
+			# derivation does not cover them -- GGX_E_TABLE has no anisotropy
+			# axis, so 1/E does not cancel an eccentric lobe's albedo. Their
+			# residual is a separate pre-existing defect (see
+			# BASELINE_INTACT_RATIO's doc comment for the three-state proof) and
+			# the regression band below is what guards them.
+			#
+			# DO NOT widen TOLERANCE to promote the anisotropic entries. The
+			# residual is a defect to fix, not a tolerance to absorb.
 			if absf(ratio - 1.0) > TOLERANCE:
-				print(("  [diagnostic] %-34s ratio %.6f vs 1.0 exceeds %.1f%% -- known pre-existing " +
-						"multi-scatter over-compensation (see BASELINE_INTACT_RATIO doc), not asserted")
-						% [tag, ratio, TOLERANCE * 100.0])
+				if is_zero_approx(aniso):
+					_failures.append(("probe1 furnace [%s]: ratio %.6f vs 1.0 exceeds %.1f%% -- a white " +
+							"furnace must return the sky radiance exactly, and for the ISOTROPIC case " +
+							"the Cycles compensation is exactly 1/E by derivation. See " +
+							"evalMultiScatterEnergy in brdf_inc.glsl and RT_MS_COMPENSATION's " +
+							"three-state falsification.")
+							% [tag, ratio, TOLERANCE * 100.0])
+				else:
+					print(("  [diagnostic] %-34s ratio %.6f vs 1.0 exceeds %.1f%% -- the separate, " +
+							"pre-existing ANISOTROPIC energy residual (present with compensation " +
+							"disabled entirely; see BASELINE_INTACT_RATIO doc), not asserted")
+							% [tag, ratio, TOLERANCE * 100.0])
 			# The REAL gate: a tight regression band around the ratio MEASURED
 			# on the intact tree. A C1-class reversion moves this same
 			# quantity by +10 to +16 percentage points (measured); ordinary
@@ -380,11 +438,15 @@ func _probe_furnace_nee_dominant(p_env: Environment) -> void:
 	var s := _measure_crop(img, 0.05, 0.95)
 	var ratio: float = s["mean"] / SKY_RADIANCE
 	print("  mean=%.6f  ratio=%.6f  (n=%d)" % [s["mean"], ratio, s["n"]])
-	# Diagnostic only -- NOT asserted (fix round 2, Important #1). See probe
-	# 1's identical treatment above.
+	# Diagnostic only -- NOT asserted, and unlike probe 1 it stays that way even
+	# after Gap #17. This configuration is anisotropy 0.9, so the isotropic
+	# 1/E derivation that made probe 1's absolute check assertable does not
+	# apply here; this is the extreme corner of the separate anisotropic
+	# residual (see BASELINE_INTACT_RATIO_NEE_DOM's doc comment).
 	if absf(ratio - 1.0) > TOLERANCE:
-		print(("  [diagnostic] ratio %.6f vs 1.0 exceeds %.1f%% -- known pre-existing multi-scatter " +
-				"over-compensation (see BASELINE_INTACT_RATIO_NEE_DOM doc), not asserted")
+		print(("  [diagnostic] ratio %.6f vs 1.0 exceeds %.1f%% -- the separate, pre-existing " +
+				"ANISOTROPIC energy residual at its worst corner (see " +
+				"BASELINE_INTACT_RATIO_NEE_DOM doc), not asserted")
 				% [ratio, TOLERANCE * 100.0])
 	# The REAL gate: regression band around the measured-intact baseline. A
 	# C1-class reversion moves this same quantity by +42.6 percentage points
