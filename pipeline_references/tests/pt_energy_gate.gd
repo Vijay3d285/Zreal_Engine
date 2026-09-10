@@ -70,11 +70,11 @@ extends "res://tests/pt_validation.gd"
 ##             specular lobe carrying almost nothing. Neither exercises the regime
 ##             where pSpec is strictly between 0 and 1 and BOTH lobes carry real
 ##             energy -- which is where the lobe-selection split in combinedPdf()
-##             has to agree with the one in shade_and_bounce(), and where the open
-##             COMBINE_BRDFS_WITH_FRESNEL integrand mismatch (the sampler
-##             attenuates diffuse by 1 - F(V.H_random) with H_random drawn from
-##             VNDF independently of L; evalCombinedBRDFSeparate attenuates by
-##             1 - F(L.H(L,V))) could first become visible.
+##             has to agree with the one in shade_and_bounce(), and where the
+##             COMBINE_BRDFS_WITH_FRESNEL integrand mismatch became visible. That
+##             mismatch is now FIXED (see the REF_PLASTIC block); this surface is
+##             the only one in the gate that can detect its return, so it is the
+##             one to watch after any change to the diffuse lobe or to MIS.
 ##   diffuse - the Lambertian plane again, as a control: it must NOT move.
 ##
 ## A SPHERE rather than a flat smooth plane is deliberate. `env_world_to_sky()`
@@ -106,34 +106,49 @@ const REF_ROUGH_RIM := 1.22400 # silhouette annulus
 const REF_BUMPY := 1.41451 # normal-mapped rough metal
 # Rough DIELECTRIC (roughness 0.4, metallic 0), added in Task 5.
 #
-# THIS SURFACE IS THE ONE EXCEPTION TO "reference == BSDF-only build". Every
-# other REF_* above is captured from the pre-MIS build, so the gate asserts
-# energy neutrality. On the rough dielectric the two builds genuinely DO NOT
-# agree, and the cause was isolated by a controlled experiment (Task 5):
+# THIS SURFACE CARRIES THE MEASUREMENT THAT CLOSED THE COMBINE_BRDFS_WITH_FRESNEL
+# INTEGRAND MISMATCH -- the open "+2.4% converged-mean shift on dielectric
+# specular surfaces" that stood through Phases B and C. All four numbers below
+# are re-derivable on any tree with RT_ENV_NEE_ENABLED (raytracing_inc.glsl),
+# which is why they are worth keeping rather than trimming to the two the gate
+# asserts on.
 #
-#   COMBINE_BRDFS_WITH_FRESNEL (brdf_inc.glsl:158)   disc      silhouette rim
-#     = 1 (shipped)   BSDF-only  0.46667 / 0.41831
-#                     with MIS   0.47089 / 0.42792   +0.91%    +2.30%
-#     = 0 (control)   BSDF-only  0.48868 / 0.44464
-#                     with MIS   0.48837 / 0.44463   -0.06%    -0.002%
+#                                    disc      silhouette rim    MIS - BSDF-only
+#   BEFORE (stochastic 1 - F(V.H_random), H_random from VNDF independent of L)
+#     BSDF-only   0.46667 / 0.41831
+#     with MIS    0.47089 / 0.42792                              +0.91%  +2.30%
+#   AFTER (deterministic 1 - data.F, the same term the evaluators apply)
+#     BSDF-only   0.47112 / 0.42776
+#     with MIS    0.47107 / 0.42821                              -0.01%  +0.11%
 #
-# Turning the macro off collapses the deviation to noise, so the whole of it is
-# the known integrand mismatch: the sampler attenuates the diffuse lobe by
-# 1 - F(V.H_random) with H_random drawn from VNDF INDEPENDENTLY of L
-# (brdf_inc.glsl:1211-1215), while evalCombinedBRDFSeparate attenuates by
-# 1 - F(L.H(L,V)) with the deterministic half-vector (:1182-1185). Different
-# functions of L, so the two MIS strategies estimate different integrands. It is
-# an OPEN defect, not fixed by this phase; it needs the two attenuations made
-# identical, which changes the analytic-light path too.
+# The BSDF-only path is what moved: it rose ~0.95% to meet where MIS-on already
+# was, which is the signature of the SAMPLER having carried the wrong integrand
+# while the evaluator carried the right one. MIS-on barely moved at all
+# (0.47089 -> 0.47107, +0.04%), so no rendered image gets materially brighter or
+# darker from this fix -- what changed is that the two strategies now estimate
+# the same function.
 #
-# So REF_PLASTIC is captured from the CURRENT build and guards against drift
-# from today's state. REF_PLASTIC_BSDF_ONLY is printed alongside so the size of
-# the open defect stays visible instead of being absorbed into a tolerance.
+# HOW TO RE-DERIVE THE "BSDF-only" ROW, because a single build cannot produce it
+# and a stale pair of constants asserting against each other would be a check
+# that can never fail: set RT_ENV_NEE_ENABLED to 0 in
+# servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl, rebuild,
+# and run this scene again. Gate 1's pass-C std-dev must read exactly 0.000000 in
+# that build -- under a constant sky BSDF sampling is a zero-variance estimator --
+# which is the instrument proving it really is BSDF-only before you trust its
+# gate 2 numbers. That control was itself validated against the pre-MIS build
+# swap it replaces: old sampler with NEE off measured 0.46636 / 0.41767 against
+# the 0.46667 / 0.41831 captured at commit de2ce2c248, i.e. 0.07% / 0.15%.
+#
+# REF_PLASTIC / REF_PLASTIC_RIM are what this gate asserts on, captured from the
+# current (fixed, MIS-on) build. REF_PLASTIC_BSDF_ONLY / _RIM_BSDF_ONLY are the
+# fixed build's control and are PRINTED, not asserted -- they are the residual
+# non-neutrality, and printing them keeps its size visible instead of letting a
+# 2% tolerance absorb a regression back to +2.30%.
 # Run-to-run spread on this surface is ~0.03%.
-const REF_PLASTIC := 0.47089
-const REF_PLASTIC_RIM := 0.42792
-const REF_PLASTIC_BSDF_ONLY := 0.46667
-const REF_PLASTIC_RIM_BSDF_ONLY := 0.41831
+const REF_PLASTIC := 0.47107
+const REF_PLASTIC_RIM := 0.42821
+const REF_PLASTIC_BSDF_ONLY := 0.47112
+const REF_PLASTIC_RIM_BSDF_ONLY := 0.42776
 const REF_TOLERANCE := 0.02 # 2 percent; gate 2 is a stochastic comparison.
 
 var _plane: MeshInstance3D
@@ -346,17 +361,19 @@ func _gate_directional(p_frames: int) -> void:
 		var pr_err: float = absf(plastic_rim["mean"] - REF_PLASTIC_RIM) / REF_PLASTIC_RIM
 		print("  plastic vs reference %.5f : ratio %.4f  (%.2f%% off)" % [REF_PLASTIC, plastic["mean"] / REF_PLASTIC, p_err * 100.0])
 		print("  plas.rim vs reference %.5f: ratio %.4f  (%.2f%% off)" % [REF_PLASTIC_RIM, plastic_rim["mean"] / REF_PLASTIC_RIM, pr_err * 100.0])
-		print("  KNOWN OPEN DEFECT: this surface sits %+.2f%% (disc) / %+.2f%% (rim) above the"
+		print("  MIS energy neutrality on this surface: %+.2f%% (disc) / %+.2f%% (rim) vs the"
 				% [(REF_PLASTIC / REF_PLASTIC_BSDF_ONLY - 1.0) * 100.0,
 				(REF_PLASTIC_RIM / REF_PLASTIC_RIM_BSDF_ONLY - 1.0) * 100.0])
-		print("    BSDF-only build (%.5f / %.5f) because of the COMBINE_BRDFS_WITH_FRESNEL"
+		print("    BSDF-only control (%.5f / %.5f). Was +0.91%% / +2.30%% before the"
 				% [REF_PLASTIC_BSDF_ONLY, REF_PLASTIC_RIM_BSDF_ONLY])
-		print("    integrand mismatch. See the REF_PLASTIC comment block.")
+		print("    COMBINE_BRDFS_WITH_FRESNEL integrand mismatch was fixed.")
+		print("    These two are STORED, not measured by this run -- re-derive the control")
+		print("    with RT_ENV_NEE_ENABLED 0. See the REF_PLASTIC comment block.")
 		if p_err > REF_TOLERANCE:
 			_failures.append("gate 2 plastic: %.5f vs reference %.5f, ratio %.4f. This is the only surface with pSpec strictly between 0 and 1 (both BRDF lobes live)."
 					% [plastic["mean"], REF_PLASTIC, plastic["mean"] / REF_PLASTIC])
 		if pr_err > REF_TOLERANCE:
-			_failures.append("gate 2 plastic rim: %.5f vs reference %.5f, ratio %.4f (grazing band, where the two diffuse-Fresnel attenuations differ most)."
+			_failures.append("gate 2 plastic rim: %.5f vs reference %.5f, ratio %.4f (grazing band, where the diffuse-Fresnel attenuation bites hardest)."
 					% [plastic_rim["mean"], REF_PLASTIC_RIM, plastic_rim["mean"] / REF_PLASTIC_RIM])
 	else:
 		print("  (no plastic reference captured yet - record REF_PLASTIC)")

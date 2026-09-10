@@ -353,6 +353,7 @@ void main() {
 	// camera ray, a backfacing-V shading point, a mirrored/recovered sample, a
 	// near-delta specular bounce, and a direction combinedPdf() cannot describe.
 	float mis_w = 1.0;
+#if RT_ENV_NEE_ENABLED
 	if (ps.mis_ray_pdf >= 0.0) {
 		float e_pdf = env_pdf(gl_WorldRayDirectionEXT);
 		// The e_pdf > 0.0 guard covers a scene with no sky at all: marginal_total
@@ -367,6 +368,7 @@ void main() {
 		// handled at the source, by mapping a zero pdf to the sentinel above.
 		mis_w = (e_pdf > 0.0) ? power_heuristic(ps.mis_ray_pdf, e_pdf) : 1.0;
 	}
+#endif // RT_ENV_NEE_ENABLED
 	vec3 sky_contribution = ps.throughput * sky_color * mis_w;
 
 #ifdef RT_DEBUG_ENABLED

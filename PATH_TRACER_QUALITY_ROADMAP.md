@@ -283,10 +283,10 @@ extra shadow ray, and this scene's baseline fired none. **Equal-time, the
 advantage is 4.8× to 6.9×** across the sweep (each sample-count ratio divided by
 `sqrt(1.8966)`; the floor is the 4096-frame row) — still far above the ≥2× C3 bar.
 
-*Open, and the reason this is not an unqualified success:* **the converged mean
-moved +2.4% on dielectric specular surfaces.** MIS must redistribute variance,
-not energy. The cause is isolated and confirmed by controlled experiment, not
-suspected — see the C3 entry below.
+*Was open, now **CLOSED** (2026-09-09):* **the converged mean moved +2.4% on
+dielectric specular surfaces.** MIS must redistribute variance, not energy. The
+cause was isolated and confirmed by controlled experiment, and the fix is
+measured — see the C3 entry below.
 
 **B3. Per-type bounce controls** — *Gap #4* — **DONE**
 `MAX_DIFFUSE_BOUNCES 2u` is gone. Diffuse and glossy counters now live in
@@ -534,7 +534,7 @@ densities; the two MIS halves are `power_heuristic()` over the *same* two
 solid-angle densities with the arguments swapped, so they sum to exactly one.
 Emitted radiance is composed in exactly one place (`emissive_radiance()`) and
 called from both sites, so the two strategies cannot drift into estimating
-different integrands — the structural defect behind B2's still-open +2.4% shift.
+different integrands — the structural defect behind B2's +2.4% shift, since fixed.
 The whole feature is behind `rendering/pathtracer/emissive_mesh_lights`, which
 **ships default off**.
 
@@ -706,10 +706,11 @@ on samples and 4.8-6.9× equal-time.*** Full numbers and method in
 > Environment NEE is **inert** in that scene by construction and any before/after
 > figure taken there means nothing. Use `pt_sky_rmse_scene.tscn`.
 
-**OPEN: +2.4% converged-mean shift on dielectric specular surfaces.**
-*(B2's defect, measured here — see the attribution note in §6. The mechanism is
+**CLOSED (2026-09-09): +2.4% converged-mean shift on dielectric specular
+surfaces.**
+*(B2's defect, measured here — see the attribution note in §6. The mechanism was
 B2's `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch; C3 is where the numbers
-were taken, not where the bug is.)*
+were taken, not where the bug was.)*
 A fully converged render (65536 frames) is 2.38% brighter with environment NEE
 than without it. Pinned to `COMBINE_BRDFS_WITH_FRESNEL` (`brdf_inc.glsl:158`,
 value 1): the sampler attenuates the diffuse lobe by `1 - F(V·H_random)` with
@@ -726,6 +727,84 @@ the attenuation is — but MIS is what puts the two on opposite sides of a weigh
 that must sum to 1. **The repair is not local to the env-NEE site:** the two
 attenuations must be made the same function of L, and `evalCombinedBRDFSeparate`
 is shared with analytic-light NEE, so it changes analytic-light shading engine-wide.
+
+> **That last sentence was wrong, and it is left standing above so the error is
+> legible rather than quietly edited out.** It assumed the repair had to move
+> `evalCombinedBRDFSeparate`. It does not. The evaluator defines what the
+> material *is*; the sampler's only job is to deliver `f·cos/pdf` for that same
+> `f`. So the **sampler** moved, and the analytic-light path is untouched — the
+> generated shader is character-identical there before and after. This is the
+> same failure mode as the §9.10 erratum: a claim about what code would have to
+> change, asserted from plausibility instead of read off the two call sites.
+
+**THE FIX.** `evalIndirectCombinedBRDF`'s `DIFFUSE_TYPE` branch now attenuates by
+`(1 - data.F)` — the same `data.F` that `prepareBRDFData` built from `data.LdotH`
+and that `evalCombinedBRDF` and `evalCombinedBRDFSeparate` already applied. The
+second VNDF draw is deleted, along with the reused random number its own comment
+conceded was wrong ("correctly it should be an new independent random number").
+Net −24 lines of shader. `COMBINE_BRDFS_WITH_FRESNEL` stays as the A/B switch it
+has always been.
+
+**MEASURED, on `pt_energy_gate.gd`'s rough dielectric (roughness 0.4, metallic 0,
+256 frames at 256×256):**
+
+|                       | disc    | rim     | MIS − BSDF-only     |
+|-----------------------|---------|---------|---------------------|
+| before, BSDF-only     | 0.46667 | 0.41831 |                     |
+| before, with MIS      | 0.47089 | 0.42792 | **+0.91% / +2.30%** |
+| after, BSDF-only      | 0.47112 | 0.42776 |                     |
+| after, with MIS       | 0.47107 | 0.42821 | **−0.01% / +0.11%** |
+
+**It is the BSDF-only path that moved**, up ~0.95% to meet where MIS-on already
+sat. MIS-on itself shifted +0.04%, i.e. inside this surface's ~0.03% run-to-run
+spread. That is the signature of the *sampler* having carried the wrong
+integrand while the evaluator carried the right one, and it means **no rendered
+image gets materially brighter or darker from this fix** — what changed is that
+the two strategies now estimate the same function. Every other gate surface is
+unmoved: `smooth` 0.01%, `rough` 0.03%, `bumpy` 0.46%, `diffuse` 0.06%, Gate 1
+absolute 0.001% — as required, since metallic surfaces have
+`diffuseReflectance == 0` and the gate's Lambertian plane sets
+`metallic_specular = 0`, so neither can see a change to the diffuse Fresnel term.
+
+**NEW INSTRUMENT: `RT_ENV_NEE_ENABLED` (`raytracing_inc.glsl`, default 1).** The
+defect is defined as (MIS on) − (BSDF only), so *neither figure alone can say
+whether it is present* — and before this switch the only way to take the second
+figure was to check the raytracing shaders out at pre-MIS commit `de2ce2c248`,
+which also reverts every unrelated change since and therefore cannot measure
+anything on a current tree. The switch moves **both halves** of the partition
+together: the env-NEE block in `shade_and_bounce` *and* the miss stage's
+`power_heuristic` weight on BSDF sky hits. Gating only the first would leave
+every sky hit scaled below 1 with nothing to restore it, and the "control" would
+read as a brightening that was really just the missing half of a partition.
+Kept permanently as scaffolding, on the standing precedent of
+`COMBINE_BRDFS_WITH_FRESNEL` and `RT_LIGHT_SELECT_UNIFORM`.
+
+*The instrument was validated before its results were believed, in three ways.*
+At `RT_ENV_NEE_ENABLED 0` the constant-sky gate's per-pixel std-dev reads
+**exactly 0.000000** — BSDF sampling under a constant sky is a zero-variance
+estimator, so this is the control proving it really is BSDF-only rather than
+merely dimmer. The old sampler with the switch at 0 reproduces the pre-MIS build
+swap it replaces: **0.46636 / 0.41767** against the **0.46667 / 0.41831**
+captured at `de2ce2c248` — 0.07% and 0.15%. And at `RT_ENV_NEE_ENABLED 1` the
+generated shader body is character-for-character identical to the pre-switch
+build, so the switch is provably inert in production.
+
+**WHAT THIS DELIBERATELY DOES NOT DO — and the follow-up it leaves.** Cycles uses
+*neither* of our two forms. It attenuates the base layer by
+`1 - albedo(layer above)`: L-**independent**, derived once at closure setup from
+`sd->wi`, and applied as a closure *weight* rather than inside a BRDF function,
+so its eval and sample paths cannot desync at all (`closure_layering_weight`,
+`intern/cycles/kernel/closure/bsdf_util.h:440-444`, called for exactly this
+specular-over-diffuse layer at `intern/cycles/kernel/svm/closure.h:468-470`).
+Our `1 - F(L·H)` is a different model, not a worse-implemented copy of that one.
+Matching Cycles' shape means giving the **base** specular lobe a
+directional-albedo estimate and routing both sides through
+`layerTransmittanceAbove` — precisely what E2d already did for the coat and E2e
+for sheen, so the machinery exists and only the base lobe was left out. *That*
+change would move analytic-light shading engine-wide and needs its own energy
+study against Cycles; it is a real parity item, filed here rather than smuggled
+into a bias fix. **This fix closes the MIS bias. It does not close Blender
+parity on the diffuse-under-specular layer.**
 
 *Other known-open items carried out of this phase:*
 - **Residual +0.42% double count on recovered (normal-mapped) samples**,
@@ -856,7 +935,7 @@ Unit-testable pieces (`tests=yes`, doctest) worth covering: Sobol dimension stra
 
 **Phase A alone** — jitter, EXR, clamp, adaptive — converts the already-built accumulator from "converges shading noise at fixed aliasing" into a genuine offline renderer. A1 in particular is a handful of lines against machinery that already works, and it is currently the most visible defect in any still.
 
-**Phase B** makes the converged image *correct* rather than merely stable: MIS and real bounce counts are what separate "a path tracer" from "a reference path tracer." **With one live exception as of B2:** environment MIS shipped a **+2.4% converged-mean error on dielectric specular surfaces** — i.e. most ordinary materials — traced to the `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch and left open. Variance is where it should be; the mean is not yet. See the B2 and C3 entries before treating Phase B as a ship verdict.
+**Phase B** makes the converged image *correct* rather than merely stable: MIS and real bounce counts are what separate "a path tracer" from "a reference path tracer." **The one live exception is now closed:** environment MIS shipped a **+2.4% converged-mean error on dielectric specular surfaces** — i.e. most ordinary materials — traced to the `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch. Fixed 2026-09-09 by moving the sampler onto the evaluator's Fresnel term; the MIS-vs-BSDF-only delta on the gate's rough dielectric fell from +0.91%/+2.30% to −0.01%/+0.11%. Variance and mean are both where they should be. See the C3 entry for the measurements, and for the Cycles-parity follow-up it does *not* close.
 
 **Phase D before E** is deliberate and non-negotiable. Material data must survive import before BSDF math is worth writing.
 
@@ -865,9 +944,11 @@ Ordering summary: **A1 → A2/A3/A4 → D → E → F (Phases B, C and D are com
 **Phase B is complete** — B1, B2, B3, B4 and B5 have all landed. "Complete" here
 means every listed item is implemented and measured; it does **not** mean Phase B
 is free of known defects. The open items recorded in this document stand
-unchanged and none of them is resolved by B4: the **+2.4% converged-mean shift on
-dielectric specular surfaces** from B2's `COMBINE_BRDFS_WITH_FRESNEL` integrand
-mismatch, the **asymmetric firefly clamping** across the MIS partition, the
+unchanged and none of them was resolved by B4. The largest of them — the **+2.4%
+converged-mean shift on dielectric specular surfaces** from B2's
+`COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch — **is now fixed** (2026-09-09,
+see the C3 entry). Still open from this phase: the **asymmetric firefly
+clamping** across the MIS partition, the
 **untested zero-pdf sentinel**, and the fact that **the doctest binary never
 executes the GLSL** — the shader-side tests mirror the shader in C++ rather than
 running it.
@@ -875,19 +956,21 @@ running it.
 **Phase C is complete** — C1, C2 and C3 have all landed. As with Phase B,
 "complete" means every listed item is implemented and measured; it does **not**
 mean the phase is free of known defects. The **+2.4% converged-mean shift on
-dielectric specular surfaces** and the `SKY_MODE_LIGHT_AND_SKY` double count are
-both still open, and C1's open items — chief among them the **fixture
+dielectric specular surfaces** measured here **is now fixed** (2026-09-09); the
+`SKY_MODE_LIGHT_AND_SKY` double count is still open, and C1's open items — chief among them the **fixture
 double-representation in `image_glb_creation.gd`**, which would materially
 brighten night renders if the setting were enabled without a pipeline change —
 are recorded in the C1 entry. **C1 ships default off.**
 
 **One attribution, stated once so the rest of this document can point at it.** The
-+2.4% dielectric-specular shift is **B2's defect, recorded under C3**: the
-mechanism is the `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch that B2's
++2.4% dielectric-specular shift was **B2's defect, recorded under C3**: the
+mechanism was the `COMBINE_BRDFS_WITH_FRESNEL` integrand mismatch that B2's
 environment MIS introduced (`brdf_inc.glsl:158`), and it was *measured* during C3,
-which is why the numbers live in the C3 entry. It is not a C3 defect and it is not
-two separate items. Earlier revisions of this section called it "C3's", which
-would send someone to the wrong code.
+which is why the numbers live in the C3 entry. It was not a C3 defect and it was
+not two separate items. Earlier revisions of this section called it "C3's", which
+would send someone to the wrong code. **It was fixed on 2026-09-09** — in B2's
+code, from C3's measurements, exactly as this attribution said it would have to
+be.
 
 - **C1**: emissive-mesh NEE with MIS, 3.2-4.1× equal-time on a 2.0 m panel and
   35-68× on a 0.25 m panel of the same power, for +9-15% frame time; converged
@@ -901,8 +984,10 @@ would send someone to the wrong code.
   a power-concentrated scene for +50.8% frame time; see the C2 entry, including
   the correction to the spec's bias claim and two open items (the cosine is
   excluded from the weight; no rendered coverage of spot/rect/directional).
-- **C3**: environment importance sampling, 4.8-6.9× equal-time, with B2's +2.4%
-  dielectric-specular shift open and measured here.
+- **C3**: environment importance sampling, 4.8-6.9× equal-time. B2's +2.4%
+  dielectric-specular shift was measured here and is now **fixed** (2026-09-09),
+  leaving a Cycles-parity follow-up on the diffuse-under-specular layer that the
+  C3 entry states in full.
 
 **MIS weights now cover both strategies that can reach the same direction: the
 environment (B2) and emissive meshes (C1). Analytic lights are a different case
@@ -1389,7 +1474,9 @@ measurements attached where relevant:**
   transmissive surfaces** (spec §6.4). NEE evaluates Schlick with no
   `pdf_reflect` factor; the BSDF strategy realises the remapped real Fresnel
   scaled by `1/pdf_reflect`; `combinedPdf`'s density matches the closure, not
-  NEE. Same structural class as B2's open +2.4% converged-mean defect. **The
+  NEE. Same structural class as B2's +2.4% converged-mean defect, which was
+  fixed on 2026-09-09 by moving the SAMPLER onto the evaluator's term rather than
+  the reverse — worth reading before assuming this one needs NEE to move. **The
   highest-value correctness item E2 inherits.** §7.1's Cycles comparison could
   not cleanly separate this contribution's magnitude from §6.1/§6.3 and the
   newly-found environment-lighting gap (§7.1's attribution paragraph) — a

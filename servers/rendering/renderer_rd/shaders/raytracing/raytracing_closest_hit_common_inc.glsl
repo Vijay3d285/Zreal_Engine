@@ -1695,6 +1695,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// by its sky has no analytic lights at all and is precisely the case this
 	// exists for.
 	// =================================================================
+#if RT_ENV_NEE_ENABLED
 	{
 		vec3 env_dir;
 		float env_pdf_val;
@@ -1819,6 +1820,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			}
 		}
 	}
+#endif // RT_ENV_NEE_ENABLED
 
 	// =================================================================
 	// Emissive-mesh NEE (roadmap C1).

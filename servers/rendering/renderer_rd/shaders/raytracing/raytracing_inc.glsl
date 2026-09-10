@@ -69,6 +69,29 @@ const float RT_MIS_PDF_NONE = -1.0;
 /// related and do not need to match.
 const float RT_MIS_DELTA_ROUGHNESS = 0.03;
 
+/// A/B switch for environment NEE (roadmap C3), kept permanently as measurement
+/// scaffolding rather than deleted after the phase -- the same standing precedent
+/// as RT_LIGHT_SELECT_UNIFORM (raytracing_lights_inc.glsl) and
+/// COMBINE_BRDFS_WITH_FRESNEL (brdf_inc.glsl).
+///   1 = environment NEE + the sky-hit MIS weight (production)
+///   0 = BSDF sampling alone, every sky hit taking MIS weight 1
+///
+/// BOTH HALVES MOVE TOGETHER, and that is the whole point of having one switch
+/// instead of two. Disabling only the NEE shadow ray would leave the miss stage
+/// still scaling every BSDF sky hit by power_heuristic(bsdf_pdf, env_pdf) < 1,
+/// so the control would not be "BSDF-only" -- it would be BSDF-only with a
+/// fraction of its energy deleted, and any comparison against it would read as a
+/// brightening that is really just the missing half of a partition.
+///
+/// It exists because the +2.4% converged-mean shift on dielectric specular
+/// surfaces is defined as (MIS on) - (BSDF only), so neither figure alone can
+/// tell you whether that defect is present. Before this switch the only way to
+/// take the second figure was to check the raytracing shaders out at a pre-MIS
+/// commit (de2ce2c248) and rebuild, which also reverts every unrelated change
+/// made since and therefore cannot be used to measure anything on a current
+/// tree.
+#define RT_ENV_NEE_ENABLED 1
+
 /// Upper bound applied to radiance/throughput when packing the payload. The
 /// old fp16 packing pinned values at 65504 as an (unintentional) side effect;
 /// fp32 packing has no such firewall. Without one, a single NaN/Inf sample

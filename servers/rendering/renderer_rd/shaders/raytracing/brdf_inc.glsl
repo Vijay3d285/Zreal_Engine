@@ -3361,30 +3361,54 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		sampleWeight = data.diffuseReflectance * diffuseTerm(data);
 
 #if COMBINE_BRDFS_WITH_FRESNEL
-		// Sample a half-vector of specular BRDF. Note that we're reusing random variable 'u' here, but correctly it should be an new independent random number
-		// E2b: rotate into the anisotropy frame, sample with ax/ay, rotate back.
-		// At anisotropy == 0 (or no usable tangent) data.anisoPhi is 0 and
-		// data.ax == data.ay == data.alpha, so both rotations are the identity
-		// and this reduces exactly to the pre-E2b call -- Vlocal/Nlocal are
-		// already in the local frame here, so unlike evalMicrofacet no extra
-		// world-to-local transform is needed.
-		float3 Hspecular;
-#ifdef RT_ANISOTROPY_ENABLED
-		if (data.anisoActive) {
-			float3 Vaniso = rotateAboutZ(Vlocal, -data.anisoPhi);
-			float3 Haniso = sampleSpecularHalfVector(Vaniso, float2(data.ax, data.ay), u);
-			Hspecular = rotateAboutZ(Haniso, data.anisoPhi);
-		} else
-#endif
-		{
-			// Fix round (Minor #2): same structural fix as sampleSpecularMicrofacet
-			// -- no rotation on the isotropic path.
-			Hspecular = sampleSpecularHalfVector(Vlocal, float2(data.alpha, data.alpha), u);
-		}
-
-		// Clamp HdotL to small value to prevent numerical instability. Assume that rays incident from below the hemisphere have been filtered
-		float VdotH = max(0.00001f, min(1.0f, dot(Vlocal, Hspecular)));
-		sampleWeight *= (float3(1.0f, 1.0f, 1.0f) - evalFresnel(data.specularF0, shadowedF90(data.specularF0), VdotH));
+		// B2 FIX -- the open +2.4% converged-mean shift on dielectric specular
+		// surfaces. Attenuate the diffuse lobe by the SAME Fresnel term the
+		// evaluators use: `data.F`, which prepareBRDFData built a few lines above
+		// from `data.LdotH`, the deterministic half-vector of the very L this call
+		// just sampled. evalCombinedBRDF (:1846) and evalCombinedBRDFSeparate
+		// (:3239) both multiply the diffuse lobe by exactly `(1 - data.F)`, so the
+		// sampler and the evaluator now describe ONE BRDF instead of two.
+		//
+		// WHAT WAS HERE, AND WHY IT WAS WRONG. A second VNDF draw taken from the
+		// `u` already spent on the cosine-hemisphere sample, yielding
+		// `1 - F(V.H_random)` with H_random drawn INDEPENDENTLY of L. That is a
+		// stochastic estimate of the specular lobe's directional ALBEDO, an
+		// L-independent quantity, while the evaluators applied an L-DEPENDENT one.
+		// Plain BSDF sampling never exposed the difference -- direct light went
+		// through the evaluator, indirect through the sampler, and the two were
+		// never required to agree. B2's environment MIS requires it: power_heuristic
+		// weights sum to 1 over a SINGLE integrand, so two different integrands do
+		// not cancel, they bias. Measured +0.91% (disc) / +2.30% (rim) on the rough
+		// dielectric in pipeline_references/tests/pt_energy_gate.gd, and pinned by
+		// that gate's COMBINE_BRDFS_WITH_FRESNEL = 0 control, where both sides agree
+		// trivially and the deviation collapses to -0.06% / -0.002%.
+		//
+		// The deleted block's own first line conceded the random-number reuse
+		// ("correctly it should be an new independent random number"). Making the
+		// factor deterministic retires that defect as a side effect: the diffuse
+		// sample weight no longer carries variance from a second draw.
+		//
+		// DIRECTION OF THE FIX. The evaluator defines what the material IS; the
+		// sampler's job is to deliver f*cos/pdf for that same f. So the SAMPLER
+		// moved. The analytic-light path is untouched and bit-identical.
+		//
+		// THIS IS NOT THE SHAPE CYCLES USES, and the divergence is deliberate and
+		// recorded, not an oversight. Cycles attenuates the base layer by
+		// `1 - albedo(layer above)` -- L-independent, derived once at closure setup
+		// from sd->wi and applied as a closure WEIGHT, so its eval and sample paths
+		// CANNOT desync (closure_layering_weight,
+		// intern/cycles/kernel/closure/bsdf_util.h:440-444, called from
+		// intern/cycles/kernel/svm/closure.h:468-470 for exactly this
+		// specular-over-diffuse layer). Matching that shape means giving the BASE
+		// specular lobe a directional-albedo estimate and routing BOTH sides through
+		// layerTransmittanceAbove -- precisely what E2d already did for the coat.
+		// That changes every analytic-light render and needs its own energy study;
+		// it is filed in PATH_TRACER_QUALITY_ROADMAP.md, not smuggled in here.
+		//
+		// data.anisoActive / data.ax / data.ay / data.anisoPhi are no longer read on
+		// this branch. The SPECULAR branch below still consumes all four, so the
+		// E2b anisotropy plumbing above stays live.
+		sampleWeight *= (float3(1.0f, 1.0f, 1.0f) - data.F);
 #endif
 
 	} else if (brdfType == SPECULAR_TYPE) {
