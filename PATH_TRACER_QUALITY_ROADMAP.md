@@ -2,10 +2,45 @@
 
 **Scope:** Code-level diagnosis of why this Godot 4.7 fork's path-traced output does not match Blender Cycles, with a prioritized, code-anchored roadmap.
 
-**Engine branch:** `vijay_PTEngine_v8_Quality`
+**Engine branch:** `vijay_PTEngine_v8_Quality` *(where this document was started; it has since been carried across many branches — currently `vijay_PTEngine_V19_GAP19`. Use git, not this line, for lineage.)*
 **Reference:** Blender Cycles at `C:\Users\aiadmin\Desktop\blender_build\blender\intern\cycles`
 
 Every "Cycles does X" claim below is anchored to a real file:line in that tree. Every "we do Y" claim is anchored to this branch. **This document was re-verified against both source trees; it supersedes the earlier `vijay_pt2_shadows`-era revision, which described several already-solved problems as open.**
+
+### Reference provenance — read this before trusting a Cycles line number
+
+**Three different Blenders appear in this document, and they are not the same version.**
+
+| what | version | where | used for |
+|---|---|---|---|
+| **Source tree** | **5.3.0-alpha** — git `d20578850b` on `main`, 2026-08-01 | `C:\Users\aiadmin\Desktop\blender_build\blender` | **every** `intern/cycles/…:NNN` citation in this document |
+| **Runnable binary** | **5.2.1 LTS**, build date 2026-08-25 | `C:\Program Files\Blender Foundation\Blender 5.2\blender.exe` | §11's anisotropic furnace (2026-09-11) |
+| **Historic binary** | **4.5.3 LTS** (one run records hash `67807e1800cc`) | **no longer installed on this machine** | the parity measurements in §7.6, §7.8, §7.10, §7.11 |
+
+Four consequences, each of which has already cost something:
+
+1. **Line numbers are 5.3-alpha's.** Function names have been stable across these
+   releases; line numbers have not. Anchor on the function name and re-grep
+   before trusting any `:NNN` here — several in this document are already stale
+   even on OUR side of the comparison: `COMBINE_BRDFS_WITH_FRESNEL` is cited
+   throughout as `brdf_inc.glsl:158` and the define sits at `:170` today.
+2. **Reading the source is not the same as running the binary.** §11.4 records a
+   control built on `svm/closure.h:309`'s tangent gate, read in 5.3-alpha, which
+   5.2.1 does not exhibit — the control came back uninformative and the real
+   activation evidence had to come from elsewhere. If a conclusion depends on
+   behaviour rather than on structure, **measure it in the binary you will run.**
+3. **The §7.x parity numbers cannot be reproduced on this machine.** They came
+   from 4.5.3 binaries that are gone; `Blender 4.2`, `4.4` and `4.5` under
+   `C:\Program Files\Blender Foundation\` are leftover `python/` and `scripts/`
+   folders with **no `blender.exe`**. Re-taking any of them means reinstalling
+   4.5.3 first — see §10.5, which is why those figures are flagged as not
+   re-measured after Gap #17.
+4. **New comparison scripts get checked in.** `tools/cycles_comparison/` holds
+   §11's furnace script. The earlier comparison tooling never was, which is the
+   direct reason point 3 is a problem rather than an afternoon's work.
+
+*Do not silently substitute one of these versions for another when citing or
+re-running. Say which one, as §11 does.*
 
 **North star:** offline-first. Converged, reference-grade stills are the primary bar; the realtime DLSS-RR path stays working but is secondary.
 
