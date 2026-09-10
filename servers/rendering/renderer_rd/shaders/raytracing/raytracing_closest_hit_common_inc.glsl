@@ -1025,7 +1025,7 @@ void debug_visualize(
 		// suite covers -- but doctest cannot execute GLSL, so the transcriptions
 		// themselves have no automated test at all. Every failure mode of a
 		// transcription is silent here: a transposed LUT axis
-		// (coatLutRead2D(base, cosNI, rough, ...) instead of
+		// (ggxLutRead2D(base, cosNI, rough, ...) instead of
 		// (base, rough, cosNI, ...)), a swapped RT_COAT_SSBO_E_OFFSET /
 		// RT_COAT_SSBO_EAVG_OFFSET, a 32<->16 dimension slip. All three compile,
 		// all three return plausible numbers inside [0,1], and all three only
@@ -1226,7 +1226,7 @@ void debug_visualize(
 		// reader function directly and never the GLSL call site that feeds it.
 		// Task 5's gate reads this mode at a point where the transposed order
 		// gives a different answer, the same way vis mode 39 is the only
-		// instrument that can catch a transposed coatLutRead2D call.
+		// instrument that can catch a transposed ggxLutRead2D call.
 		//
 		// r = transformA, g = 0.5 + 0.5*transformB, b = ltcAlbedo, all read at
 		// this hit's clamped shading normal, the view vector, and the material's

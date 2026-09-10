@@ -2003,7 +2003,11 @@ coat_albedo_table;
 // half a texel at every lookup -- a small, uniform, entirely silent energy
 // error. test_pt_coat_albedo.cpp's midpoint cases exist to catch exactly that,
 // and they only guard the CPU mirror; this function is on its honour.
-float coatLutRead1D(int base, float x, int size) {
+// Renamed from coatLutRead1D/coatLutRead2D (roadmap Gap #17). These were never
+// coat-specific -- they are generic endpoint-aligned reads into the shared LUT
+// SSBO, and the base specular lobe's energy compensation now uses them too.
+// coatLutRead3D keeps its name: it really does read only the coat albedo table.
+float ggxLutRead1D(int base, float x, int size) {
 	x = clamp(x, 0.0f, 1.0f) * float(size - 1);
 	int index = min(int(x), size - 1);
 	int nindex = min(index + 1, size - 1);
@@ -2015,16 +2019,16 @@ float coatLutRead1D(int base, float x, int size) {
 	return (1.0f - t) * data0 + t * coat_albedo_table.data[base + nindex];
 }
 
-float coatLutRead2D(int base, float x, float y, int xsize, int ysize) {
+float ggxLutRead2D(int base, float x, float y, int xsize, int ysize) {
 	y = clamp(y, 0.0f, 1.0f) * float(ysize - 1);
 	int index = min(int(y), ysize - 1);
 	int nindex = min(index + 1, ysize - 1);
 	float t = y - float(index);
-	float data0 = coatLutRead1D(base + xsize * index, x, xsize);
+	float data0 = ggxLutRead1D(base + xsize * index, x, xsize);
 	if (t == 0.0f) {
 		return data0;
 	}
-	return (1.0f - t) * data0 + t * coatLutRead1D(base + xsize * nindex, x, xsize);
+	return (1.0f - t) * data0 + t * ggxLutRead1D(base + xsize * nindex, x, xsize);
 }
 
 #define GGX_COAT_TABLE_DIM 16
@@ -2043,11 +2047,11 @@ float coatLutRead3D(float x, float y, float z) {
 	int index = min(int(z), d - 1);
 	int nindex = min(index + 1, d - 1);
 	float t = z - float(index);
-	float data0 = coatLutRead2D(RT_COAT_SSBO_ALBEDO_OFFSET + d * d * index, x, y, d, d);
+	float data0 = ggxLutRead2D(RT_COAT_SSBO_ALBEDO_OFFSET + d * d * index, x, y, d, d);
 	if (t == 0.0f) {
 		return data0;
 	}
-	float data1 = coatLutRead2D(RT_COAT_SSBO_ALBEDO_OFFSET + d * d * nindex, x, y, d, d);
+	float data1 = ggxLutRead2D(RT_COAT_SSBO_ALBEDO_OFFSET + d * d * nindex, x, y, d, d);
 	return (1.0f - t) * data0 + t * data1;
 }
 
@@ -2130,7 +2134,31 @@ float coatFssFromIor(float ior) {
 float coatGgxE(float coatRoughness, float cosNI) {
 	float alpha = coatRoughness * coatRoughness;
 	float rough = sqrt(sqrt(alpha * alpha)); // sqrt(sqrt(ax*ay)); ax == ay for the coat.
-	return coatLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, cosNI, GGX_E_DIM, GGX_E_DIM);
+	return ggxLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, cosNI, GGX_E_DIM, GGX_E_DIM);
+}
+
+// E(rough, mu) and E_avg(rough) for the BASE specular lobe (Gap #17).
+//
+// `rough` is sqrt(alpha), and that IS Cycles' sqrt(sqrt(ax*ay)): anisoAspect
+// gives ax = alpha/aspect and ay = alpha*aspect, so ax*ay == alpha^2 exactly for
+// every anisotropy, and sqrt(sqrt(alpha^2)) == sqrt(alpha). That cancellation is
+// load-bearing -- two of the three call sites are NEE sites that have roughness
+// but no ax/ay, and if the product did not cancel, compensating the sampler and
+// the NEE sites on different roughnesses would make the two MIS strategies
+// estimate different integrands (the B2 defect class).
+//
+// These take ALPHA, not roughness, so they compose with the existing
+// evalMultiScatterApproximation(alpha, ...) call sites without an arithmetic
+// edit at each one. coatGgxE above keeps its roughness argument and its own
+// sqrt(sqrt(...)) -- the coat path is deliberately left textually untouched
+// beyond the rename, which is what makes "the coat gate must not move" a real
+// check on this rename rather than a check on a simultaneous refactor.
+float ggxE(float alpha, float NdotV) {
+	return ggxLutRead2D(RT_COAT_SSBO_E_OFFSET, sqrt(alpha), NdotV, GGX_E_DIM, GGX_E_DIM);
+}
+
+float ggxEavg(float alpha) {
+	return ggxLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, sqrt(alpha), GGX_E_DIM);
 }
 
 // Fms: effective Fresnel of the MULTIPLY-scattered energy. One Fss is cancelled
@@ -2139,7 +2167,7 @@ float coatGgxE(float coatRoughness, float cosNI) {
 float coatFms(float coatRoughness, float ior) {
 	float alpha = coatRoughness * coatRoughness;
 	float rough = sqrt(sqrt(alpha * alpha));
-	float eAvg = coatLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, rough, GGX_E_DIM);
+	float eAvg = ggxLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, rough, GGX_E_DIM);
 	float fss = coatFssFromIor(ior);
 	return fss * eAvg / (1.0f - fss * (1.0f - eAvg));
 }
@@ -2500,12 +2528,12 @@ float3 coatLayeringTransmittance(MaterialProperties material, float cosNI, float
 #define SHEEN_LTC_DIM 32
 
 // THE LUT AXES ARE (cos_NI, roughness) -- coatGgxE next door reads
-// coatLutRead2D(base, rough, cosNI, ...), the TRANSPOSE. Both go through this
+// ggxLutRead2D(base, rough, cosNI, ...), the TRANSPOSE. Both go through this
 // SAME generic reader with the same argument order, so a swap here is a
 // compile-clean, in-range, wrong-everywhere defect. See
 // sheen_ltc_table.h:7-17 and test_pt_sheen.cpp's transpose test.
 float sheenLutRead2D(int base, float cosNI, float roughness) {
-	return coatLutRead2D(base, cosNI, roughness, SHEEN_LTC_DIM, SHEEN_LTC_DIM);
+	return ggxLutRead2D(base, cosNI, roughness, SHEEN_LTC_DIM, SHEEN_LTC_DIM);
 }
 
 struct SheenData {
