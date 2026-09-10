@@ -116,7 +116,7 @@ Ranked by impact on offline still quality.
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
 | 17 | **Multi-scatter energy compensation over-shoot** — **FIXED 2026-09-10, see §10.** `evalEmsApprox`/`evalMultiScatterApproximation` over-corrected the true single-scatter GGX energy loss by 3.4–8.1pp. Replaced by `evalMultiScatterEnergy`, a transcription of Cycles' `microfacet_ggx_preserve_energy` reading the `GGX_E`/`GGX_EAVG` tables E2d already ships. The white furnace's isotropic control went **1.059535 → 1.000549**. Two things this did *not* fix are now separate rows: #19 and #20. | `brdf_inc.glsl` (`evalMultiScatterEnergy`, `evalMultiScatterFactor`, `RT_MS_COMPENSATION`), call sites in `brdf_inc.glsl` (sampler), `raytracing_closest_hit_common_inc.glsl` and `raytracing_emissive_inc.glsl` (NEE) | `intern/cycles/kernel/closure/bsdf_microfacet.h:466-485` | **Fixed** |
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
-| 19 | **Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.927854** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.24% at roughness 0.4 / anisotropy 0.9 and +47.83% at roughness 0.9 / anisotropy 0.9**. `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to **0.00%** (1.000549 vs 1.000499), which is independent confirmation of the Gap #17 fix. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
+| 19 | **Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.927854** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.24% at roughness 0.4 / anisotropy 0.9 and +47.83% at roughness 0.9 / anisotropy 0.9**. `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **The transmissive lobe still uses the fitted multi-scatter approximation** — Gap #17 deliberately left `brdf_inc.glsl`'s transmissive reflection branch on `evalMultiScatterApproximation`, because Cycles compensates glass from a different table set — `ggx_glass_E` (16×16×16), `ggx_glass_Eavg` (16×16) and the `ggx_glass_inv_*` variants for `ior < 1` — none of which this project has transcribed. Pointing it at `ggxE`/`ggxEavg` would swap a measured divergence for an unmeasured one. Needs the four tables, an extended SSBO layout, and its own transmissive furnace study. The transmit branch applies no compensation at all. | `brdf_inc.glsl` (transmissive closure, reflection branch — annotated in place) | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-457` | Medium |
 
 **Not gaps — verified correct, leave alone:**
@@ -4843,13 +4843,15 @@ too (its comment: "EVERY pixel in the render is a sphere hit and none is
 background sky"), so the two sets of numbers are directly comparable with no
 dilution correction.
 
+The two isotropic rows are the control, and their agreement is the result.
+
 | configuration | Cycles 5.2.1 | ours | ours vs 1.0 | **ours vs Cycles** |
 |---|---|---|---|---|
 | roughness 0.4, anisotropy 0.0 | 1.000499 | 1.000549 | +0.05% | **+0.00%** |
 | roughness 0.4, anisotropy 0.5 | 0.990723 | 1.017584 | +1.76% | **+2.71%** |
 | roughness 0.4, anisotropy 0.9 | 0.927854 | 0.976442 | −2.36% | **+5.24%** |
 | roughness 0.9, anisotropy 0.9 | 0.864730 | 1.278307 | +27.83% | **+47.83%** |
-| roughness 0.9, anisotropy 0.0 | 0.999645 | *not measured* | — | — |
+| roughness 0.9, anisotropy 0.0 | 0.999645 | **0.999631** | −0.04% | **−0.00%** |
 
 ### 11.3 The verdict
 
@@ -4860,9 +4862,11 @@ dilution correction.
   must return; at roughness 0.9 / anisotropy 0.9 it loses 13.5%. So "port what
   Cycles does" is not a fix here — Cycles has the same blind spot, for the same
   structural reason.
-- **Isotropically the two engines agree to 0.00%** (1.000549 against 1.000499).
-  That is an independent confirmation, from a source outside this project, that
-  the Gap #17 fix landed correctly.
+- **Isotropically the two engines agree to ~1e-5, at both roughnesses tested**
+  (1.000549 against 1.000499 at roughness 0.4; 0.999631 against 0.999645 at
+  roughness 0.9). That is an independent confirmation, from a source outside
+  this project, that the Gap #17 fix landed correctly — and it holds across the
+  roughness range, not only at the 0.4 the anisotropy sweep happened to use.
 - **But the two engines fail in opposite directions**, so this is a live parity
   gap: we over-recover the missing energy, Cycles under-recovers it, and the
   divergence between the two reaches **+5.24%** at roughness 0.4 and **+47.83%**
@@ -4899,13 +4903,36 @@ therefore uninformative, and the activation evidence is check 2 above instead. T
 source read was of a different version than the binary, which is exactly the kind
 of gap this document keeps logging errata about.
 
-### 11.5 Next measurement, if this is picked up
+### 11.5 The isotropic high-roughness control — measured, and it settles the split
 
-**Our engine at roughness 0.9, anisotropy 0.0.** Cycles reads 0.999645 there, so
-it stays energy-conserving isotropically even at high roughness. If ours does too,
-the entire divergence is anisotropy and the search narrows to `evalMicrofacet`'s
-anisotropic branch and `anisoAspect`. If ours does *not*, part of it is
-roughness-dependent and Gap #17's fix is incomplete at the top of the range. Our
-gate has no isotropic roughness-0.9 furnace configuration today; adding one to
-`pt_anisotropy_gate.gd` is a few lines and is the cheapest way to split the two
-causes apart.
+**Measured 2026-09-11**, added as **probe 1c** in `pt_anisotropy_gate.gd` so it
+stays reproducible rather than living in a scratch scene.
+
+**Our engine at roughness 0.9, anisotropy 0.0 reads 0.999631. Cycles reads
+0.999645. They agree to 1.4e-5.**
+
+That was the cell separating the two candidate explanations, and it comes down
+firmly on one side:
+
+- **The entire divergence from Blender is anisotropy.** Both isotropic
+  configurations — roughness 0.4 *and* roughness 0.9 — agree with Cycles to about
+  1e-5. Every anisotropic configuration diverges, and the divergence grows with
+  both roughness and eccentricity.
+- **Gap #17's fix is complete across the roughness range**, not merely at the 0.4
+  the sweep happened to use. The `1/E` derivation holds at 0.9 too, in both
+  engines independently. Whatever Gap #19 is, it is not unfinished business from
+  Gap #17.
+- **The search narrows to the anisotropic branch itself** — `evalMicrofacet`'s
+  `anisoActive` path, `anisoAspect`, and the anisotropic VNDF sampler — plus the
+  decision both engines share, to feed an isotropic `(rough, mu)` table the
+  geometric-mean roughness.
+
+The magnitudes are worth stating together, because they show the two engines
+departing in opposite directions from the same isotropic starting point. Going
+from anisotropy 0.0 to 0.9 at roughness 0.9: **ours swings 0.999631 → 1.278307
+(+27.9%), Cycles swings 0.999645 → 0.864730 (−13.5%).** Same material, same
+parameter, same aspect formula, opposite sign.
+
+Probe 1c asserts its absolute check against 1.0. Unlike probe 1's anisotropic
+entries and probe 1b, it is isotropic, so the `1/E` derivation applies exactly and
+the assertion is sound rather than aspirational. It passes at 0.04%.

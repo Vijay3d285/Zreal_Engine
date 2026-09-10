@@ -176,6 +176,19 @@ const NEE_DOM_ANISOTROPY := 0.9
 const NEE_DOM_ROTATION := 0.0
 const NEE_DOM_FRAMES := 64
 
+# Probe 1c (Gap #19, 2026-09-11). The missing cell in the Cycles comparison:
+# probe 1 sweeps anisotropy at roughness 0.4 and probe 1b is roughness 0.9 AT
+# anisotropy 0.9, so nothing measured roughness 0.9 ISOTROPIC -- which is exactly
+# what separates "the divergence from Blender is anisotropy" from "part of it is
+# roughness". Cycles 5.2.1 reads 0.999645 in this configuration (§11).
+#
+# Same sphere, same uniform sky, same crop as probes 1 and 1b; only roughness and
+# anisotropy differ, so the three are directly comparable to each other and to
+# the Cycles table in §11.2.
+const ISO_HIROUGH_ROUGHNESS := 0.9
+const ISO_HIROUGH_ANISOTROPY := 0.0
+const ISO_HIROUGH_FRAMES := 64
+
 # Fix round 2 (Important #1): same regression-band treatment as probe 1's
 # BASELINE_INTACT_RATIO -- measured on the intact tree (task-4-report.md fix
 # round 1, I6), sits well above 1.0 for the same pre-existing `ms`
@@ -458,6 +471,39 @@ func _probe_furnace_nee_dominant(p_env: Environment) -> void:
 				% [ratio, BASELINE_INTACT_RATIO_NEE_DOM, BASELINE_BAND * 100.0])
 
 
+func _probe_furnace_isotropic_hirough(p_env: Environment) -> void:
+	print("\n=== PROBE 1c: white furnace, roughness %.2f ISOTROPIC ===" % ISO_HIROUGH_ROUGHNESS)
+	print("  roughness=%.2f anisotropy=%.2f" % [ISO_HIROUGH_ROUGHNESS, ISO_HIROUGH_ANISOTROPY])
+	print("  [gate] absolute vs 1.0, tolerance %.1f%% -- ASSERTED. This configuration is"
+			% (TOLERANCE * 100.0))
+	print("         ISOTROPIC, so the 1/E derivation applies exactly (see probe 1).")
+	print("  Cycles 5.2.1 reads 0.999645 here; see PATH_TRACER_QUALITY_ROADMAP.md section 11.2.")
+	var mat := _sphere_material(ISO_HIROUGH_ANISOTROPY, 0.0)
+	mat.roughness = ISO_HIROUGH_ROUGHNESS
+	_sphere.material_override = mat
+	var img: Image = await _render_accum(p_env, get_viewport().get_viewport_rid(), ISO_HIROUGH_FRAMES)
+	if img == null:
+		_failures.append("probe1c isotropic high-roughness furnace: accumulator readback returned null")
+		return
+	var s := _measure_crop(img, 0.05, 0.95)
+	var ratio: float = s["mean"] / SKY_RADIANCE
+	print("  mean=%.6f  ratio=%.6f  (n=%d)" % [s["mean"], ratio, s["n"]])
+	# ASSERTED, on the same derivation that made probe 1's anisotropy-0 case
+	# assertable: for this material (albedo 1, metallic 1) Fss = 1, so Fms = 1
+	# and the compensation is exactly 1/E, which cancels the lobe's directional
+	# albedo E. A white furnace must return the sky radiance. Anisotropy is 0
+	# here, so Gap #19's residual -- whatever its cause -- cannot reach this probe.
+	#
+	# DO NOT widen TOLERANCE. If this fails, the multi-scatter compensation is
+	# incomplete at high roughness and that is a finding, not a threshold.
+	if absf(ratio - 1.0) > TOLERANCE:
+		_failures.append(("probe1c isotropic high-roughness furnace: ratio %.6f vs 1.0 exceeds %.1f%% " +
+				"-- an ISOTROPIC white furnace must return the sky radiance exactly, and the Cycles " +
+				"compensation is exactly 1/E by derivation for this material. Gap #17 (section 10) is " +
+				"incomplete at roughness %.2f if this fires.")
+				% [ratio, TOLERANCE * 100.0, ISO_HIROUGH_ROUGHNESS])
+
+
 func _probe_pdf_parity(p_env: Environment) -> void:
 	print("\n=== PROBE 2: anisotropic pdf/sampler self-normalization (vis mode %d) ===" % MODE_ANISO_PDF_PARITY)
 	print("  diagnostic-only: old per-pixel |R - G| tautology check, NOT asserted (fix round 1, C2)")
@@ -517,6 +563,7 @@ func _ready() -> void:
 
 	await _probe_furnace(env)
 	await _probe_furnace_nee_dominant(env)
+	await _probe_furnace_isotropic_hirough(env)
 	await _probe_pdf_parity(env)
 
 	print("\n=== RESULT ===")
