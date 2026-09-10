@@ -80,6 +80,7 @@ Ranked by impact on offline still quality.
 | 15 | **Biased bump-map mirror recovery** | `brdf_inc.glsl:998-1009` | offset/position normals, no bias | Low-Med |
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
 | 17 | **Multi-scatter energy compensation over-shoot** — `evalEmsApprox`/`evalMultiScatterApproximation` over-corrects true single-scatter energy loss by roughly 3-8pp across the roughness/anisotropy range measured so far (E2b furnace: isotropic `anisotropy=0.0` control +5.95%, full sweep +3.4% to +8.1%; separate Cycles-comparison scene +6.52% raw, of which 5.85pp attributed to this bug). Pre-existing and anisotropy-orthogonal — reproduces with no anisotropic material involved at all, so it is not an E2b defect. Characterized in §7.8; **no fix is proposed here**, carried forward as-is for a future phase. | `brdf_inc.glsl:1156-1168` (`evalEmsApprox`/`evalMultiScatterApproximation`), call sites `:1215`, `:1375`, `raytracing_closest_hit_common_inc.glsl:1270` | approximation is engine-local; no Cycles line identified as its source or as exhibiting the same over-shoot | Low-Med |
+| 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
 
 **Not gaps — verified correct, leave alone:**
 - BRDF library (VNDF GGX, height-correlated Smith G2) — Cycles-class. Multi-scatter compensation is present but **over-corrects** — see Gap #17 above; it is no longer an unqualified "leave alone."
@@ -4462,3 +4463,106 @@ here rather than lost, and none of them blocks the feature.
   primary-hit gating but was not traced against OIDN's own path.
 - A foliage-heavy scene's cost. The aquarium carries 3 blend surfaces of 55
   materials; the worst case remains unmeasured.
+
+
+### 9.10 Open gap — low-alpha panes lose their specular, and a pipeline substitution is masking it
+
+**Status: open. Not fixed by this phase, and carried forward deliberately.**
+
+The closure weighs a blended surface's shading by its authored alpha: draw
+`u < (1 - alpha)` and the ray passes straight through, otherwise shade normally.
+That is correct for the transmitted share and it is what §9.3's gate measures.
+But it means **everything** the surface would contribute — its specular lobe and
+Fresnel response along with its albedo — is scaled by `alpha`. For a clear glass
+pane, which is exactly the case where the reflection is the whole visual, that
+scaling is severe:
+
+| asset | authored base colour | effective alpha | shaded share |
+|---|---|---|---|
+| MarineDecorativeGlassAquarium `Glass` | white `255,255,255` | 0.098 | ~10% |
+| ModernCurvedGlassCoffeeTable `Glass` | dark `106,106,106` | 0.804 | ~80% |
+
+At `alpha = 0.098` the pane keeps roughly a tenth of its reflection and reads
+flat — an open box rather than a glass tank. Measured directly: routing the
+aquarium panes through the closure instead of the transmissive conversion moved
+**10.75% of the fish-tank render by more than 8/255, rmse 14.61**, and the
+visible result was the tank glass losing its presence entirely. The smoked table
+top at `alpha = 0.804` has no such problem, because 80% of its shading survives.
+
+**What is masking it.** The GLB pipeline converts alpha-blended panes to opaque
+transmissive materials (`transparency = DISABLED`, `transmission = 1.0`,
+`ior = 1.2`), which gives them real Fresnel and makes clear glass look right.
+That conversion is a leftover workaround from before this phase, when alpha
+surfaces were dropped from the TLAS entirely and converting them was the only
+way to see them at all. It is now scoped by `_glb_alpha_convert_is_lossless()`
+to fire only where it throws nothing away — essentially colourless
+(`min RGB >= 0.90`) and mostly transparent (`alpha <= 0.35`) — because it had
+been keyed on the material's *name* and was flattening an 80%-covering dark
+smoked table top into clear colourless glass.
+
+**What Cycles actually does — checked, and it disproves the obvious hypothesis.**
+The natural reading is that our closure dims the reflection where Blender does
+not. That is wrong. `intern/cycles/kernel/svm/closure.h:108-113`:
+
+```c
+/* Before any actual shader components, apply transparency. */
+const float alpha = saturatef(stack_load(stack, data.alpha));
+if (alpha < 1.0f) {
+  bsdf_transparent_setup(sd, weight * (1.0f - alpha), path_flag);
+  weight *= alpha;
+}
+```
+
+`weight *= alpha` scales the entire Principled closure — sheen, coat, specular,
+metallic and diffuse alike — exactly as our branch does, and the comment says so
+in as many words. **Cycles' alpha weighting and ours agree.** Any explanation
+that starts "our closure weights alpha differently from Cycles" is already
+refuted; do not spend time there.
+
+**So the cause is unidentified, and the first task is to find out whether there
+is one.** Two possibilities remain open, and they lead to opposite conclusions:
+
+- Our specular response for the surviving share is genuinely weaker than
+  Cycles' — plausible candidates are the uniform `metallic = 1.0` these panes
+  author, the `KHR_materials_specular` `specularColorFactor` of `[2.0, 2.0, 2.0]`
+  they carry (which Blender maps to Specular IOR Level as `0.5 * specularFactor`
+  and we may not read at all), or our Fresnel term on a metallic surface. If so,
+  this is a real parity gap and fixing it lets the substitution go.
+- **Or Cycles renders this aquarium's glass just as flat as our closure does**,
+  and the transmissive conversion is not restoring parity at all — it is a
+  deliberate divergence that happens to look better. If so the substitution
+  should be kept and documented as an intentional deviation, not deleted.
+
+Nothing in this phase distinguishes those. The measurement that does is cheap
+and must come first.
+
+**What to investigate, in order.**
+
+1. **Render the aquarium GLB in Cycles and look at the glass.** This single
+   observation decides which of the two branches above is true, and therefore
+   whether there is anything to fix. Everything else is premature until it is
+   done.
+2. If Cycles' glass is solid where ours is flat, diff the specular path: what we
+   read from `KHR_materials_specular` (if anything), how metallic 1.0 at 10%
+   alpha resolves in each, and the Fresnel term. A change here alters every
+   alpha-blended surface in every scene, so it needs its own gate with a
+   falsifiable band in the style of §9.3.
+3. If Cycles' glass is equally flat, keep the conversion, and rewrite this
+   section to record it as an intentional divergence with that evidence — the
+   substitution then stops being a debt and becomes a decision.
+4. Only if step 2 lands does deleting `_apply_glb_transmissive_glass`, its
+   keyword lists, and `GLB_CONVERT_MAX_TINT` / `GLB_CONVERT_MAX_ALPHA` from both
+   pipeline scripts become possible.
+
+**Do not close this gap by widening the thresholds.** Tuning
+`GLB_CONVERT_MAX_TINT` or `GLB_CONVERT_MAX_ALPHA` to capture more panes moves
+the mis-classification boundary rather than removing it, and each widening
+silently discards more authored appearance. The threshold pair exists to be
+deleted or deliberately justified, not tuned.
+
+**Erratum for this section.** Its first draft asserted that the alpha weighting
+was the defect and told a future reader to reweight the reflective lobe. That
+was a hypothesis stated as a finding, and checking `closure.h` — a two-minute
+read of source that was already on disk — refuted it. Recorded because it is the
+third time in this phase that something was asserted from plausibility rather
+than read from the code (see §9.8).
