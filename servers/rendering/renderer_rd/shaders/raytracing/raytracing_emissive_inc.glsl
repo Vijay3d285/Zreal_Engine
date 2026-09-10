@@ -493,7 +493,7 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 		float ms_alpha = p_mat.roughness * p_mat.roughness;
 		float NdotV = max(dot(p_N, p_V), 0.0001);
 		vec3 specular_f0 = baseColorToSpecularF0(p_mat.baseColor, p_mat.metalness, p_mat.dielectricF0);
-		f_spec *= evalMultiScatterApproximation(ms_alpha, NdotV, specular_f0);
+		f_spec *= evalMultiScatterFactor(ms_alpha, NdotV, specular_f0);
 		// E2d Task 5b: the coat's compensation moved inside evalCoat (real
 		// Cycles preserve_energy via coatEnergyScale), so f_coat arrives
 		// already compensated. See the matching note in the environment-NEE

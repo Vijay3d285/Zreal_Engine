@@ -1769,7 +1769,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 					// rather than changed here.
 #if MICROFACET_DISTRIBUTION == GGX
 					float ms_alpha = brdf_mat.roughness * brdf_mat.roughness;
-					f_spec *= evalMultiScatterApproximation(ms_alpha, NdotV, specularF0);
+					f_spec *= evalMultiScatterFactor(ms_alpha, NdotV, specularF0);
 					// E2d Task 5b: NO coat factor here any more. The coat's
 					// compensation is coatEnergyScale (real Cycles
 					// preserve_energy, not the 1 + F0*Ems approximation, which at

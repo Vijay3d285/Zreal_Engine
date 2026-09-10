@@ -1224,6 +1224,32 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 	return 1.0 + F0 * Ems;
 }
 
+// A/B switch for roadmap Gap #17, kept permanently as measurement scaffolding
+// rather than deleted after the phase -- the same standing precedent as
+// COMBINE_BRDFS_WITH_FRESNEL (above), RT_LIGHT_SELECT_UNIFORM
+// (raytracing_lights_inc.glsl) and RT_ENV_NEE_ENABLED (raytracing_inc.glsl).
+//
+//   1 = Cycles' table-driven 1 + Fms*(1-E)/E            (production)
+//   0 = no compensation at all -- the raw single-scattering GGX lobe
+//   2 = the legacy fitted 1 + F0*Ems (evalMultiScatterApproximation above)
+//
+// THREE states, not two, because a future residual needs "off" as well as "old"
+// to be attributable, and because it gives the white-furnace gate three
+// separated values it must reproduce. State 2 in particular must reproduce
+// pt_anisotropy_gate.gd's committed BASELINE_INTACT_RATIO[2] = 1.059535, which
+// is what proves the legacy path was preserved rather than merely believed to be.
+//
+// evalEmsApprox and evalMultiScatterApproximation above are deliberately NOT
+// deleted; state 2 is what keeps them live.
+#define RT_MS_COMPENSATION 1
+
+// Forward declaration. The definition lives after the LUT readers, because it
+// reads the coat_albedo_table SSBO which is not declared until much further down
+// this file -- and this function is CALLED above that point, by
+// sampleSpecularMicrofacet. This is the only forward declaration in this file;
+// it is here rather than moving a 700-line block of E2d/E2e code.
+float3 evalMultiScatterFactor(float alpha, float NdotV, float3 F0);
+
 // Samples a reflection ray from the rough surface using selected microfacet distribution and sampling method
 // Resulting weight includes multiplication by cosine (NdotL) term
 //
@@ -1328,7 +1354,7 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	float3 F = evalFresnel(specularF0, shadowedF90(specularF0), HdotL);
 
 #if MICROFACET_DISTRIBUTION == GGX
-	float3 ms = evalMultiScatterApproximation(alpha, NdotV, specularF0);
+	float3 ms = evalMultiScatterFactor(alpha, NdotV, specularF0);
 #else
 	float3 ms = vec3(1.0f, 1.0f, 1.0f);
 #endif
@@ -1481,6 +1507,13 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		float NdotV = max(0.00001f, min(1.0f, dot(Nlocal, Vlocal)));
 		float NdotH = max(0.00001f, min(1.0f, dot(Nlocal, Hlocal)));
 #if MICROFACET_DISTRIBUTION == GGX
+		// DELIBERATELY still the legacy approximation (Gap #17 scope decision).
+		// This is the reflection branch of E1's transmissive closure, and Cycles
+		// compensates glass from a DIFFERENT table set -- ggx_glass_E (16x16x16),
+		// ggx_glass_Eavg (16x16), plus ggx_glass_inv_E / ggx_glass_inv_Eavg for
+		// ior < 1 (bsdf_microfacet.h:450-457) -- which this project has never
+		// transcribed. Pointing this at ggxE/ggxEavg would swap a MEASURED
+		// divergence for an unmeasured one. Filed as its own roadmap item.
 		float3 ms = evalMultiScatterApproximation(alpha, NdotV, F0);
 #else
 		float3 ms = float3(1.0f, 1.0f, 1.0f);
@@ -2159,6 +2192,70 @@ float ggxE(float alpha, float NdotV) {
 
 float ggxEavg(float alpha) {
 	return ggxLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, sqrt(alpha), GGX_E_DIM);
+}
+
+// Cycles' real multiple-scattering energy compensation for the BASE specular
+// lobe, replacing the fitted 1 + F0*Ems (roadmap Gap #17).
+//
+// Transcribed from microfacet_ggx_preserve_energy
+// (intern/cycles/kernel/closure/bsdf_microfacet.h:466-485). Cycles scales the
+// BSDF value by energy_scale = 1/E and the closure WEIGHT by
+// darkening = (1 + Fms*missing)/energy_scale; an engine with no separate closure
+// weight only ever sees the product, which is the 1 + Fms*missing below. That is
+// the identical derivation E2d already made for the coat -- see coatEnergyScale.
+//
+// THIS IS THE DEFAULT PATH IN CYCLES, NOT AN OPT-IN, and the code reads the
+// other way until you chase it: preserve_energy is gated on is_multiggx at all
+// three Principled microfacet lobes (svm/closure.h:346, :414, :463), but
+// node_shader_init_principled sets custom1 = SHD_GLOSSY_MULTI_GGX
+// (node_shader_bsdf_principled.cc:330), so every Principled node ever created --
+// including every one the glTF importer builds -- defaults to Multiscatter GGX.
+//
+// WHY ONE 1/21 COVERS BOTH METAL AND DIELECTRIC. Cycles uses two Fss models and
+// this engine has one specular lobe with a metallic-lerped F0. They coincide:
+// the metallic path is fresnel_f82_Fss(F0, B) = mix(F0, 1, 1/21) - B/126
+// (bsdf_util.h:140-143), and at the default white specular tint
+// fresnel_f82tint_B returns ...*(1 - tint) = 0, leaving mix(F0, 1, 1/21)
+// EXACTLY; the dielectric path is generalized Schlick with
+// s = 2/((exponent+3)*exponent + 2) = 1/21 at our Schlick exponent of 5
+// (bsdf_microfacet.h:964-965). Cycles' dielectric branch actually takes an
+// ior-derived s (:958-962) -- 0.0492 vs 0.0476 at ior 1.45, about 2% on Fss and
+// ~0.1% of final radiance. Accepted, and recorded so nobody later "discovers" it.
+//
+// shadowedF90(F0) stands where Cycles hardcodes f90 = 1. They agree: an F0
+// derived from metalness is never below MIN_DIELECTRICS_F0, so shadowedF90
+// returns 1 (see its own comment above). Using it keeps this consistent with the
+// Fresnel the lobe actually evaluates if that invariant ever changes.
+//
+// THE LOAD-BEARING PROPERTY: for a white lobe (F0 == F90 == 1) Fss = 1, so
+// Fms = Eavg/(1 - (1 - Eavg)) = 1 and this collapses to exactly 1/E. A
+// single-scattering lobe of directional albedo E times 1/E returns exactly 1 --
+// which is why pt_anisotropy_gate.gd's white furnace must read 1.0 by
+// DERIVATION, not by tuning. A CPU mirror lives in
+// tests/servers/rendering/test_pt_ms_energy.cpp; keep the two textually
+// identical modulo type names, because the suite does NOT execute this shader.
+float3 evalMultiScatterEnergy(float alpha, float NdotV, float3 F0) {
+	float E = ggxE(alpha, NdotV);
+	float Eavg = ggxEavg(alpha);
+	float missing = (1.0f - E) / E;
+	float3 Fss = mix(F0, float3(shadowedF90(F0)), 1.0f / 21.0f);
+	float3 Fms = Fss * Eavg / (float3(1.0f, 1.0f, 1.0f) - Fss * (1.0f - Eavg));
+	return float3(1.0f, 1.0f, 1.0f) + Fms * missing;
+}
+
+// The single entry point for all three base-specular call sites. They dispatch
+// through this and only this, so the sampler and the two NEE sites cannot end up
+// on different compensations -- that is the B2 defect class (two MIS strategies
+// estimating different integrands), fixed on 2026-09-09 and not to be recreated.
+// There is deliberately no per-site override.
+float3 evalMultiScatterFactor(float alpha, float NdotV, float3 F0) {
+#if RT_MS_COMPENSATION == 1
+	return evalMultiScatterEnergy(alpha, NdotV, F0);
+#elif RT_MS_COMPENSATION == 2
+	return evalMultiScatterApproximation(alpha, NdotV, F0);
+#else
+	return float3(1.0f, 1.0f, 1.0f);
+#endif
 }
 
 // Fms: effective Fresnel of the MULTIPLY-scattered energy. One Fss is cancelled
