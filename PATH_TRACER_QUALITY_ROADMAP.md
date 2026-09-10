@@ -81,7 +81,7 @@ Ranked by impact on offline still quality.
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
 | 17 | **Multi-scatter energy compensation over-shoot** — **FIXED 2026-09-10, see §10.** `evalEmsApprox`/`evalMultiScatterApproximation` over-corrected the true single-scatter GGX energy loss by 3.4–8.1pp. Replaced by `evalMultiScatterEnergy`, a transcription of Cycles' `microfacet_ggx_preserve_energy` reading the `GGX_E`/`GGX_EAVG` tables E2d already ships. The white furnace's isotropic control went **1.059535 → 1.000549**. Two things this did *not* fix are now separate rows: #19 and #20. | `brdf_inc.glsl` (`evalMultiScatterEnergy`, `evalMultiScatterFactor`, `RT_MS_COMPENSATION`), call sites in `brdf_inc.glsl` (sampler), `raytracing_closest_hit_common_inc.glsl` and `raytracing_emissive_inc.glsl` (NEE) | `intern/cycles/kernel/closure/bsdf_microfacet.h:466-485` | **Fixed** |
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
-| 19 | **Anisotropic GGX carries its own energy error, independent of the compensation** — the white furnace sits +1.7pp above the isotropic control at anisotropy −0.9 and −2.4pp below it at +0.9, and **the offset is essentially identical with compensation set to legacy, to Cycles' table, or disabled entirely** (§10.3), so it is not caused by either factor. `GGX_E_TABLE` has no anisotropy axis — it is `(rough, mu)` only, and Cycles feeds it the same geometric-mean roughness we do — so `1/E` cannot cancel an eccentric lobe's albedo. Worst corner measured: roughness 0.9 / anisotropy 0.9 returns **0.547386** uncompensated where the isotropic table predicts ~0.428, a 27.8% over-recovery. **Undetermined whether this is our E2b anisotropic branch or an approximation Cycles shares.** Isolated by Gap #17's three-state sweep; not created by it. | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` (single `rough` for both axes) | Medium |
+| 19 | **Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.927854** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.24% at roughness 0.4 / anisotropy 0.9 and +47.83% at roughness 0.9 / anisotropy 0.9**. `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to **0.00%** (1.000549 vs 1.000499), which is independent confirmation of the Gap #17 fix. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **The transmissive lobe still uses the fitted multi-scatter approximation** — Gap #17 deliberately left `brdf_inc.glsl`'s transmissive reflection branch on `evalMultiScatterApproximation`, because Cycles compensates glass from a different table set — `ggx_glass_E` (16×16×16), `ggx_glass_Eavg` (16×16) and the `ggx_glass_inv_*` variants for `ior < 1` — none of which this project has transcribed. Pointing it at `ggxE`/`ggxEavg` would swap a measured divergence for an unmeasured one. Needs the four tables, an extended SSBO layout, and its own transmissive furnace study. The transmit branch applies no compensation at all. | `brdf_inc.glsl` (transmissive closure, reflection branch — annotated in place) | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-457` | Medium |
 
 **Not gaps — verified correct, leave alone:**
@@ -4778,3 +4778,99 @@ factor is ≈ 1).
 
 Suite 1555 passed / 0 failed / 3 skipped. Anisotropy, coat, sheen and energy
 gates all green.
+
+
+---
+
+## 11. Gap #19 decided — Cycles fails the anisotropic furnace too, and by more than we do
+
+**Measured 2026-09-11.** Blender **5.2.1 LTS** (the only runnable install on this
+machine; 4.2/4.4/4.5 are leftover script folders with no executable, so this is
+*not* the 4.5.3 the §7.8/§7.10/§7.11 comparisons used — stated because it is a
+real difference, not a footnote). Script:
+`scratchpad/cycles_aniso_furnace.py`.
+
+### 11.1 The question
+
+§10.4 isolated an anisotropy-dependent furnace error that is present with our
+multi-scatter compensation set to legacy, to Cycles' table, or **disabled
+entirely** — so it could not be caused by the factor Gap #17 replaced. Two
+possibilities remained, leading to opposite conclusions: either our E2b
+anisotropic branch is wrong, or Cycles shares the approximation (both feed a
+`(rough, mu)` table with no anisotropy axis the geometric-mean roughness).
+
+### 11.2 The measurement
+
+White furnace: uniform world radiance 1.0, sphere of base colour 1 / metallic 1,
+`film_transparent` so the sphere can be isolated by alpha, 1024 samples, no
+denoising, clamping off. Our own gate's framing was verified to be sphere-only
+too (its comment: "EVERY pixel in the render is a sphere hit and none is
+background sky"), so the two sets of numbers are directly comparable with no
+dilution correction.
+
+| configuration | Cycles 5.2.1 | ours | ours vs 1.0 | **ours vs Cycles** |
+|---|---|---|---|---|
+| roughness 0.4, anisotropy 0.0 | 1.000499 | 1.000549 | +0.05% | **+0.00%** |
+| roughness 0.4, anisotropy 0.5 | 0.990723 | 1.017584 | +1.76% | **+2.71%** |
+| roughness 0.4, anisotropy 0.9 | 0.927854 | 0.976442 | −2.36% | **+5.24%** |
+| roughness 0.9, anisotropy 0.9 | 0.864730 | 1.278307 | +27.83% | **+47.83%** |
+| roughness 0.9, anisotropy 0.0 | 0.999645 | *not measured* | — | — |
+
+### 11.3 The verdict
+
+**Gap #19 is not ours to have caused, and it is not fixed by matching Cycles.**
+
+- **Cycles fails the anisotropic white furnace, worse than we do.** At roughness
+  0.4 / anisotropy 0.9 it loses 7.2% of the energy a perfectly reflective surface
+  must return; at roughness 0.9 / anisotropy 0.9 it loses 13.5%. So "port what
+  Cycles does" is not a fix here — Cycles has the same blind spot, for the same
+  structural reason.
+- **Isotropically the two engines agree to 0.00%** (1.000549 against 1.000499).
+  That is an independent confirmation, from a source outside this project, that
+  the Gap #17 fix landed correctly.
+- **But the two engines fail in opposite directions**, so this is a live parity
+  gap: we over-recover the missing energy, Cycles under-recovers it, and the
+  divergence between the two reaches **+5.24%** at roughness 0.4 and **+47.83%**
+  at roughness 0.9 with strong anisotropy. **A brushed-metal material will not
+  match Blender**, and the §7.8 brushed-metal comparison — taken at anisotropy
+  0.9 — is sitting on top of this.
+
+Reframed accordingly in the §2 table: severity raised to **High**, and the item
+is now about *reconciling with Blender*, not about restoring energy conservation.
+Making our furnace read 1.000 would move us **further** from Blender, so the two
+goals genuinely conflict here and the choice has to be made deliberately.
+
+### 11.4 How the measurement was validated, including the control that failed
+
+Three internal checks, none of which had to be taken on trust:
+
+1. **Cycles' compensation is demonstrably on.** Its isotropic roughness-0.4
+   furnace reads 1.000499; uncompensated it would read ≈0.966 (our own
+   `RT_MS_COMPENSATION 0` measured 0.965699). This also rules out a stray view
+   transform, which would have moved the number far from 1.0.
+2. **Anisotropy is demonstrably active.** The furnace result moves 1.000499 →
+   0.927854 as anisotropy goes 0.0 → 0.9. An inert parameter cannot do that.
+3. Channels read R = G = B exactly, and the alpha mask kept 62567 of 65536
+   pixels, so the material and the mask behaved as intended.
+
+**The control designed for job 2 did not work, and is recorded rather than
+quietly dropped.** Reading `svm/closure.h:309` in the 5.3-alpha source
+(`if (anisotropic > 0.0f && stack_valid(data.tangent_offset))`) suggested
+anisotropy would be inert unless a Tangent node were connected, so the script
+rendered a point-lit pair with and without one. Both pairs returned an *identical*
+RMSE of 5.008440 against the isotropic render — meaning the explicit Tangent node
+changed nothing, because 5.2.1 already supplies a default tangent. The control was
+therefore uninformative, and the activation evidence is check 2 above instead. The
+source read was of a different version than the binary, which is exactly the kind
+of gap this document keeps logging errata about.
+
+### 11.5 Next measurement, if this is picked up
+
+**Our engine at roughness 0.9, anisotropy 0.0.** Cycles reads 0.999645 there, so
+it stays energy-conserving isotropically even at high roughness. If ours does too,
+the entire divergence is anisotropy and the search narrows to `evalMicrofacet`'s
+anisotropic branch and `anisoAspect`. If ours does *not*, part of it is
+roughness-dependent and Gap #17's fix is incomplete at the top of the range. Our
+gate has no isotropic roughness-0.9 furnace configuration today; adding one to
+`pt_anisotropy_gate.gd` is a few lines and is the cheapest way to split the two
+causes apart.
