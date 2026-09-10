@@ -206,9 +206,13 @@ Changes are naming only:
   and must be updated with it. They were never coat-specific.
 - Leave `coatLutRead3D` named as it is — it reads the coat albedo table and is
   genuinely coat-specific.
-- Add `ggxE(rough, mu)` and `ggxEavg(rough)` as the shared semantic readers.
-  `coatGgxE` / `coatGgxEavg` become thin wrappers so the coat path stays
-  byte-identical.
+- Add `ggxE(alpha, mu)` and `ggxEavg(alpha)` as the shared semantic readers.
+  The coat's own helpers are left textually untouched beyond the rename:
+  `coatGgxE` keeps reading through the renamed reader directly, and there is no
+  `coatGgxEavg` to wrap — the coat reads `E_avg` inline inside `coatFms`.
+  (An earlier draft of this section asserted a `coatGgxEavg` that does not
+  exist. Leaving the coat path unchanged is also what makes "the coat and sheen
+  gates must not move" a real check on the rename.)
 - Update the SSBO resource name at `render_raytracing.cpp:174` accordingly.
 
 ### 5.5 The A/B switch
