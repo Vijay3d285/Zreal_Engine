@@ -116,7 +116,7 @@ Ranked by impact on offline still quality.
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
 | 17 | **Multi-scatter energy compensation over-shoot** — **FIXED 2026-09-10, see §10.** `evalEmsApprox`/`evalMultiScatterApproximation` over-corrected the true single-scatter GGX energy loss by 3.4–8.1pp. Replaced by `evalMultiScatterEnergy`, a transcription of Cycles' `microfacet_ggx_preserve_energy` reading the `GGX_E`/`GGX_EAVG` tables E2d already ships. The white furnace's isotropic control went **1.059535 → 1.000549**. Two things this did *not* fix are now separate rows: #19 and #20. | `brdf_inc.glsl` (`evalMultiScatterEnergy`, `evalMultiScatterFactor`, `RT_MS_COMPENSATION`), call sites in `brdf_inc.glsl` (sampler), `raytracing_closest_hit_common_inc.glsl` and `raytracing_emissive_inc.glsl` (NEE) | `intern/cycles/kernel/closure/bsdf_microfacet.h:466-485` | **Fixed** |
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
-| 19 | **Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.927854** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.24% at roughness 0.4 / anisotropy 0.9 and +47.83% at roughness 0.9 / anisotropy 0.9**. `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
+| 19 | **Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes:** a raw anisotropic lobe returning 5–10% more energy than Cycles' (undiagnosed), and `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not (found — and fixing it invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **The transmissive lobe still uses the fitted multi-scatter approximation** — Gap #17 deliberately left `brdf_inc.glsl`'s transmissive reflection branch on `evalMultiScatterApproximation`, because Cycles compensates glass from a different table set — `ggx_glass_E` (16×16×16), `ggx_glass_Eavg` (16×16) and the `ggx_glass_inv_*` variants for `ior < 1` — none of which this project has transcribed. Pointing it at `ggxE`/`ggxEavg` would swap a measured divergence for an unmeasured one. Needs the four tables, an extended SSBO layout, and its own transmissive furnace study. The transmit branch applies no compensation at all. | `brdf_inc.glsl` (transmissive closure, reflection branch — annotated in place) | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-457` | Medium |
 
 **Not gaps — verified correct, leave alone:**
@@ -4843,15 +4843,31 @@ too (its comment: "EVERY pixel in the render is a sphere hit and none is
 background sky"), so the two sets of numbers are directly comparable with no
 dilution correction.
 
+> **CORRECTED 2026-09-11 — the first version of this table was taken at the wrong
+> camera framing.** Cycles was rendered at distance 4.01 with an 85 mm lens, where
+> the sphere's whole limb is visible and `mu` is sampled over [0, 1]. Our gate puts
+> the camera at distance 2.5 with a 20° FOV, so the sphere *overfills* the frame and
+> only `mu ∈ [0.796, 1.0]` is sampled. A white furnace returns exactly 1.0 at every
+> `mu` when energy-conserving, so the **isotropic** rows were unaffected and their
+> agreement stood — but the anisotropic deviation is `mu`-dependent, so those rows
+> were comparing different integrals. Re-rendered below with the framing matched
+> (verified in-script: sphere angular radius 23.58° against a 14.00° diagonal
+> half-FOV, 65536 of 65536 pixels a sphere hit). **The conclusions did not change and
+> four of the five cells barely moved; `roughness 0.9, anisotropy 0.9` moved
+> materially, 0.864730 → 0.830896, and the headline divergence with it: +47.83% →
+> +53.85%.** The error surfaced from an internal inconsistency rather than luck —
+> §11.6's raw isotropic lobes differed by 10.5% while the compensated ones agreed to
+> 1.4e-5, which cannot both hold if both engines read the same `E` from the same table.
+
 The two isotropic rows are the control, and their agreement is the result.
 
 | configuration | Cycles 5.2.1 | ours | ours vs 1.0 | **ours vs Cycles** |
 |---|---|---|---|---|
-| roughness 0.4, anisotropy 0.0 | 1.000499 | 1.000549 | +0.05% | **+0.00%** |
-| roughness 0.4, anisotropy 0.5 | 0.990723 | 1.017584 | +1.76% | **+2.71%** |
-| roughness 0.4, anisotropy 0.9 | 0.927854 | 0.976442 | −2.36% | **+5.24%** |
-| roughness 0.9, anisotropy 0.9 | 0.864730 | 1.278307 | +27.83% | **+47.83%** |
-| roughness 0.9, anisotropy 0.0 | 0.999645 | **0.999631** | −0.04% | **−0.00%** |
+| roughness 0.4, anisotropy 0.0 | 1.000504 | 1.000549 | +0.05% | **+0.00%** |
+| roughness 0.9, anisotropy 0.0 | 0.999617 | 0.999631 | −0.04% | **+0.00%** |
+| roughness 0.4, anisotropy 0.5 | 0.992470 | 1.017584 | +1.76% | **+2.53%** |
+| roughness 0.4, anisotropy 0.9 | 0.928014 | 0.976442 | −2.36% | **+5.22%** |
+| roughness 0.9, anisotropy 0.9 | 0.830896 | 1.278307 | +27.83% | **+53.85%** |
 
 ### 11.3 The verdict
 
@@ -4859,7 +4875,7 @@ The two isotropic rows are the control, and their agreement is the result.
 
 - **Cycles fails the anisotropic white furnace, worse than we do.** At roughness
   0.4 / anisotropy 0.9 it loses 7.2% of the energy a perfectly reflective surface
-  must return; at roughness 0.9 / anisotropy 0.9 it loses 13.5%. So "port what
+  must return; at roughness 0.9 / anisotropy 0.9 it loses 16.9%. So "port what
   Cycles does" is not a fix here — Cycles has the same blind spot, for the same
   structural reason.
 - **Isotropically the two engines agree to ~1e-5, at both roughnesses tested**
@@ -4930,9 +4946,67 @@ firmly on one side:
 The magnitudes are worth stating together, because they show the two engines
 departing in opposite directions from the same isotropic starting point. Going
 from anisotropy 0.0 to 0.9 at roughness 0.9: **ours swings 0.999631 → 1.278307
-(+27.9%), Cycles swings 0.999645 → 0.864730 (−13.5%).** Same material, same
+(+27.9%), Cycles swings 0.999617 → 0.830896 (−16.9%).** Same material, same
 parameter, same aspect formula, opposite sign.
 
 Probe 1c asserts its absolute check against 1.0. Unlike probe 1's anisotropic
 entries and probe 1b, it is isotropic, so the `1/E` derivation applies exactly and
 the assertion is sound rather than aspirational. It passes at 0.04%.
+
+### 11.6 Splitting the lobe from the compensation — two divergences, one found
+
+Rendering both engines with the compensation **off** (ours `RT_MS_COMPENSATION 0`;
+Cycles by setting the Principled node's distribution to plain `GGX`, which makes
+`is_multiggx` false and skips `microfacet_ggx_preserve_energy` entirely) separates
+the raw lobe from the factor applied on top of it. Framing matched throughout.
+
+| configuration | Cycles raw | ours raw | ours vs Cycles |
+|---|---|---|---|
+| roughness 0.4, anisotropy 0.0 | 0.965085 | 0.965696 | **+0.06%** |
+| roughness 0.9, anisotropy 0.0 | 0.430197 | 0.428154 | **−0.47%** |
+| roughness 0.4, anisotropy 0.9 | 0.895165 | 0.942444 | **+5.28%** |
+| roughness 0.9, anisotropy 0.9 | 0.497473 | 0.547395 | **+10.04%** |
+
+And the compensation factor each engine actually applied (compensated ÷ raw):
+
+| configuration | Cycles | ours |
+|---|---|---|
+| roughness 0.4, anisotropy 0.0 | 1.0367 | 1.0361 |
+| roughness 0.4, anisotropy 0.9 | 1.0367 | 1.0361 |
+| roughness 0.9, anisotropy 0.0 | 2.3236 | 2.3347 |
+| **roughness 0.9, anisotropy 0.9** | **1.6702** | **2.3353** |
+
+**Divergence A — the raw anisotropic lobe.** The isotropic lobes agree (+0.06%,
+−0.47%), so the GGX evaluation, the VNDF sampler and the furnace measurement all
+line up when `ax == ay`. The anisotropic lobes do not: ours returns 5.28% more
+energy at roughness 0.4 and 10.04% more at roughness 0.9. **No diagnosis yet.** At
+roughness 0.4 no clamp is involved (see B), so this is a genuine difference in the
+anisotropic evaluation or sampling and needs its own investigation.
+
+**Divergence B — `ax`/`ay` are clamped in Cycles and not here. FOUND.**
+`bsdf_microfacet_ggx_setup` (`intern/cycles/kernel/closure/bsdf_microfacet.h:1042-1043`):
+
+```c
+bsdf->alpha_x = saturatef(bsdf->alpha_x);
+bsdf->alpha_y = saturatef(bsdf->alpha_y);
+```
+
+That runs **after** `svm/closure.h:585-587`'s `alpha_x /= aspect`, so an `ax` driven
+above 1 by anisotropy is truncated to 1. `prepareBRDFData` (`brdf_inc.glsl:1851-1852`)
+applies no upper bound at all.
+
+It fires exactly where the factors diverge and nowhere else, which is what makes the
+attribution safe rather than merely plausible: at roughness 0.9 / anisotropy 0.9,
+`ax = 0.81 / 0.4359 = 1.858`, Cycles clamps it to 1.0, and `rough` becomes
+`sqrt(sqrt(1.0 × 0.353)) = 0.771` instead of 0.9 — a much smaller `1/E`, which is the
+measured 1.6702 against our 2.3353. At roughness 0.4, `ax = 0.367`, no clamp applies,
+and the two factors agree to 0.06% at **both** anisotropies.
+
+**This breaks §5.2 of the Gap #17 spec.** That section proved `ax·ay = alpha²`
+exactly, hence `rough = sqrt(alpha)`, and `ggxE`/`ggxEavg` were built on it — which is
+what let the two NEE sites compute `rough` from `roughness` alone with no anisotropy
+plumbing. **Clamping destroys the identity**: once `ax` is truncated, `ax·ay ≠ alpha²`.
+Matching Cycles therefore requires `rough` derived from the clamped `ax`/`ay` at all
+three call sites, which means plumbing anisotropy to the two NEE sites after all. The
+sampler-versus-NEE desync hazard §5.2 avoided by accident is live again and has to be
+handled deliberately.
