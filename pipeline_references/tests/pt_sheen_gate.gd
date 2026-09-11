@@ -670,6 +670,108 @@ func _dielectric(p_albedo: float, p_roughness: float) -> StandardMaterial3D:
 # ---------------------------------------------------------------------------
 
 ## Mean over an axis-aligned crop given as fractions of the image.
+## PROBE F -- the VELVET comparison against Cycles (roadmap §7.11, re-taken).
+##
+## Reproduces §7.11.1's four arms from its written parameters: dielectric base
+## metallic 0 / roughness 0.60, base colour LINEAR (0.12, 0.02, 0.03), sheen
+## colour LINEAR (0.75, 0.70, 0.55), under the uniform radiance-1.0 world this
+## gate already builds, at sheen roughness 0.30 / 0.50 / 0.80 plus an un-sheened
+## control.
+##
+## WHY RE-TAKEN RATHER THAN RE-RUN: the original .blend and harness were never
+## checked into this repo and Blender 4.5.3 is gone. This is a NEW measurement on
+## Blender 5.2.1 with framing matched on both sides, not a reproduction.
+##
+## WHAT IT IS FOR. §7.11.1's shape was the finding: the UN-SHEENED control was the
+## worst arm at -2.062%, so the residual was the dielectric BASE, not the sheen --
+## and §7.11.2 concluded Gap #17 did not explain it but "partially masks" it. Both
+## Gap #17 (§10) and Gap #19 (§11.8/§11.9) have since landed, so this arm set is
+## the direct test of that conclusion. The base here is ISOTROPIC, so Gap #19
+## should not touch it; Gap #17 should.
+##
+## sheen_roughness is set EXPLICITLY on every arm -- see this file's header for
+## why leaving it at Godot's default 0 renders no sheen at all and reads as a
+## suspiciously perfect match.
+const VELVET_BASE_LINEAR := Color(0.12, 0.02, 0.03)
+const VELVET_SHEEN_LINEAR := Color(0.75, 0.70, 0.55)
+const VELVET_BASE_ROUGHNESS := 0.60
+const VELVET_FRAMES := 256
+# Measured by tools/cycles_comparison/cycles_velvet.py on Blender 5.2.1, framing
+# matched, bounces matched at 3. Parallel to VELVET_ARMS below. See §7.11.1.
+const VELVET_ARMS := [
+	{ "tag": "velvetsharp", "sheen_rough": 0.30 },
+	{ "tag": "velvet", "sheen_rough": 0.50 },
+	{ "tag": "velvetrough", "sheen_rough": 0.80 },
+	{ "tag": "nosheen", "sheen_rough": -1.0 },
+]
+# Blender 5.2.1, framing matched, bounces matched at 3, 2048 samples.
+#
+# THE RECONSTRUCTION VALIDATES ITSELF TWICE, which matters because the original
+# .blend was never checked in and 4.5.3 is gone:
+#   - all four arms reproduce section 7.11.1's recorded Cycles means to within
+#     0.018% (0.09024246 / 0.10501504 / 0.20694485 / 0.08954956), on a different
+#     Blender version;
+#   - the colour-space positive control -- feeding Cycles the sRGB-ENCODED numbers
+#     as if linear -- gives ratio 2.691441 against the recorded 2.691387, both
+#     +169.1%, i.e. ~99x the size of the gap being measured.
+const VELVET_CYCLES_REF := [0.09022636, 0.10500451, 0.20693646, 0.08953342]
+const VELVET_BAR := 0.05 # §8.6
+
+
+func _probe_f_velvet_vs_cycles(p_env: Environment) -> void:
+	print("\n=== PROBE F: velvet vs Cycles (roadmap 7.11, re-taken) ===")
+	print("  BASE  linear=(%.8f,%.8f,%.8f) -> authored srgb=(%.8f,%.8f,%.8f)"
+			% [VELVET_BASE_LINEAR.r, VELVET_BASE_LINEAR.g, VELVET_BASE_LINEAR.b,
+			VELVET_BASE_LINEAR.linear_to_srgb().r, VELVET_BASE_LINEAR.linear_to_srgb().g,
+			VELVET_BASE_LINEAR.linear_to_srgb().b])
+	print("  SHEEN linear=(%.8f,%.8f,%.8f) -> authored srgb=(%.8f,%.8f,%.8f)"
+			% [VELVET_SHEEN_LINEAR.r, VELVET_SHEEN_LINEAR.g, VELVET_SHEEN_LINEAR.b,
+			VELVET_SHEEN_LINEAR.linear_to_srgb().r, VELVET_SHEEN_LINEAR.linear_to_srgb().g,
+			VELVET_SHEEN_LINEAR.linear_to_srgb().b])
+	print("  Blender is handed the LINEAR numbers; each engine is compared against the")
+	print("  same authored linear value, never field-for-field against the other.")
+	_use_sphere_camera_filled()
+	var vp_rid := get_viewport().get_viewport_rid()
+	var means: Array[float] = []
+	for i in range(VELVET_ARMS.size()):
+		var arm: Dictionary = VELVET_ARMS[i]
+		var m := StandardMaterial3D.new()
+		m.albedo_color = VELVET_BASE_LINEAR.linear_to_srgb()
+		m.metallic = 0.0
+		m.roughness = VELVET_BASE_ROUGHNESS
+		var sr: float = arm["sheen_rough"]
+		if sr < 0.0:
+			m.sheen_color = Color(0.0, 0.0, 0.0)
+			m.sheen_roughness = 0.5
+		else:
+			m.sheen_color = VELVET_SHEEN_LINEAR.linear_to_srgb()
+			m.sheen_roughness = sr
+		_sphere.material_override = m
+		var img: Image = await _render_accum(p_env, vp_rid, VELVET_FRAMES)
+		if img == null:
+			_failures.append("probe F velvet: accumulator readback returned null on arm %s" % arm["tag"])
+			return
+		# WHOLE-image mean: the sphere overfills the frame at this camera, so every
+		# pixel is a surface hit and the mean is a surface-only statistic.
+		var st := _measure_crop(img, 0.0, 1.0)
+		means.append(st["mean"])
+		print("  %-12s sheen_rough=%5s  mean=%.8f  (n=%d)"
+				% [arm["tag"], ("--" if sr < 0.0 else "%.2f" % sr), st["mean"], st["n"]])
+
+	if VELVET_CYCLES_REF[0] <= 0.0:
+		print("  VELVET_CYCLES_REF not captured yet -- run tools/cycles_comparison/cycles_velvet.py")
+		return
+	print("  %-12s %12s %12s %10s" % ["arm", "ours", "Cycles", "% off"])
+	for i in range(VELVET_ARMS.size()):
+		var cyc: float = VELVET_CYCLES_REF[i]
+		var err: float = means[i] / cyc - 1.0
+		print("  %-12s %12.8f %12.8f %9.3f%%" % [VELVET_ARMS[i]["tag"], means[i], cyc, err * 100.0])
+		if absf(err) > VELVET_BAR:
+			_failures.append(("probe F velvet arm %s: %.8f vs Cycles %.8f, %+.3f%% -- outside the " +
+					"%.1f%% bar (section 8.6).")
+					% [VELVET_ARMS[i]["tag"], means[i], cyc, err * 100.0, VELVET_BAR * 100.0])
+
+
 func _measure_crop(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
 	var w := p_img.get_width()
 	var h := p_img.get_height()
@@ -1480,6 +1582,7 @@ func _ready() -> void:
 	await _probe_e1_degenerate_frame(env)
 	# LAST, because it is the only probe that adds a light to the scene.
 	await _probe_e2_frame_orientation(env)
+	await _probe_f_velvet_vs_cycles(env)
 
 	print("\n=== RESULT ===")
 	if _failures.is_empty():

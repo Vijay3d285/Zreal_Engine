@@ -118,6 +118,7 @@ Ranked by impact on offline still quality.
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
 | 19 | **Anisotropic GGX energy — FIXED 2026-09-11, see §11.8 and §11.9.** Every measured configuration now agrees with Cycles 5.2.1 to **0.21% or better**, from +53.85% at worst. Two independent causes, both landed: **A**, below-hemisphere VNDF samples clamped into the shading hemisphere rather than rejected (§11.8), and **B**, `ax`/`ay` not clamped to [0,1] as Cycles does in `bsdf_microfacet_ggx_setup` (§11.9). Guarded by probe 1d's eccentricity-monotonicity assertion, which is a physical law rather than a stored reference. *Original entry:* **~~Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one~~** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes, and the larger one is now FIXED.** **A — below-hemisphere VNDF samples were clamped into the shading hemisphere rather than rejected**, handing a finite `G2/G1` weight to directions where the BRDF is identically zero; the error scaled with eccentricity, which is why it read as an anisotropy bug. Landed 2026-09-11 (§11.8), and roughness 0.4 now matches Cycles to **0.04% across the whole anisotropy sweep**, guarded by probe 1d's eccentricity-monotonicity assertion. **B — `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not** is all that remains, and only where `ax > 1`: roughness 0.9 / anisotropy 0.9 now undershoots Cycles by 28.2% where it previously overshot by 53.85%. Fixing B invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on (§11.6). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **The transmissive lobe still uses the fitted multi-scatter approximation** — Gap #17 deliberately left `brdf_inc.glsl`'s transmissive reflection branch on `evalMultiScatterApproximation`, because Cycles compensates glass from a different table set — `ggx_glass_E` (16×16×16), `ggx_glass_Eavg` (16×16) and the `ggx_glass_inv_*` variants for `ior < 1` — none of which this project has transcribed. Pointing it at `ggxE`/`ggxEavg` would swap a measured divergence for an unmeasured one. Needs the four tables, an extended SSBO layout, and its own transmissive furnace study. The transmit branch applies no compensation at all. | `brdf_inc.glsl` (transmissive closure, reflection branch — annotated in place) | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-457` | Medium |
+| 21 | **An isotropic dielectric base renders ~1.9% dark against Cycles, cause unknown** — the un-sheened control arm of §7.11's velvet comparison (metallic 0, roughness 0.60, base linear (0.12, 0.02, 0.03), uniform world) reads **0.08786226 against Cycles 5.2.1's 0.08953342, −1.867%**. **Re-measured 2026-09-11 with Gap #17 and Gap #19 both fixed**, which moved it only from −2.062% to −1.867% — so neither explains it, confirming §7.11.2's conclusion that the residual is the *base*, not the sheen. The sheen layer's own contribution, isolated by subtracting each engine's control, agrees to **+0.300%** at sheen roughness 0.50. Inside §8.6's 5% bar, so not a ship blocker, but it is the largest confirmed unexplained parity gap left. Guarded by probe F in `pt_sheen_gate.gd`. | `brdf_inc.glsl` (dielectric base: `evalSpecular` + `evalDiffuse` and their combination), `pipeline_references/tests/pt_sheen_gate.gd` probe F | `intern/cycles/kernel/svm/closure.h` Principled dielectric base | Medium |
 
 **Not gaps — verified correct, leave alone:**
 - BRDF library (VNDF GGX, height-correlated Smith G2) — Cycles-class. Multi-scatter compensation over-corrected until 2026-09-10 and now uses Cycles' own tables (Gap #17, §10). Still not an unqualified "leave alone": the **anisotropic** branch carries a separate energy error (Gap #19) and the **transmissive** lobe still uses the old approximation (Gap #20).
@@ -3185,6 +3186,58 @@ rather than two that could quietly disagree.
 
 Per channel, velvet: R `0.986766`, G `0.978182`, B `0.978850`.
 
+#### 7.11.5 Re-taken 2026-09-11 — the finding survives, and becomes Gap #21
+
+Re-measured with Gap #17 (§10) and Gap #19 (§11.8, §11.9) both fixed. Blender
+**5.2.1**, framing matched, bounces matched at 3.
+
+| arm | sheen rough | ours | Cycles 5.2.1 | % off | *was* |
+|---|---|---|---|---|---|
+| velvetsharp | 0.30 | 0.08856258 | 0.09022636 | −1.844% | −2.044% |
+| velvet | 0.50 | 0.10337981 | 0.10500451 | −1.547% | −1.710% |
+| velvetrough | 0.80 | 0.20554066 | 0.20693646 | −0.675% | −0.746% |
+| **nosheen (control)** | — | 0.08786226 | 0.08953342 | **−1.867%** | −2.062% |
+
+**§7.11.2's conclusion holds. The un-sheened control is still the worst arm**, the
+ordering by sheen share is unchanged (−1.87% → −1.84% → −1.55% → −0.67%), and the
+two fixes moved it by only ~0.2pp. **Neither Gap #17 nor Gap #19 explains this
+residual** — which is what §7.11.2 predicted and what this re-take now confirms
+with both confounds actually removed rather than argued away. Promoted to **Gap
+#21**: an isotropic dielectric base at roughness 0.60 renders ~1.9% dark against
+Cycles, cause unknown. Gap #19 was never a candidate here — this base is
+isotropic.
+
+**The sheen layer itself is fine, and was never the problem.** Its own
+contribution, isolated by subtracting each engine's un-sheened control:
+
+| arm | ours Δ | Cycles Δ | ratio |
+|---|---|---|---|
+| velvetsharp | 0.00070032 | 0.00069294 | +1.065% |
+| velvet | 0.01551755 | 0.01547109 | **+0.300%** |
+| velvetrough | 0.11767840 | 0.11740304 | +0.235% |
+
+(+0.300% against §7.11.1's +0.324% at the same arm. The sharp arm's +1.065% sits
+on a delta of 0.0007 and is noise-dominated, as it was originally.)
+
+**This is a RE-TAKE, not a re-run**, on the same terms as §7.8.1: the original
+`.blend` and harness were never committed and 4.5.3 is gone, so the scene was
+rebuilt from §7.11.1's written parameters. *It validates itself twice:*
+
+1. **All four Cycles arms reproduce the originals to within 0.018%** — 0.09022636
+   against 0.09024246, 0.10500451 against 0.10501504, 0.20693646 against
+   0.20694485, 0.08953342 against 0.08954956 — on a different Blender version.
+2. **The colour-space positive control reproduces to five significant figures.**
+   Feeding Cycles the sRGB-encoded numbers as if linear gives ratio **2.691441**
+   against the recorded **2.691387**, both +169.1%, ~99× the gap being measured.
+
+Godot's own decode was printed live by probe F and matches §7.11.1's recorded
+round trip exactly, base and sheen. The `Sheen Weight` / `Sheen Tint` /
+`Sheen Roughness` sockets were confirmed present in 5.2.1 by the script rather
+than assumed, and every arm sets `sheen_roughness` explicitly — an arm that leaves
+it at 0 renders no sheen and reads as a suspiciously perfect match.
+
+*Original 2026-08 entry follows.*
+
 **Every arm passes the 5% bar with no adjustment at all**, but the *shape* of
 the table is the finding: the un-sheened control is the **worst** arm at
 −2.062%, and the more sheen an arm carries the closer it gets (−2.06% → −2.04%
@@ -4828,14 +4881,16 @@ measurement as its evidence.
 
 - **The transmissive lobe** keeps the fitted approximation — Gap #20.
 - **The anisotropic residual** — Gap #19.
-- **The Cycles scene comparisons in §7.10 and §7.11 have NOT been re-taken.**
+- **The Cycles scene comparison in §7.10 has NOT been re-taken.**
   Their pedestal-adjusted figures are now what the engine produces, but the raw
   comparisons against Blender were not re-measured in this work: the `.blend`
   scenes and scripts behind them were never checked into this repo, only
   `.superpowers/sdd/2026-08-21-environment-energy-fidelity/cycles-hypothesis-report.md`.
   Do not read those adjusted numbers as freshly measured. **§7.8's brushed metal
-  IS re-taken** (2026-09-11, §7.8.1) and now reads +0.015% raw; car paint and
-  velvet are the two that remain.
+  and §7.11's velvet are both re-taken** (2026-09-11, §7.8.1 and §7.11.5):
+  brushed metal now reads +0.015% raw, and velvet's arms −0.675% to −1.867% with
+  its base deficit confirmed and promoted to Gap #21. **Car paint (§7.10) is the
+  one that remains.**
 - **§7.11.2's unexplained −2.06% dielectric-base residual** may have moved. No
   claim is made about it without a re-measurement.
 - **Blender parity on the diffuse-under-specular layer** remains open (filed
