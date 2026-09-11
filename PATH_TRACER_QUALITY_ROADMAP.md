@@ -118,6 +118,7 @@ Ranked by impact on offline still quality.
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
 | 19 | **Anisotropic GGX energy — FIXED 2026-09-11, see §11.8 and §11.9.** Every measured configuration now agrees with Cycles 5.2.1 to **0.21% or better**, from +53.85% at worst. Two independent causes, both landed: **A**, below-hemisphere VNDF samples clamped into the shading hemisphere rather than rejected (§11.8), and **B**, `ax`/`ay` not clamped to [0,1] as Cycles does in `bsdf_microfacet_ggx_setup` (§11.9). Guarded by probe 1d's eccentricity-monotonicity assertion, which is a physical law rather than a stored reference. *Original entry:* **~~Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one~~** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes, and the larger one is now FIXED.** **A — below-hemisphere VNDF samples were clamped into the shading hemisphere rather than rejected**, handing a finite `G2/G1` weight to directions where the BRDF is identically zero; the error scaled with eccentricity, which is why it read as an anisotropy bug. Landed 2026-09-11 (§11.8), and roughness 0.4 now matches Cycles to **0.04% across the whole anisotropy sweep**, guarded by probe 1d's eccentricity-monotonicity assertion. **B — `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not** is all that remains, and only where `ax > 1`: roughness 0.9 / anisotropy 0.9 now undershoots Cycles by 28.2% where it previously overshot by 53.85%. Fixing B invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on (§11.6). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **CLOSED 2026-09-11.** The transmissive lobe now carries Cycles' glass energy compensation: `energy_scale = 1/E_glass(rough, μ, z)` from the four transcribed `ggx_glass_E` / `Eavg` / `inv_E` / `inv_Eavg` tables, applied to BOTH the reflected and the transmitted lobe (the transmit branch had none at all), with the reflected lobe of a partially transmissive closure blended `lerp(opaque, glass, transmission)` exactly as Cycles' two closures sum. White glass furnace at roughness 0.9: **0.496 → 0.9745 (BSDF-only) against Cycles' 0.9845**; a single entry interface restores to 1.0 within 0.13% at every angle. See §11.14. Uncovered **Gap #22** on the way. | `brdf_inc.glsl` (`ggxGlassEnergyScale`, `evalMultiScatterFactorDielectric`, `sampleDielectricMicrofacet`), `ggx_glass_energy_tables.h`, `pipeline_references/tests/pt_glass_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-462, :1091, :1107`; `app/cycles_precompute.cpp:53-80, :163-197` | Medium |
+| 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
 | 22 | **Environment NEE double-counts the sky through glass** — a shadow ray crosses a transmissive interface straight through at `transmission·(1−F)` (the transparent-shadow design, `raytracing_lights_inc.glsl` pass B), so under a uniform world the sky reached by that shadow ray is ALSO reached by the refracted BSDF path, and the two MIS strategies do not estimate the same integrand. Measured on the white glass furnace as the NEE-on/NEE-off ratio: **+2.4% / +7.3% / +8.6%** at roughness 0.3 / 0.6 / 0.9, identical on the pre-Gap-#20 path (state 2) and the fixed one — pre-existing, and only visible once Gap #20 lifted the total near 1.0. Cycles blocks shadow rays at refractive glass and gets interior lighting from caustic paths (and opt-in Shadow Caustics). **A design decision, not a one-line fix**: blocking the shadow ray restores energy conservation but darkens everything inside glass under NEE-only lighting. Found and quantified in §11.14. | `raytracing_lights_inc.glsl` (`lights_trace_shadow_ray` pass B), env-NEE site in `raytracing_closest_hit_common_inc.glsl`, `pt_glass_energy_gate.gd` (sphere arms carry the excess inside a 10% bar) | `intern/cycles/kernel/integrator/shadow_*.h` (no glass pass-through); `bsdf_microfacet.h` | Medium |
 | 21 | **CLOSED 2026-09-11.** An isotropic dielectric base rendered ~1.9% dark against Cycles; now **−0.008%**. Cause (a), the base Fresnel, §11.11; cause (b), the layering withdrawal, §11.12 — its first attempt over-withdrew because it omitted `preserve_energy`'s `darkening`, which the second attempt predicted offline and confirmed. Diagnosis in §11.10. — the un-sheened control arm of §7.11's velvet comparison (metallic 0, roughness 0.60, base linear (0.12, 0.02, 0.03), uniform world) reads **0.08786226 against Cycles 5.2.1's 0.08953342, −1.867%**. **Re-measured 2026-09-11 with Gap #17 and Gap #19 both fixed**, which moved it only from −2.062% to −1.867% — so neither explains it, confirming §7.11.2's conclusion that the residual is the *base*, not the sheen. The sheen layer's own contribution, isolated by subtracting each engine's control, agrees to **+0.300%** at sheen roughness 0.50. Inside §8.6's 5% bar, so not a ship blocker, but it is the largest confirmed unexplained parity gap left. **Decomposed: the diffuse lobe is exact (+0.009%); 83% of the deficit is the specular lobe (−3.99%) and 17% is the layering withdrawal (+14.7% too much).** Two causes, both the same shape — E2d gave the *coat* the Cycles-faithful version and the *base* was left on the approximation: (a) our base specular uses Schlick `(1−cos)^5` where Cycles' Principled uses the **exact dielectric Fresnel remapped onto F0..F90** (`bsdf_microfacet.h:299-306`, commented "Used by Principled BSDF"), and (b) our layering withdraws `1−F(L·H)` where Cycles withdraws `1−albedo(specular)` via `closure_layering_weight`. Guarded by probe F in `pt_sheen_gate.gd`, which now carries the decomposition arms. | `brdf_inc.glsl` (`evalFresnelSchlick` at the base specular; the `COMBINE_BRDFS_WITH_FRESNEL` layering), `pipeline_references/tests/pt_sheen_gate.gd` probe F | `intern/cycles/kernel/closure/bsdf_microfacet.h:299-306`, `intern/cycles/kernel/closure/bsdf_util.h:440-444` | Medium |
 
@@ -5859,3 +5860,77 @@ re-run after any of them. Re-captured with that provenance. Transparent-shadow,
 transparent-alpha, energy, sheen, anisotropy and coat gates green with no
 re-baselining. Suite 1558 passed / 0 failed / 3 skipped. **No real asset with
 glass has been rendered yet.**
+
+
+---
+
+## 11.15 Gap #23 closed — analytic lights get the multi-scatter factor
+
+**Landed 2026-09-11.** Every Cycles comparison to this point was
+environment-lit, and the environment- and emissive-NEE sites received Cycles'
+multi-scatter compensation in Gap #17. The three analytic-light NEE sites
+never did. Their comment made the case explicitly: analytic lights carry no
+MIS weight and BSDF rays cannot hit them, so there is no second strategy to
+stay consistent with, and the factor was omitted "deliberately and on the
+record". That reasoning is correct about MIS bias and beside the point about
+energy — with no second strategy, the NEE value *is* the render, and Cycles
+applies `energy_scale` to every closure evaluation including light sampling
+(`bsdf_microfacet.h:1091`). Every rough specular surface under the sun or a
+lamp — which is every production scene, the bedroom had a sun and twenty room
+lights — was short by `1/E(rough, μ)`.
+
+### The gate, and why it is ratio-to-control
+
+`pt_light_energy_gate.gd` / `cycles_light_energy.py`: a sphere under one
+delta directional light from the camera's direction, black sky. Godot's
+`light_energy` and Cycles' sun strength are different units, so each arm is
+divided by a white Lambertian control under the same light in the same
+framing — the unit, the N·L distribution and the framing cancel exactly and
+only the BRDF remains.
+
+| arm | before | **after** | Cycles 5.2.1 |
+|---|---|---|---|
+| white metal, roughness 0.3 | −1.008% | **−0.041%** | 1.58025 |
+| white metal, roughness 0.6 | **−18.104%** | **−0.024%** | 1.20757 |
+| white metal, roughness 0.9 | **−56.984%** | **−0.001%** | 0.86657 |
+| grey dielectric, roughness 0.6 | −0.130% | −0.013% | 0.52265 |
+
+### Predicted before it was fixed
+
+−57% is more than a first guess at `1/E` suggests, so the deficit was
+predicted rather than assumed: with the light on the view axis, `H = N` and
+every pixel is the closed form `D(μ)·G2(μ,μ)/(4μ)` (ours) or the same over
+`E(rough, μ)` (Cycles). Over a per-pixel trace of the matched camera the
+predicted ours/Cycles ratio is **0.9904 / 0.8196 / 0.4298** against the
+measured **0.9899 / 0.8190 / 0.4302** — there is no second cause, and the
+disc's mean μ of 0.93 is simply where a roughness-0.9 lobe's `E` has fallen
+to ~0.43. (`tools/cycles_comparison/predict_delta_light.py`; the closed form is
+three lines.) Two candidates were eliminated on the way: `light_specular`
+defaults to 1.0 on `DirectionalLight3D` in this fork, so the PT's raw use of
+it for directional lights and `×2` for positional lights (whose default is
+0.5) both land at 1.0; and forcing it to 1.0 changed nothing.
+
+### The fix
+
+`evalMultiScatterFactorForMaterial(N, V, material)` derives alpha, Gap #19's
+clamped `rough`, the metal-lerped F0 and `eta`/`transmission` exactly as the
+env- and emissive-NEE sites assemble them by hand, and calls the same
+`evalMultiScatterFactorDielectric` underneath — so the light path, the env
+path and the sampler compensate one lobe one way. Applied to `brdf_specular`
+at all three sites; the coat is not multiplied, its compensation already lives
+inside `evalCoat`. The comment's rule is corrected in place rather than
+deleted, so the reasoning that produced the defect stays legible.
+
+### Regression evidence
+
+Every gate scene run: anisotropy, coat, emissive, energy, glass, light,
+material_data, sheen, transmission, transparent_alpha, transparent_shadow,
+png16 — green with no re-baselining; no gate but the new one exercises a rough
+specular surface under an analytic light. **`pt_sky_energy_gate` fails**
+(probe B: radiance-256 ratio 1.085; probe C: 9.3% drift between radiance 256
+and 2048) — **identically on the pre-Gap-#20 binary**, so it predates
+today's work; its last commit is E2a. Not investigated here; it is
+environment-only and unrelated to this change, and it is recorded so it is
+not mistaken for a regression of it later. **No real asset has been rendered
+with Gap #20 or Gap #23.** Gap #23 changes every rough specular surface under
+every light in every render, and by more than any fix before it.

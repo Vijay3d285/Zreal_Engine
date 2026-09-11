@@ -2636,6 +2636,25 @@ float3 evalMultiScatterFactorDielectric(float alpha, float rough, float NdotV, f
 	return opaque;
 }
 
+// Gap #23. The base specular lobe's multiple-scattering factor derived from
+// nothing but (N, V, material) -- the same alpha, rough (Gap #19's clamped
+// anisotropic form), F0 and eta the environment- and emissive-NEE sites
+// assemble by hand before calling evalMultiScatterFactorDielectric. Written
+// for the three ANALYTIC-light NEE sites in raytracing_lights_inc.glsl, which
+// until 2026-09-11 applied no factor at all: their comment reasoned that with
+// no competing MIS strategy there was nothing to stay consistent with, which
+// is true of MIS and irrelevant to energy -- for a delta light NEE is the
+// ONLY estimator, so its uncompensated value IS the render. A white metal at
+// roughness 0.9 under one directional light read 43% of Cycles (roadmap
+// 11.15), and the deficit was predicted to 0.1% by 1/E alone.
+float3 evalMultiScatterFactorForMaterial(float3 N, float3 V, MaterialProperties material) {
+	float alpha = material.roughness * material.roughness;
+	float NdotV = max(dot(N, V), 0.0001f);
+	float3 F0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
+	return evalMultiScatterFactorDielectric(alpha, ggxRoughForMaterial(alpha, material, N), NdotV, F0,
+			material.eta, material.transmissivness);
+}
+
 // Fms: effective Fresnel of the MULTIPLY-scattered energy. One Fss is cancelled
 // out because this multiplies a BSDF that already carries one bounce of Fresnel
 // (bsdf_microfacet.h:474-476).

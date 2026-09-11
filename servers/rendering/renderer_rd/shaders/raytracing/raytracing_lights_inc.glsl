@@ -576,14 +576,17 @@ vec3 lights_eval_rect_light(
 	//     lost its direct-light highlight and kept base light the coat should have
 	//     absorbed. The base terms now arrive already attenuated, inside
 	//     evalCombinedBRDFSeparate.
-	//   * NO multiple-scattering factor, unlike the env- and emissive-NEE sites.
-	//     Those apply it because they are MIS-paired against combinedPdf and the
-	//     two strategies must estimate one integrand. Analytic lights carry no MIS
-	//     weight and are unreachable by BSDF rays (see the env-NEE block in
-	//     raytracing_closest_hit_common_inc.glsl), so there is no second strategy
-	//     to agree with. The base specular here already omits it, deliberately and
-	//     on the record; the coat matches the base rather than inventing a third
-	//     convention.
+	//   * THE multiple-scattering factor IS applied (Gap #23, 2026-09-11), via
+	//     evalMultiScatterFactorForMaterial -- the same dispatcher the env- and
+	//     emissive-NEE sites use underneath. The earlier rule here said "no factor,
+	//     because analytic lights have no second MIS strategy to agree with". That
+	//     was correct about MIS and wrong about energy: with no second strategy,
+	//     this value IS the render, and omitting Cycles' 1/E left every rough
+	//     specular surface under the sun or a lamp short by exactly that factor --
+	//     a white metal at roughness 0.9 under one directional light read 43% of
+	//     Cycles, predicted to 0.1% by 1/E alone (pt_light_energy_gate.gd). The
+	//     coat is NOT multiplied: its compensation (coatEnergyScale) already lives
+	//     inside evalCoat, as at the other NEE sites.
 	//   * NO RT_MIS_DELTA_ROUGHNESS guard, for the same reason -- these sites have
 	//     never had one. The guard exists to hand delta lobes to the BSDF strategy
 	//     outright; with no competing strategy here it would simply delete a
@@ -602,6 +605,9 @@ vec3 lights_eval_rect_light(
 	//     above and because the Zeltner LTC is already a multiple-scattering fit.
 	vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
 	evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
+#if MICROFACET_DISTRIBUTION == GGX
+	brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
+#endif
 	float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
 	vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
 
@@ -780,6 +786,9 @@ vec3 lights_evaluate_direct_lighting(
 		// no multiple-scatter factor and no near-delta guard.
 		vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
 		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
+#if MICROFACET_DISTRIBUTION == GGX
+		brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
+#endif
 
 		// Distance attenuation.
 		LightSample ls_atten;
@@ -833,6 +842,9 @@ vec3 lights_evaluate_direct_lighting(
 		// E2d fix round 1: see THE ANALYTIC-LIGHT RULE in lights_eval_rect_light.
 		vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
 		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
+#if MICROFACET_DISTRIBUTION == GGX
+		brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
+#endif
 
 		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
 		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
