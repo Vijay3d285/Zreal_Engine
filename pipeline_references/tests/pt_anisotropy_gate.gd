@@ -195,6 +195,42 @@ const BASELINE_BAND := 0.005 # +/- 0.5 percentage points; see BASELINE_INTACT_RA
 # the violation it exists to catch.
 const MONOTONIC_BAND := 0.002
 
+# Probe 1e -- the BRUSHED METAL comparison against Cycles, re-taken 2026-09-11.
+#
+# This reproduces §7.8's Task-5 configuration: a metallic sphere at roughness
+# 0.4, anisotropy 0.6 (>0, the range where the two engines' conventions agree
+# exactly), at anisotropy_rotation 0 and PI/2, under a spatially uniform world.
+#
+# WHY IT IS RE-TAKEN RATHER THAN RE-RUN: the original .blend and harness were
+# never checked into this repo, and the Blender it used (4.5.3) is no longer
+# installed. This is a NEW measurement built from §7.8's written parameters, on
+# Blender 5.2.1, with the framing matched to this gate on both sides. It is not
+# a reproduction of the old numbers and must not be read as one.
+#
+# THE COLOUR-SPACE TRAP, which §7.8 called out and which cost E2a a phantom 53%
+# energy error: albedo_color is sRGB as an artist types it, and
+# render_raytracing.cpp runs it through srgb_to_linear() on upload. Blender's
+# Base Color must be set to the DECODED number, not to 0.8. The decode is
+# printed live below rather than assumed, exactly as the original harness did.
+const BRUSHED_ALBEDO_SRGB := 0.8
+const BRUSHED_ROUGHNESS := 0.4
+const BRUSHED_ANISOTROPY := 0.6
+const BRUSHED_FRAMES := 64
+# Measured in Blender 5.2.1 Cycles by tools/cycles_comparison/cycles_brushed_metal.py,
+# framing matched to this gate, 2048 samples, mean of both rotations
+# (0.587468 at 0 turns, 0.587623 at 0.25 turns). See roadmap §7.8.
+#
+# THE RECONSTRUCTION VALIDATES ITSELF TWICE, which matters because the original
+# .blend was never checked in and 4.5.3 is gone:
+#   - the rotation-0 render reads 0.587468 against §7.8's recorded 0.587438,
+#     0.005% apart, on a different Blender version;
+#   - the colour-space positive control (rendering the RAW 0.8 instead of the
+#     decoded 0.60382730) gives ratio 1.333905 against §7.8's recorded 1.333904,
+#     versus a naive v/srgb_to_linear(v) prediction of 1.324882. Six decimals.
+const CYCLES_BRUSHED_REF := 0.587546
+# §8.6's acceptance bar for a Cycles material comparison.
+const BRUSHED_BAR := 0.05
+
 # Fix round 1: 0.0 added per the coordinator's C2 fix instruction -- the
 # self-normalizing check being a genuinely independent instrument (unlike the
 # old R-vs-G tautology) means an isotropic control is now meaningful evidence
@@ -598,6 +634,51 @@ func _probe_furnace_isotropic_hirough(p_env: Environment) -> void:
 				% [ratio, TOLERANCE * 100.0, ISO_HIROUGH_ROUGHNESS])
 
 
+## PROBE 1e -- brushed metal against Cycles (§7.8, re-taken).
+func _probe_brushed_metal(p_env: Environment) -> void:
+	var linear: Color = Color(BRUSHED_ALBEDO_SRGB, BRUSHED_ALBEDO_SRGB, BRUSHED_ALBEDO_SRGB).srgb_to_linear()
+	print("\n=== PROBE 1e: brushed metal vs Cycles (roughness %.2f, anisotropy %.2f) ==="
+			% [BRUSHED_ROUGHNESS, BRUSHED_ANISOTROPY])
+	print("  albedo_color %.4f sRGB decodes to LINEAR %.8f -- Blender Base Color must be THIS,"
+			% [BRUSHED_ALBEDO_SRGB, linear.r])
+	print("  not %.4f. Printed live, not assumed (the E2a colour-space trap)." % BRUSHED_ALBEDO_SRGB)
+	var vp_rid := get_viewport().get_viewport_rid()
+	var means: Array[float] = []
+	for rot in [0.0, PI / 2.0]:
+		var m := StandardMaterial3D.new()
+		# NOT pre-encoded: we want the engine's own srgb_to_linear to run, so the
+		# linear albedo is the number printed above and handed to Blender.
+		m.albedo_color = Color(BRUSHED_ALBEDO_SRGB, BRUSHED_ALBEDO_SRGB, BRUSHED_ALBEDO_SRGB)
+		m.metallic = 1.0
+		m.roughness = BRUSHED_ROUGHNESS
+		m.anisotropy_enabled = true
+		m.anisotropy = BRUSHED_ANISOTROPY
+		m.anisotropy_rotation = rot
+		_sphere.material_override = m
+		var img: Image = await _render_accum(p_env, vp_rid, BRUSHED_FRAMES)
+		if img == null:
+			_failures.append("probe1e brushed metal: accumulator readback returned null")
+			return
+		var st := _measure_crop(img, 0.05, 0.95)
+		means.append(st["mean"])
+		print("  rotation=%.4f  mean=%.6f  (n=%d)" % [rot, st["mean"], st["n"]])
+
+	var ours: float = (means[0] + means[1]) * 0.5
+	print("  ours (mean of both rotations): %.6f" % ours)
+	if CYCLES_BRUSHED_REF <= 0.0:
+		print("  CYCLES_BRUSHED_REF not captured yet -- run")
+		print("    tools/cycles_comparison/cycles_brushed_metal.py")
+		print("  with Base Color %.8f and record the result." % linear.r)
+		return
+	var err: float = ours / CYCLES_BRUSHED_REF - 1.0
+	print("  Cycles 5.2.1 reference: %.6f" % CYCLES_BRUSHED_REF)
+	print("  ratio %.6f  (%+.2f%%)  bar +/-%.1f%%" % [ours / CYCLES_BRUSHED_REF, err * 100.0, BRUSHED_BAR * 100.0])
+	if absf(err) > BRUSHED_BAR:
+		_failures.append(("probe1e brushed metal: %.6f vs Cycles %.6f, %+.2f%% -- outside the %.1f%% " +
+				"bar (§8.6). This is a MATERIAL parity comparison, not an energy law; see §7.8.")
+				% [ours, CYCLES_BRUSHED_REF, err * 100.0, BRUSHED_BAR * 100.0])
+
+
 func _probe_pdf_parity(p_env: Environment) -> void:
 	print("\n=== PROBE 2: anisotropic pdf/sampler self-normalization (vis mode %d) ===" % MODE_ANISO_PDF_PARITY)
 	print("  diagnostic-only: old per-pixel |R - G| tautology check, NOT asserted (fix round 1, C2)")
@@ -658,6 +739,7 @@ func _ready() -> void:
 	await _probe_furnace(env)
 	await _probe_furnace_nee_dominant(env)
 	await _probe_furnace_isotropic_hirough(env)
+	await _probe_brushed_metal(env)
 	await _probe_pdf_parity(env)
 
 	print("\n=== RESULT ===")
