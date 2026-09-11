@@ -5858,8 +5858,8 @@ uniform world, re-captured. Probe 5 (an opaque control) also failed, at
 binary**: that reference predates Gap #17/#19/#21, and this gate had not been
 re-run after any of them. Re-captured with that provenance. Transparent-shadow,
 transparent-alpha, energy, sheen, anisotropy and coat gates green with no
-re-baselining. Suite 1558 passed / 0 failed / 3 skipped. **No real asset with
-glass has been rendered yet.**
+re-baselining. Suite 1558 passed / 0 failed / 3 skipped. A real asset with
+glass was rendered the same day — §11.16.
 
 
 ---
@@ -5931,6 +5931,78 @@ specular surface under an analytic light. **`pt_sky_energy_gate` fails**
 and 2048) — **identically on the pre-Gap-#20 binary**, so it predates
 today's work; its last commit is E2a. Not investigated here; it is
 environment-only and unrelated to this change, and it is recorded so it is
-not mistaken for a regression of it later. **No real asset has been rendered
-with Gap #20 or Gap #23.** Gap #23 changes every rough specular surface under
-every light in every render, and by more than any fix before it.
+not mistaken for a regression of it later. Real assets rendered the same day — §11.16, whose result is not what the
+gate size suggested.
+
+
+---
+
+## 11.16 Gap #20 and Gap #23 on real assets — and what the pipeline does to them
+
+**Rendered 2026-09-11.** Two jobs through the live pipeline, deterministic
+DLSS-RR stills, all on the same day's `.gd` files:
+
+- `urbantestdark208` — a dining room with four traced-dielectric glass assets
+  (aquarium, glass vase, display grid, dining-set glass), a brass chandelier,
+  gold table legs and gold birds, a mirror, marble; sun plus 27 room lights.
+- `urbantestdark212` — the bedroom of §11.13 again; no glass.
+
+Three binaries on 208: the Gap-#21 build, a Gap-#20-only variant (the three
+light-site lines removed), and HEAD. The committed 208 PNG from 09-08
+(`ec9489e11`) was **not** usable as a baseline: it reads −22% against today's
+Gap-#21 render, far beyond anything the BSDF work explains, because 32 commits
+and the live pipeline scripts have moved since. Same-day renders only.
+
+| region | Gap #20 (g21 → g20) | Gap #23 (g20 → HEAD) |
+|---|---|---|
+| whole frame, 208 | **−0.005%** | **+0.042%** |
+| aquarium glass, side panel | +0.21% | +0.04% |
+| aquarium glass, front | +0.03% | +0.01% |
+| glass vase | 0.00% | +0.06% |
+| gold chandelier | −0.02% | +0.09% |
+| gold birds | +0.09% | +0.08% |
+| gold table legs | −0.02% | +0.06% |
+| whole frame, 212 | — | **+0.003%** |
+
+Two fixes that read −50% and −57% on their gates read a few hundredths of a
+percent on real assets. Both have exact explanations, and neither is a
+defect in the fix.
+
+**Gap #20 is invisible on production glass because production glass is
+smooth.** `image_glb_creation.gd`'s glass conversion clamps `roughness` to
+≤ 0.05, and at that roughness `E_glass` is 1.0 to three decimals — there is
+no multi-scatter energy to restore. The compensation matters for frosted and
+rough glass, which this asset library does not currently author.
+
+**Gap #23 is nearly invisible because the pipeline zeroes specular on every
+light it places.** `image_glb_creation.gd` sets `light_specular = 0.0` on the
+fill lights (:547, :1365, :1381, :1395), the portal spots (:2782), the
+daylight-helper spot (:2825), the ceiling omnis and spots (:5914, :5928,
+:5950) and the shadow companions (:5971) — "prevents the circular hotspot
+artifact". `spec_mul` is then 0 at all three light sites, and a factor
+multiplying zero is zero. Only the sun (`DirectionalLight3D`, default 1.0)
+carries specular, so the fix acts on sun-lit rough metal alone — a few
+hundred pixels of chandelier and birds here.
+
+**The consequence is a parity gap larger than any engine gap on this list,
+and it lives in the pipeline, not the engine:** no lamp in any interior
+render produces a specular highlight. Cycles' lights always do. Every glossy
+surface — marble, lacquer, brass, glass, a satin bedspread — is lit by
+interior lamps as if it were matte. Whether to restore `light_specular` (and
+accept or otherwise solve the hotspot artefact it was silenced for) is a
+pipeline decision for the owner of those scripts; the engine side is now
+Cycles-faithful for whatever specular it is handed, to 0.05% under a delta
+light (§11.15).
+
+### One device loss, not reproduced
+
+The first HEAD render of 208 died with `VK_ERROR_DEVICE_LOST` at the final
+capture, after a full-length 19m57s drive. The Gap-#21 and Gap-#20-only
+binaries rendered the same job, HEAD rendered 212, and a second HEAD run of
+208 completed in 20m with an identical PNG size. No shader-side cause was
+found (the LUT buffer is sized from `RT_GLASS_SSBO_FLOAT_COUNT` at its single
+creation site; no explicit RT stack size is set; the DLSS "duplicated
+constants" warning appears once in every run). The one thing that differed:
+a SCons build was started during that first render and failed trying to link
+over the running executable. Recorded so that a recurrence is recognised;
+not chased further on one occurrence.
