@@ -703,6 +703,17 @@ const VELVET_ARMS := [
 	{ "tag": "velvet", "sheen_rough": 0.50 },
 	{ "tag": "velvetrough", "sheen_rough": 0.80 },
 	{ "tag": "nosheen", "sheen_rough": -1.0 },
+	# Gap #21 investigation: the same base with its SPECULAR LOBE KILLED.
+	# metallic_specular 0 drives resolveDielectricF0's f0_untinted term
+	# (*= 4*specular*specular) to exactly 0, so this arm is pure diffuse. Cycles'
+	# equivalent is Specular IOR Level 0, which makes f0 = 0 hence eta = 1, and
+	# svm/closure.h skips the specular component entirely at eta == 1.
+	# Splitting the -1.87% into a diffuse part and a specular part.
+	{ "tag": "diffuseonly", "sheen_rough": -1.0, "no_spec": true },
+	# Gap #21, second split: a BLACK base. No diffuse means the layering has
+	# nothing to withdraw from, so this arm is the specular lobe ALONE --
+	# separating a specular-formula difference from a layering difference.
+	{ "tag": "specularonly", "sheen_rough": -1.0, "black_base": true },
 ]
 # Blender 5.2.1, framing matched, bounces matched at 3, 2048 samples.
 #
@@ -714,7 +725,13 @@ const VELVET_ARMS := [
 #   - the colour-space positive control -- feeding Cycles the sRGB-ENCODED numbers
 #     as if linear -- gives ratio 2.691441 against the recorded 2.691387, both
 #     +169.1%, i.e. ~99x the size of the gap being measured.
-const VELVET_CYCLES_REF := [0.09022636, 0.10500451, 0.20693646, 0.08953342]
+# The last two arms are the Gap #21 decomposition, measured by
+# tools/cycles_comparison/cycles_gap21_split.py:
+#   diffuse-only   ours 0.05665236  Cycles 0.05664716   +0.009%
+#   specular-only  ours 0.03349182  Cycles 0.03488373   -3.99%
+# Both engines' diffuse arms sit on the analytic Lambert value 0.05666667 to
+# ~0.03%, so the diffuse lobe is exact and the whole deficit is specular-side.
+const VELVET_CYCLES_REF := [0.09022636, 0.10500451, 0.20693646, 0.08953342, 0.05664716, 0.03488373]
 const VELVET_BAR := 0.05 # §8.6
 
 
@@ -736,9 +753,14 @@ func _probe_f_velvet_vs_cycles(p_env: Environment) -> void:
 	for i in range(VELVET_ARMS.size()):
 		var arm: Dictionary = VELVET_ARMS[i]
 		var m := StandardMaterial3D.new()
-		m.albedo_color = VELVET_BASE_LINEAR.linear_to_srgb()
+		if arm.get("black_base", false):
+			m.albedo_color = Color(0.0, 0.0, 0.0)
+		else:
+			m.albedo_color = VELVET_BASE_LINEAR.linear_to_srgb()
 		m.metallic = 0.0
 		m.roughness = VELVET_BASE_ROUGHNESS
+		if arm.get("no_spec", false):
+			m.metallic_specular = 0.0
 		var sr: float = arm["sheen_rough"]
 		if sr < 0.0:
 			m.sheen_color = Color(0.0, 0.0, 0.0)
@@ -764,6 +786,9 @@ func _probe_f_velvet_vs_cycles(p_env: Environment) -> void:
 	print("  %-12s %12s %12s %10s" % ["arm", "ours", "Cycles", "% off"])
 	for i in range(VELVET_ARMS.size()):
 		var cyc: float = VELVET_CYCLES_REF[i]
+		if cyc <= 0.0:
+			print("  %-12s %12.8f %12s (no Cycles reference yet)" % [VELVET_ARMS[i]["tag"], means[i], "--"])
+			continue
 		var err: float = means[i] / cyc - 1.0
 		print("  %-12s %12.8f %12.8f %9.3f%%" % [VELVET_ARMS[i]["tag"], means[i], cyc, err * 100.0])
 		if absf(err) > VELVET_BAR:
