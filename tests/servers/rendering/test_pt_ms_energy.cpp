@@ -33,6 +33,7 @@
 TEST_FORCE_LINK(test_pt_ms_energy)
 
 #include "core/math/math_funcs.h"
+#include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
 
 namespace TestPTMsEnergy {
@@ -96,6 +97,29 @@ static float ms_rough_from_alphas(float p_ax, float p_ay) {
 	return Math::sqrt(Math::sqrt(p_ax * p_ay));
 }
 
+// Mirror of coatLutRead3D over GGX_COAT_ALBEDO_TABLE (the base of that table
+// in the SSBO is RT_COAT_SSBO_ALBEDO_OFFSET; here it is the array itself).
+static float ms_lut_read_3d(const float *p_data, float p_x, float p_y, float p_z) {
+	const int d = GGX_COAT_TABLE_DIM;
+	p_z = CLAMP(p_z, 0.0f, 1.0f) * float(d - 1);
+	const int index = MIN(int(p_z), d - 1);
+	const int nindex = MIN(index + 1, d - 1);
+	const float t = p_z - float(index);
+	const float data0 = ms_lut_read_2d(p_data + d * d * index, p_x, p_y, d, d);
+	if (t == 0.0f) {
+		return data0;
+	}
+	return (1.0f - t) * data0 + t * ms_lut_read_2d(p_data + d * d * nindex, p_x, p_y, d, d);
+}
+
+// Mirror of specularLayerAlbedo's bare estimate: bsdf_microfacet_estimate_albedo's
+// generalized-Schlick branch, mix(f0, 1, s) with s from ggx_gen_schlick_ior_s.
+static float ms_layer_estimate(float p_rough, float p_cos_nv, float p_f0, float p_eta) {
+	const float z = Math::sqrt(Math::abs((p_eta - 1.0f) / (p_eta + 1.0f)));
+	const float s = ms_lut_read_3d(GGX_COAT_ALBEDO_TABLE, p_rough, p_cos_nv, z);
+	return p_f0 + (1.0f - p_f0) * s;
+}
+
 static float ms_aniso_rough(float p_alpha, float p_anisotropy) {
 	const float aspect = Math::sqrt(1.0f - p_anisotropy * 0.9f);
 	const float ax = CLAMP(p_alpha / aspect, 0.0f, 1.0f);
@@ -114,6 +138,12 @@ static float ms_energy_factor(float p_rough, float p_cos_nv, float p_f0, float p
 	const float fss = p_f0 + (p_f90 - p_f0) * (1.0f / 21.0f);
 	const float fms = fss * eavg / (1.0f - fss * (1.0f - eavg));
 	return 1.0f + fms * missing;
+}
+
+// Mirror of the darkening specularLayerAlbedo applies under RT_MS_COMPENSATION == 1:
+// evalMultiScatterEnergy * E, which is Cycles' (1 + Fms*missing) / energy_scale.
+static float ms_layer_darkening(float p_rough, float p_cos_nv, float p_f0, float p_f90) {
+	return ms_energy_factor(p_rough, p_cos_nv, p_f0, p_f90) * ms_ggx_e(p_rough, p_cos_nv);
 }
 
 TEST_CASE("[PathTracer][MsEnergy] a white lobe is compensated to exactly unity") {
@@ -202,6 +232,41 @@ TEST_CASE("[PathTracer][MsEnergy] clamping ax/ay changes rough, which is why it 
 	// and therefore a SMALLER 1/E, which is the whole of divergence B.
 	CHECK(ms_energy_factor(0.770935f, 0.9f, 1.0f, 1.0f) <
 			ms_energy_factor(0.9f, 0.9f, 1.0f, 1.0f));
+}
+
+TEST_CASE("[PathTracer][MsEnergy] the layering withdrawal is darkening * albedo, not albedo") {
+	// Gap #21 cause (b). Cycles' closure_layering_weight divides bsdf_albedo by
+	// the running weight, and bsdf_albedo returns sc->weight * estimate where
+	// sc->weight was ALREADY multiplied by darkening inside
+	// microfacet_ggx_preserve_energy (bsdf_microfacet.h:481) before
+	// svm/closure.h:468-470 reads it. The first implementation withdrew the
+	// bare estimate and over-withdrew by +20.0% (roadmap section 11.11).
+	//
+	// Anchors from the offline predictor that reproduced that +20.0% reading
+	// to -0.06% and predicts Cycles' withdrawal to -0.38% (section 11.12).
+	// Velvet control material: roughness 0.6, dielectric F0 0.04, eta 1.5.
+	CHECK(ms_layer_estimate(0.6f, 1.0f, 0.04f, 1.5f) == doctest::Approx(0.040870f).epsilon(1e-4));
+	CHECK(ms_layer_darkening(0.6f, 1.0f, 0.04f, 1.0f) == doctest::Approx(0.836376f).epsilon(1e-4));
+	CHECK(ms_layer_estimate(0.6f, 0.7f, 0.04f, 1.5f) == doctest::Approx(0.052423f).epsilon(1e-4));
+	CHECK(ms_layer_darkening(0.6f, 0.7f, 0.04f, 1.0f) == doctest::Approx(0.808976f).epsilon(1e-4));
+	CHECK(ms_layer_estimate(0.6f, 0.3f, 0.04f, 1.5f) == doctest::Approx(0.107142f).epsilon(1e-4));
+	CHECK(ms_layer_darkening(0.6f, 0.3f, 0.04f, 1.0f) == doctest::Approx(0.810622f).epsilon(1e-4));
+	CHECK(ms_layer_darkening(0.9f, 0.5f, 0.04f, 1.0f) == doctest::Approx(0.556339f).epsilon(1e-4));
+
+	// The darkening is a LOSS: a dark dielectric lobe loses most of its
+	// multi-bounce energy to Fresnel, so the withdrawal must be strictly
+	// smaller than the bare estimate wherever E < 1. This is the whole +20%.
+	CHECK(ms_layer_darkening(0.6f, 1.0f, 0.04f, 1.0f) < 1.0f);
+	CHECK(ms_layer_darkening(0.6f, 0.3f, 0.04f, 1.0f) < 1.0f);
+
+	// Two identities that make the sign and the gating derivable rather than
+	// tuned. (1) A WHITE lobe loses nothing to multi-bounce Fresnel:
+	// energy factor is exactly 1/E, so darkening = (1/E) * E = 1. (2) A
+	// MIRROR has E = 1, no missing energy, and therefore no darkening either.
+	CHECK(ms_layer_darkening(0.9f, 0.5f, 1.0f, 1.0f) == doctest::Approx(1.0f).epsilon(1e-5));
+	CHECK(ms_layer_darkening(0.6f, 0.3f, 1.0f, 1.0f) == doctest::Approx(1.0f).epsilon(1e-5));
+	CHECK(ms_layer_darkening(0.0f, 0.7f, 0.04f, 1.0f) == doctest::Approx(1.0f).epsilon(1e-5));
+	CHECK(ms_layer_estimate(0.0f, 0.7f, 0.04f, 1.5f) == doctest::Approx(0.051189f).epsilon(1e-4));
 }
 
 } // namespace TestPTMsEnergy

@@ -728,11 +728,28 @@ const VELVET_ARMS := [
 # The last two arms are the Gap #21 decomposition, measured by
 # tools/cycles_comparison/cycles_gap21_split.py:
 #   diffuse-only   ours 0.05665236  Cycles 0.05664716   +0.009%
-#   specular-only  ours 0.03349182  Cycles 0.03488373   -3.99%
+#   specular-only  ours 0.03349182  Cycles 0.03488373   -3.99%   (before Gap #21(a))
+#                  ours 0.03486378                      -0.057%  (after,  §11.11)
 # Both engines' diffuse arms sit on the analytic Lambert value 0.05666667 to
 # ~0.03%, so the diffuse lobe is exact and the whole deficit is specular-side.
 const VELVET_CYCLES_REF := [0.09022636, 0.10500451, 0.20693646, 0.08953342, 0.05664716, 0.03488373]
 const VELVET_BAR := 0.05 # §8.6
+
+# Gap #21 cause (b): the LAYERING WITHDRAWAL, isolated as
+#     diffuse_only + specular_only - control
+# in both engines. The three arms share a base, so this difference is exactly
+# the energy the specular layer removes from the diffuse lobe underneath it --
+# Cycles' closure_layering_weight (bsdf_util.h:440-444). It is ~3.5% of the
+# diffuse lobe, so the 5% totals bar above cannot see it: the pre-fix engine
+# over-withdrew by +18.7% and STILL passed VELVET_BAR at -0.433%. This bar is on
+# the withdrawal itself, and the pre-fix engine fails it.
+#
+# Cycles: 0.05664716 + 0.03488373 - 0.08953342 = 0.00199747.
+# Offline prediction from the LUTs (tools/cycles_comparison/predict_gap21_layering.py, validated by
+# reproducing the pre-fix 1-albedo reading to -0.06%): darkening*albedo puts
+# ours at -0.38% of that. Withdrawal noise across 256-frame arms is far below
+# the 5% band -- the pre-fix prediction/measurement gap was 0.06%.
+const VELVET_WITHDRAWAL_BAR := 0.05
 
 
 func _probe_f_velvet_vs_cycles(p_env: Environment) -> void:
@@ -795,6 +812,19 @@ func _probe_f_velvet_vs_cycles(p_env: Environment) -> void:
 			_failures.append(("probe F velvet arm %s: %.8f vs Cycles %.8f, %+.3f%% -- outside the " +
 					"%.1f%% bar (section 8.6).")
 					% [VELVET_ARMS[i]["tag"], means[i], cyc, err * 100.0, VELVET_BAR * 100.0])
+
+	# Gap #21 cause (b): the layering withdrawal on its own. See
+	# VELVET_WITHDRAWAL_BAR for why the totals bar above cannot catch this.
+	var w_ours: float = means[4] + means[5] - means[3]
+	var w_cyc: float = VELVET_CYCLES_REF[4] + VELVET_CYCLES_REF[5] - VELVET_CYCLES_REF[3]
+	var w_err: float = w_ours / w_cyc - 1.0
+	print("  %-12s %12.8f %12.8f %9.3f%%   (diffuseonly + specularonly - nosheen)"
+			% ["withdrawal", w_ours, w_cyc, w_err * 100.0])
+	if absf(w_err) > VELVET_WITHDRAWAL_BAR:
+		_failures.append(("probe F layering withdrawal: %.8f vs Cycles %.8f, %+.3f%% -- outside the " +
+				"%.1f%% bar. The specular layer removes the wrong amount of energy from the diffuse " +
+				"lobe under it (Gap #21 cause (b), roadmap section 11.12).")
+				% [w_ours, w_cyc, w_err * 100.0, VELVET_WITHDRAWAL_BAR * 100.0])
 
 
 func _measure_crop(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:

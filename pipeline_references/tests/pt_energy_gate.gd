@@ -183,10 +183,20 @@ const REF_BUMPY := 1.41124 # normal-mapped rough metal
 # metallic 1, where Cycles uses F82 and our Schlick already matched, and the
 # Lambertian plane has metallic_specular 0 so it carries no specular lobe at all.
 # Previous values: 0.47109 / 0.42832 / 0.47105 / 0.42776.
-const REF_PLASTIC := 0.47660
-const REF_PLASTIC_RIM := 0.43739
-const REF_PLASTIC_BSDF_ONLY := 0.47657
-const REF_PLASTIC_RIM_BSDF_ONLY := 0.43686
+# RE-CAPTURED AGAIN 2026-09-11 for Gap #21 cause (b): the diffuse lobe is now
+# attenuated by 1 - darkening*albedo(specular, N.V), Cycles' closure_layering_weight,
+# instead of 1 - F(L.H) (roadmap §11.12). Again the only surface that moves. It
+# moves DOWN -- -0.91% on the disc, -2.2% on the rim -- although the furnace
+# withdrawal shrank, because Cycles' withdrawal keys on the VIEW angle
+# (bsdf_microfacet_estimate_albedo's cos_NI = dot(wi, N)) and is ~8.7% at the
+# grazing rim where F(L.H) for a light off to the side was ~4-5%. That is the
+# faithful behaviour; the rim was too bright before. Gate 1's pass-C std-dev read
+# exactly 0.000000 in the control build. Previous values: 0.47660 / 0.43739 /
+# 0.47657 / 0.43686.
+const REF_PLASTIC := 0.47225
+const REF_PLASTIC_RIM := 0.42770
+const REF_PLASTIC_BSDF_ONLY := 0.47228
+const REF_PLASTIC_RIM_BSDF_ONLY := 0.42711
 const REF_TOLERANCE := 0.02 # 2 percent; gate 2 is a stochastic comparison.
 
 var _plane: MeshInstance3D

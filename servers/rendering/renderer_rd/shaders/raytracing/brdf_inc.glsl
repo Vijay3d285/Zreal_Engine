@@ -173,9 +173,16 @@ V mul(const M &m, const V &v) {
 // replaces -- so attributing a future residual needs each to be disableable on
 // its own.
 //   RT_BASE_EXACT_FRESNEL  1 = Cycles' exact-dielectric remap, 0 = Schlick
-//   RT_BASE_ALBEDO_LAYERING 1 = withdraw 1 - albedo(specular), 0 = 1 - F(L.H)
+//   RT_BASE_ALBEDO_LAYERING 1 = withdraw 1 - darkening*albedo(specular), 0 = 1 - F(L.H)
+//
+// RT_BASE_ALBEDO_LAYERING shipped OFF on 2026-09-11 because its first form
+// withdrew 1 - albedo and over-withdrew by +20.0% (roadmap §11.11). It is ON
+// as of the same day's follow-up: Cycles withdraws darkening * albedo, because
+// bsdf_albedo returns sc->weight * estimate and sc->weight was already scaled
+// by microfacet_ggx_preserve_energy's darkening before closure_layering_weight
+// ever reads it. Predicted offline at -0.4% of Cycles' withdrawal (§11.12).
 #define RT_BASE_EXACT_FRESNEL 1
-#define RT_BASE_ALBEDO_LAYERING 0
+#define RT_BASE_ALBEDO_LAYERING 1
 //
 // DEFINED HERE, next to the other configuration macros, and NOT down with
 // RT_MS_COMPENSATION: evalFresnelBase sits ~500 lines above that point, and an
@@ -2048,15 +2055,16 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 // diffuse branch. They must agree: a sampler and an NEE site attenuating by
 // different amounts is the B2 defect class, and that is exactly the bug the
 // 2026-09-09 fix closed here. One function, three callers, no way to drift.
-float3 baseLayerAttenuation(BrdfData data, float eta) {
+float3 baseLayerAttenuation(BrdfData data, MaterialProperties material) {
 #if RT_BASE_ALBEDO_LAYERING
 #ifdef RT_ANISOTROPY_ENABLED
 	float rough = ggxRoughFromAlphas(data.ax, data.ay);
 #else
 	float rough = sqrt(clamp(data.alpha, 0.0f, 1.0f));
 #endif
-	// Scalar, per closure_layering_weight's reduce_max -- see specularLayerAlbedo.
-	float t = 1.0f - specularLayerAlbedo(rough, data.NdotV, data.specularF0, eta);
+	// Scalar, per closure_layering_weight's reduce_max, and on the DIELECTRIC
+	// F0 -- see specularLayerAlbedo for both.
+	float t = 1.0f - specularLayerAlbedo(rough, data.NdotV, material.dielectricF0, material.eta);
 	return float3(t, t, t);
 #else
 	// Pre-Gap-#21 behaviour, kept for attribution: withdraw 1 - F(L.H).
@@ -2081,7 +2089,7 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 	// Combine specular and diffuse layers
 #if COMBINE_BRDFS_WITH_FRESNEL
 	// Specular is already multiplied by F, just attenuate diffuse
-	return baseLayerAttenuation(data, material.eta) * diffuse + specular;
+	return baseLayerAttenuation(data, material) * diffuse + specular;
 #else
 	return diffuse + specular;
 #endif
@@ -2393,33 +2401,6 @@ float coatGgxE(float coatRoughness, float cosNI) {
 // which was valid only while ax * ay == alpha^2 held -- Gap #19 divergence B's
 // clamp broke that identity, so the caller now derives rough via
 // ggxRoughFromAlphas / ggxRoughForMaterial.
-// Gap #21 cause (b). The directional albedo of the BASE specular layer, which is
-// what Cycles withdraws from everything beneath it.
-//
-// closure_layering_weight (intern/cycles/kernel/closure/bsdf_util.h:440-444) is
-//   weight * saturatef(1 - reduce_max(safe_divide_color(layer_albedo, weight)))
-// so with the base weight at 1 the attenuation is `1 - reduce_max(albedo)`. The
-// REDUCE_MAX matters and is not a per-channel operation: Cycles withdraws a
-// single scalar driven by the brightest channel.
-//
-// `albedo` is bsdf_microfacet_estimate_albedo's generalized-Schlick branch,
-// mix(f0, f90, s) with s from the ggx_gen_schlick_ior_s LUT -- the SAME table
-// and the same read the coat already uses via coatAlbedoEstimate, which is why
-// no new upload is needed. Only the base lobe never used it.
-//
-// This replaces `1 - F(L.H)`, which withdrew 14.7% more energy than Cycles and
-// was 17% of Gap #21 (roadmap §11.10). Unlike F(L.H) it does not depend on L at
-// all, which is also what makes it structurally safe: an L-independent scalar
-// cannot desync between the sampler and the two NEE sites the way a function of
-// L can (the B2 defect class).
-float specularLayerAlbedo(float rough, float cosNI, float3 F0, float eta) {
-	float q = (eta - 1.0f) / (eta + 1.0f);
-	float z = sqrt(abs(q));
-	float sLut = coatLutRead3D(rough, cosNI, z);
-	float3 alb = lerp(F0, float3(1.0f, 1.0f, 1.0f), sLut);
-	return saturate(max(max(alb.r, alb.g), alb.b));
-}
-
 float ggxE(float rough, float NdotV) {
 	return ggxLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, NdotV, GGX_E_DIM, GGX_E_DIM);
 }
@@ -2475,6 +2456,60 @@ float3 evalMultiScatterEnergy(float rough, float NdotV, float3 F0) {
 	float3 Fss = mix(F0, float3(shadowedF90(F0)), 1.0f / 21.0f);
 	float3 Fms = Fss * Eavg / (float3(1.0f, 1.0f, 1.0f) - Fss * (1.0f - Eavg));
 	return float3(1.0f, 1.0f, 1.0f) + Fms * missing;
+}
+
+// Gap #21 cause (b). The directional albedo of the BASE specular layer, which is
+// what Cycles withdraws from everything beneath it.
+//
+// closure_layering_weight (intern/cycles/kernel/closure/bsdf_util.h:440-444) is
+//   weight * saturatef(1 - reduce_max(safe_divide_color(layer_albedo, weight)))
+// where layer_albedo is bsdf_albedo(specular) = sc->weight * estimate_albedo.
+// The REDUCE_MAX matters and is not a per-channel operation: Cycles withdraws a
+// single scalar driven by the brightest channel.
+//
+// THE PART THAT WAS MISSED THE FIRST TIME: sc->weight is NOT the running
+// `weight` any more by the time bsdf_albedo reads it. svm/closure.h:440-470
+// allocates the closure with `weight`, then calls
+// bsdf_microfacet_setup_fresnel_generalized_schlick -> microfacet_ggx_preserve_energy,
+// which does `bsdf->weight *= darkening` (bsdf_microfacet.h:481) BEFORE the
+// `bsdf_albedo(...)` / `closure_layering_weight(...)` pair at :468-470. So the
+// ratio safe_divide_color(layer_albedo, weight) is darkening * estimate, not
+// estimate. Withdrawing the bare estimate over-withdrew by +20.0% (roadmap
+// §11.11); with darkening the offline prediction is -0.4% of Cycles (§11.12).
+//
+// darkening = (1 + Fms*missing) / energy_scale, and energy_scale = 1/E, so it is
+// evalMultiScatterEnergy * E -- assembled from the two pieces this engine already
+// has rather than a third transcription of the same formula. It is gated on
+// RT_MS_COMPENSATION == 1 because in Cycles the darkening exists only when
+// preserve_energy runs; with compensation off, Cycles' weight is untouched and
+// the withdrawal is the bare estimate. (State 2, the fitted approximation, has
+// no Cycles analogue; it gets the bare estimate too.)
+//
+// `estimate` is bsdf_microfacet_estimate_albedo's generalized-Schlick branch,
+// mix(f0, f90, s) with s from the ggx_gen_schlick_ior_s LUT -- the SAME table
+// and the same read the coat already uses via coatAlbedoEstimate, which is why
+// no new upload is needed. Only the base lobe never used it.
+//
+// F0 here must be the DIELECTRIC F0 (material.dielectricF0), never the
+// metalness-lerped data.specularF0: Cycles splits the metallic closure off
+// first (`weight *= 1 - metallic`, closure.h:351) and layers the dielectric
+// specular, with fresnel->f0 = F0_from_ior(eta) * specular_tint, over what is
+// left. Identical at metalness 0, wrong in between if the lerped F0 is used.
+//
+// This replaces `1 - F(L.H)`, which withdrew 18.7% more energy than Cycles once
+// cause (a) landed. Unlike F(L.H) it does not depend on L at all, which is also
+// what makes it structurally safe: an L-independent scalar cannot desync
+// between the sampler and the two NEE sites the way a function of L can (the
+// B2 defect class).
+float specularLayerAlbedo(float rough, float cosNI, float3 F0, float eta) {
+	float q = (eta - 1.0f) / (eta + 1.0f);
+	float z = sqrt(abs(q));
+	float sLut = coatLutRead3D(rough, cosNI, z);
+	float3 alb = lerp(F0, float3(1.0f, 1.0f, 1.0f), sLut);
+#if RT_MS_COMPENSATION == 1
+	alb *= evalMultiScatterEnergy(rough, cosNI, F0) * ggxE(rough, cosNI);
+#endif
+	return saturate(max(max(alb.r, alb.g), alb.b));
 }
 
 // The single entry point for all three base-specular call sites. They dispatch
@@ -3601,7 +3636,7 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 
 #if COMBINE_BRDFS_WITH_FRESNEL
 	// Specular is already multiplied by F, just attenuate diffuse
-	outDiffuse = baseLayerAttenuation(data, material.eta) * outDiffuse;
+	outDiffuse = baseLayerAttenuation(data, material) * outDiffuse;
 #endif
 
 	// E2d fix round 1. The layer, both halves.
@@ -3771,7 +3806,7 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// data.anisoActive / data.ax / data.ay / data.anisoPhi are no longer read on
 		// this branch. The SPECULAR branch below still consumes all four, so the
 		// E2b anisotropy plumbing above stays live.
-		sampleWeight *= baseLayerAttenuation(data, materialLocal.eta);
+		sampleWeight *= baseLayerAttenuation(data, materialLocal);
 #endif
 
 	} else if (brdfType == SPECULAR_TYPE) {
