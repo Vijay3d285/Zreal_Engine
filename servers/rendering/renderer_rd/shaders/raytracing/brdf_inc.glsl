@@ -164,6 +164,26 @@ V mul(const M &m, const V &v) {
 // Nothing has lower reflectance than 2%, but we use 4% to have consistent results with UE4, Frostbite, et al.
 #define MIN_DIELECTRICS_F0 0.04f
 
+// A/B switches for Gap #21's two causes (roadmap §11.10), kept permanently as
+// measurement scaffolding on the standing precedent of COMBINE_BRDFS_WITH_FRESNEL,
+// RT_LIGHT_SELECT_UNIFORM, RT_ENV_NEE_ENABLED and RT_MS_COMPENSATION.
+//
+// They are SEPARATE switches even though they shipped together, because the two
+// causes interact -- (b)'s withdrawal was computed from the very Fresnel (a)
+// replaces -- so attributing a future residual needs each to be disableable on
+// its own.
+//   RT_BASE_EXACT_FRESNEL  1 = Cycles' exact-dielectric remap, 0 = Schlick
+//   RT_BASE_ALBEDO_LAYERING 1 = withdraw 1 - albedo(specular), 0 = 1 - F(L.H)
+#define RT_BASE_EXACT_FRESNEL 1
+#define RT_BASE_ALBEDO_LAYERING 0
+//
+// DEFINED HERE, next to the other configuration macros, and NOT down with
+// RT_MS_COMPENSATION: evalFresnelBase sits ~500 lines above that point, and an
+// undefined macro evaluates to 0 in #if, so placing them there silently compiled
+// cause (a) OUT. It built cleanly and the specular-only furnace arm did not move
+// a single digit -- the same class of trap as the declaration-order bug in
+// §11.9.1, and equally invisible to SCons.
+
 // Enable this to weigh diffuse by Fresnel too, otherwise specular and diffuse will be simply added together
 // (this is disabled by default for Frostbite diffuse which is normalized to combine well with GGX Specular BRDF)
 #if DIFFUSE_BRDF != FROSTBITE
@@ -722,6 +742,49 @@ float3 evalFresnel(float3 f0, float f90, float NdotS) {
 	return evalFresnelSchlick(f0, f90, NdotS);
 }
 
+// Gap #21 cause (a). The Fresnel Cycles' Principled BSDF actually uses on its
+// BASE specular lobe -- which is NOT Schlick.
+//
+// svm/closure.h sets `fresnel->exponent = -eta` for the dielectric specular
+// closure, and a negative exponent selects a special branch
+// (bsdf_microfacet.h:299-306, commented "Used by Principled BSDF"): the EXACT
+// dielectric Fresnel curve, remapped onto [F0, F90]. Ours used
+// evalFresnelSchlick's (1 - cos)^5 there, which measured -3.99% on the specular
+// lobe of an isotropic dielectric and was 83% of Gap #21 (roadmap §11.10).
+//
+// THE METALLIC END IS ALREADY CORRECT AND IS DELIBERATELY LEFT ALONE. Cycles
+// gives metals fresnel_f82_tint, and at the default white specular tint
+// fresnel_f82tint_B returns `... * (1 - tint)` = 0, which collapses F82 to
+// plain Schlick with f90 = 1 -- exactly what we compute. So this blends by
+// metalness rather than replacing outright.
+//
+// EXACT AT BOTH ENDPOINTS, an approximation between them. Cycles carries two
+// SEPARATE closures weighted by `metallic`, each with its own Fresnel model;
+// this engine has one lobe with a metalness-lerped F0, so lerping the two
+// Fresnel models is the closest faithful thing the single-lobe architecture
+// allows. At metalness 0 and 1 it reduces to Cycles exactly.
+//
+// The remap itself is not new code -- dielectricFresnelSplit (E1) has performed
+// it for the TRANSMISSIVE lobe since Phase E1. Only the opaque base never used it.
+float3 evalFresnelBase(float3 f0, float f90, float NdotS, float eta, float metalness) {
+	float3 F_schlick = evalFresnelSchlick(f0, f90, NdotS);
+#if RT_BASE_EXACT_FRESNEL
+	// eta == 1 is a degenerate interface with no Fresnel curve to remap; fall
+	// back rather than divide by a zero range.
+	if (abs(eta - 1.0f) < 1e-5f) {
+		return F_schlick;
+	}
+	float cos_theta_t;
+	float F_real = fresnel_dielectric(NdotS, eta, cos_theta_t);
+	float F0_real = F0_from_ior(eta);
+	float sr = saturate((F_real - F0_real) / max(1.0f - F0_real, 0.00001f));
+	float3 F_dielectric = lerp(f0, float3(f90, f90, f90), sr);
+	return lerp(F_dielectric, F_schlick, saturate(metalness));
+#else
+	return F_schlick;
+#endif
+}
+
 // Attenuates F90 for very low F0 values
 // Source: "An efficient and Physically Plausible Real-Time Shading Model" in ShaderX7 by Schuler
 // Also see section "Overbright highlights" in Hoffman's 2010 "Crafting Physically Motivated Shading Models for Game Development" for discussion
@@ -1257,6 +1320,14 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 // deleted; state 2 is what keeps them live.
 #define RT_MS_COMPENSATION 1
 
+
+// Forward declaration -- defined after the LUT readers, because it reads the
+// same ggx_gen_schlick_ior_s albedo table the coat uses and that SSBO is not
+// declared until much further down, while evalCombinedBRDF calls this above it.
+// (Defining it late without this prototype compiled cleanly through SCons and
+// then failed at pipeline creation -- see §11.9.1.)
+float specularLayerAlbedo(float rough, float cosNI, float3 F0, float eta);
+
 // Forward declaration. The definition lives after the LUT readers, because it
 // reads the coat_albedo_table SSBO which is not declared until much further down
 // this file -- and this function is CALLED above that point, by
@@ -1386,6 +1457,7 @@ float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared,
 }
 
 float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0,
+		float eta, float metalness,
 #ifdef RT_ANISOTROPY_ENABLED
 		float ax, float ay, float anisoPhi, bool anisoActive,
 #endif
@@ -1399,7 +1471,8 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 #endif
 			u, HdotL, NdotV, weightRatio);
 
-	float3 F = evalFresnel(specularF0, shadowedF90(specularF0), HdotL);
+	// Gap #21 cause (a). MUST match prepareBRDFData's data.F exactly.
+	float3 F = evalFresnelBase(specularF0, shadowedF90(specularF0), HdotL, eta, metalness);
 
 #if MICROFACET_DISTRIBUTION == GGX
 	// Gap #19 divergence B: rough comes from the CLAMPED alphas this sampler was
@@ -1958,9 +2031,37 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 #endif // RT_ANISOTROPY_ENABLED
 
 	// Pre-calculate some more BRDF terms
-	data.F = evalFresnel(data.specularF0, shadowedF90(data.specularF0), data.LdotH);
+	// Gap #21 cause (a): the base specular Fresnel is Cycles' exact-dielectric
+	// remap, not Schlick. sampleSpecularMicrofacet computes the SAME thing from
+	// the same inputs -- if these two ever diverge the sampler and the evaluator
+	// describe different materials, which is the B2 defect class.
+	data.F = evalFresnelBase(data.specularF0, shadowedF90(data.specularF0), data.LdotH,
+			material.eta, material.metalness);
 
 	return data;
+}
+
+// Gap #21 cause (b). How much of the base survives the specular layer above it.
+//
+// SINGLE SOURCE OF TRUTH for all three sites that attenuate the diffuse lobe --
+// evalCombinedBRDF, evalCombinedBRDFSeparate and evalIndirectCombinedBRDF's
+// diffuse branch. They must agree: a sampler and an NEE site attenuating by
+// different amounts is the B2 defect class, and that is exactly the bug the
+// 2026-09-09 fix closed here. One function, three callers, no way to drift.
+float3 baseLayerAttenuation(BrdfData data, float eta) {
+#if RT_BASE_ALBEDO_LAYERING
+#ifdef RT_ANISOTROPY_ENABLED
+	float rough = ggxRoughFromAlphas(data.ax, data.ay);
+#else
+	float rough = sqrt(clamp(data.alpha, 0.0f, 1.0f));
+#endif
+	// Scalar, per closure_layering_weight's reduce_max -- see specularLayerAlbedo.
+	float t = 1.0f - specularLayerAlbedo(rough, data.NdotV, data.specularF0, eta);
+	return float3(t, t, t);
+#else
+	// Pre-Gap-#21 behaviour, kept for attribution: withdraw 1 - F(L.H).
+	return float3(1.0f, 1.0f, 1.0f) - data.F;
+#endif
 }
 
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for direct light)
@@ -1980,7 +2081,7 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 	// Combine specular and diffuse layers
 #if COMBINE_BRDFS_WITH_FRESNEL
 	// Specular is already multiplied by F, just attenuate diffuse
-	return (float3(1.0f, 1.0f, 1.0f) - data.F) * diffuse + specular;
+	return baseLayerAttenuation(data, material.eta) * diffuse + specular;
 #else
 	return diffuse + specular;
 #endif
@@ -2292,6 +2393,33 @@ float coatGgxE(float coatRoughness, float cosNI) {
 // which was valid only while ax * ay == alpha^2 held -- Gap #19 divergence B's
 // clamp broke that identity, so the caller now derives rough via
 // ggxRoughFromAlphas / ggxRoughForMaterial.
+// Gap #21 cause (b). The directional albedo of the BASE specular layer, which is
+// what Cycles withdraws from everything beneath it.
+//
+// closure_layering_weight (intern/cycles/kernel/closure/bsdf_util.h:440-444) is
+//   weight * saturatef(1 - reduce_max(safe_divide_color(layer_albedo, weight)))
+// so with the base weight at 1 the attenuation is `1 - reduce_max(albedo)`. The
+// REDUCE_MAX matters and is not a per-channel operation: Cycles withdraws a
+// single scalar driven by the brightest channel.
+//
+// `albedo` is bsdf_microfacet_estimate_albedo's generalized-Schlick branch,
+// mix(f0, f90, s) with s from the ggx_gen_schlick_ior_s LUT -- the SAME table
+// and the same read the coat already uses via coatAlbedoEstimate, which is why
+// no new upload is needed. Only the base lobe never used it.
+//
+// This replaces `1 - F(L.H)`, which withdrew 14.7% more energy than Cycles and
+// was 17% of Gap #21 (roadmap §11.10). Unlike F(L.H) it does not depend on L at
+// all, which is also what makes it structurally safe: an L-independent scalar
+// cannot desync between the sampler and the two NEE sites the way a function of
+// L can (the B2 defect class).
+float specularLayerAlbedo(float rough, float cosNI, float3 F0, float eta) {
+	float q = (eta - 1.0f) / (eta + 1.0f);
+	float z = sqrt(abs(q));
+	float sLut = coatLutRead3D(rough, cosNI, z);
+	float3 alb = lerp(F0, float3(1.0f, 1.0f, 1.0f), sLut);
+	return saturate(max(max(alb.r, alb.g), alb.b));
+}
+
 float ggxE(float rough, float NdotV) {
 	return ggxLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, NdotV, GGX_E_DIM, GGX_E_DIM);
 }
@@ -3473,7 +3601,7 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 
 #if COMBINE_BRDFS_WITH_FRESNEL
 	// Specular is already multiplied by F, just attenuate diffuse
-	outDiffuse = (float3(1.0f, 1.0f, 1.0f) - data.F) * outDiffuse;
+	outDiffuse = baseLayerAttenuation(data, material.eta) * outDiffuse;
 #endif
 
 	// E2d fix round 1. The layer, both halves.
@@ -3643,12 +3771,13 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// data.anisoActive / data.ax / data.ay / data.anisoPhi are no longer read on
 		// this branch. The SPECULAR branch below still consumes all four, so the
 		// E2b anisotropy plumbing above stays live.
-		sampleWeight *= (float3(1.0f, 1.0f, 1.0f) - data.F);
+		sampleWeight *= baseLayerAttenuation(data, materialLocal.eta);
 #endif
 
 	} else if (brdfType == SPECULAR_TYPE) {
 		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, materialLocal);
 		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0,
+				materialLocal.eta, materialLocal.metalness,
 #ifdef RT_ANISOTROPY_ENABLED
 				data.ax, data.ay, data.anisoPhi, data.anisoActive,
 #endif

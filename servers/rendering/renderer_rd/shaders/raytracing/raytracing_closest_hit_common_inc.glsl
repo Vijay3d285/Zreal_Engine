@@ -897,6 +897,8 @@ void debug_visualize(
 		vec3 dbg_weight35;
 		vec3 dbg_Llocal35 = sampleSpecularMicrofacet(dbg_Vlocal35, dbg_alpha35, dbg_alpha35 * dbg_alpha35,
 				dbg_specularF0_35,
+				// Gap #21 cause (a): eta/metalness now select the base Fresnel model.
+				dbg_mat.eta, dbg_mat.metalness,
 #ifdef RT_ANISOTROPY_ENABLED
 				dbg_data35.ax, dbg_data35.ay, dbg_data35.anisoPhi, dbg_data35.anisoActive,
 #endif

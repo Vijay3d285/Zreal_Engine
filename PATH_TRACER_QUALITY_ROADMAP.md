@@ -118,7 +118,7 @@ Ranked by impact on offline still quality.
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
 | 19 | **Anisotropic GGX energy — FIXED 2026-09-11, see §11.8 and §11.9.** Every measured configuration now agrees with Cycles 5.2.1 to **0.21% or better**, from +53.85% at worst. Two independent causes, both landed: **A**, below-hemisphere VNDF samples clamped into the shading hemisphere rather than rejected (§11.8), and **B**, `ax`/`ay` not clamped to [0,1] as Cycles does in `bsdf_microfacet_ggx_setup` (§11.9). Guarded by probe 1d's eccentricity-monotonicity assertion, which is a physical law rather than a stored reference. *Original entry:* **~~Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one~~** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes, and the larger one is now FIXED.** **A — below-hemisphere VNDF samples were clamped into the shading hemisphere rather than rejected**, handing a finite `G2/G1` weight to directions where the BRDF is identically zero; the error scaled with eccentricity, which is why it read as an anisotropy bug. Landed 2026-09-11 (§11.8), and roughness 0.4 now matches Cycles to **0.04% across the whole anisotropy sweep**, guarded by probe 1d's eccentricity-monotonicity assertion. **B — `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not** is all that remains, and only where `ax > 1`: roughness 0.9 / anisotropy 0.9 now undershoots Cycles by 28.2% where it previously overshot by 53.85%. Fixing B invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on (§11.6). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **The transmissive lobe still uses the fitted multi-scatter approximation** — Gap #17 deliberately left `brdf_inc.glsl`'s transmissive reflection branch on `evalMultiScatterApproximation`, because Cycles compensates glass from a different table set — `ggx_glass_E` (16×16×16), `ggx_glass_Eavg` (16×16) and the `ggx_glass_inv_*` variants for `ior < 1` — none of which this project has transcribed. Pointing it at `ggxE`/`ggxEavg` would swap a measured divergence for an unmeasured one. Needs the four tables, an extended SSBO layout, and its own transmissive furnace study. The transmit branch applies no compensation at all. | `brdf_inc.glsl` (transmissive closure, reflection branch — annotated in place) | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-457` | Medium |
-| 21 | **An isotropic dielectric base renders ~1.9% dark against Cycles — CAUSE FOUND 2026-09-11, see §11.10** — the un-sheened control arm of §7.11's velvet comparison (metallic 0, roughness 0.60, base linear (0.12, 0.02, 0.03), uniform world) reads **0.08786226 against Cycles 5.2.1's 0.08953342, −1.867%**. **Re-measured 2026-09-11 with Gap #17 and Gap #19 both fixed**, which moved it only from −2.062% to −1.867% — so neither explains it, confirming §7.11.2's conclusion that the residual is the *base*, not the sheen. The sheen layer's own contribution, isolated by subtracting each engine's control, agrees to **+0.300%** at sheen roughness 0.50. Inside §8.6's 5% bar, so not a ship blocker, but it is the largest confirmed unexplained parity gap left. **Decomposed: the diffuse lobe is exact (+0.009%); 83% of the deficit is the specular lobe (−3.99%) and 17% is the layering withdrawal (+14.7% too much).** Two causes, both the same shape — E2d gave the *coat* the Cycles-faithful version and the *base* was left on the approximation: (a) our base specular uses Schlick `(1−cos)^5` where Cycles' Principled uses the **exact dielectric Fresnel remapped onto F0..F90** (`bsdf_microfacet.h:299-306`, commented "Used by Principled BSDF"), and (b) our layering withdraws `1−F(L·H)` where Cycles withdraws `1−albedo(specular)` via `closure_layering_weight`. Guarded by probe F in `pt_sheen_gate.gd`, which now carries the decomposition arms. | `brdf_inc.glsl` (`evalFresnelSchlick` at the base specular; the `COMBINE_BRDFS_WITH_FRESNEL` layering), `pipeline_references/tests/pt_sheen_gate.gd` probe F | `intern/cycles/kernel/closure/bsdf_microfacet.h:299-306`, `intern/cycles/kernel/closure/bsdf_util.h:440-444` | Medium |
+| 21 | **An isotropic dielectric base rendered ~1.9% dark against Cycles — cause (a) FIXED 2026-09-11, now −0.43%; cause (b) attempted and left OFF. See §11.10 and §11.11.** — the un-sheened control arm of §7.11's velvet comparison (metallic 0, roughness 0.60, base linear (0.12, 0.02, 0.03), uniform world) reads **0.08786226 against Cycles 5.2.1's 0.08953342, −1.867%**. **Re-measured 2026-09-11 with Gap #17 and Gap #19 both fixed**, which moved it only from −2.062% to −1.867% — so neither explains it, confirming §7.11.2's conclusion that the residual is the *base*, not the sheen. The sheen layer's own contribution, isolated by subtracting each engine's control, agrees to **+0.300%** at sheen roughness 0.50. Inside §8.6's 5% bar, so not a ship blocker, but it is the largest confirmed unexplained parity gap left. **Decomposed: the diffuse lobe is exact (+0.009%); 83% of the deficit is the specular lobe (−3.99%) and 17% is the layering withdrawal (+14.7% too much).** Two causes, both the same shape — E2d gave the *coat* the Cycles-faithful version and the *base* was left on the approximation: (a) our base specular uses Schlick `(1−cos)^5` where Cycles' Principled uses the **exact dielectric Fresnel remapped onto F0..F90** (`bsdf_microfacet.h:299-306`, commented "Used by Principled BSDF"), and (b) our layering withdraws `1−F(L·H)` where Cycles withdraws `1−albedo(specular)` via `closure_layering_weight`. Guarded by probe F in `pt_sheen_gate.gd`, which now carries the decomposition arms. | `brdf_inc.glsl` (`evalFresnelSchlick` at the base specular; the `COMBINE_BRDFS_WITH_FRESNEL` layering), `pipeline_references/tests/pt_sheen_gate.gd` probe F | `intern/cycles/kernel/closure/bsdf_microfacet.h:299-306`, `intern/cycles/kernel/closure/bsdf_util.h:440-444` | Medium |
 
 **Not gaps — verified correct, leave alone:**
 - BRDF library (VNDF GGX, height-correlated Smith G2) — Cycles-class. Multi-scatter compensation over-corrected until 2026-09-10 and now uses Cycles' own tables (Gap #17, §10). Still not an unqualified "leave alone": the **anisotropic** branch carries a separate energy error (Gap #19) and the **transmissive** lobe still uses the old approximation (Gap #20).
@@ -5439,3 +5439,90 @@ would replace, so fixing (a) alone moves (b)'s magnitude too. They want one
 design, measured together, with the furnace and probe F as the instruments and
 a real dielectric asset as the acceptance check. The 5% bar is not at risk
 either way: at −1.875% this is inside it, and each cause alone is smaller still.
+
+
+---
+
+## 11.11 Gap #21 — cause (a) fixed, cause (b) attempted and rejected
+
+**Landed 2026-09-11.** The velvet un-sheened control went **−1.866% → −0.433%**
+against Cycles, and the specular lobe it sits on went **−3.99% → −0.057%**.
+
+| component | ours | Cycles 5.2.1 | Δ | *before* |
+|---|---|---|---|---|
+| diffuse | 0.05665231 | 0.05664716 | +0.009% | +0.009% |
+| specular lobe | 0.03486378 | 0.03488373 | **−0.057%** | −3.990% |
+| **total (un-sheened)** | **0.08914580** | **0.08953342** | **−0.433%** | −1.866% |
+
+All four velvet arms improved with it: −0.422% / −0.351% / −0.145% / −0.433%,
+from −1.844% / −1.547% / −0.674% / −1.866%.
+
+### Cause (a) — shipped
+
+`evalFresnelBase` replaces Schlick on the base specular lobe with Cycles'
+exact-dielectric Fresnel remapped onto [F0, F90]
+(`bsdf_microfacet.h:299-306`). **The metallic end is deliberately untouched**:
+Cycles gives metals `fresnel_f82_tint`, and at the default white tint
+`fresnel_f82tint_B` returns `… * (1 − tint) = 0`, collapsing F82 to plain
+Schlick with `f90 = 1` — which is exactly what we already computed. The new
+function blends the two by `metalness`, exact at both endpoints and an
+approximation between, because Cycles carries two separate closures where this
+engine has one metalness-lerped lobe. Behind `RT_BASE_EXACT_FRESNEL`.
+
+The remap itself was not new code: `dielectricFresnelSplit` has performed it for
+the *transmissive* lobe since E1. Only the opaque base never used it.
+
+### Cause (b) — implemented, measured, and left OFF
+
+`specularLayerAlbedo` + `baseLayerAttenuation` implement Cycles'
+`closure_layering_weight` withdrawal (`1 − reduce_max(albedo)`) against the same
+`ggx_gen_schlick_ior_s` LUT the coat uses. **It made things worse and is shipped
+disabled behind `RT_BASE_ALBEDO_LAYERING 0`:**
+
+| layering | withdrawal, ours | Cycles | over-withdrawal | total |
+|---|---|---|---|---|
+| `1 − F(L·H)` (shipped) | 0.00237028 | 0.00199747 | **+18.7%** | −0.433% |
+| `1 − albedo` (this attempt) | 0.00239665 | 0.00199747 | **+20.0%** | −0.462% |
+
+**The leading hypothesis for why, not yet tested:** Cycles withdraws
+`darkening × estimate_albedo`, not `estimate_albedo`. `bsdf_albedo` returns
+`sc->weight * estimate`, and `sc->weight` was already multiplied by `darkening`
+inside `microfacet_ggx_preserve_energy` — this codebase's own coat comment states
+exactly that, and this implementation did not apply it. A rough estimate puts
+`darkening ≈ 0.935` at roughness 0.6, which would take the withdrawal from
++20.0% to about +12% — better than the shipped `1 − F(L·H)`, but not closed, so
+something else is also involved. The code is left in place and switched off
+precisely so the next attempt starts from it.
+
+*Note the interaction that made shipping (a) alone the right call:* (b)'s
+withdrawal is a function of the Fresnel (a) replaces, so the old `1 − F(L·H)`
+path also moved — its over-withdrawal went from +14.7% to +18.7% purely because
+`F` changed. The two causes are not separable by simple addition, which is why
+they were implemented together and why the switches are separate.
+
+### Two self-inflicted failures, both recorded rather than tidied away
+
+1. **The switches were defined *after* the function that reads them.**
+   `#define RT_BASE_EXACT_FRESNEL 1` went in beside `RT_MS_COMPENSATION` at
+   ~line 1244, but `evalFresnelBase` lives at ~769. An undefined macro is 0 in
+   `#if`, so cause (a) was **compiled out entirely** — it built cleanly and the
+   specular-only furnace arm did not move a single digit. Same class as
+   §11.9.1's declaration-order trap, same invisibility to SCons.
+2. **A `sampleSpecularMicrofacet` call site was missed** because the grep used
+   was `sampleSpecular(` — which cannot match `sampleSpecularMicrofacet(`. The
+   missed site was a vis-mode-35 debug call, so only the `RT_DEBUG_ENABLED`
+   variant failed to compile, and the symptom was three *other* gates reporting
+   GPU LUT reads of `0.000000` while the main shading path was perfect. The
+   error was sitting in Godot's own stderr the whole time
+   (`'sampleSpecularMicrofacet' : no matching overloaded function found`);
+   reading the log first would have been faster than reasoning about it.
+
+### Regression evidence
+
+`plastic` is the only surface in `pt_energy_gate.gd` that moved, which is the
+control that says (a) is dielectric-specific: `smooth`, `rough` and `bumpy` are
+metallic 1 where our Schlick already matched Cycles' F82, and the Lambertian
+plane sets `metallic_specular = 0` so it has no specular lobe. Re-captured with
+the documented BSDF-only control (gate 1's pass-C std-dev exactly `0.000000`).
+Anisotropy, coat and sheen gates green with no re-baselining. Suite 1556 passed
+/ 0 failed / 3 skipped.

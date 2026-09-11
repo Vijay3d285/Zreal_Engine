@@ -177,10 +177,16 @@ const REF_BUMPY := 1.41124 # normal-mapped rough metal
 # (0.47107 -> 0.47109 MIS-on, 0.00%): it is a dielectric, F0 = 0.04, where the
 # compensation is ~1.004 either way. The B2 neutrality figure it reports is
 # unchanged in character: -0.01% (disc) / +0.13% (rim).
-const REF_PLASTIC := 0.47109
-const REF_PLASTIC_RIM := 0.42832
-const REF_PLASTIC_BSDF_ONLY := 0.47105
-const REF_PLASTIC_RIM_BSDF_ONLY := 0.42776
+# RE-CAPTURED 2026-09-11 for Gap #21 cause (a): the base specular Fresnel is now
+# Cycles' exact-dielectric remap rather than Schlick (roadmap §11.11). This is
+# the ONLY surface in this gate that moves -- `smooth`, `rough` and `bumpy` are
+# metallic 1, where Cycles uses F82 and our Schlick already matched, and the
+# Lambertian plane has metallic_specular 0 so it carries no specular lobe at all.
+# Previous values: 0.47109 / 0.42832 / 0.47105 / 0.42776.
+const REF_PLASTIC := 0.47660
+const REF_PLASTIC_RIM := 0.43739
+const REF_PLASTIC_BSDF_ONLY := 0.47657
+const REF_PLASTIC_RIM_BSDF_ONLY := 0.43686
 const REF_TOLERANCE := 0.02 # 2 percent; gate 2 is a stochastic comparison.
 
 var _plane: MeshInstance3D
