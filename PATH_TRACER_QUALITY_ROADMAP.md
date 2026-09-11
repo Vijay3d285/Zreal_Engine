@@ -5051,3 +5051,71 @@ anisotropy *parameter* itself (`svm/closure.h:296`), clamping negatives to zero,
 while ours is signed [−1, 1]. That is a separate parity divergence already noted as
 a Phase D residual, and changing it would alter every negative-anisotropy material
 rather than the energy behaviour B is about.
+
+### 11.8 Divergence A — ROOT CAUSE FOUND: below-hemisphere samples are clamped, not rejected
+
+**Diagnosed 2026-09-11.** `sampleMicrofacetDirection` (`brdf_inc.glsl`) does
+
+```glsl
+float NdotL = max(0.00001f, min(1.0f, dot(Nlocal, Llocal)));
+```
+
+and then computes the sample weight `G2/G1` from it. A VNDF draw whose reflected
+direction lands **below the shading hemisphere** is therefore *clamped into* the
+hemisphere rather than rejected, and receives a finite weight where the BRDF is
+identically zero. The behaviour is not new — `pt_energy_gate.gd`'s header already
+describes "the `dot(N,L) <= 0` band that `sampleSpecularMicrofacet` CLAMPS into
+rather than rejecting" — but its energy consequence was never measured.
+
+**Why it presents as an anisotropy bug.** A stretched lobe reaches toward grazing
+far more often than an isotropic one, so it produces below-hemisphere draws far
+more often. The spurious energy therefore scales with eccentricity, and vanishes at
+`ax == ay` — which is exactly why every isotropic comparison in §11 agreed while
+every anisotropic one did not.
+
+**The measurement that made it visible was our own sweep, not the Cycles gap.**
+Our raw furnace was **non-monotonic**: 0.965696 at anisotropy 0.0 rising to
+0.982142 at 0.5. A more eccentric lobe has more masking-shadowing and must lose
+*more* energy; gaining it is physically impossible, and that is a defect
+independently of what Cycles does.
+
+**Test (minimal, one variable): zero the sample weight when `dot(Nlocal, Llocal) <= 0`.**
+
+| anisotropy | before | after | Cycles | after vs Cycles |
+|---|---|---|---|---|
+| −0.90 | 0.982335 | 0.958076 | — | — |
+| −0.50 | 0.985205 | 0.962722 | — | — |
+| **0.00** | 0.965696 | **0.965652** | 0.965085 | **+0.06%** |
+| **0.50** | 0.982142 | **0.957821** | 0.957336 | **+0.05%** |
+| **0.90** | 0.942444 | **0.895884** | 0.895165 | **+0.08%** |
+
+The curve is monotonic again and **matches Cycles to 0.08% at every anisotropy**,
+against +2.6% and +5.28% before. The isotropic case moves by 0.005%, so the change
+touches only the case that was broken — the control that distinguishes a real fix
+from a coincidence.
+
+**What was ruled out first, and how.** `bsdf_aniso_D` and `bsdf_aniso_lambda` are
+*textually identical* to our `GGX_D_Aniso` and `Smith_Lambda_Aniso`, so the BRDF
+core was never a candidate. The tangent field was measured and exonerated — RADIAL
+Z/X/Y, UV_MAP and no tangent node at all span 0.02% in Cycles — which also
+exonerates `anisoPhi` and the frame rotations by implication, since energy that is
+insensitive to tangent *direction* cannot be broken by an error in the tangent
+*angle*. And a BSDF-only run (`RT_ENV_NEE_ENABLED 0`) matched the MIS run to 0.01%,
+proving sampler and evaluator agree with each other, so the fault had to be
+something both share.
+
+**Not yet landed.** The guard above was a diagnostic and has been reverted; the
+tree is back at production values with all four gates green. Landing it properly
+needs: a test that fails first, the interaction with the *geometry*-plane recovery
+path checked (`recoverBelowHemisphereSample`,
+`raytracing_closest_hit_common_inc.glsl:2147` — a different plane, so they look
+complementary rather than colliding), a decision on whether to terminate the path
+instead of tracing a zero-weight ray, and re-baselining `pt_anisotropy_gate` plus
+`pt_energy_gate`'s `rough` and `bumpy` spheres. **It also changes every anisotropic
+material in every render**, so it wants its own before/after on a real scene.
+
+**Order with divergence B.** B (the `ax`/`ay` clamp, §11.7) still stands and is
+still Cycles-faithful, and it is still true that half of B is worse than none. With
+A fixed, B's remaining contribution should be re-measured rather than assumed: A
+accounts for essentially all of the roughness-0.4 gap, and B's cell
+(roughness 0.9 / anisotropy 0.9) has not been re-measured with A in place.
