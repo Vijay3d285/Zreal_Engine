@@ -5010,3 +5010,44 @@ Matching Cycles therefore requires `rough` derived from the clamped `ax`/`ay` at
 three call sites, which means plumbing anisotropy to the two NEE sites after all. The
 sampler-versus-NEE desync hazard §5.2 avoided by accident is live again and has to be
 handled deliberately.
+
+### 11.7 The clamp was implemented and measured — it makes parity WORSE on its own
+
+**Measured 2026-09-11, then reverted.** The change is two lines at the single
+derivation site (`prepareBRDFData`, `brdf_inc.glsl:1850-1852`); every other
+consumer reads `data.ax`/`data.ay`, so clamping there reaches the distribution,
+Smith G2, the VNDF sampler, `combinedPdf` and the multi-scatter lookup at once,
+exactly as Cycles' setup-time clamp does.
+
+Raw lobe (compensation off), against Cycles:
+
+| configuration | ours before | ours **with clamp** | Cycles | after |
+|---|---|---|---|---|
+| roughness 0.4, anisotropy 0.0 | 0.965696 | 0.965701 | 0.965085 | +0.06% |
+| roughness 0.4, anisotropy 0.9 | 0.942444 | 0.942445 | 0.895165 | +5.28% |
+| roughness 0.9, anisotropy 0.0 | 0.428154 | 0.428155 | 0.430197 | −0.47% |
+| **roughness 0.9, anisotropy 0.9** | 0.547395 | **0.690459** | 0.497473 | **+38.8%** |
+
+The three rows where `ax < 1` are untouched to six decimals, which confirms the
+clamp fires exactly where predicted and nowhere else. But at the one row where it
+does fire it moves us **from +10.0% off Cycles to +38.8% off**. Compensated, probe
+1b goes 1.278307 → **1.612333** — further from 1.0 *and* further from Cycles'
+0.830896.
+
+**Half of B is worse than none of B**, so the clamp must not ship without the
+`rough`-from-clamped-alphas half. Completing B is still a real improvement —
+0.690459 × Cycles' own 1.6702 factor ≈ 1.153 against Cycles' 0.830896, i.e.
+**+38.8% where today's shipped build sits at +53.85%** — but that arithmetic also
+shows the shape of the problem: **divergence A dominates, and it dominates by
+more at roughness 0.9 than the raw-lobe table alone suggested.**
+
+Reverted rather than left in the tree. It is two lines to re-apply, and re-applying
+it is a prerequisite for A being measurable cleanly (until the alphas match Cycles',
+any A-fix is being tuned against a lobe fed different parameters). **The order that
+follows from this measurement is: diagnose A first, then land B and A together.**
+
+*Not attempted, and deliberately out of scope for B:* Cycles also `saturatef`s the
+anisotropy *parameter* itself (`svm/closure.h:296`), clamping negatives to zero,
+while ours is signed [−1, 1]. That is a separate parity divergence already noted as
+a Phase D residual, and changing it would alter every negative-anisotropy material
+rather than the energy behaviour B is about.
