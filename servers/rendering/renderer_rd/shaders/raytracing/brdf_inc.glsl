@@ -1331,6 +1331,40 @@ float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared,
 		weightRatio = specularSampleWeight(alpha, alphaSquared, NdotL, NdotV, HdotL, NdotH);
 	}
 
+	// Gap #19 divergence A. A VNDF draw whose reflected direction lands BELOW
+	// the shading hemisphere carries no energy -- the BRDF is identically zero
+	// there. NdotL above is CLAMPED into the hemisphere
+	// (max(0.00001f, ...)) rather than rejected, which is fine for numerical
+	// stability of the terms that use it but must NOT be allowed to hand such a
+	// sample a finite G2/G1 weight. Test the raw dot, not the clamped one.
+	//
+	// WHY THIS READ AS AN ANISOTROPY BUG: a stretched lobe reaches toward
+	// grazing far more often than an isotropic one, so it produces these draws
+	// far more often, and the spurious energy scales with eccentricity while
+	// vanishing at ax == ay. That is why every isotropic comparison against
+	// Cycles agreed and every anisotropic one did not, and why the white
+	// furnace was NON-MONOTONIC -- 0.965696 at anisotropy 0.0 rising to
+	// 0.982142 at 0.5, i.e. GAINING energy as masking-shadowing increased,
+	// which is physically impossible. See PATH_TRACER_QUALITY_ROADMAP.md §11.8
+	// for the full diagnosis and pt_anisotropy_gate.gd's probe 1d for the
+	// assertion that now guards it.
+	//
+	// This is the SHADING hemisphere. It is a different plane from the
+	// GEOMETRY-plane test that drives recoverBelowHemisphereSample
+	// (raytracing_closest_hit_common_inc.glsl) -- that one exists to stop a ray
+	// self-intersecting the surface it left, this one states that the BRDF is
+	// zero. They are complementary and both are needed.
+	//
+	// The zero-weight ray is still returned and still traced. Terminating the
+	// path here instead would save that trace, but it is an optimisation and is
+	// deliberately not bundled with this correctness fix.
+	if (dot(Nlocal, Llocal) <= 0.0f) {
+		outWeightRatio = 0.0f;
+		outHdotL = HdotL;
+		outNdotV = NdotV;
+		return Llocal;
+	}
+
 	outHdotL = HdotL;
 	outNdotV = NdotV;
 	outWeightRatio = weightRatio;

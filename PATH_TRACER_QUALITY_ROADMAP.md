@@ -116,7 +116,7 @@ Ranked by impact on offline still quality.
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
 | 17 | **Multi-scatter energy compensation over-shoot** — **FIXED 2026-09-10, see §10.** `evalEmsApprox`/`evalMultiScatterApproximation` over-corrected the true single-scatter GGX energy loss by 3.4–8.1pp. Replaced by `evalMultiScatterEnergy`, a transcription of Cycles' `microfacet_ggx_preserve_energy` reading the `GGX_E`/`GGX_EAVG` tables E2d already ships. The white furnace's isotropic control went **1.059535 → 1.000549**. Two things this did *not* fix are now separate rows: #19 and #20. | `brdf_inc.glsl` (`evalMultiScatterEnergy`, `evalMultiScatterFactor`, `RT_MS_COMPENSATION`), call sites in `brdf_inc.glsl` (sampler), `raytracing_closest_hit_common_inc.glsl` and `raytracing_emissive_inc.glsl` (NEE) | `intern/cycles/kernel/closure/bsdf_microfacet.h:466-485` | **Fixed** |
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
-| 19 | **Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes:** a raw anisotropic lobe returning 5–10% more energy than Cycles' (undiagnosed), and `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not (found — and fixing it invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
+| 19 | **Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes, and the larger one is now FIXED.** **A — below-hemisphere VNDF samples were clamped into the shading hemisphere rather than rejected**, handing a finite `G2/G1` weight to directions where the BRDF is identically zero; the error scaled with eccentricity, which is why it read as an anisotropy bug. Landed 2026-09-11 (§11.8), and roughness 0.4 now matches Cycles to **0.04% across the whole anisotropy sweep**, guarded by probe 1d's eccentricity-monotonicity assertion. **B — `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not** is all that remains, and only where `ax > 1`: roughness 0.9 / anisotropy 0.9 now undershoots Cycles by 28.2% where it previously overshot by 53.85%. Fixing B invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on (§11.6). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **The transmissive lobe still uses the fitted multi-scatter approximation** — Gap #17 deliberately left `brdf_inc.glsl`'s transmissive reflection branch on `evalMultiScatterApproximation`, because Cycles compensates glass from a different table set — `ggx_glass_E` (16×16×16), `ggx_glass_Eavg` (16×16) and the `ggx_glass_inv_*` variants for `ior < 1` — none of which this project has transcribed. Pointing it at `ggxE`/`ggxEavg` would swap a measured divergence for an unmeasured one. Needs the four tables, an extended SSBO layout, and its own transmissive furnace study. The transmit branch applies no compensation at all. | `brdf_inc.glsl` (transmissive closure, reflection branch — annotated in place) | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-457` | Medium |
 
 **Not gaps — verified correct, leave alone:**
@@ -5104,15 +5104,47 @@ insensitive to tangent *direction* cannot be broken by an error in the tangent
 proving sampler and evaluator agree with each other, so the fault had to be
 something both share.
 
-**Not yet landed.** The guard above was a diagnostic and has been reverted; the
-tree is back at production values with all four gates green. Landing it properly
-needs: a test that fails first, the interaction with the *geometry*-plane recovery
-path checked (`recoverBelowHemisphereSample`,
-`raytracing_closest_hit_common_inc.glsl:2147` — a different plane, so they look
-complementary rather than colliding), a decision on whether to terminate the path
-instead of tracing a zero-weight ray, and re-baselining `pt_anisotropy_gate` plus
-`pt_energy_gate`'s `rough` and `bumpy` spheres. **It also changes every anisotropic
-material in every render**, so it wants its own before/after on a real scene.
+**LANDED 2026-09-11.** `sampleMicrofacetDirection` now zeroes the sample weight
+when `dot(Nlocal, Llocal) <= 0`, testing the raw dot rather than the clamped
+`NdotL`. Guarded by **probe 1d** in `pt_anisotropy_gate.gd`, which asserts that the
+furnace return never *rises* with eccentricity — a physical law, so unlike a stored
+reference it needs no re-capture when the integrator legitimately changes. Probe 1d
+was written first and **failed on the unfixed build** (anisotropy −0.50 returning
+1.020749 against anisotropy 0.00's 1.000552, +2.02pp the wrong way) before the fix
+made it pass.
+
+Against Cycles 5.2.1 on the identical furnace, **roughness 0.4 is now essentially
+exact across the whole anisotropy sweep**:
+
+| configuration | ours | Cycles | Δ |
+|---|---|---|---|
+| roughness 0.4, anisotropy 0.0 | 1.000547 | 1.000504 | **+0.00%** |
+| roughness 0.4, anisotropy 0.5 | 0.992494 | 0.992470 | **+0.00%** |
+| roughness 0.4, anisotropy 0.9 | 0.928423 | 0.928014 | **+0.04%** |
+| roughness 0.9, anisotropy 0.0 | 0.999611 | 0.999617 | **−0.00%** |
+| roughness 0.9, anisotropy 0.9 | 0.596594 | 0.830896 | **−28.2%** |
+
+That last cell **flipped sign** — it was +53.85% — and it is the one configuration
+in the gate where `ax = 0.81 / 0.4359 = 1.858` exceeds 1. **Divergence B is now the
+sole remaining cause of it**, cleanly isolated: Cycles clamps `ax`/`ay` to [0,1] and
+we do not, so our lobe there is far more eccentric than Cycles' and now undershoots.
+
+*The geometry-plane recovery path was checked and is complementary, not colliding.*
+`recoverBelowHemisphereSample` (`raytracing_closest_hit_common_inc.glsl:2147`) tests
+the **geometry** plane, to stop a ray self-intersecting the surface it left; this
+guard tests the **shading** hemisphere, where the BRDF is zero. Different planes,
+both needed.
+
+*Blast radius, measured rather than assumed:* every other gate passed **unchanged**,
+no re-baselining required — `pt_coat_gate` and `pt_sheen_gate` green, and
+`pt_energy_gate` moved by 0.00% (smooth), 0.02% (diffuse), 0.05% (bumpy) and 0.01%
+(plastic), with Gate 1's absolute still 0.49999. Suite 1555 passed / 0 failed / 3
+skipped. Only `pt_anisotropy_gate`'s own baselines needed re-capture. The change is
+anisotropy-specific in effect, which is the control that separates a real fix from a
+coincidence.
+
+*Deliberately not bundled:* the zero-weight ray is still traced. Terminating the path
+would save that trace but is an optimisation, not part of this correctness fix.
 
 **Order with divergence B.** B (the `ax`/`ay` clamp, §11.7) still stands and is
 still Cycles-faithful, and it is still true that half of B is worse than none. With

@@ -147,8 +147,25 @@ const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 # where no compensation is applied at all. GGX_E_TABLE has no anisotropy axis
 # (it is (rough, mu) only, and Cycles feeds it the same geometric-mean
 # roughness we do), so the isotropic table cannot describe an eccentric lobe.
-# Whether that is our E2b anisotropic branch or Cycles' shared approximation
-# is undetermined and filed as its own roadmap item.
+#
+# RE-CAPTURED AGAIN 2026-09-11, after Gap #19 divergence A was fixed (roadmap
+# §11.8): below-hemisphere VNDF samples were being CLAMPED into the shading
+# hemisphere rather than rejected, handing a finite G2/G1 weight to directions
+# where the BRDF is identically zero. The previous values were
+#   [1.0177450, 1.0207473, 1.0005490, 1.0176387, 0.9765347]
+# and carried that spurious energy. They were also NON-MONOTONIC in
+# eccentricity, which probe 1d now asserts against.
+#
+# Against Cycles 5.2.1 on the identical furnace, roughness 0.4, the anisotropy
+# sweep now agrees essentially exactly:
+#   anisotropy 0.0   ours 1.000547   Cycles 1.000504   +0.00%
+#   anisotropy 0.5   ours 0.992494   Cycles 0.992470   +0.00%
+#   anisotropy 0.9   ours 0.928423   Cycles 0.928014   +0.04%
+#
+# What remains is divergence B, and only where ax > 1: Cycles clamps ax/ay to
+# [0,1] in bsdf_microfacet_ggx_setup and we do not, so at roughness 0.9 /
+# anisotropy 0.9 (probe 1b) our lobe is far more eccentric than Cycles' and now
+# UNDERSHOOTS it. See roadmap §11.7.
 #
 # The point of asserting a TIGHT band around a number that is itself known to
 # be over 1.0 is regression detection, not correctness measurement: reverting
@@ -158,8 +175,24 @@ const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 # task-4-report.md fix round 1, I6's C1-revert experiment table) -- vastly
 # outside BASELINE_BAND, while ordinary run-to-run Monte Carlo noise (~0.02pp
 # per the per-rotation spread above) stays vastly inside it.
-const BASELINE_INTACT_RATIO := [1.0177450, 1.0207473, 1.0005490, 1.0176387, 0.9765347] # parallel to ANISOTROPY_VALUES
+const BASELINE_INTACT_RATIO := [0.9926503, 0.9975017, 1.0005473, 0.9924937, 0.9284227] # parallel to ANISOTROPY_VALUES
 const BASELINE_BAND := 0.005 # +/- 0.5 percentage points; see BASELINE_INTACT_RATIO's doc comment.
+
+# Probe 1d (Gap #19 divergence A, 2026-09-11). Monotonicity band.
+#
+# A more ECCENTRIC lobe has more masking-shadowing, so a white furnace must
+# return LESS energy as ax:ay departs from 1 -- never more. This is a physical
+# law, not a reference number, so unlike BASELINE_INTACT_RATIO it needs no
+# re-capture when the integrator legitimately changes.
+#
+# It is the check that would have caught divergence A years earlier. Before the
+# fix the sweep read 0.965696 at anisotropy 0.0 and 0.985205 at -0.5 -- a 1.95pp
+# INCREASE with eccentricity, physically impossible, and sitting in committed
+# measurements the whole time because nothing asserted on it.
+#
+# 0.2pp is ~10x the measured run-to-run spread (~0.02pp) and ~10x smaller than
+# the violation it exists to catch.
+const MONOTONIC_BAND := 0.002
 
 # Fix round 1: 0.0 added per the coordinator's C2 fix instruction -- the
 # self-normalizing check being a genuinely independent instrument (unlike the
@@ -196,15 +229,22 @@ const ISO_HIROUGH_FRAMES := 64
 # and NEE_DOM_ROUGHNESS is 0.9 vs probe 1's 0.4), and reverting the C1 fix
 # moves it by +42.6 percentage points (measured, the I6 C1-revert experiment)
 # -- far outside BASELINE_BAND.
-# RE-CAPTURED 2026-09-10 (Gap #17); was 1.345900. This probe is the extreme
-# corner of the anisotropic residual documented above -- roughness 0.9 AND
-# anisotropy 0.9, i.e. an ax:ay of about 5.26:1. The three-state sweep:
-# legacy 1.345901, NO compensation 0.547386, Cycles table 1.278307. The
-# UNCOMPENSATED anisotropic lobe returns 54.7% of the sky here, while the
-# isotropic table for the same geometric-mean roughness predicts about 42.8%,
-# so 1/E over-recovers it by the 27.8% seen below. Deliberately still NOT
-# asserted against 1.0 for that reason; the regression band is the live gate.
-const BASELINE_INTACT_RATIO_NEE_DOM := 1.278307
+# RE-CAPTURED 2026-09-11 (Gap #19 divergence A, roadmap §11.8); was 1.278307,
+# and 1.345900 before Gap #17. This probe is roughness 0.9 AND anisotropy 0.9 --
+# an ax:ay of about 5.26:1, and the ONE configuration in this gate where
+# ax = 0.81 / 0.4359 = 1.858 exceeds 1.
+#
+# That matters because it is the only cell still diverging from Cycles.
+# bsdf_microfacet_ggx_setup clamps ax/ay to [0,1]
+# (intern/cycles/kernel/closure/bsdf_microfacet.h:1042-1043) and we do not, so
+# our lobe here is far more eccentric than Cycles'. Having fixed divergence A,
+# this probe now UNDERSHOOTS Cycles (0.596594 against 0.830896) where before it
+# overshot (+53.85%). Divergence B is the whole of what is left; see §11.7.
+#
+# Deliberately still NOT asserted against 1.0: this configuration is
+# anisotropic, so the isotropic 1/E derivation that makes probe 1's
+# anisotropy-0 check and probe 1c assertable does not apply here.
+const BASELINE_INTACT_RATIO_NEE_DOM := 0.596594
 
 var _sphere: MeshInstance3D
 var _cam: Camera3D
@@ -367,9 +407,13 @@ func _probe_furnace(p_env: Environment) -> void:
 	var vp_rid := get_viewport().get_viewport_rid()
 	var worst_ratio := 1.0
 	var worst_label := ""
+	# Probe 1d: mean ratio per anisotropy, for the monotonicity check below.
+	var by_aniso: Array[float] = []
 	for ai in range(ANISOTROPY_VALUES.size()):
 		var aniso: float = ANISOTROPY_VALUES[ai]
 		var baseline: float = BASELINE_INTACT_RATIO[ai]
+		var aniso_sum := 0.0
+		var aniso_n := 0
 		for rot in ROTATION_VALUES:
 			_sphere.material_override = _sphere_material(aniso, rot)
 			var img: Image = await _render_accum(p_env, vp_rid, FURNACE_FRAMES)
@@ -379,6 +423,8 @@ func _probe_furnace(p_env: Environment) -> void:
 				continue
 			var s := _measure_crop(img, 0.05, 0.95)
 			var ratio: float = s["mean"] / SKY_RADIANCE
+			aniso_sum += ratio
+			aniso_n += 1
 			print("  %-34s mean=%.6f  ratio=%.6f  (n=%d)" % [tag, s["mean"], ratio, s["n"]])
 			if absf(ratio - 1.0) > absf(worst_ratio - 1.0):
 				worst_ratio = ratio
@@ -430,7 +476,55 @@ func _probe_furnace(p_env: Environment) -> void:
 						"a reverted C1 fix (evalMicrofacet's G2/4*NdotL*NdotV, brdf_inc.glsl) or " +
 						"another regression in the anisotropic branch")
 						% [tag, ratio, baseline, BASELINE_BAND * 100.0])
+		by_aniso.append(aniso_sum / maxf(float(aniso_n), 1.0))
 	print("  worst deviation: %s  ratio=%.6f" % [worst_label, worst_ratio])
+	_check_eccentricity_monotonic(by_aniso)
+
+
+## PROBE 1d -- eccentricity monotonicity (Gap #19 divergence A).
+##
+## A white furnace must return LESS energy as the lobe gets more eccentric,
+## because masking-shadowing grows with eccentricity. Never more.
+##
+## Eccentricity is ax:ay. With ax = alpha/aspect, ay = alpha*aspect and
+## aspect = sqrt(1 - 0.9*anisotropy), that ratio is 1/(1 - 0.9*a) for a > 0 and
+## (1 - 0.9*a) for a < 0 -- so the SIGNED sweep is not monotonic in `a` itself,
+## and the entries have to be sorted by eccentricity before comparing. At the
+## gate's five values that order is 0.0 (1.00), -0.5 (1.45), -0.9 (1.81),
+## +0.5 (1.82), +0.9 (5.26): note -0.9 and +0.5 are nearly tied, which is why
+## the band has to exceed their genuine 0.03pp separation.
+##
+## This assertion is independent of Cycles and of any stored reference. It is
+## what divergence A violated, in committed measurements, unnoticed.
+func _check_eccentricity_monotonic(p_by_aniso: Array[float]) -> void:
+	if p_by_aniso.size() != ANISOTROPY_VALUES.size():
+		_failures.append("probe1d: got %d ratios for %d anisotropies -- the sweep did not run as expected"
+				% [p_by_aniso.size(), ANISOTROPY_VALUES.size()])
+		return
+	var rows: Array = []
+	for i in range(ANISOTROPY_VALUES.size()):
+		var a: float = ANISOTROPY_VALUES[i]
+		var aspect_sq: float = 1.0 - 0.9 * a
+		var ecc: float = maxf(1.0 / aspect_sq, aspect_sq)
+		rows.append({ "a": a, "ecc": ecc, "ratio": p_by_aniso[i] })
+	rows.sort_custom(func(x, y): return x["ecc"] < y["ecc"])
+
+	print("\n=== PROBE 1d: eccentricity monotonicity ===")
+	print("  a white furnace must not RETURN MORE energy as the lobe gets more eccentric")
+	print("  %10s %12s %12s" % ["anisotropy", "ax:ay", "ratio"])
+	for r in rows:
+		print("  %10.2f %12.4f %12.6f" % [r["a"], r["ecc"], r["ratio"]])
+
+	for i in range(1, rows.size()):
+		var prev: Dictionary = rows[i - 1]
+		var cur: Dictionary = rows[i]
+		if cur["ratio"] > prev["ratio"] + MONOTONIC_BAND:
+			_failures.append(("probe1d monotonicity: anisotropy %.2f (ax:ay %.4f) returns %.6f, MORE than " +
+					"anisotropy %.2f (ax:ay %.4f) at %.6f, by %.2fpp. A more eccentric lobe has more " +
+					"masking-shadowing and must return LESS. Energy gain with eccentricity is " +
+					"physically impossible -- see PATH_TRACER_QUALITY_ROADMAP.md section 11.8.")
+					% [cur["a"], cur["ecc"], cur["ratio"], prev["a"], prev["ecc"], prev["ratio"],
+					(cur["ratio"] - prev["ratio"]) * 100.0])
 
 
 func _probe_furnace_nee_dominant(p_env: Environment) -> void:
