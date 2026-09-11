@@ -1048,6 +1048,20 @@ float GGX_D(float alphaSquared, float NdotH) {
 // 90 degrees gives 1.818. Different eccentricity, not a different orientation.
 // Nothing is lost -- KHR_materials_anisotropy has no sign, so every glTF or
 // Blender-imported material lands in a >= 0 where the two agree exactly.
+// `rough` for the GGX_E / GGX_EAVG lookup: Cycles' sqrt(sqrt(alpha_x * alpha_y))
+// on the CLAMPED alphas (bsdf_microfacet.h:437). NOT sqrt(alpha) -- see
+// ggxAnisoAlphas for why that shortcut stopped being valid (Gap #19 divergence B).
+//
+// DEFINED HERE, next to anisoAspect, and NOT down with the LUT readers: GLSL
+// requires declaration before use, and sampleSpecularMicrofacet calls this ~500
+// lines above them. Defining it late compiled cleanly through SCons and then
+// failed at pipeline creation -- rendering every ANISOTROPIC surface black while
+// isotropic scenes were untouched, because anisotropy is a per-scene feature gate
+// so isotropic scenes never compile the branch that calls it.
+float ggxRoughFromAlphas(float ax, float ay) {
+	return sqrt(sqrt(ax * ay));
+}
+
 float anisoAspect(float anisotropy) {
 	// Exactly 1.0 at anisotropy 0, which is what makes ax == ay == alpha and
 	// keeps untouched materials bit-identical to pre-E2b.
@@ -1248,7 +1262,7 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 // this file -- and this function is CALLED above that point, by
 // sampleSpecularMicrofacet. This is the only forward declaration in this file;
 // it is here rather than moving a 700-line block of E2d/E2e code.
-float3 evalMultiScatterFactor(float alpha, float NdotV, float3 F0);
+float3 evalMultiScatterFactor(float alpha, float rough, float NdotV, float3 F0);
 
 // Samples a reflection ray from the rough surface using selected microfacet distribution and sampling method
 // Resulting weight includes multiplication by cosine (NdotL) term
@@ -1388,7 +1402,15 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 	float3 F = evalFresnel(specularF0, shadowedF90(specularF0), HdotL);
 
 #if MICROFACET_DISTRIBUTION == GGX
-	float3 ms = evalMultiScatterFactor(alpha, NdotV, specularF0);
+	// Gap #19 divergence B: rough comes from the CLAMPED alphas this sampler was
+	// handed, not from sqrt(alpha). When anisotropy is inactive prepareBRDFData
+	// leaves ax == ay == alpha, so this reduces to sqrt(alpha) exactly.
+#ifdef RT_ANISOTROPY_ENABLED
+	float ms_rough = ggxRoughFromAlphas(ax, ay);
+#else
+	float ms_rough = sqrt(clamp(alpha, 0.0f, 1.0f));
+#endif
+	float3 ms = evalMultiScatterFactor(alpha, ms_rough, NdotV, specularF0);
 #else
 	float3 ms = vec3(1.0f, 1.0f, 1.0f);
 #endif
@@ -1809,6 +1831,68 @@ bool recoverBelowHemisphereSample(
 //    Combined BRDF
 // -------------------------------------------------------------------------
 
+// SINGLE SOURCE OF TRUTH for the CLAMPED (ax, ay) a material's specular lobe
+// actually uses, for its anisotropy azimuth, and for whether anisotropy is active
+// at all (Gap #19 divergence B).
+//
+// WHY THIS EXISTS RATHER THAN THE ARITHMETIC BEING INLINED TWICE. Cycles clamps
+// both alphas to [0,1] in bsdf_microfacet_ggx_setup
+// (intern/cycles/kernel/closure/bsdf_microfacet.h:1042-1043), AFTER
+// svm/closure.h:585-587 divides alpha_x by aspect. That clamp DESTROYS the
+// identity `ax * ay == alpha^2`, which Gap #17's spec §5.2 relied on to let the
+// multi-scatter compensation derive `rough` from `alpha` alone -- which in turn is
+// what let the two NEE sites skip anisotropy plumbing entirely. With the clamp in,
+// `rough` must come from the clamped product, so every compensation site needs the
+// real alphas. A sampler and an NEE site compensating on different roughnesses is
+// exactly the B2 defect class (two MIS strategies estimating different
+// integrands), so both derive them from HERE and cannot drift.
+//
+// The activation test is the tangent-degeneracy one prepareBRDFData already used:
+// a tangent parallel to N projects to Tlocal.xy ~= 0, making atan(0,0) undefined,
+// so such a material falls back to isotropic. Sharing this function is what keeps
+// the NEE sites' view of "is this lobe anisotropic" identical to the sampler's,
+// including in that degenerate case.
+#ifdef RT_ANISOTROPY_ENABLED
+bool ggxAnisoAlphas(float alpha, MaterialProperties material, float3 N,
+		OUT_PARAMETER(float) outAx, OUT_PARAMETER(float) outAy, OUT_PARAMETER(float) outPhi) {
+	// Cycles saturates unconditionally. alpha is roughness^2 and roughness is
+	// [0,1], so the isotropic clamp is a no-op today; it is applied anyway to
+	// match Cycles exactly rather than depend on that invariant holding forever.
+	outAx = clamp(alpha, 0.0f, 1.0f);
+	outAy = outAx;
+	outPhi = 0.0f;
+
+	float tangentLen = length(material.tangent);
+	if (material.anisotropy != 0.0f && tangentLen > 1e-6f) {
+		float4 qToZ = getRotationToZAxis(N);
+		float3 Tlocal = rotatePoint(qToZ, material.tangent / tangentLen);
+		if (dot(Tlocal.xy, Tlocal.xy) > 1e-12f) {
+			float aspect = anisoAspect(material.anisotropy);
+			outAx = clamp(alpha / aspect, 0.0f, 1.0f);
+			outAy = clamp(alpha * aspect, 0.0f, 1.0f);
+			outPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;
+			return true;
+		}
+	}
+	return false;
+}
+#endif // RT_ANISOTROPY_ENABLED
+
+// The same quantity for a call site that has a material but no BrdfData -- the two
+// NEE compensation sites. Routes through ggxAnisoAlphas so it cannot disagree with
+// what the sampler used.
+float ggxRoughForMaterial(float alpha, MaterialProperties material, float3 N) {
+#ifdef RT_ANISOTROPY_ENABLED
+	float ax;
+	float ay;
+	float phi;
+	ggxAnisoAlphas(alpha, material, N, ax, ay, phi);
+	return ggxRoughFromAlphas(ax, ay);
+#else
+	return sqrt(clamp(alpha, 0.0f, 1.0f));
+#endif
+}
+
 // Precalculates commonly used terms in BRDF evaluation
 // Clamps around dot products prevent NaNs and ensure numerical stability, but make sure to
 // correctly ignore rays outside of the sampling hemisphere, by using 'Vbackfacing' and 'Lbackfacing' flags
@@ -1854,39 +1938,23 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	// build, nor the rotatePoint below is emitted -- this block is the producer
 	// half of the state the struct gating removes.
 #ifdef RT_ANISOTROPY_ENABLED
-	data.ax = data.alpha;
-	data.ay = data.alpha;
-	data.anisoPhi = 0.0f;
-	data.anisoActive = false;
-
-	float tangentLen = length(material.tangent);
-	if (material.anisotropy != 0.0f && tangentLen > 1e-6f) {
-		// Project the tangent into the local frame and take its azimuth there.
-		// getRotationToZAxis(N) sends N to +Z but leaves X arbitrary, so the
-		// azimuth must be measured, not assumed. Computed BEFORE deciding
-		// anisoActive (Minor #3 fix, below) because the activation guard now
-		// depends on it.
-		float4 qToZ = getRotationToZAxis(N);
-		float3 Tlocal = rotatePoint(qToZ, material.tangent / tangentLen);
-
-		// Minor #3 fix: tangentLen > 1e-6f only rules out a zero-length
-		// tangent. A unit-length tangent that is NORMAL-COLLINEAR (parallel to
-		// N) passes that guard but rotates to Tlocal.xy ~= (0,0) -- all of its
-		// length lands on Tlocal.z -- making atan(Tlocal.y, Tlocal.x) ==
-		// atan(0,0), which is undefined in GLSL and propagates NaN into
-		// anisoPhi and every specular sample on that surface. Guard on the
-		// LOCAL projected length instead, falling back to isotropic when it
-		// is degenerate. The original zero-length world-space guard above is
-		// kept as-is (it is still needed: it is what makes `tangentLen`, and
-		// therefore the normalize a few lines up, safe to divide by).
-		if (dot(Tlocal.xy, Tlocal.xy) > 1e-12f) {
-			data.anisoActive = true;
-			float aspect = anisoAspect(material.anisotropy);
-			data.ax = data.alpha / aspect;
-			data.ay = data.alpha * aspect;
-			data.anisoPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;
-		}
-	}
+	// Gap #19 divergence B: the derivation moved into ggxAnisoAlphas above, which
+	// is now the ONLY place ax/ay are computed. Every other consumer -- the
+	// distribution, Smith G2, the VNDF sampler, combinedPdf -- reads data.ax /
+	// data.ay, and the multi-scatter compensation sites route through the same
+	// helper, so all of them see the same clamped values Cycles' setup-time
+	// saturatef produces.
+	// Locals, NOT data.ax/data.ay/data.anisoPhi directly: passing members of the
+	// same struct as both an in-parameter (data.alpha) and out-parameters is
+	// aliasing, which GLSL leaves undefined. It rendered every anisotropic surface
+	// black on this driver.
+	float anisoAx;
+	float anisoAy;
+	float anisoPhiOut;
+	data.anisoActive = ggxAnisoAlphas(data.alpha, material, N, anisoAx, anisoAy, anisoPhiOut);
+	data.ax = anisoAx;
+	data.ay = anisoAy;
+	data.anisoPhi = anisoPhiOut;
 #endif // RT_ANISOTROPY_ENABLED
 
 	// Pre-calculate some more BRDF terms
@@ -2220,12 +2288,16 @@ float coatGgxE(float coatRoughness, float cosNI) {
 // sqrt(sqrt(...)) -- the coat path is deliberately left textually untouched
 // beyond the rename, which is what makes "the coat gate must not move" a real
 // check on this rename rather than a check on a simultaneous refactor.
-float ggxE(float alpha, float NdotV) {
-	return ggxLutRead2D(RT_COAT_SSBO_E_OFFSET, sqrt(alpha), NdotV, GGX_E_DIM, GGX_E_DIM);
+// Takes `rough` directly. It used to take alpha and do sqrt(alpha) internally,
+// which was valid only while ax * ay == alpha^2 held -- Gap #19 divergence B's
+// clamp broke that identity, so the caller now derives rough via
+// ggxRoughFromAlphas / ggxRoughForMaterial.
+float ggxE(float rough, float NdotV) {
+	return ggxLutRead2D(RT_COAT_SSBO_E_OFFSET, rough, NdotV, GGX_E_DIM, GGX_E_DIM);
 }
 
-float ggxEavg(float alpha) {
-	return ggxLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, sqrt(alpha), GGX_E_DIM);
+float ggxEavg(float rough) {
+	return ggxLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, rough, GGX_E_DIM);
 }
 
 // Cycles' real multiple-scattering energy compensation for the BASE specular
@@ -2268,9 +2340,9 @@ float ggxEavg(float alpha) {
 // DERIVATION, not by tuning. A CPU mirror lives in
 // tests/servers/rendering/test_pt_ms_energy.cpp; keep the two textually
 // identical modulo type names, because the suite does NOT execute this shader.
-float3 evalMultiScatterEnergy(float alpha, float NdotV, float3 F0) {
-	float E = ggxE(alpha, NdotV);
-	float Eavg = ggxEavg(alpha);
+float3 evalMultiScatterEnergy(float rough, float NdotV, float3 F0) {
+	float E = ggxE(rough, NdotV);
+	float Eavg = ggxEavg(rough);
 	float missing = (1.0f - E) / E;
 	float3 Fss = mix(F0, float3(shadowedF90(F0)), 1.0f / 21.0f);
 	float3 Fms = Fss * Eavg / (float3(1.0f, 1.0f, 1.0f) - Fss * (1.0f - Eavg));
@@ -2282,9 +2354,13 @@ float3 evalMultiScatterEnergy(float alpha, float NdotV, float3 F0) {
 // on different compensations -- that is the B2 defect class (two MIS strategies
 // estimating different integrands), fixed on 2026-09-09 and not to be recreated.
 // There is deliberately no per-site override.
-float3 evalMultiScatterFactor(float alpha, float NdotV, float3 F0) {
+// Takes BOTH alpha and rough. State 1 needs `rough` (the clamped
+// sqrt(sqrt(ax*ay)), Gap #19 divergence B); state 2 needs `alpha`, because
+// evalEmsApprox is a polynomial in alpha and must stay bit-identical to what it
+// always computed -- that is what makes RT_MS_COMPENSATION 2 a usable control.
+float3 evalMultiScatterFactor(float alpha, float rough, float NdotV, float3 F0) {
 #if RT_MS_COMPENSATION == 1
-	return evalMultiScatterEnergy(alpha, NdotV, F0);
+	return evalMultiScatterEnergy(rough, NdotV, F0);
 #elif RT_MS_COMPENSATION == 2
 	return evalMultiScatterApproximation(alpha, NdotV, F0);
 #else

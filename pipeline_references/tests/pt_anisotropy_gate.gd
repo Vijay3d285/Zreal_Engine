@@ -162,10 +162,11 @@ const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 #   anisotropy 0.5   ours 0.992494   Cycles 0.992470   +0.00%
 #   anisotropy 0.9   ours 0.928423   Cycles 0.928014   +0.04%
 #
-# What remains is divergence B, and only where ax > 1: Cycles clamps ax/ay to
-# [0,1] in bsdf_microfacet_ggx_setup and we do not, so at roughness 0.9 /
-# anisotropy 0.9 (probe 1b) our lobe is far more eccentric than Cycles' and now
-# UNDERSHOOTS it. See roadmap §11.7.
+# Divergence B landed 2026-09-11 as well: ax/ay are now clamped to [0,1] as
+# Cycles does, and `rough` for the GGX_E lookup comes from the clamped product
+# rather than from sqrt(alpha). That only moves configurations where ax > 1, so
+# the roughness-0.4 sweep above is unchanged by it; probe 1b is the cell it
+# fixes. See roadmap §11.9.
 #
 # The point of asserting a TIGHT band around a number that is itself known to
 # be over 1.0 is regression detection, not correctness measurement: reverting
@@ -175,7 +176,7 @@ const ROTATION_VALUES := [0.0, PI / 4.0, PI / 2.0]
 # task-4-report.md fix round 1, I6's C1-revert experiment table) -- vastly
 # outside BASELINE_BAND, while ordinary run-to-run Monte Carlo noise (~0.02pp
 # per the per-rotation spread above) stays vastly inside it.
-const BASELINE_INTACT_RATIO := [0.9926503, 0.9975017, 1.0005473, 0.9924937, 0.9284227] # parallel to ANISOTROPY_VALUES
+const BASELINE_INTACT_RATIO := [0.9926490, 0.9974993, 1.0005453, 0.9924913, 0.9284207] # parallel to ANISOTROPY_VALUES
 const BASELINE_BAND := 0.005 # +/- 0.5 percentage points; see BASELINE_INTACT_RATIO's doc comment.
 
 # Probe 1d (Gap #19 divergence A, 2026-09-11). Monotonicity band.
@@ -234,17 +235,16 @@ const ISO_HIROUGH_FRAMES := 64
 # an ax:ay of about 5.26:1, and the ONE configuration in this gate where
 # ax = 0.81 / 0.4359 = 1.858 exceeds 1.
 #
-# That matters because it is the only cell still diverging from Cycles.
-# bsdf_microfacet_ggx_setup clamps ax/ay to [0,1]
-# (intern/cycles/kernel/closure/bsdf_microfacet.h:1042-1043) and we do not, so
-# our lobe here is far more eccentric than Cycles'. Having fixed divergence A,
-# this probe now UNDERSHOOTS Cycles (0.596594 against 0.830896) where before it
-# overshot (+53.85%). Divergence B is the whole of what is left; see §11.7.
+# RE-CAPTURED AGAIN 2026-09-11 after divergence B landed (roadmap §11.9); was
+# 0.596594 with only A fixed, and 1.278307 before either. This is the ONE
+# configuration in this gate where ax = 0.81 / 0.4359 = 1.858 exceeds 1, so it is
+# the only cell B moves at all -- and it now agrees with Cycles 5.2.1 to 0.21%
+# (0.829155 against 0.830896), from +53.85% before A and -28.2% after A alone.
 #
 # Deliberately still NOT asserted against 1.0: this configuration is
 # anisotropic, so the isotropic 1/E derivation that makes probe 1's
 # anisotropy-0 check and probe 1c assertable does not apply here.
-const BASELINE_INTACT_RATIO_NEE_DOM := 0.596594
+const BASELINE_INTACT_RATIO_NEE_DOM := 0.829155
 
 var _sphere: MeshInstance3D
 var _cam: Camera3D
