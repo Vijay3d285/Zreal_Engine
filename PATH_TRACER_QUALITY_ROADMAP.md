@@ -5641,6 +5641,110 @@ Anisotropy and coat gates green with no re-baselining. Suite 1557 passed /
 
 Nothing measurable in the furnace. The three rows of §11.10's table — energy,
 Fresnel, layering — are now all on the Cycles-faithful version for the base as
-well as the coat. **No real asset has been rendered with any of Gap #17, #19
-or #21**; every number in §10–§11 is furnace-and-sphere evidence, and these
-fixes change every dielectric and every anisotropic material in every render.
+well as the coat. A real asset was rendered the same day — §11.13.
+
+
+---
+
+## 11.13 The first real asset — and the two holes it found in the gates
+
+**Rendered 2026-09-11.** Job `urbantestdark212` (a 4K bedroom: painted walls,
+marble floor, satin bedspread, sheer curtains, a red leather bench, two framed
+paintings, a rug; 6 spp × 128 DLSS-RR frames, 12 bounces) through the live
+pipeline with three binaries on the identical input:
+
+| binary | contains |
+|---|---|
+| `492ca3132` (the committed render, 2026-09-10) | Gap #17 only |
+| `164b0313e` with `RT_BASE_ALBEDO_LAYERING 0` | + Gap #19, Gap #21(a) |
+| `164b0313e` (HEAD) | + Gap #21(b) |
+
+**The DLSS-RR still path is bit-deterministic.** Two independent runs of the
+same binary seventeen minutes apart produced md5-identical PNGs, so every
+number below is change, not noise. (This does not contradict
+`pt-render-is-nondeterministic` for the accumulate/OIDN path, but it means a
+single DLSS-RR still IS evidence on this pipeline.)
+
+### Attribution
+
+| region | material | Gap #19 + (a) | + (b) | *total* |
+|---|---|---|---|---|
+| paintings | metallic **0.45 / 0.41**, rough 0.16–0.23, `specularColorFactor` 2.0 | +0.6% | **+16.0%** | +16.0% |
+| red art frame | metallic **0.61**, rough 0.18 | +0.2% | **+37.1%** | +37.1% |
+| marble floor, near | metallic 0, rough 0.8 × map, grazing view | −0.3% | **−8.6%** | −8.6% |
+| marble floor, front | " | +2.0% | −6.6% | −6.6% |
+| rug | metallic 0.10, rough 0.84 | +1.2% | +6.7% | +6.7% |
+| satin bedspread | dielectric | +0.6% | −4.0% | −4.0% |
+| sheer curtain | dielectric | −0.2% | −2.7% | −2.7% |
+| dark throw | near-black dielectric | **+9.0%** | +9.5% | +9.5% |
+| walls / ceiling | painted | −0.3 … 0% | +0.8 … +1.7% | +0.8 … +1.7% |
+| **whole frame** | | **+0.125%** | | **−0.31%** |
+
+Gap #19 and cause (a) together move the frame by +0.125% and every region by
+under 2% — except the near-black throw, where the specular lobe *is* most of
+the light and (a)'s brighter exact-dielectric Fresnel shows at +9%. **Cause (b)
+owns every large move**, and the large moves fall into two classes that the
+sphere gates had never measured:
+
+1. **Partial metallic.** glTF materials with `metallic` strictly between 0 and
+   1 are common in this asset library (canvases at 0.45, a frame at 0.61, a rug
+   at 0.10). Cycles splits them into a metallic closure (weight `metallic`,
+   F82) and a dielectric stack (weight `1 − metallic`) whose diffuse is layered
+   under the *dielectric* specular only (`svm/closure.h:351`, `:468-470`). The
+   old `1 − F(L·H)` used the metalness-lerped F0 — for a bright texel at
+   metallic 0.45 that is a ~27% withdrawal Cycles never makes. Every gate
+   before today was at metallic exactly 0 or exactly 1.
+2. **Grazing view of a smooth dielectric.** Cycles' withdrawal keys on the view
+   angle (`bsdf_microfacet_estimate_albedo`'s `cos_NI = dot(wi, N)`) and on
+   this floor's material is **20% of the diffuse at μ = 0.30 against 4% at
+   μ = 0.90**. Every Cycles comparison before today used an overfilled sphere,
+   μ ≥ 0.9, which cannot see the band a standing camera views a floor in.
+
+### Both holes are now gates, and both are falsified
+
+**Probe F, partial metallic** — three arms on a cream base (0.50, 0.42, 0.30)
+with the two assets' parameters. Cycles side
+`tools/cycles_comparison/cycles_partial_metal.py`:
+
+| arm | ours | Cycles 5.2.1 | Δ | *pre-(b)* |
+|---|---|---|---|---|
+| metallic 0.45, rough 0.20 | 0.41957776 | 0.41962916 | **−0.012%** | −9.22% |
+| metallic 0.61, rough 0.18 | 0.41580017 | 0.41583097 | **−0.007%** | −8.93% |
+| metallic 0, rough 0.20 (control) | 0.43063376 | 0.43055718 | +0.018% | −0.09% |
+
+The control is the attribution: the pre-(b) path was right at metallic 0 on
+this framing and wrong only where the lerped F0 differed from the dielectric one.
+
+**Probe G, grazing dielectric** — the tilted quad (exact per-pixel cos map,
+near-orthographic) against an orthographic Cycles camera on a plane at the same
+tilt, `tools/cycles_comparison/cycles_grazing_dielectric.py`. Two arms per
+angle so the withdrawal itself is isolated as `Lambert + black − full`:
+
+| μ | full, ours | Cycles | Δ | withdrawal Δ | *pre-(b) full* | *pre-(b) withdrawal* |
+|---|---|---|---|---|---|---|
+| 0.30 | 0.52553293 | 0.52548877 | **+0.008%** | **+0.004%** | +11.20% | −71.7% |
+| 0.50 | 0.45945509 | 0.45942263 | +0.007% | −0.006% | +3.54% | −44.4% |
+| 0.90 | 0.43087322 | 0.43083656 | +0.009% | −0.199% | −0.11% | +2.7% |
+
+The pre-(b) row at μ = 0.90 is within 0.1% — which is exactly why an overfilled
+sphere never caught a +11% error at μ = 0.30. The old withdrawal had no
+view-dependence at all.
+
+### What this says about the render
+
+The paintings are brighter and less veiled — the muted look of a canvas whose
+diffuse was being withdrawn by a metal's Fresnel is gone. The marble floor is
+darker at grazing, which is what Cycles does with a smooth dielectric seen from
+standing height. Both are the engine landing on the reference, measured to
+better than 0.03% on the material class in question. Neither is a tuning
+choice, and neither should be "corrected" back by a material-side boost.
+
+### The lesson for the gate suite
+
+Two gates that were green at −0.008% against Cycles sat on top of an +11% and
+a −9% error, because they sampled only the corner of parameter space (metallic
+∈ {0, 1}, μ ≥ 0.9) where the old and new code happened to agree. **A real asset
+is a parameter-space sampler the furnace is not**: it found both holes in one
+render. `pt-measurement-instruments-must-be-falsifiable` gains a corollary —
+an instrument that cannot fail is one thing; an instrument that only looks
+where the defect is not is the same thing wearing a passing grade.

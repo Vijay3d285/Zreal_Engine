@@ -714,6 +714,19 @@ const VELVET_ARMS := [
 	# nothing to withdraw from, so this arm is the specular lobe ALONE --
 	# separating a specular-formula difference from a layering difference.
 	{ "tag": "specularonly", "sheen_rough": -1.0, "black_base": true },
+	# PARTIAL METALLIC (roadmap §11.13). The real-asset render of 2026-09-11 put
+	# the largest visible effect of Gap #21 cause (b) on glTF materials with
+	# metallic 0.45 (an art-frame set, +16%) and 0.61 (a wall frame, +37%) -- a
+	# region between the metallic 0 and 1 endpoints that no gate had measured.
+	# Cycles splits such a material into a metallic closure (weight = metallic)
+	# and a dielectric stack (weight = 1 - metallic) whose diffuse is layered
+	# under the DIELECTRIC specular only (svm/closure.h:351, :468-470); the old
+	# 1 - F(L.H) withdrawal used the metalness-LERPED F0 and took 25-45% off the
+	# diffuse of a half-metal. These arms use those assets' parameters on a
+	# cream, painting-like base, plus a metallic-0 control on the same base.
+	{ "tag": "metal45", "sheen_rough": -1.0, "base": Color(0.50, 0.42, 0.30), "metallic": 0.45, "roughness": 0.20 },
+	{ "tag": "metal61", "sheen_rough": -1.0, "base": Color(0.50, 0.42, 0.30), "metallic": 0.61, "roughness": 0.18 },
+	{ "tag": "metal0ctl", "sheen_rough": -1.0, "base": Color(0.50, 0.42, 0.30), "metallic": 0.0, "roughness": 0.20 },
 ]
 # Blender 5.2.1, framing matched, bounces matched at 3, 2048 samples.
 #
@@ -732,7 +745,11 @@ const VELVET_ARMS := [
 #                  ours 0.03486378                      -0.057%  (after,  §11.11)
 # Both engines' diffuse arms sit on the analytic Lambert value 0.05666667 to
 # ~0.03%, so the diffuse lobe is exact and the whole deficit is specular-side.
-const VELVET_CYCLES_REF := [0.09022636, 0.10500451, 0.20693646, 0.08953342, 0.05664716, 0.03488373]
+# The last three arms are the partial-metallic set, measured by
+# tools/cycles_comparison/cycles_partial_metal.py on Blender 5.2.1:
+#   metal45   0.41962916    metal61   0.41583097    metal0ctl 0.43055718
+const VELVET_CYCLES_REF := [0.09022636, 0.10500451, 0.20693646, 0.08953342, 0.05664716, 0.03488373,
+		0.41962916, 0.41583097, 0.43055718]
 const VELVET_BAR := 0.05 # §8.6
 
 # Gap #21 cause (b): the LAYERING WITHDRAWAL, isolated as
@@ -750,6 +767,34 @@ const VELVET_BAR := 0.05 # §8.6
 # ours at -0.38% of that. Withdrawal noise across 256-frame arms is far below
 # the 5% band -- the pre-fix prediction/measurement gap was 0.06%.
 const VELVET_WITHDRAWAL_BAR := 0.05
+
+# PROBE G: a smooth dielectric at a GRAZING view, against Cycles (roadmap §11.13).
+# The real-asset render of 2026-09-11 put Gap #21 cause (b)'s largest dielectric
+# effect on the marble floor, -6.6% to -8.6%, and probe F's overfilled sphere
+# (mu >= 0.9) cannot see why: Cycles' closure_layering_weight keys on the VIEW
+# angle, and its withdrawal on this material is 20% of the diffuse at mu 0.30
+# against 4% at mu 0.90. The tilted quad has the exact per-pixel cos map to
+# measure that band. Two arms per angle -- the full material and the same on a
+# BLACK base (specular alone) -- so the withdrawal itself is isolated as
+# Lambert + black - full, Lambert being analytic at every angle.
+#
+# Cycles side: tools/cycles_comparison/cycles_grazing_dielectric.py, Blender
+# 5.2.1, ORTHOGRAPHIC camera on a plane tilted to exactly mu. Ours is measured
+# over the pixels within +/-GRAZING_BAND of the target cos; the reported mean
+# cos is printed so any residual Jensen error is visible rather than assumed.
+const GRAZING_BASE_LINEAR := Color(0.50, 0.42, 0.30)
+const GRAZING_ROUGHNESS := 0.20
+const GRAZING_MUS := [0.30, 0.50, 0.90]
+const GRAZING_BAND := 0.01
+const GRAZING_FRAMES := 256
+# [full, black] per mu, parallel to GRAZING_MUS.
+const GRAZING_CYCLES_REF := [
+	[0.52548877, 0.20079830],
+	[0.45942263, 0.08923150],
+	[0.43083656, 0.04085891],
+]
+const GRAZING_BAR := 0.02 # on the totals; the withdrawal is 8% of the total at mu 0.30
+const GRAZING_WITHDRAWAL_BAR := 0.10 # on the isolated withdrawal
 
 
 func _probe_f_velvet_vs_cycles(p_env: Environment) -> void:
@@ -772,10 +817,12 @@ func _probe_f_velvet_vs_cycles(p_env: Environment) -> void:
 		var m := StandardMaterial3D.new()
 		if arm.get("black_base", false):
 			m.albedo_color = Color(0.0, 0.0, 0.0)
+		elif arm.has("base"):
+			m.albedo_color = (arm["base"] as Color).linear_to_srgb()
 		else:
 			m.albedo_color = VELVET_BASE_LINEAR.linear_to_srgb()
-		m.metallic = 0.0
-		m.roughness = VELVET_BASE_ROUGHNESS
+		m.metallic = arm.get("metallic", 0.0)
+		m.roughness = arm.get("roughness", VELVET_BASE_ROUGHNESS)
 		if arm.get("no_spec", false):
 			m.metallic_specular = 0.0
 		var sr: float = arm["sheen_rough"]
@@ -918,6 +965,60 @@ func _assert_single_cell(p_tag: String, p_cell: int, p_s: Dictionary) -> bool:
 				"widen the tolerance") % [p_tag, p_s["cos_lo"], p_s["cos_hi"], p_cell, lo, hi])
 		return false
 	return true
+
+
+# ---------------------------------------------------------------------------
+# PROBE G
+# ---------------------------------------------------------------------------
+
+func _probe_g_grazing_dielectric_vs_cycles(p_env: Environment) -> void:
+	print("\n=== PROBE G: smooth dielectric at a grazing view vs Cycles (roadmap 11.13) ===")
+	print("  base linear=(%.2f,%.2f,%.2f) metallic 0 roughness %.2f metallic_specular 0.5"
+			% [GRAZING_BASE_LINEAR.r, GRAZING_BASE_LINEAR.g, GRAZING_BASE_LINEAR.b, GRAZING_ROUGHNESS])
+	_use_quad_camera()
+	var vp_size := get_viewport().get_visible_rect().size
+	var vp_rid := get_viewport().get_viewport_rid()
+	var lambert: float = (GRAZING_BASE_LINEAR.r + GRAZING_BASE_LINEAR.g + GRAZING_BASE_LINEAR.b) / 3.0
+	print("  %-6s %-6s %12s %12s %9s" % ["mu", "arm", "ours", "Cycles", "% off"])
+	for i in range(GRAZING_MUS.size()):
+		var mu: float = GRAZING_MUS[i]
+		await _tilt_quad(mu, int(vp_size.x), int(vp_size.y))
+		var got: Array[float] = []
+		for a in range(2):
+			var m := StandardMaterial3D.new()
+			# Pre-encode: render_raytracing.cpp:1585 runs albedo_color through
+			# srgb_to_linear, the same round trip probe F documents.
+			m.albedo_color = GRAZING_BASE_LINEAR.linear_to_srgb() if a == 0 else Color(0.0, 0.0, 0.0)
+			m.metallic = 0.0
+			m.roughness = GRAZING_ROUGHNESS
+			_quad.material_override = m
+			var img: Image = await _render_accum(p_env, vp_rid, GRAZING_FRAMES)
+			if img == null:
+				_failures.append("probe G: accumulator readback returned null at mu %.2f" % mu)
+				return
+			var st := _measure_masked(img, mu, GRAZING_BAND)
+			if int(st["n"]) == 0:
+				_failures.append("probe G: no pixels within +/-%.3f of cos %.2f" % [GRAZING_BAND, mu])
+				return
+			var cyc: float = GRAZING_CYCLES_REF[i][a]
+			var err: float = float(st["mean"]) / cyc - 1.0
+			got.append(float(st["mean"]))
+			print("  %-6.2f %-6s %12.8f %12.8f %8.3f%%   (mean cos %.4f, n=%d)"
+					% [mu, "full" if a == 0 else "black", st["mean"], cyc, err * 100.0, st["cos"], int(st["n"])])
+			if absf(err) > GRAZING_BAR:
+				_failures.append(("probe G mu=%.2f %s: %.8f vs Cycles %.8f, %+.3f%% -- outside the %.1f%% bar. " +
+						"A smooth dielectric seen at a grazing angle does not match Cycles.")
+						% [mu, "full" if a == 0 else "black", st["mean"], cyc, err * 100.0, GRAZING_BAR * 100.0])
+		var w_ours: float = lambert + got[1] - got[0]
+		var w_cyc: float = lambert + GRAZING_CYCLES_REF[i][1] - GRAZING_CYCLES_REF[i][0]
+		var w_err: float = w_ours / w_cyc - 1.0
+		print("  %-6.2f %-6s %12.8f %12.8f %8.3f%%   (%.1f%% of the diffuse in Cycles)"
+				% [mu, "wdraw", w_ours, w_cyc, w_err * 100.0, w_cyc / lambert * 100.0])
+		if absf(w_err) > GRAZING_WITHDRAWAL_BAR:
+			_failures.append(("probe G mu=%.2f layering withdrawal: %.8f vs Cycles %.8f, %+.3f%% -- outside the " +
+					"%.0f%% bar. The view-dependent energy the specular layer removes from the diffuse " +
+					"under it is wrong at this angle (Gap #21 cause (b), roadmap section 11.13).")
+					% [mu, w_ours, w_cyc, w_err * 100.0, GRAZING_WITHDRAWAL_BAR * 100.0])
 
 
 # ---------------------------------------------------------------------------
@@ -1635,6 +1736,7 @@ func _ready() -> void:
 	await _probe_c_furnace(env)
 	await _probe_d_pdf(env)
 	await _probe_e1_degenerate_frame(env)
+	await _probe_g_grazing_dielectric_vs_cycles(env)
 	# LAST, because it is the only probe that adds a light to the scene.
 	await _probe_e2_frame_orientation(env)
 	await _probe_f_velvet_vs_cycles(env)
