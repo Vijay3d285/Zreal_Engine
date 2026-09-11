@@ -1342,6 +1342,13 @@ float specularLayerAlbedo(float rough, float cosNI, float3 F0, float eta);
 // it is here rather than moving a 700-line block of E2d/E2e code.
 float3 evalMultiScatterFactor(float alpha, float rough, float NdotV, float3 F0);
 
+// Gap #20 forward declarations. Both read the glass tables through the
+// binding-38 SSBO, which is declared much further down, while
+// sampleDielectricMicrofacet calls them above it -- the same reason the two
+// prototypes above exist (section 11.9.1's declaration-order trap).
+float ggxGlassEnergyScale(float rough, float NdotV, float eta);
+float3 evalMultiScatterFactorDielectric(float alpha, float rough, float NdotV, float3 F0, float eta, float transmission);
+
 // Samples a reflection ray from the rough surface using selected microfacet distribution and sampling method
 // Resulting weight includes multiplication by cosine (NdotL) term
 //
@@ -1613,10 +1620,12 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		float NdotV = max(0.00001f, min(1.0f, dot(Nlocal, Vlocal)));
 		float NdotH = max(0.00001f, min(1.0f, dot(Nlocal, Hlocal)));
 		float HdotL = max(0.00001f, min(1.0f, abs(dot(Hlocal, Llocal))));
-		// NOTE: no evalMultiScatterApproximation here. It is derived for
-		// reflection-only GGX and applying it to the transmitted lobe would add
-		// energy its derivation does not cover, so this lobe is single-scatter
-		// and slightly dark at high roughness. Cycles has the same limitation.
+		// Gap #20: the transmitted lobe IS compensated, by Cycles' 1/E_glass
+		// (ggxGlassEnergyScale) -- the earlier note here that "Cycles has the
+		// same limitation" was wrong: Cycles' energy_scale multiplies the whole
+		// glass closure, transmission included (bsdf_microfacet.h:1091, :1107).
+		// Uncompensated, a white glass sphere at roughness 0.9 returned 0.496
+		// under a uniform world where Cycles returns 0.984 (roadmap 11.14).
 		// transmittance is per-channel (bsdf_microfacet.h:329), so a tinted
 		// dielectric's transmitted lobe carries colour, not just its reflection.
 		// I1 fix: anisoActive branch mirrors sampleSpecularMicrofacet's own
@@ -1635,7 +1644,17 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		{
 			weightRatioT = specularSampleWeight(alpha, alphaSquared, abs(NdotL), NdotV, HdotL, NdotH);
 		}
-		weight = transmittance / denom_t * weightRatioT;
+#if MICROFACET_DISTRIBUTION == GGX && RT_MS_COMPENSATION == 1
+#ifdef RT_ANISOTROPY_ENABLED
+		float roughT = anisoActive ? ggxRoughFromAlphas(ax, ay) : sqrt(clamp(alpha, 0.0f, 1.0f));
+#else
+		float roughT = sqrt(clamp(alpha, 0.0f, 1.0f));
+#endif
+		float msT = ggxGlassEnergyScale(roughT, NdotV, eta);
+#else
+		float msT = 1.0f;
+#endif
+		weight = transmittance / denom_t * weightRatioT * msT;
 	} else {
 		Llocal = reflect(-Vlocal, Hlocal);
 		float HdotL = max(0.00001f, min(1.0f, dot(Hlocal, Llocal)));
@@ -1643,14 +1662,17 @@ bool sampleDielectricMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 		float NdotV = max(0.00001f, min(1.0f, dot(Nlocal, Vlocal)));
 		float NdotH = max(0.00001f, min(1.0f, dot(Nlocal, Hlocal)));
 #if MICROFACET_DISTRIBUTION == GGX
-		// DELIBERATELY still the legacy approximation (Gap #17 scope decision).
-		// This is the reflection branch of E1's transmissive closure, and Cycles
-		// compensates glass from a DIFFERENT table set -- ggx_glass_E (16x16x16),
-		// ggx_glass_Eavg (16x16), plus ggx_glass_inv_E / ggx_glass_inv_Eavg for
-		// ior < 1 (bsdf_microfacet.h:450-457) -- which this project has never
-		// transcribed. Pointing this at ggxE/ggxEavg would swap a MEASURED
-		// divergence for an unmeasured one. Filed as its own roadmap item.
-		float3 ms = evalMultiScatterApproximation(alpha, NdotV, F0);
+		// Gap #20 (was Gap #17's deliberate leftover): the reflected lobe of the
+		// transmissive closure goes through the same dispatcher the NEE sites
+		// use, which blends the opaque tables and the glass tables by
+		// `transmission` exactly as Cycles' two closures sum. Under
+		// RT_MS_COMPENSATION 2 this is still the legacy approximation.
+#ifdef RT_ANISOTROPY_ENABLED
+		float roughR = anisoActive ? ggxRoughFromAlphas(ax, ay) : sqrt(clamp(alpha, 0.0f, 1.0f));
+#else
+		float roughR = sqrt(clamp(alpha, 0.0f, 1.0f));
+#endif
+		float3 ms = evalMultiScatterFactorDielectric(alpha, roughR, NdotV, F0, eta, transmission);
 #else
 		float3 ms = float3(1.0f, 1.0f, 1.0f);
 #endif
@@ -2238,6 +2260,16 @@ coat_albedo_table;
 #define RT_COAT_SSBO_EAVG_OFFSET 5120 // GGX_EAVG_TABLE, 32
 #define RT_COAT_SSBO_FLOAT_COUNT 5152
 
+// Gap #20: the four GLASS energy tables, appended after the sheen's three
+// blocks in Cycles' own order. Mirrored in ggx_glass_energy_tables.h and pinned
+// by the same test_pt_coat_albedo.cpp case as the offsets above.
+#define RT_GLASS_SSBO_E_OFFSET 8224 // GGX_GLASS_E_TABLE, 16x16x16
+#define RT_GLASS_SSBO_EAVG_OFFSET 12320 // GGX_GLASS_EAVG_TABLE, 16x16
+#define RT_GLASS_SSBO_INV_E_OFFSET 12576 // GGX_GLASS_INV_E_TABLE, 16x16x16
+#define RT_GLASS_SSBO_INV_EAVG_OFFSET 16672 // GGX_GLASS_INV_EAVG_TABLE, 16x16
+#define RT_GLASS_SSBO_FLOAT_COUNT 16928
+#define GGX_GLASS_TABLE_DIM 16
+
 // Cycles' lookup_table_read* (intern/cycles/kernel/util/lookup_table.h:14-71),
 // transcribed. ENDPOINT-ALIGNED: [0,1] maps onto [0, size-1] and lerps between
 // integer entries.
@@ -2409,6 +2441,54 @@ float ggxEavg(float rough) {
 	return ggxLutRead1D(RT_COAT_SSBO_EAVG_OFFSET, rough, GGX_E_DIM);
 }
 
+// Gap #20. Same trilinear, endpoint-aligned read as coatLutRead3D, with the
+// table base as a parameter so the glass tables can be read through it.
+// coatLutRead3D is deliberately left textually untouched.
+float ggxLutRead3D(int base, float x, float y, float z, int d) {
+	z = clamp(z, 0.0f, 1.0f) * float(d - 1);
+	int index = min(int(z), d - 1);
+	int nindex = min(index + 1, d - 1);
+	float t = z - float(index);
+	float data0 = ggxLutRead2D(base + d * d * index, x, y, d, d);
+	if (t == 0.0f) {
+		return data0;
+	}
+	float data1 = ggxLutRead2D(base + d * d * nindex, x, y, d, d);
+	return (1.0f - t) * data0 + t * data1;
+}
+
+// Gap #20. Cycles' multiple-scattering energy scale for the GLASS closure:
+// energy_scale = 1 / E_glass(rough, mu, z), transcribed from
+// microfacet_ggx_preserve_energy's CLOSURE_BSDF_MICROFACET_GGX_GLASS_ID branch
+// (bsdf_microfacet.h:450-462, :468-469). E_glass is the total (reflected +
+// transmitted) directional albedo of a single-scattering GGX dielectric, so
+// 1/E is what restores the energy the single-scatter lobes lose -- and Cycles
+// applies it to the WHOLE closure, both lobes (bsdf_microfacet_ggx_eval, :1091;
+// bsdf_microfacet_ggx_sample, :1107).
+//
+// `eta` is the RELATIVE ior the ray sees: > 1 entering, < 1 leaving (this
+// engine's interior-hit flip, same as Cycles' `backfacing ? 1/ior : ior`).
+// Cycles flips a < 1 ior back above 1 and switches to the `inv` table pair;
+// so does this. mu is dot(N, V) with N facing the viewer, which is how both
+// engines hand it in.
+//
+// No darkening term. Cycles' darkening for glass uses Fss = transmission tint
+// = sqrt(base_color) (bsdf_microfacet.h:975-977), which is 1 for an untinted
+// transmission -- and this engine's dielectric closure carries no transmission
+// tint (its colour is volumetric absorption), so the term is identically 1.
+// The E_avg tables it would need are uploaded regardless, for a future port.
+float ggxGlassEnergyScale(float rough, float NdotV, float eta) {
+	float ior = eta;
+	int base = RT_GLASS_SSBO_E_OFFSET;
+	if (ior < 1.0f) {
+		ior = 1.0f / ior;
+		base = RT_GLASS_SSBO_INV_E_OFFSET;
+	}
+	float z = sqrt(abs((ior - 1.0f) / (ior + 1.0f)));
+	float E = ggxLutRead3D(base, rough, NdotV, z, GGX_GLASS_TABLE_DIM);
+	return 1.0f / max(E, 1e-4f);
+}
+
 // Cycles' real multiple-scattering energy compensation for the BASE specular
 // lobe, replacing the fitted 1 + F0*Ems (roadmap Gap #17).
 //
@@ -2529,6 +2609,31 @@ float3 evalMultiScatterFactor(float alpha, float rough, float NdotV, float3 F0) 
 #else
 	return float3(1.0f, 1.0f, 1.0f);
 #endif
+}
+
+// Gap #20. The compensation for the REFLECTED lobe of a material that may
+// transmit -- the single entry point for the dielectric sampler's reflect
+// branch AND every NEE site, so the two MIS strategies cannot compensate the
+// same lobe differently (the B2 defect class; before Gap #20 they DID: the
+// sampler used evalMultiScatterApproximation and NEE used
+// evalMultiScatterFactor on every transmissive surface).
+//
+// Cycles has two closures where this engine has one reflected lobe: the glass
+// closure at weight `transmission`, compensated by 1/E_glass, and the opaque
+// specular at weight `1 - transmission`, compensated by the opaque tables plus
+// darkening (svm/closure.h:363-424, :437-470). Both reflect the same Fresnel
+// F, so their sum is F * lerp(opaque, glass, transmission) -- which is exactly
+// this. At transmission 0 it is evalMultiScatterFactor unchanged, instruction
+// for instruction, so opaque materials cannot move.
+float3 evalMultiScatterFactorDielectric(float alpha, float rough, float NdotV, float3 F0, float eta, float transmission) {
+	float3 opaque = evalMultiScatterFactor(alpha, rough, NdotV, F0);
+#if RT_MS_COMPENSATION == 1
+	if (transmission > 0.0f) {
+		float glass = ggxGlassEnergyScale(rough, NdotV, eta);
+		return lerp(opaque, float3(glass, glass, glass), transmission);
+	}
+#endif
+	return opaque;
 }
 
 // Fms: effective Fresnel of the MULTIPLY-scattered energy. One Fss is cancelled

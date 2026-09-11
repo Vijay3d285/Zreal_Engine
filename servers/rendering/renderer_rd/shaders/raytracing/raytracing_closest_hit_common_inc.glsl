@@ -1771,8 +1771,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 					// rather than changed here.
 #if MICROFACET_DISTRIBUTION == GGX
 					float ms_alpha = brdf_mat.roughness * brdf_mat.roughness;
-					f_spec *= evalMultiScatterFactor(ms_alpha,
-							ggxRoughForMaterial(ms_alpha, brdf_mat, N), NdotV, specularF0);
+					// Gap #20: routed through the dielectric dispatcher so a
+					// transmissive surface's reflected lobe is compensated here
+					// exactly as the sampler compensates it.
+					f_spec *= evalMultiScatterFactorDielectric(ms_alpha,
+							ggxRoughForMaterial(ms_alpha, brdf_mat, N), NdotV, specularF0,
+							brdf_mat.eta, brdf_mat.transmissivness);
 					// E2d Task 5b: NO coat factor here any more. The coat's
 					// compensation is coatEnergyScale (real Cycles
 					// preserve_energy, not the 1 + F0*Ems approximation, which at

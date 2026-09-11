@@ -35,6 +35,7 @@ TEST_FORCE_LINK(test_pt_coat_albedo)
 #include "core/math/math_funcs.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
+#include "servers/rendering/renderer_rd/storage_rd/ggx_glass_energy_tables.h"
 #include "servers/rendering/renderer_rd/storage_rd/sheen_ltc_table.h"
 
 namespace TestPTCoatAlbedo {
@@ -304,6 +305,17 @@ TEST_CASE("[PathTracer][CoatAlbedo] SSBO offsets are the ones the shader hard-co
 	// either table at a different resolution must not silently corrupt reads
 	// of the other. See sheen_ltc_table.h's SSBO-placement comment.
 	CHECK(SHEEN_LTC_DIM == 32);
+
+	// Gap #20: the four glass energy tables' placement after the sheen's
+	// blocks. brdf_inc.glsl mirrors these as RT_GLASS_SSBO_*_OFFSET and
+	// GGX_GLASS_TABLE_DIM; if you edit this case, edit brdf_inc.glsl in the
+	// same commit.
+	CHECK(RT_GLASS_SSBO_E_OFFSET == 8224);
+	CHECK(RT_GLASS_SSBO_EAVG_OFFSET == 12320);
+	CHECK(RT_GLASS_SSBO_INV_E_OFFSET == 12576);
+	CHECK(RT_GLASS_SSBO_INV_EAVG_OFFSET == 16672);
+	CHECK(RT_GLASS_SSBO_FLOAT_COUNT == 16928);
+	CHECK(GGX_GLASS_TABLE_DIM == 16);
 }
 
 TEST_CASE("[PathTracer][CoatAlbedo] Fss matches Cycles' dielectric fit") {

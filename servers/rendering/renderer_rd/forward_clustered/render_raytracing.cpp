@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
+#include "servers/rendering/renderer_rd/storage_rd/ggx_glass_energy_tables.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/sheen_ltc_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
@@ -158,20 +159,29 @@ RID RenderRaytracing::_get_emissive_fallback_buffer() {
 // to sit right after RT_COAT_SSBO_FLOAT_COUNT with the same relative A/B/albedo
 // spacing (static_assert'd in that header), so ONE memcpy of the whole array
 // lands all three blocks in their correct global slots.
+//
+// Gap #20: FOUR more tables -- GGX_GLASS_E_TABLE, GGX_GLASS_EAVG_TABLE and
+// their inverse-IOR twins -- appended after the sheen's blocks in Cycles' own
+// order, through RT_GLASS_SSBO_*_OFFSET (ggx_glass_energy_tables.h), and
+// RT_GLASS_SSBO_FLOAT_COUNT is now the whole-buffer total.
 RID RenderRaytracing::_get_coat_albedo_buffer() {
 	if (coat_albedo_buffer.is_valid()) {
 		return coat_albedo_buffer;
 	}
 	Vector<uint8_t> bytes;
-	bytes.resize(RT_SHEEN_SSBO_FLOAT_COUNT * (int)sizeof(float));
+	bytes.resize(RT_GLASS_SSBO_FLOAT_COUNT * (int)sizeof(float));
 	float *dst = (float *)bytes.ptrw();
 	memcpy(dst + RT_COAT_SSBO_ALBEDO_OFFSET, GGX_COAT_ALBEDO_TABLE, sizeof(GGX_COAT_ALBEDO_TABLE));
 	memcpy(dst + RT_COAT_SSBO_E_OFFSET, GGX_E_TABLE, sizeof(GGX_E_TABLE));
 	memcpy(dst + RT_COAT_SSBO_EAVG_OFFSET, GGX_EAVG_TABLE, sizeof(GGX_EAVG_TABLE));
 	memcpy(dst + RT_SHEEN_SSBO_A_OFFSET, SHEEN_LTC_TABLE, sizeof(SHEEN_LTC_TABLE));
+	memcpy(dst + RT_GLASS_SSBO_E_OFFSET, GGX_GLASS_E_TABLE, sizeof(GGX_GLASS_E_TABLE));
+	memcpy(dst + RT_GLASS_SSBO_EAVG_OFFSET, GGX_GLASS_EAVG_TABLE, sizeof(GGX_GLASS_EAVG_TABLE));
+	memcpy(dst + RT_GLASS_SSBO_INV_E_OFFSET, GGX_GLASS_INV_E_TABLE, sizeof(GGX_GLASS_INV_E_TABLE));
+	memcpy(dst + RT_GLASS_SSBO_INV_EAVG_OFFSET, GGX_GLASS_INV_EAVG_TABLE, sizeof(GGX_GLASS_INV_EAVG_TABLE));
 	coat_albedo_buffer = RD::get_singleton()->storage_buffer_create(bytes.size(), bytes);
 	if (coat_albedo_buffer.is_valid()) {
-		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT GGX+Coat+Sheen LUTs (Albedo+E+EAvg+SheenLTC)");
+		RD::get_singleton()->set_resource_name(coat_albedo_buffer, "RT GGX+Coat+Sheen+Glass LUTs (Albedo+E+EAvg+SheenLTC+GlassE)");
 	}
 	return coat_albedo_buffer;
 }

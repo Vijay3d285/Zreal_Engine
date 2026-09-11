@@ -35,6 +35,7 @@ TEST_FORCE_LINK(test_pt_ms_energy)
 #include "core/math/math_funcs.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_coat_albedo_table.h"
 #include "servers/rendering/renderer_rd/storage_rd/ggx_energy_tables.h"
+#include "servers/rendering/renderer_rd/storage_rd/ggx_glass_energy_tables.h"
 
 namespace TestPTMsEnergy {
 
@@ -138,6 +139,25 @@ static float ms_energy_factor(float p_rough, float p_cos_nv, float p_f0, float p
 	const float fss = p_f0 + (p_f90 - p_f0) * (1.0f / 21.0f);
 	const float fms = fss * eavg / (1.0f - fss * (1.0f - eavg));
 	return 1.0f + fms * missing;
+}
+
+// Gap #20. Mirror of ggxGlassEnergyScale: 1 / E_glass(rough, mu, z) with the
+// inverse-IOR tables when eta < 1, z = sqrt(|(ior - 1) / (ior + 1)|) on the
+// ior >= 1 side. Reads GGX_GLASS_*_TABLE through the same 3D reader shape as
+// coatLutRead3D / ggxLutRead3D (endpoint-aligned trilinear).
+static float ms_glass_e(float p_rough, float p_mu, float p_eta) {
+	float ior = p_eta;
+	const float *tab = GGX_GLASS_E_TABLE;
+	if (ior < 1.0f) {
+		ior = 1.0f / ior;
+		tab = GGX_GLASS_INV_E_TABLE;
+	}
+	const float z = Math::sqrt(Math::abs((ior - 1.0f) / (ior + 1.0f)));
+	return ms_lut_read_3d(tab, p_rough, p_mu, z);
+}
+
+static float ms_glass_energy_scale(float p_rough, float p_mu, float p_eta) {
+	return 1.0f / MAX(ms_glass_e(p_rough, p_mu, p_eta), 1e-4f);
 }
 
 // Mirror of the darkening specularLayerAlbedo applies under RT_MS_COMPENSATION == 1:
@@ -267,6 +287,37 @@ TEST_CASE("[PathTracer][MsEnergy] the layering withdrawal is darkening * albedo,
 	CHECK(ms_layer_darkening(0.6f, 0.3f, 1.0f, 1.0f) == doctest::Approx(1.0f).epsilon(1e-5));
 	CHECK(ms_layer_darkening(0.0f, 0.7f, 0.04f, 1.0f) == doctest::Approx(1.0f).epsilon(1e-5));
 	CHECK(ms_layer_estimate(0.0f, 0.7f, 0.04f, 1.5f) == doctest::Approx(0.051189f).epsilon(1e-4));
+}
+
+TEST_CASE("[PathTracer][MsEnergy] glass tables: axes, inverse selection, and anchors") {
+	// Gap #20. Anchors computed from the transcribed tables with the same
+	// endpoint-aligned reads, at ior 1.5 (z = 0.447214). The E rows were
+	// confirmed against a rendered single entry interface on an uncompensated
+	// build (pt_glass_energy_gate.gd probe 2: 0.9258 / 0.7499 at roughness 0.9,
+	// mu 1.0 / 0.2) and against Cycles' own GGX-distribution plane
+	// (tools/cycles_comparison/cycles_glass_interface.py: 0.92467 / 0.74827).
+	CHECK(ms_glass_e(0.3f, 1.0f, 1.5f) == doctest::Approx(0.998982f).epsilon(1e-4));
+	CHECK(ms_glass_e(0.9f, 1.0f, 1.5f) == doctest::Approx(0.923986f).epsilon(1e-4));
+	CHECK(ms_glass_e(0.9f, 0.2f, 1.5f) == doctest::Approx(0.748106f).epsilon(1e-4));
+	CHECK(ms_glass_e(0.6f, 0.5f, 1.5f) == doctest::Approx(0.932647f).epsilon(1e-4));
+
+	// eta < 1 selects the INVERSE tables, indexed by the flipped-back ior. The
+	// values differ from the entry side by up to 40%, so a build that ignored
+	// the flip would fail here, not just be slightly off.
+	CHECK(ms_glass_e(0.3f, 1.0f, 1.0f / 1.5f) == doctest::Approx(0.990675f).epsilon(1e-4));
+	CHECK(ms_glass_e(0.9f, 1.0f, 1.0f / 1.5f) == doctest::Approx(0.532140f).epsilon(1e-4));
+	CHECK(ms_glass_e(0.9f, 0.2f, 1.0f / 1.5f) == doctest::Approx(0.606545f).epsilon(1e-4));
+	CHECK(ms_glass_e(0.6f, 0.5f, 1.0f / 1.5f) == doctest::Approx(0.748661f).epsilon(1e-4));
+
+	// A smooth interface loses nothing to multiple scattering on either side.
+	CHECK(ms_glass_e(0.0f, 0.7f, 1.5f) == doctest::Approx(1.0f).epsilon(1e-5));
+	CHECK(ms_glass_e(0.0f, 0.7f, 1.0f / 1.5f) == doctest::Approx(1.0f).epsilon(1e-5));
+	CHECK(ms_glass_energy_scale(0.0f, 0.7f, 1.5f) == doctest::Approx(1.0f).epsilon(1e-5));
+
+	// The scale never darkens and grows with roughness at fixed angle.
+	CHECK(ms_glass_energy_scale(0.9f, 1.0f, 1.5f) > ms_glass_energy_scale(0.6f, 1.0f, 1.5f));
+	CHECK(ms_glass_energy_scale(0.6f, 1.0f, 1.5f) > ms_glass_energy_scale(0.3f, 1.0f, 1.5f));
+	CHECK(ms_glass_energy_scale(0.3f, 1.0f, 1.5f) >= 1.0f);
 }
 
 } // namespace TestPTMsEnergy

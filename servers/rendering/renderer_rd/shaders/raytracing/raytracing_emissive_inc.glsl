@@ -493,8 +493,10 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 		float ms_alpha = p_mat.roughness * p_mat.roughness;
 		float NdotV = max(dot(p_N, p_V), 0.0001);
 		vec3 specular_f0 = baseColorToSpecularF0(p_mat.baseColor, p_mat.metalness, p_mat.dielectricF0);
-		f_spec *= evalMultiScatterFactor(ms_alpha,
-				ggxRoughForMaterial(ms_alpha, p_mat, p_N), NdotV, specular_f0);
+		// Gap #20: same dispatcher as the environment-NEE site and the sampler.
+		f_spec *= evalMultiScatterFactorDielectric(ms_alpha,
+				ggxRoughForMaterial(ms_alpha, p_mat, p_N), NdotV, specular_f0,
+				p_mat.eta, p_mat.transmissivness);
 		// E2d Task 5b: the coat's compensation moved inside evalCoat (real
 		// Cycles preserve_energy via coatEnergyScale), so f_coat arrives
 		// already compensated. See the matching note in the environment-NEE

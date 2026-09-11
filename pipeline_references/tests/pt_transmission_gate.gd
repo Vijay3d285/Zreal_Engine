@@ -149,7 +149,14 @@ const P5_TOLERANCE := 2e-5 # Global Constraints: noise floor ~1e-5.
 ## correctness guard, using the same captured-reference pattern as
 ## P6_REF_CORRECT. The determinism check is kept alongside it, not replaced --
 ## it is still useful for catching non-determinism specifically.
-const P5_REF_CORRECT := 0.998713
+## RE-CAPTURED 2026-09-11. 0.998713 was captured before Gap #17 (multi-scatter
+## energy), #19 (anisotropic sampler) and #21 (base Fresnel + layering) moved
+## every dielectric; this gate was not re-run after any of them, and it failed
+## IDENTICALLY (0.999925, three readings) on the pre-Gap-#20 binary, so the move
+## is theirs, not Gap #20's -- which is arithmetically incapable of touching a
+## transmission-0 material (evalMultiScatterFactorDielectric returns the opaque
+## factor unchanged there). Previous value: 0.998713.
+const P5_REF_CORRECT := 0.999925
 const P5_REF_TOLERANCE := 2e-5 # Global Constraints noise floor, same as P5_TOLERANCE.
 const P5_FLOOR := 1e-6 # I2.
 
@@ -228,7 +235,15 @@ const P8_TRANSMISSION := 0.5
 ## evalMultiScatterApproximation call) is a real, documented deficit, but at
 ## these settings it is evidently a small contributor next to the additive
 ## diffuse layer.
-const P8_REF_CORRECT := 0.994691
+##
+## RE-CAPTURED 2026-09-11 for Gap #20: the transmitted lobe is now compensated
+## by Cycles' 1/E_glass (ggxGlassEnergyScale), and the reflected lobe of a
+## transmissive closure by lerp(opaque, glass, transmission) -- so the
+## "single-scatter-only" deficit the paragraph above describes no longer
+## exists. This arm moved +0.569%, from 0.994691 to 1.000353 (pre-Gap-#20
+## binary still read 0.994691 on the same day). Under a uniform world a
+## lossless rough half-glass landing at ~1.0 is the expected outcome.
+const P8_REF_CORRECT := 1.000353
 ## Fix round 2 correction: 0.02 (2%) was 20,000x the measured 0.000001
 ## run-to-run spread, and unjustified in its own doc comment -- while THE
 ## SAME fix-round-1 commit tightened P7_TOLERANCE from 0.02 to 0.005 on the
