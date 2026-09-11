@@ -915,7 +915,7 @@ GGX refraction sampling; remove the `transmissivness = 0.0` hardcode (`closest_h
 
 **E2. Anisotropy, clearcoat, sheen** — anisotropy **COMPLETE (E2b)**, clearcoat **COMPLETE (E2d)**, sheen **COMPLETE (E2e, §7.11)**. All three acceptance targets measured against Blender/Cycles; `coat_normal` and transmissive-lobe anisotropy are the named remainders.
 `sampleGGXVNDF` already takes `alpha2D` and callers pass `(alpha, alpha)` (`brdf_inc.glsl:837`) — thread real anisotropy through instead. Add a clearcoat GGX lobe and a sheen lobe. **Not Charlie** — Cycles replaced the Charlie/velvet sheen with Zeltner's linearly-transformed-cosine lobe (`bsdf_sheen.h`), and E2e ports that; see §7.11.3.
-*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) was accounted for. **RE-TAKEN 2026-09-11 after Gap #17 and Gap #19 landed: the raw comparison is now +0.015%** (ours 0.587634, Cycles 5.2.1 0.587546) — inside the 5% bar with no adjustment at all, and better than the old *adjusted* figure. Guarded by probe 1e in `pt_anisotropy_gate.gd`, with the Cycles side checked in at `tools/cycles_comparison/cycles_brushed_metal.py`. See §7.8.1. **Car paint: met (radiometrically) — see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised (that pedestal is gone as of 2026-09-10, §10; the raw comparison has not been re-taken — §10.5); the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. Geometrically incomplete, though: `coat_normal` — the coat's own bump/orange-peel normal — is not shipped (§7.10.7 calls it "the one piece of Blender coat parity E2d does not ship"); a reader who only sees this table's "met" would not know a coat-normal texture on a car-paint material still renders identically to a base-normal one. **Velvet: met — see §7.11** — sheen ships as Cycles' Zeltner LTC lobe (`pdf == eval`, so its sample weight is exactly 1), against a byte-exact copy of Cycles' 32×32×3 table, and as a *layer* on the same general N-layer stack the coat uses: sheen at registry index 3 withdraws from coat, specular and diffuse via `closure_layering_weight`, and Cycles' allocation order (`svm/closure.h:115` sheen first, `:146` coat second) makes registry index order and physical layer order agree. Measured against Blender 4.5.3/Cycles on a velvet sphere at **−1.710% raw**, **−2.137%** with Gap #17's pedestal neutralised (gone as of 2026-09-10, §10; raw not re-taken — §10.5) — *worse* adjusted, because here the pedestal partially masks a base deficit rather than causing an excess (§7.11.2). **The sheen layer's own contribution, isolated by subtracting each engine's un-sheened control, agrees to +0.324%**, and to +0.269% / +0.257% at sheen roughness 0.30 / 0.80; the 0.30:0.50:0.80 roughness ladder reproduces a 169× dynamic range to 1.1e-4. **The raw residual is the dielectric base, not the sheen** — the un-sheened control is the worst arm at −2.062% — which is a new open item (§7.11.2), not a sheen one. Geometrically incomplete for the same reason car paint is: `coat_normal` is still not shipped, and Cycles couples it to the *sheen* normal too (`svm/closure.h:127-129`), so it now blocks both. **This closes E2's original acceptance line: all three of brushed metal, car paint and velvet are measured against Cycles and all three clear the 5% bar raw.** The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), E2d is its first real N=3 (§7.10.5) and E2e its first N=4 (§7.11.4); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
+*Accept:* brushed metal, car paint, and velvet respond comparably to Cycles. **Brushed metal: met, see §7.8** — anisotropic GGX now threads real `ax`/`ay` through distribution, Smith G2, VNDF sampling and pdf, sharing its `ax`/`ay` formula verbatim with Cycles and this engine's own raster; measured at **+6.52% raw** against Cycles (5% bar), narrowing to within **0.67%** once the pre-existing, anisotropy-orthogonal `evalMultiScatterApproximation` pedestal (§7.8) was accounted for. **RE-TAKEN 2026-09-11 after Gap #17 and Gap #19 landed: the raw comparison is now +0.015%** (ours 0.587634, Cycles 5.2.1 0.587546) — inside the 5% bar with no adjustment at all, and better than the old *adjusted* figure. Guarded by probe 1e in `pt_anisotropy_gate.gd`, with the Cycles side checked in at `tools/cycles_comparison/cycles_brushed_metal.py`. See §7.8.1. **Car paint: met (radiometrically) — see §7.10** — the clearcoat ships as a Cycles *coat layer*, not merely a fourth lobe: a GGX lobe at registry index 2 that also withdraws energy from everything beneath it (`closure_layering_weight`), with Cycles' `ggx_gen_schlick_ior_s` albedo LUT, its `table_ggx_E`/`table_ggx_Eavg` energy compensation, exact dielectric Fresnel, and Beer's-law `clearcoat_tint`. Measured against Blender 4.5.3/Cycles on a car-paint sphere at **+0.381% raw**, **−0.098%** with Gap #17's `evalMultiScatterApproximation` pedestal neutralised. **RE-TAKEN 2026-09-11 (§7.10.4): +0.004% raw**, ours 0.16803900 against Cycles 5.2.1's 0.16803261, with the coat-only delta agreeing to +0.009% and the Beer's-law tint to −0.001%; the coat layer's own contribution, isolated by subtracting each engine's uncoated control, agrees to **0.066%**, and the tint to **0.016%**. Geometrically incomplete, though: `coat_normal` — the coat's own bump/orange-peel normal — is not shipped (§7.10.7 calls it "the one piece of Blender coat parity E2d does not ship"); a reader who only sees this table's "met" would not know a coat-normal texture on a car-paint material still renders identically to a base-normal one. **Velvet: met — see §7.11** — sheen ships as Cycles' Zeltner LTC lobe (`pdf == eval`, so its sample weight is exactly 1), against a byte-exact copy of Cycles' 32×32×3 table, and as a *layer* on the same general N-layer stack the coat uses: sheen at registry index 3 withdraws from coat, specular and diffuse via `closure_layering_weight`, and Cycles' allocation order (`svm/closure.h:115` sheen first, `:146` coat second) makes registry index order and physical layer order agree. Measured against Blender 4.5.3/Cycles on a velvet sphere at **−1.710% raw**, **−2.137%** with Gap #17's pedestal neutralised. **RE-TAKEN 2026-09-11 (§7.11.5): −1.548%**, with the un-sheened control still the worst arm at −1.866% — the base deficit is real and is now **Gap #21**, while the sheen layer's own contribution agrees to +0.300% — *worse* adjusted, because here the pedestal partially masks a base deficit rather than causing an excess (§7.11.2). **The sheen layer's own contribution, isolated by subtracting each engine's un-sheened control, agrees to +0.324%**, and to +0.269% / +0.257% at sheen roughness 0.30 / 0.80; the 0.30:0.50:0.80 roughness ladder reproduces a 169× dynamic range to 1.1e-4. **The raw residual is the dielectric base, not the sheen** — the un-sheened control is the worst arm at −2.062% — which is a new open item (§7.11.2), not a sheen one. Geometrically incomplete for the same reason car paint is: `coat_normal` is still not shipped, and Cycles couples it to the *sheen* normal too (`svm/closure.h:127-129`), so it now blocks both. **This closes E2's original acceptance line: all three of brushed metal, car paint and velvet are measured against Cycles and all three clear the 5% bar raw.** The two-way→N-way lobe-selection rewrite they depend on is done (E2c, §7.9), E2d is its first real N=3 (§7.10.5) and E2e its first N=4 (§7.11.4); anisotropy on the transmissive lobe remains. **The path tracer's coat deliberately diverges from this engine's own raster** (`alpha = r²` vs `mix(0.001, 0.1, r)`, and layered vs purely additive) — see §7.10.3 before filing that as a bug.
 
 **E3. Subsurface scattering**
 Random-walk BSSRDF following `subsurface_random_walk.h`.
@@ -2734,6 +2734,45 @@ linear `(0.90, 0.75, 0.50)` on both sides. This is a genuine formula match:
 including refracting into the coat before measuring path length
 (`cosNT = sqrt(1 - (1/ior)^2 (1 - cosNI^2))`, `optical_depth = 1/cosNT`) and
 including the `mix` against `coat_weight` rather than a bare multiply.
+
+#### 7.10.4 Re-taken 2026-09-11 — +0.381% becomes +0.004%
+
+Re-measured with Gap #17 (§10) and Gap #19 (§11.8, §11.9) both fixed. Blender
+**5.2.1**, framing matched, bounces matched at 3.
+
+| arm | ours | Cycles 5.2.1 | % off | *was* |
+|---|---|---|---|---|
+| car paint (`clearcoat=1.0`) | 0.16803900 | 0.16803261 | **+0.004%** | +0.381% |
+| uncoated control | 0.13292208 | 0.13291879 | **+0.002%** | +0.499% |
+| amber-tinted coat | 0.14598557 | 0.14598167 | **+0.003%** | +0.388% |
+
+The isolations tighten with it: the **coat-only delta** (coated minus uncoated
+inside each engine, which cancels every base-specular term) agrees to **+0.009%**
+against §7.10.2's 0.066%, and the **Beer's-law tint** ratio-of-ratios to
+**−0.001%** against 0.016%.
+
+§7.10.1 predicted exactly this. Its per-channel split put the gap almost entirely
+in R — the bright-base channel — and attributed it to Gap #17's `F0`-dependent
+pedestal, with G and B already near zero. Removing that pedestal removes the gap,
+which is a prediction made in 2026-08 and confirmed by measurement in 2026-09
+rather than a number that merely moved in a convenient direction.
+
+**RE-TAKE, not re-run**, on the same terms as §7.8.1 and §7.11.5 — the original
+`.blend` was never committed and 4.5.3 is gone. *It validates itself twice:*
+
+1. **All three Cycles arms reproduce the recorded originals to within 0.0032%** —
+   0.16803261 against 0.16803674, 0.13291879 against 0.13292308, 0.14598167
+   against 0.14598414 — on a different Blender version.
+2. **The colour-space positive control reproduces to six significant figures:**
+   ratio **2.290430** against the recorded **2.290434**, both +129.0%.
+
+Godot's decode was printed live by probe H and matches §7.10.1's recorded round
+trip exactly. The `Coat Weight` / `Coat Roughness` / `Coat IOR` / `Coat Tint`
+sockets were confirmed present in 5.2.1 by the script rather than assumed. Guarded
+by **probe H** in `pt_coat_gate.gd`; Cycles side at
+`tools/cycles_comparison/cycles_carpaint.py`.
+
+*Original 2026-08 entry follows.*
 
 **Positive control — the colour-space trap, reproduced.** A Cycles-only arm
 with `Base Color` set to the sRGB-encoded number an artist reads off the Godot
@@ -4881,16 +4920,18 @@ measurement as its evidence.
 
 - **The transmissive lobe** keeps the fitted approximation — Gap #20.
 - **The anisotropic residual** — Gap #19.
-- **The Cycles scene comparison in §7.10 has NOT been re-taken.**
+- **The Cycles scene comparisons have all been re-taken.**
   Their pedestal-adjusted figures are now what the engine produces, but the raw
   comparisons against Blender were not re-measured in this work: the `.blend`
   scenes and scripts behind them were never checked into this repo, only
   `.superpowers/sdd/2026-08-21-environment-energy-fidelity/cycles-hypothesis-report.md`.
-  Do not read those adjusted numbers as freshly measured. **§7.8's brushed metal
-  and §7.11's velvet are both re-taken** (2026-09-11, §7.8.1 and §7.11.5):
-  brushed metal now reads +0.015% raw, and velvet's arms −0.675% to −1.867% with
-  its base deficit confirmed and promoted to Gap #21. **Car paint (§7.10) is the
-  one that remains.**
+  **ALL THREE ARE NOW RE-TAKEN** (2026-09-11 — §7.8.1, §7.10.4, §7.11.5), so
+  nothing in this document still rests on the un-re-taken 4.5.3 figures:
+  brushed metal **+6.52% → +0.015%**, car paint **+0.381% → +0.004%**, velvet
+  −1.710% → −1.548% with its base deficit confirmed and promoted to **Gap #21**.
+  Each re-take is validated by reproducing the original Cycles arms and the
+  original colour-space control; each Cycles script is checked in under
+  `tools/cycles_comparison/`, which none of the originals were.
 - **§7.11.2's unexplained −2.06% dielectric-base residual** may have moved. No
   claim is made about it without a re-measurement.
 - **Blender parity on the diffuse-under-specular layer** remains open (filed

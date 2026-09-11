@@ -580,6 +580,106 @@ func _metal(p_color: Color, p_roughness: float) -> StandardMaterial3D:
 # ---------------------------------------------------------------------------
 
 ## Mean over an axis-aligned crop given as fractions of the image.
+## PROBE H -- the CAR PAINT comparison against Cycles (roadmap 7.10.1, re-taken).
+##
+## Reproduces 7.10.1's three arms from its written parameters: metallic base
+## roughness 0.25, base colour LINEAR (0.30, 0.05, 0.05), clearcoat 1.0 /
+## roughness 0.1 / ior 1.5, under the uniform radiance-1.0 world this gate already
+## builds; plus an uncoated control and an amber-tinted arm at clearcoat_tint
+## LINEAR (0.90, 0.75, 0.50).
+##
+## RE-TAKEN, NOT RE-RUN: the original .blend and harness were never checked into
+## this repo and Blender 4.5.3 is gone. New measurement on 5.2.1, framing matched.
+##
+## Of the three re-takes this one was expected to move least -- 7.10.1 already
+## passed the 5% bar raw with an order of magnitude to spare (+0.381%), and its
+## per-channel split put the gap almost entirely in R, the bright-base channel,
+## which is Gap #17's F0-dependent pedestal. With Gap #17 fixed that R excess
+## should shrink; G and B were already ~+0.05%.
+const CARPAINT_ALBEDO_LINEAR := Color(0.30, 0.05, 0.05)
+const CARPAINT_BASE_ROUGHNESS := 0.25
+const CARPAINT_COAT_ROUGHNESS := 0.1
+const CARPAINT_COAT_IOR := 1.5
+const CARPAINT_TINT_LINEAR := Color(0.90, 0.75, 0.50)
+const CARPAINT_FRAMES := 256
+# tag, clearcoat, tinted
+const CARPAINT_ARMS := [
+	{ "tag": "carpaint", "coat": 1.0, "tinted": false },
+	{ "tag": "uncoated", "coat": 0.0, "tinted": false },
+	{ "tag": "amber", "coat": 1.0, "tinted": true },
+]
+# Measured by tools/cycles_comparison/cycles_carpaint.py on Blender 5.2.1,
+# framing matched, bounces matched at 3. Parallel to CARPAINT_ARMS.
+# Blender 5.2.1, framing matched, bounces matched at 3, 2048 samples.
+#
+# THE RECONSTRUCTION VALIDATES ITSELF TWICE, which matters because the original
+# .blend was never checked in and 4.5.3 is gone:
+#   - all three arms reproduce section 7.10.1's recorded Cycles means to within
+#     0.0032% (0.16803674 / 0.13292308 / 0.14598414), on a different Blender;
+#   - the colour-space positive control -- feeding Cycles the sRGB-ENCODED Base
+#     Color as if linear -- gives ratio 2.290430 against the recorded 2.290434,
+#     both +129.0%.
+const CARPAINT_CYCLES_REF := [0.16803261, 0.13291879, 0.14598167]
+const CARPAINT_BAR := 0.05 # section 8.6
+
+
+func _probe_h_carpaint_vs_cycles(p_env: Environment) -> void:
+	print("\n=== PROBE H: car paint vs Cycles (roadmap 7.10.1, re-taken) ===")
+	var enc: Color = CARPAINT_ALBEDO_LINEAR.linear_to_srgb()
+	print("  ALBEDO linear=(%.8f,%.8f,%.8f) -> authored srgb=(%.8f,%.8f,%.8f)"
+			% [CARPAINT_ALBEDO_LINEAR.r, CARPAINT_ALBEDO_LINEAR.g, CARPAINT_ALBEDO_LINEAR.b,
+			enc.r, enc.g, enc.b])
+	print("  Blender is handed the LINEAR numbers on both albedo and coat tint.")
+	_use_sphere_camera_filled()
+	var vp_rid := get_viewport().get_viewport_rid()
+	var means: Array[float] = []
+	for i in range(CARPAINT_ARMS.size()):
+		var arm: Dictionary = CARPAINT_ARMS[i]
+		var m := StandardMaterial3D.new()
+		m.albedo_color = enc
+		m.metallic = 1.0
+		m.roughness = CARPAINT_BASE_ROUGHNESS
+		m = _apply_coat(m, arm["coat"], CARPAINT_COAT_ROUGHNESS, CARPAINT_COAT_IOR)
+		if arm["tinted"]:
+			# _apply_coat writes a white tint; override AFTER it, pre-encoded,
+			# because render_raytracing.cpp:1855 srgb-decodes clearcoat_tint.
+			m.clearcoat_tint = CARPAINT_TINT_LINEAR.linear_to_srgb()
+		_sphere.material_override = m
+		var img: Image = await _render_accum(p_env, vp_rid, CARPAINT_FRAMES)
+		if img == null:
+			_failures.append("probe H car paint: accumulator readback returned null on arm %s" % arm["tag"])
+			return
+		# WHOLE-image mean: the sphere overfills the frame at this camera.
+		var st := _measure_crop(img, 0.0, 1.0)
+		means.append(st["mean"])
+		print("  %-10s coat=%.1f tinted=%s  mean=%.8f  (n=%d)"
+				% [arm["tag"], arm["coat"], str(arm["tinted"]), st["mean"], st["n"]])
+
+	if CARPAINT_CYCLES_REF[0] <= 0.0:
+		print("  CARPAINT_CYCLES_REF not captured yet -- run tools/cycles_comparison/cycles_carpaint.py")
+		return
+	print("  %-10s %12s %12s %10s" % ["arm", "ours", "Cycles", "% off"])
+	for i in range(CARPAINT_ARMS.size()):
+		var cyc: float = CARPAINT_CYCLES_REF[i]
+		var err: float = means[i] / cyc - 1.0
+		print("  %-10s %12.8f %12.8f %9.3f%%" % [CARPAINT_ARMS[i]["tag"], means[i], cyc, err * 100.0])
+		if absf(err) > CARPAINT_BAR:
+			_failures.append(("probe H car paint arm %s: %.8f vs Cycles %.8f, %+.3f%% -- outside the " +
+					"%.1f%% bar (section 8.6).")
+					% [CARPAINT_ARMS[i]["tag"], means[i], cyc, err * 100.0, CARPAINT_BAR * 100.0])
+	# The coat layer isolated by subtraction, which cancels every base-specular
+	# term inside each engine without touching code.
+	var od: float = means[0] - means[1]
+	var cd: float = CARPAINT_CYCLES_REF[0] - CARPAINT_CYCLES_REF[1]
+	print("  coat-only delta: ours %.8f  Cycles %.8f  ratio %.6f  (%+.3f%%)"
+			% [od, cd, od / cd, (od / cd - 1.0) * 100.0])
+	# Beer's-law tint, isolated as tinted/carpaint within each engine.
+	var ot: float = means[2] / means[0]
+	var ct: float = CARPAINT_CYCLES_REF[2] / CARPAINT_CYCLES_REF[0]
+	print("  tint ratio:      ours %.6f  Cycles %.6f  ratio of ratios %.6f (%+.4f%%)"
+			% [ot, ct, ot / ct, (ot / ct - 1.0) * 100.0])
+
+
 func _measure_crop(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
 	var w := p_img.get_width()
 	var h := p_img.get_height()
@@ -1079,6 +1179,7 @@ func _ready() -> void:
 	await _probe_d_pdf(env)
 	await _probe_e_fresnel(env)
 	await _probe_g_inert_ior(env)
+	await _probe_h_carpaint_vs_cycles(env)
 
 	print("\n=== RESULT ===")
 	if _failures.is_empty():
