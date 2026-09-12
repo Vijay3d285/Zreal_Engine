@@ -119,6 +119,32 @@ const P3_EXPECTED_T := 0.96 # Fresnel transmittance at normal incidence, ior 1.5
 ## in this gate.
 const P3_TOLERANCE := 0.002 # 0.2%.
 
+# Probe 3b: the SAME thin slab, DOUBLE-SIDED, tilted 70 degrees (Gap #24).
+#
+# Probe 3's box passes at T = 0.96 -- one face's worth -- because its material
+# culls back faces, so the slab's inner face is never hit. Real glass assets are
+# authored doubleSided (both aquarium GLBs are), which disables that cull at the
+# TLAS instance, and then the inner face IS hit: from behind, by a ray that a
+# thin-walled surface did NOT bend. The engine flipped eta to 1/ior on every
+# back-face hit, thin-walled included, so the inner face saw the unbent 70
+# degrees at eta 1/1.5, and sin(70) > 1/1.5 is total internal reflection: the
+# pane became a 100% mirror beyond asin(1/ior) = 41.8 degrees (56.4 at the
+# pipeline's ior 1.2) while staying clear near normal incidence. That is the
+# fish-tank symptom of roadmap 11.17 exactly -- front panel fine, side panels
+# mirrors.
+#
+# Cycles' thin wall (bsdf_thin_glass_fresnel, bsdf_microfacet.h:1236-1280)
+# evaluates the sheet's back side at the REFRACTED angle and 1/ior, which by
+# reciprocity is the front-side reflectance again -- a thin sheet cannot TIR.
+# Expected T through two independent thin faces at 70 degrees, ior 1.5:
+# t1^2 = 0.829^2 = 0.687, rising toward Cycles' single-sheet closed form
+# t1^2/(1 - r1^2) = 0.708 as the bounce budget admits inter-face reflections.
+# The defective engine reads ~0: the transmitted share reaches the inner face,
+# TIRs, and leaves toward the black world.
+const P3B_TILT_DEG := 70.0
+const P3B_EXPECTED_T_MIN := 0.66
+const P3B_EXPECTED_T_MAX := 0.72
+
 # ---------------------------------------------------------------------------
 # Probe 4: volumetric absorption, isolated via a white-vs-tinted ratio on
 # otherwise-identical geometry (see _probe4_absorption for why this is the
@@ -379,6 +405,7 @@ func _ready() -> void:
 
 	print("\n=== PROBE 3: thin-walled straight-through ===")
 	await _probe3_thin_walled()
+	await _probe3b_thin_walled_double_sided_grazing()
 
 	print("\n=== PROBE 4: volumetric absorption ===")
 	await _probe4_absorption()
@@ -754,6 +781,80 @@ func _probe3_thin_walled() -> void:
 ## that proves the exit-hit detection and back-face visibility: if back faces
 ## were culled, the ray would never find the exit interface and both renders
 ## would read black, giving a 0/0 ratio this gate treats as a hard failure.
+func _probe3b_thin_walled_double_sided_grazing() -> void:
+	print("\n=== PROBE 3b: thin-walled, DOUBLE-SIDED slab at %.0f degrees (Gap #24) ===" % P3B_TILT_DEG)
+	for c in get_children():
+		c.queue_free()
+
+	var backdrop := MeshInstance3D.new()
+	var backdrop_mesh := BoxMesh.new()
+	# NARROW in x on purpose. At a 70-degree tilt the outer face's mirror
+	# direction is (0.64, 0, -0.77) -- still heading toward the backdrop plane,
+	# reaching z = -3 at x = 2.5. A wide backdrop is hit by the REFLECTED path
+	# as well as the straight-through one and the ratio saturates at 1.0
+	# regardless of Fresnel (that is how the first draft of this probe read
+	# 1.0046 on a correct build, and 0.17 on the defective one -- the 0.17 was
+	# the reflection). +/-1 in x admits only the straight-through path.
+	backdrop_mesh.size = Vector3(2, 12, 0.1)
+	backdrop.mesh = backdrop_mesh
+	backdrop.position = Vector3(0, 0, -3)
+	var backdrop_mat := StandardMaterial3D.new()
+	backdrop_mat.emission_enabled = true
+	backdrop_mat.emission = Color(0.6, 0.5, 0.4)
+	backdrop_mat.emission_energy_multiplier = 3.0
+	backdrop.material_override = backdrop_mat
+	add_child(backdrop)
+
+	var slab := MeshInstance3D.new()
+	var slab_mesh := BoxMesh.new()
+	slab_mesh.size = Vector3(8, 8, 0.05)
+	slab.mesh = slab_mesh
+	var glass_mat := StandardMaterial3D.new()
+	glass_mat.transmission = 1.0
+	glass_mat.thickness = 0.0
+	glass_mat.roughness = 0.0
+	glass_mat.metallic = 0.0
+	glass_mat.ior = 1.5
+	# THE POINT: as authored on every glTF glass pane in the asset library.
+	glass_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	slab.material_override = glass_mat
+	# Tilt about Y: the slab's normal now makes P3B_TILT_DEG with the view axis.
+	slab.rotation = Vector3(0.0, deg_to_rad(P3B_TILT_DEG), 0.0)
+	add_child(slab)
+
+	var cam := Camera3D.new()
+	cam.position = Vector3(0, 0, 4)
+	cam.fov = 25.0
+	add_child(cam)
+	cam.make_current()
+
+	var env := _new_env(Color(0, 0, 0))
+	# Two faces plus one inter-face bounce pair need more than probe 3's two.
+	env.set_pathtracing_max_bounces(6)
+	await _settle_sky()
+
+	slab.visible = false
+	var bg_img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), P3_FRAMES)
+	var bg_stats := _measure_crop(bg_img, 0.4, 0.6)
+	print("  backdrop-only mean  : %.6f" % bg_stats["mean"])
+
+	slab.visible = true
+	await _settle()
+	var glass_img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), P3_FRAMES)
+	var glass_stats := _measure_crop(glass_img, 0.4, 0.6)
+	print("  with-slab mean      : %.6f" % glass_stats["mean"])
+
+	var measured_t: float = glass_stats["mean"] / maxf(bg_stats["mean"], 1e-9)
+	print("  measured T = %.6f, expected [%.2f, %.2f] (two thin faces at %.0f deg, ior 1.5: t1^2 = 0.687, Cycles sheet 0.708)"
+			% [measured_t, P3B_EXPECTED_T_MIN, P3B_EXPECTED_T_MAX, P3B_TILT_DEG])
+	_checks += 1
+	if measured_t < P3B_EXPECTED_T_MIN or measured_t > P3B_EXPECTED_T_MAX:
+		_failures.append(("probe3b thin-walled double-sided slab at %.0f deg: measured T %.6f outside [%.2f, %.2f]. "
+				+ "A thin sheet's back face must not flip eta -- that is total internal reflection of an unbent "
+				+ "ray, the fish-tank side-panel mirror (Gap #24).")
+				% [P3B_TILT_DEG, measured_t, P3B_EXPECTED_T_MIN, P3B_EXPECTED_T_MAX])
+
+
 func _probe4_absorption() -> void:
 	for c in get_children():
 		c.queue_free()

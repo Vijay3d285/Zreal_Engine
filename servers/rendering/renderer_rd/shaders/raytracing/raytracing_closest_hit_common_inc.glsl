@@ -1548,11 +1548,27 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// per-hit fact, and stays wrong for one case even after fix round 1 (C2)
 	// made its maintenance symmetric with the actual transmit/reflect outcome:
 	// a THIN-walled material (m.thickness == 0.0) never sets the flag at all
-	// (Step 5 gates it on thickness > 0), yet a back-side hit on a thin
-	// surface still needs the flipped Fresnel split -- is_inside_medium would
-	// read false there and silently skip the flip. h.is_front_face carries no
-	// such gap; it is correct for both the thick-medium and the thin-walled
-	// case from the same one-line expression.
+	// (Step 5 gates it on thickness > 0).
+	//
+	// GAP #24 (2026-09-12): A THIN-WALLED SURFACE MUST NOT FLIP ETA ON ITS
+	// BACK FACE. The earlier text here said the opposite -- "a back-side hit
+	// on a thin surface still needs the flipped Fresnel split" -- and that
+	// produced the fish-tank side-panel mirrors (roadmap 11.17). A thin wall
+	// has no interior: the ray was NOT bent at the first face, so the second
+	// face of a double-sided slab (every glTF glass pane is authored
+	// doubleSided) is hit from behind at the SAME angle the outer face saw.
+	// With eta flipped to 1/ior that is total internal reflection for every
+	// angle past asin(1/ior) -- 41.8 degrees at 1.5, 56.4 at the pipeline's
+	// 1.2 -- and the pane turns into a 100% mirror exactly where a side panel
+	// is viewed, while staying clear near normal incidence. Cycles' thin wall
+	// (bsdf_thin_glass_fresnel, bsdf_microfacet.h:1236-1280) evaluates the
+	// sheet's back side at the REFRACTED angle and 1/ior, which by reciprocity
+	// is the front-side reflectance again: a thin sheet cannot TIR, and its
+	// back face carries the exterior Fresnel. So does ours now, from either
+	// face. THICK media (thickness > 0) keep the flip: there the ray really
+	// did refract into the medium, and the exit face really can TIR.
+	// pt_transmission_gate.gd probe 3b holds this at 70 degrees: T = 0.17
+	// before, [0.66, 0.72] expected.
 	//
 	// Guard on the reciprocal itself (E1 final fix wave, part 2). ior == 0.0
 	// is legal glTF and resolveDielectricF0 correctly resolves it to
@@ -1568,7 +1584,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// fresnel_dielectric regardless of sign (eta_cos_theta_t_sq is <= 0.0 for
 	// every cos_theta_i when eta == 0.0), so leaving it un-flipped in that
 	// case is physically correct, not merely defensive.
-	brdf_mat.eta = h.is_front_face ? resolved_eta : ((resolved_eta > 0.0) ? (1.0 / resolved_eta) : resolved_eta);
+	brdf_mat.eta = (h.is_front_face || m.thickness == 0.0)
+			? resolved_eta
+			: ((resolved_eta > 0.0) ? (1.0 / resolved_eta) : resolved_eta); // Gap #24: thin walls never flip.
 	brdf_mat.opacity = 1.0;
 	// E2b Task 3 Step 5. The production path -- consumed by prepareBRDFData
 	// (evalIndirectCombinedBRDF's specular sample, combinedPdf, evalCombinedBRDFSeparate)
