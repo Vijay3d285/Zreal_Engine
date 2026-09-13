@@ -58,9 +58,14 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	// The camera ray has no preceding BSDF sample, so sky seen directly through a
 	// window takes its full contribution.
 	ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+	ps.skip_geom = RT_SKIP_NONE;
+	ps.skip_prim = RT_SKIP_NONE;
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
+	// Gap #26: a ray that carries a skip id restarts at the exact hit point
+	// with no minimum distance; every other ray keeps the historical 0.001.
+	float t_min = 0.001;
 
 	// A transparent pass-through (the alpha closure in shade_and_bounce) returns
 	// BEFORE the per-lobe cap block, so it is the only surface interaction that
@@ -90,7 +95,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 #ifdef USE_SER
 		hitObjectEXT hitObject;
-		hitObjectTraceRayEXT(hitObject, tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+		hitObjectTraceRayEXT(hitObject, tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, 10000.0, 0);
 
 		// Reorder with a coherence hint that has 8 bits
 		uint hint = 0;
@@ -102,16 +107,28 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 		hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-		traceRayEXT(tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
+		traceRayEXT(tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, 10000.0, 0);
 #endif
 
 		ps = path_unpack(payload);
 		if (is_path_terminated(ps.packed_bounces_flags)) {
 			break;
 		}
-		// Reconstruct the next ray origin from the current ray + hit distance, apply bias
+		// Reconstruct the next ray origin from the current ray + hit distance.
 		vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
-		ray_origin = offset_ray_origin(hit_pos, ps.offset_normal);
+		// Gap #26. After a THROUGH-event the hit shader left the crossed
+		// triangle's id in skip_geom/skip_prim and the any-hit stage refuses
+		// exactly that triangle, so the restart needs no distance margin at
+		// all: exact hit point, t_min 0. That is what lets a face 0.1 mm
+		// behind a pane be hit (the aquarium water, spec 2026-09-13). Both
+		// margins were each individually enough to skip it -- t_min 0.001 is
+		// 1 mm, the 256-ulp offset is 0.24-0.49 mm at room-scale coordinates
+		// -- and zeroing t_min without the id skip re-hit the pane until the
+		// bounce cap (the black window). Every ray WITHOUT a skip id takes the
+		// historical path unchanged.
+		const bool skip_active = (ps.skip_geom != RT_SKIP_NONE);
+		ray_origin = skip_active ? hit_pos : offset_ray_origin(hit_pos, ps.offset_normal);
+		t_min = skip_active ? 0.0 : 0.001;
 		ray_dir = ps.next_ray_dir;
 	}
 
@@ -693,6 +710,14 @@ layout(set = 0, binding = 32, std430) readonly buffer MotionTransforms {
 #endif
 
 void main() {
+	// Gap #26: refuse the one triangle the previous segment passed through.
+	// Runs for every instance that has any-hit enabled (blend, alpha-scissor,
+	// transmissive -- see build_tlas). Opaque instances are FORCE_OPAQUE and
+	// never produce a through-event, so they need no guard.
+	if (payload.skip_geom == gl_InstanceCustomIndexEXT && payload.skip_prim == gl_PrimitiveID) {
+		ignoreIntersectionEXT;
+	}
+
 	uint geometry_idx = gl_InstanceCustomIndexEXT;
 	GeometryData geom = geometries[geometry_idx];
 

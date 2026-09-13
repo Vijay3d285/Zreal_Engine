@@ -1272,6 +1272,11 @@ void debug_visualize(
 /// Also handles DLSS-RR G-buffer output on primary ray.
 void shade_and_bounce(HitData h, MaterialResult m) {
 	PathState ps = path_unpack(payload);
+	// Gap #26: the skip id describes the segment that just ENDED. Cleared here
+	// so every outcome of this hit defaults to "no skip"; only the two
+	// through-events below set it again.
+	ps.skip_geom = RT_SKIP_NONE;
+	ps.skip_prim = RT_SKIP_NONE;
 
 	// Beer-Lambert absorption through a solid (roadmap E1).
 	//
@@ -1400,6 +1405,10 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			// it -- the same reason the transmissive lobe negates below.
 			ps.offset_normal = -h.geometry_normal;
 			ps.next_ray_dir = gl_WorldRayDirectionEXT;
+			// Gap #26: through-event. The next ray may hit anything at any
+			// distance except this triangle.
+			ps.skip_geom = gl_InstanceCustomIndexEXT;
+			ps.skip_prim = gl_PrimitiveID;
 			ps.rng_packed = rng_pack(rng_next_bounce(rng));
 			// INSIDE_MEDIUM_FLAG is deliberately untouched. It means "the ray
 			// about to be traced is inside a solid", and it drives both the
@@ -2266,6 +2275,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.
 	ps.hit_t = gl_HitTEXT;
+	// Gap #26: a transmissive-lobe sample is a through-event (thin or thick).
+	if (took_transmissive_lobe) {
+		ps.skip_geom = gl_InstanceCustomIndexEXT;
+		ps.skip_prim = gl_PrimitiveID;
+	}
 	// Raygen offsets the next ray origin ALONG this normal
 	// (scene_raytracing_raygen.glsl). A refracted ray is heading INTO the
 	// surface, so it must be offset the other way or it restarts outside the

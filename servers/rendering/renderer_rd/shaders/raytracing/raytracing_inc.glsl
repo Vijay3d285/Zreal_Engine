@@ -41,10 +41,15 @@
 // weight against the environment pdf. A NEGATIVE value means "no MIS, use
 // weight 1" -- see RT_MIS_PDF_NONE below.
 //
-// NOTE ON SIZE: 48 bytes assumes vec3 packs at 12 bytes in the payload. Some
-// drivers pad vec3 to 16, making the effective size 56. Either way both stages
-// declare the identical struct so they agree; the frame-time measurement in
-// Step 8 is what tells us whether the growth cost anything.
+// NOTE ON SIZE: 56 bytes (48 before Gap #26) assumes vec3 packs at 12 bytes in
+// the payload. Some drivers pad vec3 to 16, making the effective size 64. Either
+// way both stages declare the identical struct so they agree; the frame-time
+// measurement in Step 8 is what tells us whether the growth cost anything.
+
+/// "No triangle to skip." A restart with skip_geom == RT_SKIP_NONE uses the
+/// pre-Gap-#26 margins (offset_ray_origin + t_min 0.001) and is byte-identical
+/// to the engine before the fix.
+const uint RT_SKIP_NONE = 0xFFFFFFFFu;
 
 struct PathPayload {
 	vec3 radiance; // 12 bytes
@@ -55,6 +60,13 @@ struct PathPayload {
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
 	uint oct_next_dir; //  4 bytes - packUnorm2x16(vec3_to_oct(next direction))
 	float mis_ray_pdf; //  4 bytes - BSDF pdf of this segment, <0 = no MIS
+	// Gap #26. The triangle a THROUGH-event (Transparent BSDF pass-through,
+	// transmissive-lobe sample) just crossed. The raygen restarts such a ray at
+	// the exact hit point with t_min = 0 and the any-hit stage refuses this one
+	// triangle by identity -- Cycles' ray->self.prim -- so a surface 0.1 mm
+	// behind a pane is hit instead of being skipped by a distance margin.
+	uint skip_geom; //  4 bytes - gl_InstanceCustomIndexEXT, or RT_SKIP_NONE
+	uint skip_prim; //  4 bytes - gl_PrimitiveID within that geometry
 };
 
 /// Sentinel: this ray has no meaningful BSDF pdf, so anything it hits takes the
@@ -123,6 +135,8 @@ struct PathState {
 	vec3 offset_normal;
 	vec3 next_ray_dir;
 	float mis_ray_pdf;
+	uint skip_geom;
+	uint skip_prim;
 };
 
 PathState path_unpack(PathPayload p) {
@@ -135,6 +149,8 @@ PathState path_unpack(PathPayload p) {
 	s.offset_normal = oct_to_vec3(unpackUnorm2x16(p.oct_offset_nrm) * 2.0 - 1.0);
 	s.next_ray_dir = oct_to_vec3(unpackUnorm2x16(p.oct_next_dir) * 2.0 - 1.0);
 	s.mis_ray_pdf = p.mis_ray_pdf;
+	s.skip_geom = p.skip_geom;
+	s.skip_prim = p.skip_prim;
 	return s;
 }
 
@@ -147,6 +163,8 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.oct_offset_nrm = packUnorm2x16(vec3_to_oct(s.offset_normal));
 	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
 	p.mis_ray_pdf = s.mis_ray_pdf;
+	p.skip_geom = s.skip_geom;
+	p.skip_prim = s.skip_prim;
 }
 
 // Bounce count helpers.
