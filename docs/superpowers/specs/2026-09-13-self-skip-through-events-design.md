@@ -145,6 +145,16 @@ T1 and T4b are the falsifiable ones: red on the current engine by
 construction, green only if the skip works. T2/T3 hold the fix to zero
 collateral. T4 covers the transmissive-instance flag change.
 
+Implementation note (Task 1): the fixture is shifted by `Z_OFF = +16` on z so
+that at the pane (|z| ≈ 14) the 256-ulp origin offset is 0.24 mm — larger than
+the 0.1 mm gap — and both pre-fix margins are exercised, not only `t_min`. The
+pane is a single-sided `QuadMesh` rather than a double-sided box: a box's back
+face is a second blend surface whose diffuse share reflects what is behind it
+(controls read 0.44 / 0.37 instead of 0.5 on the first run). Pre-fix readings
+on the current shaders: T1 = 1.093 (grey mix, plate skipped), T2 = 0.500002,
+T3 = 0.500002, T4a = 0.991734, T4b = 2.168 (plate skipped); exactly the
+predicted red set {T1, T4b}.
+
 ### Whole-suite and asset checks
 
 - The full `pipeline_references/tests` suite green with **no re-baselining**.
