@@ -120,6 +120,7 @@ Ranked by impact on offline still quality.
 | 20 | **CLOSED 2026-09-11.** The transmissive lobe now carries Cycles' glass energy compensation: `energy_scale = 1/E_glass(rough, μ, z)` from the four transcribed `ggx_glass_E` / `Eavg` / `inv_E` / `inv_Eavg` tables, applied to BOTH the reflected and the transmitted lobe (the transmit branch had none at all), with the reflected lobe of a partially transmissive closure blended `lerp(opaque, glass, transmission)` exactly as Cycles' two closures sum. White glass furnace at roughness 0.9: **0.496 → 0.9745 (BSDF-only) against Cycles' 0.9845**; a single entry interface restores to 1.0 within 0.13% at every angle. See §11.14. Uncovered **Gap #22** on the way. | `brdf_inc.glsl` (`ggxGlassEnergyScale`, `evalMultiScatterFactorDielectric`, `sampleDielectricMicrofacet`), `ggx_glass_energy_tables.h`, `pipeline_references/tests/pt_glass_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-462, :1091, :1107`; `app/cycles_precompute.cpp:53-80, :163-197` | Medium |
 | 25 | **A 4K frame is one GPU submission of ~8 s, and this machine's watchdog is 8 s.** Three builds across four days lost the device on job 216 at different frames; the same build renders the same job at 1080p. Not VRAM, not the shaders. **Resolved on the pipeline side 2026-09-12** (§11.19): `PT_SPP_DAY/NIGHT` halved to 3/2 and the drive doubled to 256 frames — same samples per pixel, half the work per submission; job 216 at 4K then completes (23 min) and the reference scene's quality is unchanged (−0.2%). **Tiling the dispatch inside the frame does NOT help** — measured: four bands per frame still lost the device — because the watchdog times the whole frame submission and the main `RenderingDevice` cannot submit mid-frame. Engine-side, the only real fix would be mid-frame submission support in RD; not attempted. `TdrDelay` remains the machine-side belt-and-braces. | `pipeline_references/image_glb_creation.gd` (`PT_SPP_*`), `pipeline_references/render.gd` (`DLSS_RR_REALTIME_STILL_FRAMES`) | — | Medium |
 | 26 | **CLOSED 2026-09-13.** After a through-event (Transparent BSDF pass-through, transmissive-lobe sample) the next ray restarted with two distance margins -- `t_min` 1 mm and a 256-ulp origin offset (0.24-0.49 mm at room scale) -- and any surface inside either was never hit. The aquarium water's front face sits 0.14 mm behind the glass: clear tank where Cycles shows teal, and the source of the "ghost" tank. Fixed Cycles' way: exact restart, `t_min` 0, skip the crossed triangle by id in any-hit; transmissive instances now run any-hit (skip-only, `RT_MAT_FLAG_ANYHIT_SKIP_ONLY`). Opaque bounces byte-identical. Gate `pt_thin_layer_gate` (T1 1.093 → 0.500002, T4b 2.168 → 0.991734; controls unchanged). replay192 water B−R −1.3 → +6.4, window −0.05%; 217 frame outside the tank +0.2%. See §11.20. | `raytracing_inc.glsl` (payload), `scene_raytracing_raygen.glsl` (restart, any-hit), `raytracing_closest_hit_common_inc.glsl` (two through-sites), `render_raytracing.cpp` (FORCE_OPAQUE, emissive gather) | `intern/cycles/kernel/bvh/util.h` (`intersection_skip_self`) | **High** |
+| 27 | **Sky radiance map was a point downsample of the panorama — CLOSED 2026-09-13**, with a residual filed. `PanoramaSkyMaterial` sampled with `filter_linear` (mip 0 only) while the sky pass renders it once per radiance-map texel: 8:1 point downsample at the gate's 2048→256 and at production's 8192→1024. `pt_sky_energy_gate` probe C swung 9.34% between radiance 256 and 2048 on a 1-row band (HIGH at 256 — aliasing, not loss; the gate's FAIL text said "losing energy" regardless of sign). Fix: `filter_linear_mipmap` — swing 0.56%. **Production effect: 0.00%** on replay192 and 217 (a hazy HDRI has no sub-texel energy; the sun is a DirectionalLight) — correct, gate-closing, not a look difference. **Residual (open):** probe B reads 1.5–2.2% low at *every* size and band width on a peaked sky, not on a uniform one — env-NEE/MIS weighting vs the CDF; gate tolerance for B set to 3% with the numbers recorded so it can still newly fail. See §11.21. | `scene/resources/3d/sky_material.cpp` (panorama shader filter), `pt_sky_energy_gate.gd` | Cycles samples the source image at the ray direction, never a downsampled map | Medium (residual: Low) |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
 | 22 | **Environment NEE double-counts the sky through glass** — a shadow ray crosses a transmissive interface straight through at `transmission·(1−F)` (the transparent-shadow design, `raytracing_lights_inc.glsl` pass B), so under a uniform world the sky reached by that shadow ray is ALSO reached by the refracted BSDF path, and the two MIS strategies do not estimate the same integrand. Measured on the white glass furnace as the NEE-on/NEE-off ratio: **+2.4% / +7.3% / +8.6%** at roughness 0.3 / 0.6 / 0.9, identical on the pre-Gap-#20 path (state 2) and the fixed one — pre-existing, and only visible once Gap #20 lifted the total near 1.0. Cycles blocks shadow rays at refractive glass and gets interior lighting from caustic paths (and opt-in Shadow Caustics). **A design decision, not a one-line fix**: blocking the shadow ray restores energy conservation but darkens everything inside glass under NEE-only lighting. Found and quantified in §11.14. | `raytracing_lights_inc.glsl` (`lights_trace_shadow_ray` pass B), env-NEE site in `raytracing_closest_hit_common_inc.glsl`, `pt_glass_energy_gate.gd` (sphere arms carry the excess inside a 10% bar) | `intern/cycles/kernel/integrator/shadow_*.h` (no glass pass-through); `bsdf_microfacet.h` | Medium |
@@ -6261,3 +6262,51 @@ A restart on a shared triangle edge can hit the neighbouring triangle of the
 same flat face at `t ≈ 0` and count a second pass-through; Cycles has the
 same property. T3 (a flat two-triangle pane) reads the pre-fix value to six
 decimals, so it is not measurable here.
+
+
+---
+
+## 11.21 Gap #27 — the sky radiance map was point-sampled; the residual is not the map
+
+**2026-09-13.** `pt_sky_energy_gate` had failed since E2a with probe B at
+radiance 256 reading 1.08484 and probe C moving 9.338% between sizes 256 and
+2048. Its own verdict line said "RESOLUTION-SENSITIVE, NO ENERGY LOSS"; the
+FAIL string said "losing energy" regardless of sign. The reading was HIGH at
+256 -- aliasing overshoot on a sub-texel band -- not loss.
+
+### Mechanism
+
+`env_sky_radiance()` and the miss stage read the Sky's `radiance_octmap`,
+which the sky pass renders at `radiance_size` by evaluating the sky material
+once per texel. `PanoramaSkyMaterial`'s generated shader declared
+`uniform sampler2D source_panorama : filter_linear` -- bilinear at mip
+level 0 -- so a 2048-wide panorama into a 256 map (and production's
+8192×4096 EXR into a 1024 map) was an 8:1 **point** downsample. The
+pipeline's `generate_mipmaps()` on the EXR was ignored by that filter.
+Cycles samples the source image at the exact ray direction and never
+downsamples.
+
+### Two predictions, both held
+
+| step | probe B @256 | @2048 | C shift |
+|---|---|---|---|
+| before | 1.08484 | 0.98354 | 9.338% |
+| stimulus given mipmaps, engine unchanged | 1.08484 | 0.98354 | 9.338% (filter ignores mips) |
+| `filter_linear_mipmap` | 0.97811 | 0.98354 | **0.555%** |
+| same, 8-row band (wider than any map texel) | 0.98581 | 0.98625 | 0.045% |
+
+### The residual, filed rather than folded in
+
+After the fix both sizes read 1.5–2.2% low, independent of resolution and
+band width, while a uniform sky passes `pt_energy_gate`'s furnace to 1%.
+Peakedness-dependent and resolution-independent points at the env-NEE / MIS
+weighting against the CDF, not the map. The gate's probe B tolerance is set
+to 3% with these readings recorded (probe C keeps 2%), so it passes today
+and fails on any regression past today; the verdict text names Gap #27.
+
+### On production
+
+replay192 and urbantestdark217 at FHD, production route, before vs after:
+window / walls / floor / whole frame all **±0.00%** (mean |diff| 0.03 and
+0.17 of 255). The fix is right and the gate is green; it does not move the
+production look, and should not be counted as progress on the Blender gap.

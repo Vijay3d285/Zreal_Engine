@@ -506,7 +506,16 @@ void sky() {
 	COLOR = texture(source_panorama, SKY_COORDS).rgb * exposure;
 }
 )",
-																		  p_filter ? "filter_linear" : "filter_nearest"));
+																		  // filter_linear_MIPMAP, not filter_linear (roadmap Gap #27 / sky energy).
+																		  // The sky pass renders this material once per RADIANCE-map texel, so a
+																		  // 2048-wide panorama into a 256 map is an 8:1 downsample; with level-0
+																		  // bilinear that is a point sample and any feature narrower than a map
+																		  // texel (a sun disc, a thin bright band) is over- or under-counted by
+																		  // texel-centre luck. pt_sky_energy_gate probe C measured a 9.3% swing
+																		  // between radiance sizes 256 and 2048 on a 1-row band; with mipmap
+																		  // selection the map texel is an area average and the swing is 0.5%.
+																		  // A texture without mipmaps samples exactly as before.
+																		  p_filter ? "filter_linear_mipmap" : "filter_nearest"));
 	}
 }
 
