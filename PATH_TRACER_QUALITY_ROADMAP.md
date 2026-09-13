@@ -119,6 +119,7 @@ Ranked by impact on offline still quality.
 | 19 | **Anisotropic GGX energy — FIXED 2026-09-11, see §11.8 and §11.9.** Every measured configuration now agrees with Cycles 5.2.1 to **0.21% or better**, from +53.85% at worst. Two independent causes, both landed: **A**, below-hemisphere VNDF samples clamped into the shading hemisphere rather than rejected (§11.8), and **B**, `ax`/`ay` not clamped to [0,1] as Cycles does in `bsdf_microfacet_ggx_setup` (§11.9). Guarded by probe 1d's eccentricity-monotonicity assertion, which is a physical law rather than a stored reference. *Original entry:* **~~Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one~~** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes, and the larger one is now FIXED.** **A — below-hemisphere VNDF samples were clamped into the shading hemisphere rather than rejected**, handing a finite `G2/G1` weight to directions where the BRDF is identically zero; the error scaled with eccentricity, which is why it read as an anisotropy bug. Landed 2026-09-11 (§11.8), and roughness 0.4 now matches Cycles to **0.04% across the whole anisotropy sweep**, guarded by probe 1d's eccentricity-monotonicity assertion. **B — `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not** is all that remains, and only where `ax > 1`: roughness 0.9 / anisotropy 0.9 now undershoots Cycles by 28.2% where it previously overshot by 53.85%. Fixing B invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on (§11.6). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **CLOSED 2026-09-11.** The transmissive lobe now carries Cycles' glass energy compensation: `energy_scale = 1/E_glass(rough, μ, z)` from the four transcribed `ggx_glass_E` / `Eavg` / `inv_E` / `inv_Eavg` tables, applied to BOTH the reflected and the transmitted lobe (the transmit branch had none at all), with the reflected lobe of a partially transmissive closure blended `lerp(opaque, glass, transmission)` exactly as Cycles' two closures sum. White glass furnace at roughness 0.9: **0.496 → 0.9745 (BSDF-only) against Cycles' 0.9845**; a single entry interface restores to 1.0 within 0.13% at every angle. See §11.14. Uncovered **Gap #22** on the way. | `brdf_inc.glsl` (`ggxGlassEnergyScale`, `evalMultiScatterFactorDielectric`, `sampleDielectricMicrofacet`), `ggx_glass_energy_tables.h`, `pipeline_references/tests/pt_glass_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-462, :1091, :1107`; `app/cycles_precompute.cpp:53-80, :163-197` | Medium |
 | 25 | **A 4K frame is one GPU submission of ~8 s, and this machine's watchdog is 8 s.** Three builds across four days lost the device on job 216 at different frames; the same build renders the same job at 1080p. Not VRAM, not the shaders. **Resolved on the pipeline side 2026-09-12** (§11.19): `PT_SPP_DAY/NIGHT` halved to 3/2 and the drive doubled to 256 frames — same samples per pixel, half the work per submission; job 216 at 4K then completes (23 min) and the reference scene's quality is unchanged (−0.2%). **Tiling the dispatch inside the frame does NOT help** — measured: four bands per frame still lost the device — because the watchdog times the whole frame submission and the main `RenderingDevice` cannot submit mid-frame. Engine-side, the only real fix would be mid-frame submission support in RD; not attempted. `TdrDelay` remains the machine-side belt-and-braces. | `pipeline_references/image_glb_creation.gd` (`PT_SPP_*`), `pipeline_references/render.gd` (`DLSS_RR_REALTIME_STILL_FRAMES`) | — | Medium |
+| 26 | **CLOSED 2026-09-13.** After a through-event (Transparent BSDF pass-through, transmissive-lobe sample) the next ray restarted with two distance margins -- `t_min` 1 mm and a 256-ulp origin offset (0.24-0.49 mm at room scale) -- and any surface inside either was never hit. The aquarium water's front face sits 0.14 mm behind the glass: clear tank where Cycles shows teal, and the source of the "ghost" tank. Fixed Cycles' way: exact restart, `t_min` 0, skip the crossed triangle by id in any-hit; transmissive instances now run any-hit (skip-only, `RT_MAT_FLAG_ANYHIT_SKIP_ONLY`). Opaque bounces byte-identical. Gate `pt_thin_layer_gate` (T1 1.093 → 0.500002, T4b 2.168 → 0.991734; controls unchanged). replay192 water B−R −1.3 → +6.4, window −0.05%; 217 frame outside the tank +0.2%. See §11.20. | `raytracing_inc.glsl` (payload), `scene_raytracing_raygen.glsl` (restart, any-hit), `raytracing_closest_hit_common_inc.glsl` (two through-sites), `render_raytracing.cpp` (FORCE_OPAQUE, emissive gather) | `intern/cycles/kernel/bvh/util.h` (`intersection_skip_self`) | **High** |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
 | 22 | **Environment NEE double-counts the sky through glass** — a shadow ray crosses a transmissive interface straight through at `transmission·(1−F)` (the transparent-shadow design, `raytracing_lights_inc.glsl` pass B), so under a uniform world the sky reached by that shadow ray is ALSO reached by the refracted BSDF path, and the two MIS strategies do not estimate the same integrand. Measured on the white glass furnace as the NEE-on/NEE-off ratio: **+2.4% / +7.3% / +8.6%** at roughness 0.3 / 0.6 / 0.9, identical on the pre-Gap-#20 path (state 2) and the fixed one — pre-existing, and only visible once Gap #20 lifted the total near 1.0. Cycles blocks shadow rays at refractive glass and gets interior lighting from caustic paths (and opt-in Shadow Caustics). **A design decision, not a one-line fix**: blocking the shadow ray restores energy conservation but darkens everything inside glass under NEE-only lighting. Found and quantified in §11.14. | `raytracing_lights_inc.glsl` (`lights_trace_shadow_ray` pass B), env-NEE site in `raytracing_closest_hit_common_inc.glsl`, `pt_glass_energy_gate.gd` (sphere arms carry the excess inside a 10% bar) | `intern/cycles/kernel/integrator/shadow_*.h` (no glass pass-through); `bsdf_microfacet.h` | Medium |
@@ -6178,3 +6179,85 @@ hold the two edits with their rationale. A resolution-aware version — spp
 scaled by `(3840·2160)/(w·h)` with frames scaled inversely — would keep the
 per-submission cost constant at every output size; not done, since 3 × 256
 is simply faster at lower resolutions rather than riskier.
+
+
+---
+
+## 11.20 Gap #26 — the water was 0.14 mm behind the glass, and the ray restart jumped over it
+
+**Found and closed 2026-09-13**, chasing the "ghost" fish tank against the
+Blender render of the same asset.
+
+### Eliminated first, each by a measured render of the dining scene
+
+| suspect | test | result |
+|---|---|---|
+| the game denoiser smears the sparse 10% mirror | accumulate 256 spp + OIDN vs DLSS-RR | identical glass (frame mean 85.0 vs 85.1) |
+| lamps set to reflect nothing (`light_specular = 0`, 27 lamps) | all restored | room +7% brighter, glass unchanged |
+| the mirror share of the Transparent closure is broken | force the glass to a 100% mirror | reflections correct (a bowl turned chrome) |
+| the shelving unit's "glass panes" | force its `Glass` material opaque | the material is a 1.3 m decor piece; the cells are open in both files -- a misread, nothing to chase |
+
+### The mechanism
+
+Forcing the aquarium's `Water` (authored: teal, metallic 1, alpha 0.2) to a
+100% opaque teal mirror still showed the plants through the tank's FRONT,
+while the top and sides became mirrors. Removing the glass made the front a
+solid mirror. So the water's front face was fine and never hit when the
+glass was in front of it. The geometry: glass inner face at `z = 14.050`,
+water front face at `z = 14.040` model units × 0.014031 m/unit = **0.14 mm**
+apart; the sides have 4 mm. After the pass-through the raygen restarted
+the next ray with `t_min = 0.001` (1 mm) AND `offset_ray_origin` at 256 ulps
+(0.24 mm at |z| ≈ 10 m, 0.49 mm at 20 m). Each alone skips 0.14 mm -- which is
+why shrinking one at a time (offset → 8 ulps; `t_min` → 0) changed nothing,
+and why `t_min → 0` with the offset kept turned the window black: the pane
+was re-hit until the transmission cap killed the path. Cycles has neither
+margin: it restarts at the hit point and refuses the primitive it just left
+by id (`ray->self.prim`, `intersection_skip_self`).
+
+### The fix (approach A of the spec)
+
+- `PathPayload` carries `skip_geom` / `skip_prim` (+8 bytes).
+- `shade_and_bounce` clears them at entry and sets them at exactly the two
+  through-sites (Transparent pass-through, `took_transmissive_lobe`).
+- The raygen restarts a skip-carrying ray at the exact hit point with
+  `t_min 0`; every other ray keeps the historical offset + 0.001 unchanged.
+- The any-hit stage refuses `(skip_geom, skip_prim)` first thing.
+- Transmissive instances lose `FORCE_OPAQUE`; `RT_MAT_FLAG_ANYHIT_SKIP_ONLY`
+  makes their any-hit do nothing but the guard and keeps them opaque emitters
+  for the emissive gather (a `FORCE_OPAQUE` consumer the spec had missed).
+
+The flag step was not cosmetic: with the shader change alone T4a drifted
+0.991734 → 0.990748 (some exact-point restarts re-crossed the pane); with the
+guard on the pane it is back to 0.991734 exactly, and T4b equals it.
+
+### Gate `pt_thin_layer_gate`
+
+Single-sided blend / converted-glass pane with a teal emissive plate 0.1 mm
+or 5 mm behind it, fixture shifted to |z| ≈ 14 so both margins exceed the gap.
+
+| probe | before | after |
+|---|---|---|
+| T1 blend, 0.1 mm | 1.093 (plate skipped, grey mix) | **0.500002** |
+| T2 blend, 5 mm | 0.500002 | 0.500002 |
+| T3 blend, backdrop | 0.500002 | 0.500002 |
+| T4a glass, 5 mm | 0.991734 | 0.991734 |
+| T4b glass, 0.1 mm | 2.168 (plate skipped) | **0.991734** |
+
+Whole suite green with no re-baselining; `pt_sky_energy_gate` fails with its
+recorded pre-existing numbers (1.08484 / 9.338%). Doctest 1558/1558.
+
+### On the assets (FHD, production route, same pipeline)
+
+| | before | after |
+|---|---|---|
+| replay192 water B−R (above the plants) | −1.3 | **+6.4** -- the water is teal, the surface line shows |
+| replay192 window mean | 178.19 | 178.11 (−0.05%) -- no black window |
+| replay192 outside the tanks | 174.84 | 174.68 (−0.09%) |
+| urbantestdark217 outside the tank | 83.56 | 83.74 (+0.21%) |
+
+### Inherited property
+
+A restart on a shared triangle edge can hit the neighbouring triangle of the
+same flat face at `t ≈ 0` and count a second pass-through; Cycles has the
+same property. T3 (a flat two-triangle pane) reads the pre-fix value to six
+decimals, so it is not measurable here.
