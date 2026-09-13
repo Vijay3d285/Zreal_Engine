@@ -118,7 +118,7 @@ Ranked by impact on offline still quality.
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
 | 19 | **Anisotropic GGX energy — FIXED 2026-09-11, see §11.8 and §11.9.** Every measured configuration now agrees with Cycles 5.2.1 to **0.21% or better**, from +53.85% at worst. Two independent causes, both landed: **A**, below-hemisphere VNDF samples clamped into the shading hemisphere rather than rejected (§11.8), and **B**, `ax`/`ay` not clamped to [0,1] as Cycles does in `bsdf_microfacet_ggx_setup` (§11.9). Guarded by probe 1d's eccentricity-monotonicity assertion, which is a physical law rather than a stored reference. *Original entry:* **~~Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one~~** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes, and the larger one is now FIXED.** **A — below-hemisphere VNDF samples were clamped into the shading hemisphere rather than rejected**, handing a finite `G2/G1` weight to directions where the BRDF is identically zero; the error scaled with eccentricity, which is why it read as an anisotropy bug. Landed 2026-09-11 (§11.8), and roughness 0.4 now matches Cycles to **0.04% across the whole anisotropy sweep**, guarded by probe 1d's eccentricity-monotonicity assertion. **B — `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not** is all that remains, and only where `ax > 1`: roughness 0.9 / anisotropy 0.9 now undershoots Cycles by 28.2% where it previously overshot by 53.85%. Fixing B invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on (§11.6). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
 | 20 | **CLOSED 2026-09-11.** The transmissive lobe now carries Cycles' glass energy compensation: `energy_scale = 1/E_glass(rough, μ, z)` from the four transcribed `ggx_glass_E` / `Eavg` / `inv_E` / `inv_Eavg` tables, applied to BOTH the reflected and the transmitted lobe (the transmit branch had none at all), with the reflected lobe of a partially transmissive closure blended `lerp(opaque, glass, transmission)` exactly as Cycles' two closures sum. White glass furnace at roughness 0.9: **0.496 → 0.9745 (BSDF-only) against Cycles' 0.9845**; a single entry interface restores to 1.0 within 0.13% at every angle. See §11.14. Uncovered **Gap #22** on the way. | `brdf_inc.glsl` (`ggxGlassEnergyScale`, `evalMultiScatterFactorDielectric`, `sampleDielectricMicrofacet`), `ggx_glass_energy_tables.h`, `pipeline_references/tests/pt_glass_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:450-462, :1091, :1107`; `app/cycles_precompute.cpp:53-80, :163-197` | Medium |
-| 25 | **A 4K frame is one GPU submission of ~8 s, and this machine's watchdog is 8 s.** Three builds across four days lost the device on job 216 at different frames; the same build renders the same job at 1080p (~2 s/frame). Not VRAM (10.8/16 GB), not the shaders. Tile the raygen dispatch (or drive 1 spp per submission) so no submission can approach a watchdog on any machine; until then raise `TdrDelay`. See §11.18. | `render_raytracing.cpp` (raygen dispatch), `render.gd` (drive loop) | — | **High** |
+| 25 | **A 4K frame is one GPU submission of ~8 s, and this machine's watchdog is 8 s.** Three builds across four days lost the device on job 216 at different frames; the same build renders the same job at 1080p. Not VRAM, not the shaders. **Resolved on the pipeline side 2026-09-12** (§11.19): `PT_SPP_DAY/NIGHT` halved to 3/2 and the drive doubled to 256 frames — same samples per pixel, half the work per submission; job 216 at 4K then completes (23 min) and the reference scene's quality is unchanged (−0.2%). **Tiling the dispatch inside the frame does NOT help** — measured: four bands per frame still lost the device — because the watchdog times the whole frame submission and the main `RenderingDevice` cannot submit mid-frame. Engine-side, the only real fix would be mid-frame submission support in RD; not attempted. `TdrDelay` remains the machine-side belt-and-braces. | `pipeline_references/image_glb_creation.gd` (`PT_SPP_*`), `pipeline_references/render.gd` (`DLSS_RR_REALTIME_STILL_FRAMES`) | — | Medium |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
 | 22 | **Environment NEE double-counts the sky through glass** — a shadow ray crosses a transmissive interface straight through at `transmission·(1−F)` (the transparent-shadow design, `raytracing_lights_inc.glsl` pass B), so under a uniform world the sky reached by that shadow ray is ALSO reached by the refracted BSDF path, and the two MIS strategies do not estimate the same integrand. Measured on the white glass furnace as the NEE-on/NEE-off ratio: **+2.4% / +7.3% / +8.6%** at roughness 0.3 / 0.6 / 0.9, identical on the pre-Gap-#20 path (state 2) and the fixed one — pre-existing, and only visible once Gap #20 lifted the total near 1.0. Cycles blocks shadow rays at refractive glass and gets interior lighting from caustic paths (and opt-in Shadow Caustics). **A design decision, not a one-line fix**: blocking the shadow ray restores energy conservation but darkens everything inside glass under NEE-only lighting. Found and quantified in §11.14. | `raytracing_lights_inc.glsl` (`lights_trace_shadow_ray` pass B), env-NEE site in `raytracing_closest_hit_common_inc.glsl`, `pt_glass_energy_gate.gd` (sphere arms carry the excess inside a 10% bar) | `intern/cycles/kernel/integrator/shadow_*.h` (no glass pass-through); `bsdf_microfacet.h` | Medium |
@@ -6130,3 +6130,51 @@ longer, but the losses predate it.
 4. The pipeline's "out of VRAM" message should not claim VRAM; -4 is
    `VK_ERROR_DEVICE_LOST`, and on this machine it has meant the watchdog every
    time.
+
+
+---
+
+## 11.19 Gap #25 — what fixed the watchdog resets, and what did not
+
+**2026-09-12/13.** Two remedies were tried against job 216 at 4K, the case
+that lost the device on every build.
+
+### The stop-gap works, and costs nothing
+
+`PT_SPP_DAY 6 → 3`, `PT_SPP_NIGHT 4 → 2`, `DLSS_RR_REALTIME_STILL_FRAMES
+128 → 256`. Samples per pixel are unchanged; each GPU submission does half
+the work.
+
+| job | settings | result |
+|---|---|---|
+| 216 at 4K, live build | 6 × 128 | device lost (three builds, three different frames) |
+| 216 at 4K, live build | **3 × 256** | **completed, 23 min** |
+| 215 at 4K, live build | 6 × 128 vs 3 × 256 | −0.21% luminance, median pixel ratio 1.0000 |
+
+`render.gd`'s own note already preferred this direction: DLSS-RR integrates
+frames, not samples, so more frames of fewer samples is the better side of
+the trade anyway.
+
+### Tiling the dispatch does not work — measured, then reverted
+
+The obvious engine-side fix was implemented in full: a push constant carrying
+the tile origin and full frame size, `RT_PIXEL_ID()` / `RT_FRAME_SIZE()`
+macros replacing all eleven `gl_LaunchIDEXT` / `gl_LaunchSizeEXT` reads
+across the raygen, closest-hit and custom-fragment stages, a
+`rendering/pathtracer/dispatch_tiles` setting, and the frame traced as four
+horizontal bands. It built and ran. **Job 216 at 6 × 128 still lost the
+device, ~6 minutes into the drive.** Four 2-second dispatches inside one
+8-second frame reset exactly like one 8-second dispatch: the watchdog times
+the *submission*, and Godot's main `RenderingDevice` submits once per frame
+(`submit()` / `sync()` are local-device only). The change was reverted rather
+than kept as inert machinery. If an engine-side fix is ever wanted, it is
+mid-frame submission in `RenderingDevice`, which is a render-graph change,
+not a shader one.
+
+### What to carry across
+
+`pipeline_references/image_glb_creation.gd` and `pipeline_references/render.gd`
+hold the two edits with their rationale. A resolution-aware version — spp
+scaled by `(3840·2160)/(w·h)` with frames scaled inversely — would keep the
+per-submission cost constant at every output size; not done, since 3 × 256
+is simply faster at lower resolutions rather than riskier.
