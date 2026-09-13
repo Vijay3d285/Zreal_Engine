@@ -5,111 +5,58 @@ extends "res://tests/pt_validation.gd"
 ##   bin\godot.windows.editor.x86_64.console.exe --path pipeline_references \
 ##       res://tests/pt_transparent_shadow_gate_scene.tscn
 ##
-## WHAT THIS PROVES. Before transparent shadows, lights_trace_shadow_ray used
-## gl_RayFlagsTerminateOnFirstHitEXT and returned a boolean, and the any-hit stage
-## consulted only alpha cutout -- so a transmissive surface was a full occluder and
-## anything enclosed in glass received ZERO direct light from every source
-## (analytic, emissive-mesh, and environment NEE all route through that one
-## function). This gate measures that directly as a ratio.
+## WHAT THIS PROVES. lights_trace_shadow_ray is the one function every direct
+## light source routes through (analytic, emissive-mesh and environment NEE).
+## This gate measures, as a ratio of a lit floor with and without a pane between
+## it and the light, what a shadow ray does at two kinds of surface:
 ##
-## The doctest suite cannot catch this: it mirrors GLSL formulas in C++ and never
-## executes a shader, and the headless renderer discards material parameters
-## entirely. Only a real GPU render through the real shadow path measures it.
+##   - a REFRACTIVE (dielectric, transmission > 0) pane BLOCKS it -- Cycles'
+##     rule (intern/cycles/kernel/integrator/surface_shader.h,
+##     surface_shader_transparency(): a shadow ray passes a Transparent BSDF's
+##     extinction and nothing else). Probes 1-4 read 0.0 whatever the angle,
+##     pane count or transmission factor. This is roadmap Gap #22 (2026-09-13);
+##     before it pass B let the ray through at transmission*(1-F), which
+##     double-counted the sky with the refracted BSDF path (+2.4..8.6% on the
+##     glass furnace) and these probes asserted 0.9216 / 0.3749 / 0.8493 / 0.2304.
+##   - a BLEND pane's (1 - alpha) Transparent share PASSES it -- probe 5 reads
+##     (1 - 0.5)^2 = 0.25 for two crossings, identical to Cycles' mix.
 ##
-## THIS GATE IS EXPECTED TO FAIL until the glass-passing pass (the task after
-## this one) lands. Task 3 tags transmissive TLAS instances with a cull mask and
-## lights_trace_shadow_ray already returns a vec3, but every call site still
-## resolves to vec3(0.0) or vec3(1.0) -- the fractional Fresnel transmittance
-## this gate measures does not exist yet. Probe 1 is the one that carries the
-## gate before that fix: the pre-fix ratio is ~0.0 and cannot satisfy
-## [P1_RATIO_MIN, P1_RATIO_MAX] under any tolerance. Probes 2, 3 and 4 are
-## two-sided bands, so the pre-fix 0.0 fails them as well.
+## The doctest suite cannot catch any of this: it mirrors GLSL formulas in C++
+## and never executes a shader, and the headless renderer discards material
+## parameters entirely. Only a real GPU render through the real shadow path
+## measures it.
 ##
-## The five probes measure five different things and none of them is redundant:
-##   1 -- the fractional transmittance exists at all (pre-fix reads 0.0)
-##   2 -- the Fresnel term is the EXACT dielectric form, at grazing incidence
-##   3 -- every crossing is counted (the t_min march's traversal order)
-##   4 -- the mat.transmission factor is applied, not just (1 - F)
-##   5 -- (Task 4) a BLEND surface's (1 - alpha) share passes the shadow ray
-##        even with transmission = 0.0 and probes 1-4's dielectric mix absent
+## The five probes are not redundant:
+##   1 -- a dielectric pane at normal incidence blocks (was: passes 0.9216)
+##   2 -- and at 80 deg incidence (was: exact-Fresnel 0.374905)
+##   3 -- and two panes stacked (was: 0.849346; the crossing-count probe)
+##   4 -- and at transmission = 0.5 (was: 0.2304; the transmission-factor probe)
+##   5 -- a BLEND surface's (1 - alpha) share passes, two crossings -> 0.25.
+##        This is the probe that keeps the gate two-sided: "glass blocks
+##        everything, alpha included" reads 0.0 here and fails.
 
 const FRAMES := 128
 
-# One pane crossed twice (front and back face) at near-normal incidence, ior 1.5:
-# F0 = ((1.5-1)/(1.5+1))^2 = 0.04, so each crossing passes ~0.96 and the pair
-# ~0.92. The floor is what carries the gate -- the pre-fix value is 0.0 and
-# cannot satisfy it under any tolerance.
-#
-# This band CANNOT count crossings: one crossing reads 0.96 and two read 0.9216,
-# and both sit inside it. Probe 3 exists to close exactly that hole; do not widen
-# probe 3 into this one's role or the crossing count goes unmeasured again.
-const P1_RATIO_MIN := 0.85
-const P1_RATIO_MAX := 1.00
+# GAP #22 (2026-09-13): the dielectric share BLOCKS the shadow ray, as in
+# Cycles. Probes 1-4 each read 0.0 by construction; measured on the day of the
+# change: 0.000000 on all four. ONE-SIDED CEILINGS ARE ACCEPTABLE HERE ONLY
+# BECAUSE PROBE 5 IS TWO-SIDED: a "glass blocks everything, including the alpha
+# share" regression reads 0.0 on probe 5 and fails its [0.23, 0.27] band; a
+# "glass blocks nothing" regression reads ~0.92 on probe 1 and fails this
+# ceiling. Between them both directions are covered.
+const DIELECTRIC_BLOCK_MAX := 0.005
 
 # PROBE 2. The light (not the pane -- see _measure_ratio's geometry note) tilted
-# to 80deg incidence from the horizontal pane's normal.
-#
-# This is a TWO-SIDED band, not a bare ceiling, and the difference is the whole
-# point. Round 1 of pass B asserted only `ratio < 0.80`, and the eta-flip defect
-# drove the reading to EXACTLY 0.000000 -- total internal reflection, glass gone
-# black -- which satisfied that ceiling and was reported as a pass. ZERO MUST NOT
-# SATISFY THIS PROBE. A floor is what makes "the glass went black" a failure
-# instead of a strong pass.
-#
-# Theory (unbent two-crossing thin slab, ior 1.5, external 80deg):
-#   sin_t = sin(80)/1.5 = 0.656539, cos_t = 0.754292, cos_i = 0.173648
-#   r_s = -0.733889 -> r_s^2 = 0.538593
-#   r_p = -0.486637 -> r_p^2 = 0.236816
-#   F   = (r_s^2 + r_p^2)/2 = 0.387705
-#   (1 - F)^2 = 0.612295^2 = 0.374905
-#
-# The band is +/- 0.01 around that. It was +/- 0.045; measurement then came back
-# at 0.374911, agreeing with theory to five decimal places, and at the wider width
-# Schlick's approximation would have passed too:
-#   F_schlick = 0.04 + 0.96 * (1 - cos_i)^5 = 0.04 + 0.96 * 0.826352^5 = 0.409911
-#   (1 - F_schlick)^2 = 0.590089^2 = 0.348205
-# 0.348205 sits inside [0.33, 0.42] and OUTSIDE [0.365, 0.385], so the old band did
-# not pin the exact-Fresnel form the shader actually uses and this one does.
-#
-# There is NO spread of incidence angles to widen this for (an earlier revision of
-# this comment claimed one). The light is directional and the pane is flat and
-# unrotated, so every crossing in the crop is at exactly P2_INCIDENCE_DEG; the
-# measured five-decimal agreement is itself the evidence.
+# to 80deg incidence from the horizontal pane's normal. Kept because the OLD
+# defect this probe caught (eta flipped on the exit face -> spurious TIR -> 0.0)
+# would now read the same as the correct answer; the probe's value today is that
+# grazing incidence does not somehow LEAK (a reading above the ceiling), and it
+# preserves the geometry should pass-through ever be reinstated behind a flag.
 const P2_INCIDENCE_DEG := 80.0
-const P2_RATIO_MIN := 0.365
-const P2_RATIO_MAX := 0.385
 
-# PROBE 3. TWO stacked panes at normal incidence = FOUR crossings, so the ratio
-# is 0.96^4 = 0.849346. This is the crossing COUNTER: the band is tight enough
-# that a miscount reads as a failure.
-#   3 crossings -> 0.96^3 = 0.884736  (above P3_RATIO_MAX)
-#   4 crossings -> 0.96^4 = 0.849346  (inside)
-#   5 crossings -> 0.96^5 = 0.815373  (below P3_RATIO_MIN)
-# That is what makes the loop's traversal order falsifiable. With
-# gl_RayFlagsTerminateOnFirstHitEXT still on pass B's ray query, the query commits
-# whichever hit the BVH reaches first rather than the nearest, the t_min march can
-# step past intervening crossings, and the product is taken over too few panes --
-# which shows up here as a ratio drifting up toward 0.885 or 0.92 and out of band.
-# Probe 1 cannot see that at all: with one pane, both the right answer (0.9216)
-# and the under-counted one (0.96) sit inside [0.85, 1.00].
-const P3_RATIO_MIN := 0.82
-const P3_RATIO_MAX := 0.88
-
-# PROBE 4. The TRANSMISSION-FACTOR probe. Probes 1-3 all render glass with
-# transmission = 1.0, which makes `mat.transmission` an invisible multiply-by-one:
-# deleting it from the shader's accumulation outright, leaving
-# `atten *= (1.0 - F)`, satisfies all three of them to the last digit. So without
-# this probe half of the accumulation expression is unmeasured.
-#
-# One pane at normal incidence, exactly probe 1's layout, but transmission = 0.5:
-#   per crossing  = 0.5 * (1 - 0.04) = 0.5 * 0.96 = 0.48
-#   two crossings = 0.48^2           = 0.2304
-# The band is +/- 0.01 around that. Probe 1's own reading, 0.921600, is the answer
-# a shader that ignores mat.transmission would produce here -- more than 30 band
-# widths away.
+# PROBE 4. transmission = 0.5: half glass, half diffuse. Both halves block a
+# shadow ray in Cycles (only a Transparent closure passes), so 0.0 here too.
 const P4_TRANSMISSION := 0.5
-const P4_RATIO_MIN := 0.2204
-const P4_RATIO_MAX := 0.2404
 
 # PROBE 5. The BLEND-ALPHA pass-through probe -- this is the term Task 4 adds
 # and none of probes 1-4 can see it: they all use transparency = DISABLED
@@ -193,55 +140,47 @@ func _ready() -> void:
 ## alone.
 func _probe1_interior_lit() -> void:
 	var ratio := await _measure_ratio(0.0)
-	print("  ratio through pane = %.6f (band %.2f - %.2f)"
-			% [ratio, P1_RATIO_MIN, P1_RATIO_MAX])
+	print("  ratio through pane = %.6f (Cycles rule: 0.0, ceiling %.3f; pre-Gap-#22 read 0.9216)"
+			% [ratio, DIELECTRIC_BLOCK_MAX])
 	_checks += 1
-	if ratio < P1_RATIO_MIN or ratio > P1_RATIO_MAX:
-		_failures.append("probe1 interior lit: ratio %.6f outside [%.2f, %.2f]"
-				% [ratio, P1_RATIO_MIN, P1_RATIO_MAX])
+	if ratio > DIELECTRIC_BLOCK_MAX:
+		_failures.append(("probe1 dielectric blocks: ratio %.6f above %.3f -- a shadow ray is "
+				+ "passing a refractive pane. Cycles blocks it (Gap #22); near 0.9216 the old "
+				+ "transmission*(1-F) pass-through is back in pass B")
+				% [ratio, DIELECTRIC_BLOCK_MAX])
 
 
 func _probe2_grazing_darkens() -> void:
 	var ratio := await _measure_ratio(P2_INCIDENCE_DEG)
-	print("  incidence = %.1fdeg, ratio = %.6f (band %.3f - %.3f, theory 0.374905)"
-			% [P2_INCIDENCE_DEG, ratio, P2_RATIO_MIN, P2_RATIO_MAX])
+	print("  incidence = %.1fdeg, ratio = %.6f (Cycles rule: 0.0, ceiling %.3f; pre-Gap-#22 read 0.374905)"
+			% [P2_INCIDENCE_DEG, ratio, DIELECTRIC_BLOCK_MAX])
 	_checks += 1
-	if ratio < P2_RATIO_MIN:
-		# The failure that a bare ceiling let through: 0.0 is "below 0.80".
-		_failures.append(("probe2 grazing: ratio %.6f is BELOW %.3f -- the glass went "
-				+ "darker than exact Fresnel allows. At exactly 0.0 the likely cause is "
-				+ "a spurious total-internal-reflection branch (eta flipped to 1/ior on "
-				+ "the exit face while the ray still carries the external angle). Near "
-				+ "0.3482 the cause is Schlick's approximation replacing the exact "
-				+ "dielectric Fresnel")
-				% [ratio, P2_RATIO_MIN])
-	elif ratio > P2_RATIO_MAX:
-		_failures.append(("probe2 grazing: ratio %.6f is ABOVE %.3f -- Fresnel is not "
-				+ "reaching the accumulation, or a flat factor is being applied")
-				% [ratio, P2_RATIO_MAX])
+	if ratio > DIELECTRIC_BLOCK_MAX:
+		_failures.append(("probe2 grazing: ratio %.6f above %.3f -- a shadow ray is passing a "
+				+ "refractive pane at grazing incidence")
+				% [ratio, DIELECTRIC_BLOCK_MAX])
 
 
-## The crossing counter. Two panes at normal incidence must attenuate as the
-## SQUARE of one pane: 0.9216^2 = 0.849346. Probe 1 alone cannot tell one
-## crossing from two, so without this probe the loop's traversal order is
-## unmeasured -- see P3_RATIO_MIN's note.
+## Two panes stacked. Under the pass-through design this was the crossing
+## counter (0.9216^2 = 0.849346); under Cycles' rule the first crossing already
+## blocks, so it reads 0.0 like probe 1. Kept so the stacked geometry stays
+## measured (a leak that only appears past the first pane would show here).
 func _probe3_two_panes() -> void:
 	var ratio := await _measure_ratio(0.0, true)
-	print("  ratio through two panes = %.6f (band %.2f - %.2f, theory 0.849346)"
-			% [ratio, P3_RATIO_MIN, P3_RATIO_MAX])
+	print("  ratio through two panes = %.6f (Cycles rule: 0.0, ceiling %.3f; pre-Gap-#22 read 0.849346)"
+			% [ratio, DIELECTRIC_BLOCK_MAX])
 	_checks += 1
-	if ratio < P3_RATIO_MIN or ratio > P3_RATIO_MAX:
-		_failures.append(("probe3 two panes: ratio %.6f outside [%.2f, %.2f] -- four "
-				+ "crossings must give 0.96^4 = 0.849346. Above the band means "
-				+ "crossings were SKIPPED (3 would read 0.884736), below means extra "
-				+ "crossings were counted (5 would read 0.815373)")
-				% [ratio, P3_RATIO_MIN, P3_RATIO_MAX])
+	if ratio > DIELECTRIC_BLOCK_MAX:
+		_failures.append(("probe3 two panes: ratio %.6f above %.3f -- a shadow ray is passing "
+				+ "two stacked refractive panes")
+				% [ratio, DIELECTRIC_BLOCK_MAX])
 
 
-## The transmission-factor probe. Probes 1-3 all use transmission = 1.0, so
-## mat.transmission multiplies by one in every one of them and the shader could
-## drop it entirely without moving any of their readings. Halving it must halve
-## each crossing: (0.5 * 0.96)^2 = 0.2304 instead of 0.9216.
+## The transmission-factor probe. Under the pass-through design halving
+## transmission halved each crossing ((0.5 * 0.96)^2 = 0.2304); under Cycles'
+## rule a half-glass, half-diffuse pane blocks entirely (neither share is a
+## Transparent closure), so it reads 0.0. Kept so a partial-transmission
+## material cannot re-acquire a pass-through by a different code path.
 ##
 ## Geometry is probe 1's exactly -- ONE pane at y = 1, normal incidence -- so both
 ## constraints are inherited unchanged rather than re-derived from scratch:
@@ -257,18 +196,13 @@ func _probe3_two_panes() -> void:
 ## disturb either one.
 func _probe4_partial_transmission() -> void:
 	var ratio := await _measure_ratio(0.0, false, P4_TRANSMISSION)
-	print("  transmission = %.2f, ratio = %.6f (band %.4f - %.4f, theory 0.230400)"
-			% [P4_TRANSMISSION, ratio, P4_RATIO_MIN, P4_RATIO_MAX])
+	print("  transmission = %.2f, ratio = %.6f (Cycles rule: 0.0, ceiling %.3f; pre-Gap-#22 read 0.230400)"
+			% [P4_TRANSMISSION, ratio, DIELECTRIC_BLOCK_MAX])
 	_checks += 1
-	if ratio < P4_RATIO_MIN or ratio > P4_RATIO_MAX:
-		_failures.append(("probe4 partial transmission: ratio %.6f outside "
-				+ "[%.4f, %.4f] -- with transmission = %.2f each of the two crossings "
-				+ "must pass %.2f * 0.96 = %.2f, so the pair must read "
-				+ "%.2f^2 = 0.230400. A ratio near 0.9216 means the mat.transmission "
-				+ "factor is being IGNORED and only the Fresnel term (1 - F) is "
-				+ "reaching the accumulation")
-				% [ratio, P4_RATIO_MIN, P4_RATIO_MAX, P4_TRANSMISSION,
-				P4_TRANSMISSION, P4_TRANSMISSION * 0.96, P4_TRANSMISSION * 0.96])
+	if ratio > DIELECTRIC_BLOCK_MAX:
+		_failures.append(("probe4 partial transmission: ratio %.6f above %.3f -- a shadow ray "
+				+ "is passing a transmission-%.2f pane; both its glass and its diffuse share block in Cycles")
+				% [ratio, DIELECTRIC_BLOCK_MAX, P4_TRANSMISSION])
 
 
 ## The blend-alpha probe. Same single-pane, normal-incidence geometry as

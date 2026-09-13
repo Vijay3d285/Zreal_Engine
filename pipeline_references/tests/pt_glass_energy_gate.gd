@@ -36,10 +36,12 @@ extends "res://tests/pt_validation.gd"
 ## (raytracing_lights_inc.glsl, pass B): a shadow ray passes a glass interface
 ## straight through at transmission*(1-F), so under a uniform world the sky is
 ## collected once by that shadow ray and once by the refracted BSDF path.
-## Cycles blocks shadow rays at refractive glass. Filed as roadmap Gap #22;
-## the sphere's bar below is wide enough to admit that known excess and no
-## wider, and probe 2's quad -- one interface, no second surface for a shadow
-## ray to pass -- is the tight assertion on the compensation itself.
+## Cycles blocks shadow rays at refractive glass. Filed as roadmap Gap #22 and
+## CLOSED 2026-09-13 by adopting Cycles' rule in pass B: with NEE on the sphere
+## now reads 0.99211 / 0.96440 / 0.97451 -- the NEE-off values above to four
+## decimals, within 1.7% of Cycles everywhere -- and the bar below is tightened
+## accordingly. Probe 2's quad -- one interface, no second surface for a shadow
+## ray to pass -- remains the tight assertion on the compensation itself.
 
 const SKY_RADIANCE := 1.0
 const FRAMES := 256
@@ -55,10 +57,13 @@ const ROUGHNESS := [0.0, 0.3, 0.6, 0.9]
 # half the energy gone at roughness 0.9, and OVER at 0.3 where the fitted
 # reflection-only approximation was doing the wrong job.
 const CYCLES_REF := [1.00000000, 0.97555717, 0.96399465, 0.98448974]
-# 10%, not 5%: see the header. The pre-Gap-#20 engine fails this at -12.3% and
-# -49.6%; the fixed engine reads +4.2% / +7.8% / +8.1%, of which all but ~1%
-# is Gap #22's NEE excess. Tighten this only after Gap #22 lands.
-const BAR := 0.10
+# 3% since Gap #22 landed (2026-09-13). History: the pre-Gap-#20 engine failed
+# at -12.3% and -49.6%; after Gap #20 the sphere read +4.2% / +7.8% / +8.1%
+# against Cycles, of which all but ~1% was Gap #22's shadow-ray double count
+# and the bar sat at 10% to admit it. With shadow rays blocked at glass the
+# readings are +1.70% / +0.04% / -1.01%; 3% holds them with margin and fails
+# on any return of the pass-through (which alone adds +2.4..+8.6%).
+const BAR := 0.03
 
 # PROBE 2: ONE interface, no bounces. A huge transmissive quad (a QuadMesh has a
 # single surface, so the refracted ray hits nothing and sees the white world)

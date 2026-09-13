@@ -123,7 +123,7 @@ Ranked by impact on offline still quality.
 | 27 | **Sky radiance map was a point downsample of the panorama — CLOSED 2026-09-13**, with a residual filed. `PanoramaSkyMaterial` sampled with `filter_linear` (mip 0 only) while the sky pass renders it once per radiance-map texel: 8:1 point downsample at the gate's 2048→256 and at production's 8192→1024. `pt_sky_energy_gate` probe C swung 9.34% between radiance 256 and 2048 on a 1-row band (HIGH at 256 — aliasing, not loss; the gate's FAIL text said "losing energy" regardless of sign). Fix: `filter_linear_mipmap` — swing 0.56%. **Production effect: 0.00%** on replay192 and 217 (a hazy HDRI has no sub-texel energy; the sun is a DirectionalLight) — correct, gate-closing, not a look difference. **Residual (open):** probe B reads 1.5–2.2% low at *every* size and band width on a peaked sky, not on a uniform one — env-NEE/MIS weighting vs the CDF; gate tolerance for B set to 3% with the numbers recorded so it can still newly fail. See §11.21. | `scene/resources/3d/sky_material.cpp` (panorama shader filter), `pt_sky_energy_gate.gd` | Cycles samples the source image at the ray direction, never a downsampled map | Medium (residual: Low) |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
-| 22 | **Environment NEE double-counts the sky through glass** — a shadow ray crosses a transmissive interface straight through at `transmission·(1−F)` (the transparent-shadow design, `raytracing_lights_inc.glsl` pass B), so under a uniform world the sky reached by that shadow ray is ALSO reached by the refracted BSDF path, and the two MIS strategies do not estimate the same integrand. Measured on the white glass furnace as the NEE-on/NEE-off ratio: **+2.4% / +7.3% / +8.6%** at roughness 0.3 / 0.6 / 0.9, identical on the pre-Gap-#20 path (state 2) and the fixed one — pre-existing, and only visible once Gap #20 lifted the total near 1.0. Cycles blocks shadow rays at refractive glass and gets interior lighting from caustic paths (and opt-in Shadow Caustics). **A design decision, not a one-line fix**: blocking the shadow ray restores energy conservation but darkens everything inside glass under NEE-only lighting. Found and quantified in §11.14. | `raytracing_lights_inc.glsl` (`lights_trace_shadow_ray` pass B), env-NEE site in `raytracing_closest_hit_common_inc.glsl`, `pt_glass_energy_gate.gd` (sphere arms carry the excess inside a 10% bar) | `intern/cycles/kernel/integrator/shadow_*.h` (no glass pass-through); `bsdf_microfacet.h` | Medium |
+| 22 | **CLOSED 2026-09-13 (decision A).** Shadow rays now follow Cycles' rule (`surface_shader_transparency()`): a BLEND material's (1−alpha) Transparent share passes, and the dielectric share — any refractive pane, any transmission factor — **blocks**. Pass B's `transmission·(1−F)` pass-through double-counted the sky with the refracted BSDF path (+2.4/+7.3/+8.6% at r0.3/0.6/0.9). With it gone the white glass furnace reads **0.99211 / 0.96440 / 0.97451** with NEE on — the recorded NEE-off values to four decimals, within 1.7% of Cycles — and `pt_glass_energy_gate`'s bar drops 10% → 3%. `pt_transparent_shadow_gate` probes 1–4 read 0.0 (glass casts a solid shadow, as in Blender); probe 5 (alpha share, 0.25) unchanged. Light inside glass now arrives only via refracted bounces; a delta lamp cannot light it — Cycles' behaviour (its opt-in Shadow Caustics is out of scope). Production: BLEND glass is the alpha share in both engines; job 217 has zero traced-dielectric materials. See §11.22. | `raytracing_lights_inc.glsl` (pass B), `pt_transparent_shadow_gate.gd`, `pt_glass_energy_gate.gd` | `intern/cycles/kernel/integrator/surface_shader.h:1053` | Medium |
 | 21 | **CLOSED 2026-09-11.** An isotropic dielectric base rendered ~1.9% dark against Cycles; now **−0.008%**. Cause (a), the base Fresnel, §11.11; cause (b), the layering withdrawal, §11.12 — its first attempt over-withdrew because it omitted `preserve_energy`'s `darkening`, which the second attempt predicted offline and confirmed. Diagnosis in §11.10. — the un-sheened control arm of §7.11's velvet comparison (metallic 0, roughness 0.60, base linear (0.12, 0.02, 0.03), uniform world) reads **0.08786226 against Cycles 5.2.1's 0.08953342, −1.867%**. **Re-measured 2026-09-11 with Gap #17 and Gap #19 both fixed**, which moved it only from −2.062% to −1.867% — so neither explains it, confirming §7.11.2's conclusion that the residual is the *base*, not the sheen. The sheen layer's own contribution, isolated by subtracting each engine's control, agrees to **+0.300%** at sheen roughness 0.50. Inside §8.6's 5% bar, so not a ship blocker, but it is the largest confirmed unexplained parity gap left. **Decomposed: the diffuse lobe is exact (+0.009%); 83% of the deficit is the specular lobe (−3.99%) and 17% is the layering withdrawal (+14.7% too much).** Two causes, both the same shape — E2d gave the *coat* the Cycles-faithful version and the *base* was left on the approximation: (a) our base specular uses Schlick `(1−cos)^5` where Cycles' Principled uses the **exact dielectric Fresnel remapped onto F0..F90** (`bsdf_microfacet.h:299-306`, commented "Used by Principled BSDF"), and (b) our layering withdraws `1−F(L·H)` where Cycles withdraws `1−albedo(specular)` via `closure_layering_weight`. Guarded by probe F in `pt_sheen_gate.gd`, which now carries the decomposition arms. | `brdf_inc.glsl` (`evalFresnelSchlick` at the base specular; the `COMBINE_BRDFS_WITH_FRESNEL` layering), `pipeline_references/tests/pt_sheen_gate.gd` probe F | `intern/cycles/kernel/closure/bsdf_microfacet.h:299-306`, `intern/cycles/kernel/closure/bsdf_util.h:440-444` | Medium |
 
 **Not gaps — verified correct, leave alone:**
@@ -6310,3 +6310,50 @@ replay192 and urbantestdark217 at FHD, production route, before vs after:
 window / walls / floor / whole frame all **±0.00%** (mean |diff| 0.03 and
 0.17 of 255). The fix is right and the gate is green; it does not move the
 production look, and should not be counted as progress on the Blender gap.
+
+
+---
+
+## 11.22 Gap #22 closed — shadow rays block refractive glass, as Cycles does
+
+**2026-09-13, decision A.** The transparent-shadow design of 2026-09-05 let a
+shadow ray cross a refractive interface at `transmission·(1−F)` so that
+things inside or behind glass stayed lit under NEE. Cycles never does this:
+`surface_shader_transparency()` returns a Transparent BSDF's extinction and
+zero for everything else, so refractive glass blocks a shadow ray outright
+and light reaches the inside of glass only through refracted bounce paths
+(never from a delta lamp) — the familiar solid shadow under a Cycles glass
+object. Our pass-through and the refracted BSDF path both collected the sky,
+with attenuations that disagree (smooth Fresnel vs the rough lobe's real
+transmittance), which is the +2.4/+7.3/+8.6% excess of §11.14.
+
+### Change
+
+Pass B's per-crossing factor is now the Transparent share alone,
+`atten *= pass_through`, with the Fresnel evaluation removed. A non-blend
+transmissive crossing zeroes the attenuation and the march returns a full
+occluder. The Environment transmission toggle no longer enters pass B.
+
+### Gates, re-derived rather than re-fitted
+
+| gate | probe | before (pass-through) | after (Cycles rule) |
+|---|---|---|---|
+| glass furnace, NEE on | r0.3 / 0.6 / 0.9 vs Cycles | +4.2% / +7.8% / +8.1% (bar 10%) | **+1.70% / +0.04% / −1.01%** (bar 3%) |
+| transparent shadow | dielectric pane, normal | 0.9216 | **0.000000** |
+| | dielectric pane, 80° | 0.374905 | 0.000000 |
+| | two panes | 0.849346 | 0.000000 |
+| | transmission 0.5 | 0.2304 | 0.000000 |
+| | BLEND alpha 0.5, two crossings | 0.25 | 0.250000 (unchanged) |
+| thin layer | T4a / T4b (converted glass over an emitter) | 0.991734 | 0.991734 (unchanged) |
+
+Probe 5 is what keeps the shadow gate two-sided under one-sided ceilings on
+probes 1–4: "glass blocks everything, alpha included" fails it at 0.0.
+
+### Suite and assets
+
+All 14 gates green — including `pt_sky_energy_gate`, green since Gap #27
+the same day, so **the whole suite is green for the first time since E2a**.
+Doctest 1558/1558. replay192 and urbantestdark217 at FHD, production route:
+−0.01% and −0.10% whole-frame (mean |diff| 0.06 and 0.19 of 255) — as
+predicted, BLEND glass is the alpha share in both engines and job 217 has no
+traced-dielectric material for the rule to bite on.

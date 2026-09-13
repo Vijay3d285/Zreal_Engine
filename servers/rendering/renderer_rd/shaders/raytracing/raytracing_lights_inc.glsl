@@ -278,14 +278,16 @@ float rt_max_component(vec3 v) {
 /// and miss are invoked; TerminateOnFirstHit exits on the first confirmed
 /// opaque hit.
 ///
-/// PASS B then walks the transmissive instances that pass A deliberately no
-/// longer sees and multiplies their Fresnel-weighted transmittance together.
-/// The two halves are one unit: narrowing pass A without pass B culls glass
-/// out of the shadow test entirely (glass casts no shadow), and pass B without
-/// the narrowing double-counts every pane -- pass A occludes on it AND pass B
-/// attenuates through it. For the same reason pass B must keep running when the
-/// Environment transmission toggle is OFF: the TLAS mask is a material property,
-/// so pass A still cannot see the pane, and only pass B is left to occlude it.
+/// PASS B then walks the transmissive-masked instances that pass A deliberately
+/// no longer sees. Since Gap #22 (2026-09-13) it applies Cycles' rule: a BLEND
+/// material's (1 - alpha) Transparent share passes the ray, and every other
+/// crossing -- the dielectric share, a non-blend refractive pane -- blocks it
+/// outright. The two halves are one unit: narrowing pass A without pass B culls
+/// glass out of the shadow test entirely (glass casts no shadow), and pass B
+/// without the narrowing double-counts every pane. Pass B must keep running
+/// whatever the Environment transmission toggle says: the TLAS mask is a
+/// material property, so pass A still cannot see the pane, and only pass B is
+/// left to occlude it.
 vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 #ifdef USE_SER
 	hitObjectEXT hitObject;
@@ -358,9 +360,10 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 	// as fully opaque (raytracing_closest_hit_common_inc.glsl:1468,
 	// `transmissivness = RT_GET_TRANSMISSION_ENABLED() ? m.transmission : 0.0`).
 	//
-	// The toggle is honoured in the accumulation below instead: with it OFF the
-	// first transmissive crossing drives atten to zero and the epsilon early-out
-	// returns vec3(0.0) -- a FULL occluder, which is what the BSDF is drawing.
+	// Since Gap #22 (2026-09-13) the toggle plays no part in the accumulation
+	// either: a non-blend transmissive crossing drives atten to zero whether the
+	// toggle is on or off -- a FULL occluder, Cycles' rule for refractive glass.
+	// Only a BLEND material's (1 - alpha) Transparent share passes.
 	if (!RT_GET_TRANSMISSIVE_GEOMETRY()) {
 		return vec3(1.0);
 	}
@@ -418,77 +421,42 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 		get_triangle_indices_ex(geom, prim_id, i0, i1, i2);
 		vec3 bary = vec3(1.0 - cb.x - cb.y, cb.x, cb.y);
 
-		// gl_ObjectToWorldEXT does NOT exist inside a ray query -- every use of it
-		// in this codebase is in a hit shader. This is the ray-query form.
-		mat3 m3 = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true));
-		mat3 nrm_mat = mat3(normalize(m3[0]), normalize(m3[1]), normalize(m3[2]));
-		vec3 N = normalize(nrm_mat * fetch_tbn(geom, i0, i1, i2, bary).normal);
-
-		// CORRECTED 2026-09-06 BY MEASUREMENT. Do NOT flip eta on the back face.
-		// An earlier revision of this code mirrored the BSDF's flip at
-		// raytracing_closest_hit_common_inc.glsl:1504. That is wrong here: the BSDF
-		// flips because it REFRACTS the ray and evaluates the exit interface at the
-		// INTERNAL angle (41 deg for an 80 deg external ray). Pass B deliberately
-		// does not bend the ray (the no-caustics decision), so at the back face it
-		// still holds the EXTERNAL angle. fresnel_dielectric's TIR test is
-		// eta^2 - sin^2(theta) <= 0; eta = 1/ior against an external 80 deg gives
-		// -0.525, reported as total internal reflection: F = 1.0, attenuation zero,
-		// glass black at grazing angles. Measured: probe 2 read 0.000000 where
-		// theory says 0.3749.
+		// GAP #22 (2026-09-13): THE DIELECTRIC SHARE BLOCKS THE SHADOW RAY.
+		// This is Cycles' rule (surface_shader_transparency(): a shadow ray passes
+		// a Transparent BSDF's extinction and nothing else). Until today pass B
+		// let the ray through a refractive interface at transmission*(1-F),
+		// which double-counted the sky with the refracted BSDF path -- the two
+		// MIS strategies did not estimate the same integrand, because the
+		// pass-through used smooth Fresnel while the lobe transmits with the
+		// rough microfacet transmittance. Measured on the white glass furnace
+		// as +2.4% / +7.3% / +8.6% at roughness 0.3 / 0.6 / 0.9 (roadmap
+		// 11.14, 11.22). Light behind glass now arrives the way it does in
+		// Cycles: through refracted bounce paths (BSDF sampling, MIS weight 1
+		// for a near-delta lobe), never through a shadow ray -- so a delta lamp
+		// cannot light the inside of a glass object, and glass casts a solid
+		// shadow for its dielectric share. Only the Transparent-BSDF share of a
+		// BLEND material, (1 - alpha), passes -- identical to Cycles' mix.
 		//
-		// Using ior at BOTH crossings is EXACT, not an approximation: by Fresnel
-		// reciprocity R(theta_internal, 1/n) == R(theta_external, n), so the unbent
-		// two-crossing product (1-F)^2 IS the thin-slab transmittance -- 0.9216 at
-		// normal incidence, 0.3749 at 80 deg for ior 1.5.
+		// A non-blend transmissive instance therefore zeroes atten at its first
+		// crossing and the epsilon early-out below returns vec3(0.0): a full
+		// occluder, exactly what pass A does for opaque geometry. Pass A cannot
+		// do the job itself -- its RT_INSTANCE_MASK_OPAQUE cull never sees a
+		// transmissive instance -- which is why pass B still runs for them.
+		// RT_GET_TRANSMISSION_ENABLED() no longer enters here: on or off, the
+		// dielectric share blocks, which is also what the BSDF draws with it off.
 		//
-		// The flip is harmless at normal incidence (both forms give F = 0.04), which
-		// is why probe 1 read a perfect 0.9216 while probe 2 read zero. A
-		// normal-incidence probe alone cannot catch this.
-		//
-		// No ior > 0 guard is needed now that the reciprocal is gone: ior == 0.0 is
-		// legal glTF and passing it through unchanged makes fresnel_dielectric take
-		// its TIR branch and return exactly 1.0 -- a fully reflective pane, the same
-		// answer resolveDielectricF0 gives for ior == 0.
-		float eta = mat.ior;
-		float cos_t;
-		float F = fresnel_dielectric(dot(direction, N), eta, cos_t);
-
-		// The Environment toggle is applied HERE, not at the early return above.
-		// RT_GET_TRANSMISSION_ENABLED() is a specialization constant, so in a build
-		// with transmission disabled this whole expression folds to the constant 0.0:
-		// the first committed crossing sets atten to zero, rt_max_component(atten)
-		// is 0.0 < RT_SHADOW_ATTEN_EPSILON, and the ray returns vec3(0.0) -- a full
-		// occluder. That matches what the BSDF draws with the toggle off
-		// (raytracing_closest_hit_common_inc.glsl:1468 forces transmissivness to 0.0),
-		// so the pane blocks exactly the light it visibly absorbs. Pass A cannot do
-		// this job instead: its RT_INSTANCE_MASK_OPAQUE cull never sees a transmissive
-		// instance, and that mask is derived from the material, not from the toggle.
-		// A surface passes light two ways: the Transparent BSDF share (1 - m_alpha)
-		// goes straight through unfiltered, and the remaining m_alpha share is
-		// filtered by the dielectric closure (mat.transmission * (1 - F)), exactly
-		// as raytracing_material_eval_inc.glsl mixes the two BSDFs for BLEND
-		// materials. pass_through is zeroed for non-BLEND materials -- an
+		// The (1 - m_alpha) share is taken ONLY for BLEND materials: an
 		// alpha-scissor material's base-colour alpha can sit below 1.0 while the
-		// texel is meant to be fully solid, same reason the closure itself branches
-		// on RT_MAT_FLAG_BLEND rather than on alpha directly (raytracing_material_eval_inc.glsl:22).
-		//
-		// Fetch m_alpha with ray_query_alpha_test's exact pattern (this file,
-		// above): sample the albedo texture's alpha at this hit's UV and modulate
-		// by mat.albedo_color.a. i0/i1/i2 and bary are already available from the
-		// get_triangle_indices_ex() / barycentric computation above.
+		// texel is meant to be fully solid, same reason the closure itself
+		// branches on RT_MAT_FLAG_BLEND rather than on alpha directly
+		// (raytracing_material_eval_inc.glsl:22). Fetch m_alpha with
+		// ray_query_alpha_test's exact pattern (this file, above).
 		vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 		uv = uv * mat.uv1_scale + mat.uv1_offset;
 		float m_alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
 		m_alpha *= mat.albedo_color.a;
-
-		float surface_share = RT_GET_TRANSMISSION_ENABLED() ? (mat.transmission * (1.0 - F)) : 0.0;
-		// The (1 - m_alpha) pass-through share is taken ONLY for BLEND materials.
-		// pass_through == 0 for everything else makes the next line reduce to
-		// EXACTLY the pre-task `atten *= surface_share`, for any alpha that
-		// material happens to carry -- this is what keeps the four alpha==1.0
-		// probes from moving.
 		float pass_through = ((mat.flags & RT_MAT_FLAG_BLEND) != 0u) ? (1.0 - m_alpha) : 0.0;
-		atten *= pass_through + (1.0 - pass_through) * surface_share;
+		atten *= pass_through;
 		if (rt_max_component(atten) < RT_SHADOW_ATTEN_EPSILON) {
 			return vec3(0.0);
 		}
