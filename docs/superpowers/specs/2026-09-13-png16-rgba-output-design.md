@@ -99,3 +99,20 @@ render `replay192_fishtank` at FHD twice: flag off, flag on.
 `pipeline_references/render.gd` only — the user's file; edited in the
 reference copy, left uncommitted, carried to the live project by the user.
 The spec and plan are committed.
+
+## Result (2026-09-13)
+
+`replay192_fishtank` at FHD, engine build at `bin/` (HEAD), same scratch
+project with only `PNG16_WRITE_ALPHA` flipped:
+
+| | flag off | flag on |
+|---|---|---|
+| IHDR | 16-bit, colortype 2 (RGB) | 16-bit, colortype 6 (RGBA) |
+| file size | 12,462,849 | 16,616,261 |
+| IDAT / raw scanlines | — | 1.0001 (stored, level 0) |
+| alpha | — | one distinct value, 65535 |
+| RGB samples differing, on vs off | **0 of 6,220,800** | |
+
+Job log line: `[Render] Wrote 16-bit RGBA PNG (zlib level 0, ...)`.
+At 4K the file will be 66,357,360 raw pixel bytes → ≈ 63.3 MiB, the same
+as `blender_dining.png`.
