@@ -2735,6 +2735,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		// keyed by material RID and shared across every surface using it; the two
 		// Phase 2 push sites OR this into a local copy instead of the cached struct.
 		bool mat_uses_blend;
+		// Gap #26: RT_MAT_FLAG_ANYHIT_SKIP_ONLY for this surface, same reasoning.
+		bool anyhit_skip_only;
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -2888,6 +2890,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				uint32_t inst_flags = 0;
+				bool mat_anyhit_skip_only = false; // Gap #26
 				if (mm_surf->shader) {
 					switch (mm_surf->shader->rt_cull_mode()) {
 						case RSE::CULL_MODE_DISABLED:
@@ -2913,9 +2916,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				} else {
 					bool is_alpha = mm_surf->shader &&
 							(mm_surf->shader->uses_alpha_clip || mm_surf->shader->uses_blend_alpha || mm_surf->shader->uses_alpha);
-					if (!is_alpha) {
+					// Gap #26: see the mesh site.
+					const bool mm_anyhit_skip_only = !is_alpha &&
+							(mat_data->feature_bits & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) != 0;
+					if (!is_alpha && !mm_anyhit_skip_only) {
 						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 					}
+					mat_anyhit_skip_only = mm_anyhit_skip_only;
 				}
 				bool mat_uses_blend = mm_surf->shader && mm_surf->shader->rt_uses_alpha_blending();
 
@@ -2933,6 +2940,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
 				pending.mat_uses_blend = mat_uses_blend;
+				pending.anyhit_skip_only = mat_anyhit_skip_only;
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -3058,10 +3066,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// surf->shader is per-surface, mat_data is the process_material() cache
 			// shared across every surface using this material RID, so OR the bit
 			// into a local copy here rather than mutating the cached struct.
+			// Gap #26: a transmissive material with no alpha usage runs any-hit
+			// for the self-skip guard only.
+			const bool surf_uses_any_alpha = surf->shader && (surf->shader->uses_alpha_clip || surf->shader->uses_blend_alpha || surf->shader->uses_alpha);
+			const bool surf_transmissive = (mat_data->feature_bits & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) != 0;
+			const bool surf_anyhit_skip_only = surf_transmissive && !surf_uses_any_alpha && mat_data->rt_sbt_offset == 0;
 			{
 				RT_MaterialData push_mat_data = mat_data->data;
 				if (surf->shader && surf->shader->rt_uses_alpha_blending()) {
 					push_mat_data.flags |= RT_MAT_FLAG_BLEND;
+				}
+				if (surf_anyhit_skip_only) {
+					push_mat_data.flags |= RT_MAT_FLAG_ANYHIT_SKIP_ONLY;
 				}
 				material_data.push_back(push_mat_data);
 			}
@@ -3093,9 +3109,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
 			} else {
-				// Standard material: FORCE_OPAQUE if no alpha usage.
-				bool is_alpha = surf->shader && (surf->shader->uses_alpha_clip || surf->shader->uses_blend_alpha || surf->shader->uses_alpha);
-				if (!is_alpha) {
+				// Standard material: FORCE_OPAQUE if no alpha usage -- unless it
+				// is transmissive, which needs any-hit for the Gap #26 skip.
+				if (!surf_uses_any_alpha && !surf_anyhit_skip_only) {
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
 			}
@@ -3150,6 +3166,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				if (pending.mat_uses_blend) {
 					push_mat_data.flags |= RT_MAT_FLAG_BLEND;
 				}
+				if (pending.anyhit_skip_only) {
+					push_mat_data.flags |= RT_MAT_FLAG_ANYHIT_SKIP_ONLY;
+				}
 				material_data.push_back(push_mat_data);
 			}
 			motion_indices.push_back(-1);
@@ -3195,6 +3214,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			RT_MaterialData push_mat_data = pending.mat_data->data;
 			if (pending.mat_uses_blend) {
 				push_mat_data.flags |= RT_MAT_FLAG_BLEND;
+			}
+			if (pending.anyhit_skip_only) {
+				push_mat_data.flags |= RT_MAT_FLAG_ANYHIT_SKIP_ONLY;
 			}
 
 			for (uint32_t mi = 0; mi < pending.mm_count; mi++) {
@@ -3738,7 +3760,11 @@ uint32_t RenderRaytracing::gather_emissive_instances(LocalVector<RendererRD::Emi
 		// This is not an exotic case: it is C1's archetypal content -- a neon sign,
 		// an LED strip card, a monitor bezel authored as a textured quad -- where
 		// the cut-out can be most of the surface.
-		if ((instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) == 0) {
+		// Gap #26: an instance that runs any-hit only for the self-skip guard
+		// (RT_MAT_FLAG_ANYHIT_SKIP_ONLY) has no alpha cut-outs; it is an opaque
+		// emitter for NEE purposes exactly as before.
+		if ((instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) == 0 &&
+				(material_data[i].flags & RT_MAT_FLAG_ANYHIT_SKIP_ONLY) == 0) {
 			continue;
 		}
 

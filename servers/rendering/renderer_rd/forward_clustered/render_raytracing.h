@@ -224,6 +224,13 @@ enum {
 	// scissor threshold but below 1.0, so an alpha-value test would silently turn
 	// every cutout translucent. MIRRORED IN raytracing_data_inc.glsl.
 	RT_MAT_FLAG_BLEND = 8u,
+	// Bit 4 (Gap #26): the instance runs the any-hit stage ONLY so the
+	// self-skip guard can refuse the triangle a through-event just crossed. Set
+	// on transmissive (converted-glass) materials that use no alpha at all. The
+	// any-hit must not apply its alpha test to these, and the emissive-light
+	// gather must keep treating them as opaque emitters. MIRRORED IN
+	// raytracing_data_inc.glsl.
+	RT_MAT_FLAG_ANYHIT_SKIP_ONLY = 16u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

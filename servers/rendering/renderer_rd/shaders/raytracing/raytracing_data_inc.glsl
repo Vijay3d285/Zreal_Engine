@@ -121,6 +121,7 @@ struct InstanceMotionData {
 // MATERIAL DATA (matches C++ layout, 192 bytes)
 // ============================================================================
 #define RT_MAT_FLAG_BLEND 8u // Bit 3. MIRRORS RT_MAT_FLAG_BLEND in render_raytracing.h.
+#define RT_MAT_FLAG_ANYHIT_SKIP_ONLY 16u // Bit 4. MIRRORS render_raytracing.h (Gap #26).
 
 struct MaterialData {
 	uint albedo_texture_idx;

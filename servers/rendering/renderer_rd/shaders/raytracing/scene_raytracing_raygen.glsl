@@ -721,6 +721,13 @@ void main() {
 	uint geometry_idx = gl_InstanceCustomIndexEXT;
 	GeometryData geom = geometries[geometry_idx];
 
+	// Gap #26: this instance runs any-hit only for the guard above. No alpha
+	// test -- its albedo alpha is meaningless (opaque material) and testing it
+	// could cut holes that the raster path never had.
+	if ((materials[geometry_idx].flags & RT_MAT_FLAG_ANYHIT_SKIP_ONLY) != 0u) {
+		return;
+	}
+
 	uint i0, i1, i2;
 	get_triangle_indices(geom, i0, i1, i2);
 	vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
