@@ -390,7 +390,11 @@ func render_image(data, output_path):
 	# SPP lives in image_glb_creation.gd (PT_SPP_DAY / PT_SPP_NIGHT, overridable
 	# with ZR_PT_SPP) and was 20 — twenty times what this route's own "raw 1-SPP
 	# noisy input" design called for.
-	const DLSS_RR_REALTIME_STILL_FRAMES = 128
+	# 256 since 2026-09-12: PT_SPP_DAY/NIGHT were halved (image_glb_creation.gd,
+	# roadmap Gap #25 -- the 8 s GPU watchdog) and the frame count doubled so the
+	# total samples per pixel are exactly what they were. Per the note above,
+	# more frames of fewer samples is the direction DLSS-RR prefers anyway.
+	const DLSS_RR_REALTIME_STILL_FRAMES = 256
 	# Number of warmup frames to feed DLSS-RR after convergence so its temporal history
 	# locks onto the converged image (reset=true frame 1, reset=false after). Cheap — each
 	# warmup frame re-blends the same converged image, letting the reconstructor settle.

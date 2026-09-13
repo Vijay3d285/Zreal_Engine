@@ -1,5 +1,11 @@
 extends Node3D
 
+# Every surface of every light fixture, flushed to
+# godot_project/logs/video_emission_scan.txt during scene build. The video
+# path writes no Godot log file, so this is the only diagnostic that
+# survives a stopped render.
+var _emission_scan_lines = []
+
 # video_glb_creation.gd
 # Scene builder for VIDEO rendering.
 # Mirrors image_glb_creation.gd logic but handles the VIDEO JSON format:
@@ -929,11 +935,16 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	# pass touches. Same key names, same clamp, same application points.
 	var _auto_ambient_boost: float = 1.0
 	var _auto_sun_multiplier: float = 1.0
+	# Whole-image exposure trim from the same automation pass. Read here,
+	# applied last in this function so it scales the final value.
+	var _auto_exposure_scale: float = 1.0
 	if typeof(data) == TYPE_DICTIONARY:
 		if data.has("_automationAmbientBoost"):
 			_auto_ambient_boost = clampf(float(data["_automationAmbientBoost"]), 0.5, 2.5)
 		if data.has("_automationSunMultiplier"):
 			_auto_sun_multiplier = clampf(float(data["_automationSunMultiplier"]), 0.5, 2.5)
+		if data.has("_tonemapExposureScale"):
+			_auto_exposure_scale = clampf(float(data["_tonemapExposureScale"]), 0.6, 1.6)
 		if _auto_ambient_boost != 1.0 or _auto_sun_multiplier != 1.0:
 			print("[AUTO-LIGHTING] ambientBoost=%.2f, sunMultiplier=%.2f" % [_auto_ambient_boost, _auto_sun_multiplier])
 
@@ -1172,7 +1183,20 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 			print("[AUTO-LIGHTING] exposure compensation: base 1.5 × %.2f = %.2f" % [_expo_factor, env.tonemap_exposure])
 		# ambient_light_energy=6.0: sky dome energy sampled from all directions
 		# to fill dark corners and shadowed walls without casting shadows.
-		env.ambient_light_energy = 10.0 * _auto_ambient_boost
+		# illuminationLevel scales the day ambient, as in image_glb_creation.gd.
+		# Without this the LLM could lower illuminationLevel all it liked and the
+		# day render never moved - the level reached the night path only.
+		#
+		#   level 5 -> x1.00 (10.0)   level 3 -> x0.60 (6.0)
+		#   level 4 -> x0.80 (8.0)    level 2 -> x0.40 (4.0)
+		#                             level 1 -> x0.35 (3.5)
+		#
+		# Floored at 0.35: the ambient still has to reach into corners the sun
+		# cannot, and zero fill is a different broken render.
+		var _illum_ambient_factor = clampf(_lighting_illumination_scale / 0.5, 0.35, 1.0)
+		env.ambient_light_energy = 10.0 * _auto_ambient_boost * _illum_ambient_factor
+		print("[Lighting] Day ambient: 10.0 x boost %.2f x illumination %.2f = %.2f" % [
+				_auto_ambient_boost, _illum_ambient_factor, env.ambient_light_energy])
 		env.ambient_light_color = Color(1.0, 1.0, 1.0) # Color(1.0, 0.835, 0.50) # warm golden sky
 		# Printed from the live values, never hardcoded — the image builder's equivalent
 		# line claimed "exposure=1.0" while the constant said 1.5, which sent a brightness
@@ -1194,6 +1218,21 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 			env.tonemap_exposure *= 1.08
 	else:
 		env.tonemap_white = lighting["tonemap_white"]
+
+	# Global exposure trim, applied LAST so it scales whatever the mood,
+	# profile and AGX terms above arrived at.
+	#
+	# Written by the colour pass as _tonemapExposureScale. Exposure is the
+	# right control for a whole-image brightness difference: when a render
+	# is uniformly too bright - ceiling, walls and floor all off by the
+	# same factor - that uniformity is what identifies it as exposure
+	# rather than lighting. Fixing it here rather than by re-deflating the
+	# per-light energies keeps those tuned where they were measured.
+	if _auto_exposure_scale < 0.999 or _auto_exposure_scale > 1.001:
+		var _expo_before = env.tonemap_exposure
+		env.tonemap_exposure *= _auto_exposure_scale
+		print("[AUTO-LIGHTING] exposure trim: %.3f x %.3f = %.3f" % [
+				_expo_before, _auto_exposure_scale, env.tonemap_exposure])
 
 	# ── SDFGI ─────────────────────────────────────────────────────────────────
 	# DAY: SDFGI ON at artifact-safe low settings.
@@ -2766,14 +2805,14 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 
 		var outer_mat: StandardMaterial3D
 		if outer_mat_data != null:
-			outer_mat = create_material(outer_mat_data)
+			outer_mat = create_material(outer_mat_data, "wall")
 		else:
 			outer_mat = StandardMaterial3D.new()
 			outer_mat.albedo_color = Color(0.82, 0.82, 0.82)
 
 		var inner_mat_for_wall: StandardMaterial3D
 		if inner_mat_data != null:
-			inner_mat_for_wall = create_material(inner_mat_data)
+			inner_mat_for_wall = create_material(inner_mat_data, "wall")
 		else:
 			inner_mat_for_wall = StandardMaterial3D.new()
 			inner_mat_for_wall.albedo_color = Color(0.82, 0.82, 0.82)
@@ -2822,7 +2861,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 				inner_box.polygon = poly_pts
 				inner_box.depth = face_t
 				inner_box.position = Vector3(0, 0, face_t / 2.0)
-				var inner_mat = create_material(inner_mat_data)
+				var inner_mat = create_material(inner_mat_data, "wall")
 				inner_mat = _apply_architecture_texture_scale(
 					inner_mat,
 					inner_mat_data,
@@ -2848,7 +2887,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 				outer_box.polygon = poly_pts
 				outer_box.depth = face_t
 				outer_box.position = Vector3(0, 0, face_t / 2.0)
-				var outer_panel_mat = create_material(outer_mat_data)
+				var outer_panel_mat = create_material(outer_mat_data, "wall")
 				outer_panel_mat = _apply_architecture_texture_scale(
 					outer_panel_mat,
 					outer_mat_data,
@@ -3209,7 +3248,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					poly.depth = shape_depth
 					
 					if shape.has("material") and not is_opening:
-						var smat = create_material(shape["material"])
+						var smat = create_material(shape["material"], "wall")
 						smat = _apply_architecture_texture_scale(smat, shape["material"], shape_poly_span)
 						poly.material = smat
 					else:
@@ -3324,7 +3363,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			
 			var floor_span = _get_polygon_world_span(polygon)
 			if area.has("material") and typeof(area["material"]) == TYPE_DICTIONARY:
-				var f_mat = create_material(area["material"])
+				var f_mat = create_material(area["material"], "floor")
 				f_mat = _apply_architecture_texture_scale(f_mat, area["material"], floor_span)
 				floor_poly.material = f_mat
 			else:
@@ -3390,7 +3429,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			var floor_span = _get_polygon_world_span(polygon)
 
 			if area.has("floor_properties") and typeof(area["floor_properties"]) == TYPE_DICTIONARY and area["floor_properties"].has("material"):
-				var f_mat = create_material(area["floor_properties"]["material"])
+				var f_mat = create_material(area["floor_properties"]["material"], "floor")
 				f_mat = _apply_architecture_texture_scale(
 					f_mat,
 					area["floor_properties"]["material"],
@@ -3464,7 +3503,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					# Sit 5 mm above floor base (avoids z-fighting with paving)
 					s_poly.position.y = layer_altitude + 0.005 + 0.001 * shape_idx
 					if shape.has("material"):
-						var smat = create_material(shape["material"])
+						var smat = create_material(shape["material"], "floor")
 						var span = Vector2(max_x - min_x, max_y - min_y)
 						smat = _apply_architecture_texture_scale(smat, shape["material"], span)
 						s_poly.material = smat
@@ -3522,7 +3561,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			var ceil_span = _get_polygon_world_span(polygon)
 
 			if area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY and area["ceiling_properties"].has("material"):
-				var c_mat = create_material(area["ceiling_properties"]["material"])
+				var c_mat = create_material(area["ceiling_properties"]["material"], "ceiling")
 				c_mat = _apply_architecture_texture_scale(
 					c_mat,
 					area["ceiling_properties"]["material"],
@@ -3609,7 +3648,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					# Top of the shape anchors to bottom of the ceiling, dropping down by shape_depth
 					s_poly.position.y = (layer_altitude + ceil_height - ceil_depth) - shape_depth - 0.001 * shape_idx
 					if shape.has("material"):
-						var smat = create_material(shape["material"])
+						var smat = create_material(shape["material"], "ceiling")
 						var span = Vector2(max_x - min_x, max_y - min_y)
 						smat = _apply_architecture_texture_scale(smat, shape["material"], span)
 						s_poly.material = smat
@@ -3865,6 +3904,44 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 	if not day_render:
 		final_emission_energy *= 1.5 * mood_emission_scale
 
+	# ── Which surface in this fixture is the REAL emitter ────────────
+	#
+	# Ported from image_glb_creation.gd. See
+	# the-emitter-discriminator-was-backwards.md.
+	#
+	# Three of these fixtures light TWO surfaces each - Tripod
+	# 'plastic'+'metal', Bell 'metal.005'+'plastic.002', Modern tall
+	# 'plastic'+'metal.010' - because both carry emission=(1,1,1). Only
+	# one of the two is the lamp.
+	#
+	# The discriminator is the authored emissive TEXTURE, read the way
+	# round the scan actually supports:
+	#
+	#   plain (NO texture) + white emission  ->  the shade. Black albedo
+	#       with white emission is the ordinary way to author a surface
+	#       that reflects nothing and only glows.
+	#   textured                             ->  trim. The emissive
+	#       texture is mostly BLACK; it is a MASK whose job is to keep
+	#       the metal band from glowing.
+	#
+	# Fixtures that were always fine ('material', 'emission_light')
+	# carry no texture at all, so this pre-pass finds nothing textured
+	# and they are left exactly as they were.
+	var fixture_has_plain_emitter = false
+	var fixture_has_textured_emitter = false
+	for pm in meshes:
+		if not pm.mesh:
+			continue
+		for pi in range(pm.mesh.get_surface_count()):
+			var pmat = pm.get_active_material(pi)
+			if pmat == null:
+				pmat = pm.mesh.surface_get_material(pi)
+			if pmat and pmat is BaseMaterial3D:
+				if pmat.emission_texture != null:
+					fixture_has_textured_emitter = true
+				elif pmat.emission_enabled or pmat.emission != Color(0, 0, 0):
+					fixture_has_plain_emitter = true
+
 	for m in meshes:
 		if not m.mesh:
 			continue
@@ -3886,6 +3963,10 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 				# (glass/plastic/fabric) or an albedo-luminance fallback: they light the whole
 				# fixture, flattening it into one blob so per-fixture intensity becomes invisible.
 				var is_emissive_surface = mat.emission_enabled
+				# True when the ONLY reason this surface is treated as an emitter is a
+				# name match. Those are usually opaque outer shades, so the day tint
+				# below leaves their albedo alone rather than forcing them white.
+				var keyword_only = false
 				if not is_emissive_surface and mat.emission != Color(0, 0, 0):
 					is_emissive_surface = true
 				if not is_emissive_surface:
@@ -3893,12 +3974,70 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 					for kw in strict_keywords:
 						if kw in mat_name or kw in surface_name:
 							is_emissive_surface = true
+							keyword_only = true
 							break
+
+				# Full surface scan, printed AND kept for the file written at the
+				# end of this function. Every surface of every fixture, with the
+				# properties the emitter decision is made from.
+				var scan_line = "[EmissionScan] '%s' surface='%s' mat='%s' emission_enabled=%s emission=%s emission_texture=%s albedo=%s albedo_lum=%.3f metallic=%.2f roughness=%.2f transparency=%s CHOSEN=%s keyword_only=%s" % [
+					node.name, surface_name, mat_name,
+					mat.emission_enabled, mat.emission, mat.emission_texture,
+					mat.albedo_color, mat.albedo_color.get_luminance(),
+					mat.metallic, mat.roughness, mat.transparency,
+					is_emissive_surface, keyword_only]
+				print(scan_line)
+				_emission_scan_lines.append(scan_line)
 
 				if not is_emissive_surface:
 					continue
 
+				# ── Trim and bodywork are left alone entirely ─────────────
+				#
+				# When a fixture has BOTH kinds of emissive surface, the plain
+				# one is the lamp and the textured one is the metal band, the
+				# collar, the trim. Skip the textured one: authored material,
+				# authored emissive mask, no emission. Metal remains metal.
+				#
+				# A fixture whose ONLY emissive surface is a textured one still
+				# takes the path below, because skipping it would leave that
+				# fixture with no light source at all.
+				if mat.emission_texture != null and fixture_has_plain_emitter:
+					print("[Emission] Trim surface left as authored (no emission, mask kept): surface='%s' mat='%s' metallic=%.2f albedo_lum=%.3f" % [surface_name, mat_name, mat.metallic, mat.albedo_color.get_luminance()])
+					continue
+
 				var new_mat = mat.duplicate()
+
+				# ── Make the surface behave like an emitter ───────────────
+				#
+				# Everything reaching here is a real light source. The surface
+				# scan settled what that has to mean for these GLBs:
+				#
+				#   lit   'emission_light' / 'material':
+				#         transparency=0  metallic=0.00  roughness=0.50
+				#   dark  'metal' / 'metal.005' / 'metal.010':
+				#         transparency=4  metallic=1.00  roughness=1.00
+				#
+				# transparency=4 is TRANSPARENCY_ALPHA_DEPTH_PRE_PASS - those
+				# shades are alpha-blended, which is the real reason the bell
+				# lamp read as see-through. metallic=1.0 is the other half: a
+				# conductor has no diffuse response and a lampshade is not a
+				# conductor. Both are exporter defaults, not authored intent -
+				# note 'wood' and 'marble.001' carry the same pair.
+				#
+				# Only surfaces already decided to be light sources are touched.
+				var had_emission_texture = new_mat.emission_texture != null
+				new_mat.emission_texture = null
+				new_mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+				new_mat.metallic = 0.0
+				new_mat.roughness = 0.5
+
+				# A pure-black albedo is not a material description, it is a
+				# missing one, and it renders an emitter as a black object with a
+				# glow stuck to it. The working emitters all sit at 0.906. This
+				# applies in day renders too, unlike the < 0.2 lift below.
+				if new_mat.albedo_color.get_luminance() < 0.05:
+					new_mat.albedo_color = Color(0.9063, 0.9063, 0.9063)
 				# Emissive fixtures (bulbs/shades) are often authored near-black (artists rely on
 				# glow alone). Force a soft white albedo so they don't render as black holes when
 				# emission is off/faint. Metal frames are excluded by keyword match.
@@ -3938,18 +4077,62 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 							hardcoded_mood_color = light_color # Fallback to passed color
 					
 					if day_render:
-						# Day render: pure white so emission_energy_multiplier alone drives
-						# per-fixture brightness (mirrors staging engine and image_glb_creation.gd).
-						new_mat.emission = Color(1.0, 1.0, 1.0)
+						# Day render: the shade is tinted by the fixture's own colour
+						# temperature, NORMALISED so its brightest channel is 1.0.
+						#
+						# This was a flat Color(1,1,1) on the stated grounds that
+						# emission_energy_multiplier alone should drive per-fixture
+						# brightness. Normalising to a peak of 1.0 preserves exactly
+						# that: the tint carries hue but no energy.
+						if keyword_only:
+							# A surface matched on its NAME alone is usually the opaque
+							# outer shade. Forcing that to pure white destroys its
+							# shading and silhouette and it reads as see-through.
+							new_mat.emission = new_mat.albedo_color
+						else:
+							# Normalised to a peak of 1.0, then DESATURATED toward white.
+							# At full saturation 3200K is (1.00, 0.72, 0.48), which on a
+							# lampshade reads as orange plastic rather than warm light.
+							# Mixing 55% of the way to white gives (1.00, 0.85, 0.72) -
+							# clearly warm, clearly a lamp, still part of the same room.
+							var tint_peak = max(light_color.r, max(light_color.g, light_color.b))
+							if tint_peak > 0.001:
+								var tint_mix = 0.55
+								new_mat.emission = Color(
+										lerp(1.0, light_color.r / tint_peak, tint_mix),
+										lerp(1.0, light_color.g / tint_peak, tint_mix),
+										lerp(1.0, light_color.b / tint_peak, tint_mix))
+							else:
+								new_mat.emission = Color(1.0, 1.0, 1.0)
 					else:
 						if mat.emission_enabled and mat.emission != Color(0, 0, 0):
 							new_mat.emission = mat.emission
 						else:
 							new_mat.emission = hardcoded_mood_color
 					new_mat.emission_energy_multiplier = final_emission_energy
-					print("[Emission] Applied: surface='%s' mat='%s' multiplier=%s day=%s" % [surface_name, mat_name, final_emission_energy, day_render])
+					var applied_line = "[Emission] Applied: '%s' surface='%s' mat='%s' multiplier=%s plain_emitter=%s cleared_emission_texture=%s keyword_only=%s day=%s" % [node.name, surface_name, mat_name, final_emission_energy, not had_emission_texture, had_emission_texture, keyword_only, day_render]
+					print(applied_line)
+					_emission_scan_lines.append(applied_line)
 				m.set_surface_override_material(i, new_mat)
 				applied = true
+	# ── Emission scan written to disk ─────────────────────────────────
+	#
+	# The video path in main.py writes NO Godot log file (only the image
+	# path does, at godot_logs/<job>_godot.log), so stopping a video
+	# render part-way through destroys every [Emission] line printed to
+	# stdout - which is exactly when a fixture most needs diagnosing.
+	#
+	# Emission is applied during scene build, long before the path tracer
+	# starts, so this file is complete within seconds of launch. Stop the
+	# render whenever you like; the scan survives.
+	var scan_text = ""
+	for scan_entry in _emission_scan_lines:
+		scan_text += str(scan_entry) + "\n"
+	var scan_file = FileAccess.open("res://logs/video_emission_scan.txt", FileAccess.WRITE)
+	if scan_file:
+		scan_file.store_string(scan_text)
+		scan_file.close()
+
 	return applied
 
 func _node_has_emissive_material(node: Node3D) -> bool:
@@ -4176,11 +4359,37 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 	# Night render OR a day render with night-lights toggled ON enter the lit path.
 	if not day_render or _night_light_on:
 		if day_render and _night_light_on and has_light_meta:
-			# Scenario A — day + night-lights-on + per-fixture slider. Honor the slider,
-			# dampened 0.35 so fixtures don't fight the sun. (Video has no Kelvin→RGB path.)
+			# Scenario A - day + night-lights-on + per-fixture slider, driven by the
+			# LLM emission pass (zlendo_llm/automation/emission_agent.py) which writes
+			# light_meta.intensity and light_meta.temperature per fixture.
+			#
+			# These constants are the ones measured in the image engine and MUST stay
+			# identical to it. They were 0.35 and max(0.5, intensity * 2.0) here.
+			#
+			# light_energy 0.35 -> 0.15: this is the analytic pool under each lamp,
+			# and it controls ROOM illumination only. Six fixtures at 0.35 add about
+			# 2.0 of energy concentrated around the lamps, against a sun of ~6.0 -
+			# which reads as heavy and uneven rather than as a uniform lift.
+			#
+			# emission 2.0 -> 0.7 with a clamp: 2.0 is a NIGHT-scale value. The
+			# non-meta day branch below uses 0.6 and its own comment says why - at
+			# day exposure 2.0 renders as a blown-out white blob. Worse, once every
+			# shade clips to flat white the per-fixture intensities the LLM pass
+			# carefully differentiated become invisible: a 0.6 lamp and a 1.2 lamp
+			# look identical when both are saturated. The 0.36 floor keeps a dim
+			# fixture clear of 0.30, which is this function's "switched off" value;
+			# the 1.10 ceiling stops one outlier reintroducing the blow-out.
 			var base_intensity = float(light_meta.get("intensity", light_energy))
-			light_energy = base_intensity * 0.35
-			emission_energy = max(0.5, base_intensity * 2.0)
+			light_energy = base_intensity * 0.15
+			emission_energy = clamp(base_intensity * 0.7, 0.36, 1.10)
+			# Colour temperature. light_meta.temperature was computed by the LLM pass
+			# and then discarded here - the video engine had no Kelvin path at all, so
+			# every fixture emitted the same warm_color no matter what Kelvin it was
+			# given, and the half of the pass that unifies a room spanning 2000-7500K
+			# down to a single value did nothing to a video render.
+			var meta_kelvin = float(light_meta.get("temperature", 0.0))
+			if meta_kelvin > 1000.0:
+				light_color = _kelvin_to_rgb(meta_kelvin)
 			skip_normalization = true # honor the manual slider exactly (no sqrt(N) dimming)
 			print("[Diagnostics] Daytime META light: item '%s' intensity=%s -> light_energy=%s emission=%s" % [item.get("name", "?"), base_intensity, light_energy, emission_energy])
 		else:
@@ -4189,7 +4398,10 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 			light_energy = _lighting_illumination_scale * (illuminationLevel / 5.0) * 2.2
 			if mounting_type == "ceiling_mount":
 				light_range = 8.5
-			emission_energy *= _lighting_illumination_scale * (illuminationLevel / 5.0)
+			# Divisor 6.0 and the 2.2 gain match image_glb_creation.gd exactly. A
+			# still and a walkthrough of the same room get compared side by side,
+			# so the two builders must read illuminationLevel the same way.
+			emission_energy *= _lighting_illumination_scale * (illuminationLevel / 6.0) * 2.2
 			# Scenario B — day render, night-lights ON, but no slider: dampen generically.
 			if day_render and _night_light_on:
 				light_energy *= 0.35
@@ -4793,7 +5005,7 @@ func _get_all_meshes(node: Node) -> Array:
 # applies them to Godot materials so floors and walls look realistic and react 
 # correctly to light.
 # ==============================================================================
-func create_material(mat_data):
+func create_material(mat_data, surface_type: String = "item"):
 	var mat = StandardMaterial3D.new()
 	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	mat.roughness = mat_data.get("roughness", 0.65)
@@ -4813,6 +5025,35 @@ func create_material(mat_data):
 			has_explicit_color = true
 		else:
 			print("[VideoGLB] Warning: Invalid color string: ", c_str)
+	# ── Physical albedo ceiling for architecture ──────────────────────────
+	#
+	# Ported from image_glb_creation.gd (albedo-1.0-was-amplifying-the-room).
+	#
+	# A surface cannot reflect all the light that hits it. The default a few
+	# lines above is 0.82 - a sane value for white paint - but it is only a
+	# FALLBACK: when the editor supplies a colour it is used verbatim, and
+	# the editor default for walls, ceilings and floors is "#ffffff", which
+	# is albedo 1.00.
+	#
+	# Indirect light compounds as the sum of albedo^bounce, so over 8
+	# bounces 0.85 gives 5.1x while 1.00 gives 9.0x - at 1.00 nothing in
+	# the room ever absorbs light, and the room amplifies the SUN by that
+	# same factor. That is the washed-out, corner-less render, and it is
+	# almost unaffected by dimming the lamps.
+	#
+	# Scaling preserves hue and alpha; only magnitude is capped. Applied
+	# only to architecture, and only when the colour is explicit - a
+	# texture carries its own colour and uses white here as a neutral
+	# tint, which must not be darkened.
+	var architectural_max_albedo = 0.85
+	if has_explicit_color and (surface_type == "wall" or surface_type == "ceiling" or surface_type == "floor"):
+		var base_lum = base_color.get_luminance()
+		if base_lum > architectural_max_albedo:
+			var k = architectural_max_albedo / base_lum
+			print("[Albedo] %s surface at %.3f exceeds the physical ceiling; scaled to %.3f" % [
+					surface_type, base_lum, architectural_max_albedo])
+			base_color = Color(base_color.r * k, base_color.g * k, base_color.b * k, base_color.a)
+
 	mat.albedo_color = base_color
 
 	var map_url = ""
@@ -5852,7 +6093,7 @@ func _build_paving_overlay(
 		tile_mat = StandardMaterial3D.new()
 		tile_mat.albedo_color = Color(0.85, 0.82, 0.78)
 	else:
-		tile_mat = create_material(material_data)
+		tile_mat = create_material(material_data, "floor")
 		# Apply texture scale so texture fills individual tiles (not the whole room)
 		var per_tile_span = Vector2(tile_w, tile_h)
 		tile_mat = _apply_architecture_texture_scale(tile_mat, material_data, per_tile_span)

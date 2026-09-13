@@ -1,4 +1,4 @@
-extends Node3D
+﻿extends Node3D
 const MOImage = preload("res://mo_image.gd")
 # image_glb_creation.gd
 # Handles the construction of the scene: Architecture (Walls, Floors, Ceilings) and Asset Loading.
@@ -10,6 +10,10 @@ var _tracked_assets = []
 var _window_sunlight_data = [] # Collected during hole building, used to place window sunlights
 var _door_hole_data = [] # Collected during hole building, used for subtle door fill lights
 var _exterior_assets = [] # Tracks trees/plants/etc for shadow optimization
+# Surface scan lines for the light fixtures, flushed to
+# godot_project/logs/emission_scan.txt during scene build. See
+# _apply_light_fixture_emission().
+var _emission_scan_lines = []
 var _dir_light: DirectionalLight3D = null
 var _directional_light_authoring_locked: bool = false
 var _interior_shadow_clusters := {}
@@ -138,9 +142,11 @@ const GLB_CONVERTED_WATER_IOR = 1.2
 # 0.2 * (teal metal) + 0.8 * straight-through; the closure now does the same,
 # which is the "blue reflection in the water" the reference render shows.
 #
-# Glass is deliberately NOT included. Its white base colour means the
-# conversion is lossless for it, and it is what produced the clear panes that
-# replaced the earlier milky-veil look.
+# Glass now keeps its alpha too -- see _glb_alpha_kind_keeps_alpha() for the
+# measurement. The "lossless" argument was wrong: a white 10% mirror is not the
+# same surface as sub-1% Fresnel on clear IOR-1.2 glass, and the earlier "clear
+# panes" verdict was made against side panels that an engine bug had turned
+# into mirrors (roadmap Gap #24).
 const GLB_WATER_KEEPS_ALPHA = true
 # Repair the asset's metallic channel on water. DIVERGES FROM BLENDER -- off by
 # default, and read this before turning it on.
@@ -207,8 +213,8 @@ const GLB_WATER_REPAIR_METALLIC = false
 # so the authored values are simply what renders. This gate exists only because
 # we substitute values at all, and it is scoped to never substitute them when
 # that would be visible.
-const GLB_CONVERT_MAX_TINT = 0.90   # min RGB channel must be at least this (1.0 = white)
-const GLB_CONVERT_MAX_ALPHA = 0.35  # effective coverage must be below this
+const GLB_CONVERT_MAX_TINT = 0.90 # min RGB channel must be at least this (1.0 = white)
+const GLB_CONVERT_MAX_ALPHA = 0.35 # effective coverage must be below this
 # Coarse grid used to read the authored texture. 16x16 = 256 taps regardless of
 # map size; these are 4096x4096, so reading every texel would be 16M taps per
 # material for a number two decimal places wide.
@@ -597,11 +603,20 @@ func setup_lighting(data, geom_data = {}):
 	# black out a 4K path-traced frame.
 	var _auto_ambient_boost: float = 1.0
 	var _auto_sun_multiplier: float = 1.0
+	# Global exposure trim from the pipeline. The field has been written into
+	# the scene JSON by pipeline.py, validated by validate.py and declared in
+	# schema.py for as long as those files have existed - and never read here,
+	# so the exposure critic's verdict was computed and discarded. This is the
+	# fourth value in this pipeline found written-but-unwired, after
+	# light_meta.temperature, light_energy and illuminationLevel.
+	var _auto_exposure_scale: float = 1.0
 	if typeof(data) == TYPE_DICTIONARY:
 		if data.has("_automationAmbientBoost"):
 			_auto_ambient_boost = clampf(float(data["_automationAmbientBoost"]), 0.5, 2.5)
 		if data.has("_automationSunMultiplier"):
 			_auto_sun_multiplier = clampf(float(data["_automationSunMultiplier"]), 0.5, 2.5)
+		if data.has("_tonemapExposureScale"):
+			_auto_exposure_scale = clampf(float(data["_tonemapExposureScale"]), 0.6, 1.6)
 		if _auto_ambient_boost != 1.0 or _auto_sun_multiplier != 1.0:
 			print("[AUTO-LIGHTING] ambientBoost=%.2f, sunMultiplier=%.2f" % [_auto_ambient_boost, _auto_sun_multiplier])
 
@@ -852,7 +867,39 @@ func setup_lighting(data, geom_data = {}):
 		# from ALL directions to fill dark corners and shadowed walls. Unlike an OmniLight
 		# it has no position, no shadow rays, and casts no shadows — it is purely an
 		# environment contribution integrated across the hemisphere at each surface point.
-		env.ambient_light_energy = 10.0 * _auto_ambient_boost
+		# illuminationLevel now reaches the day render.
+		#
+		# It did not before. The night branch below multiplies its ambient by
+		# _lighting_illumination_scale; this line did not, and the sun
+		# deliberately ignores the scale too (see the comment above
+		# dir_light.light_energy). So on a day render illuminationLevel
+		# controlled NOTHING - not the sun, not the ambient, and not
+		# light_meta fixtures, which take their values from the LLM. The
+		# colour pass has been carefully choosing 1 and 2 for a very bright
+		# room and being ignored.
+		#
+		# It also left day ambient pinned at 10.0 against a directional of
+		# 4.0 - a sky fill 2.5x stronger than the sun. Ambient here is
+		# integrated from every direction with no position and no shadows, so
+		# a lampshade and the wall behind it receive the SAME fill and end up
+		# at the same value. That is what makes a render read as a collage of
+		# flat shapes: not too much light, too much UNDIRECTED light.
+		#
+		# Normalised against level 5 (the default when the field is absent) so
+		# nothing gets brighter than it is today and scenes without the field
+		# are byte-for-byte unchanged:
+		#
+		#   level 5 -> x1.00 (10.0)   level 3 -> x0.60 (6.0)
+		#   level 4 -> x0.80 (8.0)    level 2 -> x0.40 (4.0)
+		#                             level 1 -> x0.35 (3.5)
+		#
+		# Floored at 0.35: the ambient still has to reach into corners the sun
+		# cannot, and zero fill is a different broken render.
+		var _illum_ambient_factor = clampf(_lighting_illumination_scale / 0.5, 0.35, 1.0)
+		env.ambient_light_energy = 10.0 * _auto_ambient_boost * _illum_ambient_factor
+		print("[Lighting] Day ambient: 10.0 x boost %.2f x illumination %.2f = %.2f (directional %.2f)" % [
+				_auto_ambient_boost, _illum_ambient_factor,
+				env.ambient_light_energy, dir_light.light_energy])
 		env.ambient_light_color = Color(1.0, 1.0, 1.0) # Color(1.0, 0.835, 0.50)
 		# Printed from the live values, never hardcoded — this line claimed "exposure=1.0"
 		# for as long as the constant above said 1.5/1.4, which sent brightness
@@ -874,6 +921,26 @@ func setup_lighting(data, geom_data = {}):
 			env.tonemap_exposure *= 1.08
 	else:
 		env.tonemap_white = lighting["tonemap_white"]
+
+	# Global exposure trim, applied LAST so it scales whatever the mood,
+	# profile and AGX terms above arrived at.
+	#
+	# Exposure is the right control for a whole-image brightness difference,
+	# and the block that sets the 1.3 base says so: "if this needs adjusting
+	# again, move it here rather than re-inflating the per-light energies
+	# that were tuned underneath it."
+	#
+	# Measured against the reference render, the current output was 1.22x
+	# brighter - and near-identically so on the ceiling (1.14), the walls
+	# (1.22-1.26) and the floor (1.25). That uniformity is what identifies it
+	# as an exposure difference rather than a lighting one: had it come from
+	# the fixtures, surfaces near a lamp would have diverged from the
+	# ceiling.
+	if _auto_exposure_scale < 0.999 or _auto_exposure_scale > 1.001:
+		var _expo_before = env.tonemap_exposure
+		env.tonemap_exposure *= _auto_exposure_scale
+		print("[AUTO-LIGHTING] exposure trim: %.3f x %.3f = %.3f" % [
+				_expo_before, _auto_exposure_scale, env.tonemap_exposure])
 
 
 	# ── SDFGI ─────────────────────────────────────────────────────────────────
@@ -1129,8 +1196,15 @@ func setup_lighting(data, geom_data = {}):
 	# with ZR_PT_SPP before settling: 4 and 2 are both worth trying, and each
 	# halving is close to a halving of trace time. Compare against a Phase B
 	# render of the same scene, by eye, before committing to a value.
-	const PT_SPP_DAY := 6
-	const PT_SPP_NIGHT := 4
+	# Halved 2026-09-12 (roadmap Gap #25), with DLSS_RR_REALTIME_STILL_FRAMES in
+	# render.gd doubled to 256 so the per-pixel budget is unchanged. Each drive
+	# frame is ONE GPU submission of spp samples over the whole frame; at 4K on
+	# a heavy scene that was ~8 s, and this machine's GPU watchdog (TdrDelay)
+	# is 8 s -- job 216 lost the device on three builds at different frames and
+	# rendered fine at 1080p. Half the samples per submission halves the time
+	# the watchdog sees. Stop-gap until the engine tiles its dispatch (Gap #25).
+	const PT_SPP_DAY := 3
+	const PT_SPP_NIGHT := 2
 
 	var spp := PT_SPP_DAY if day_render else PT_SPP_NIGHT
 	var spp_env := OS.get_environment("ZR_PT_SPP")
@@ -1439,8 +1513,22 @@ func _glb_alpha_kind_keeps_alpha(mat: BaseMaterial3D, kind: String) -> bool:
 	if kind == "water":
 		return GLB_WATER_KEEPS_ALPHA
 	if kind == "glass":
-		# Decided from the authored values, not the name. See GLB_CONVERT_MAX_TINT.
-		return not _glb_alpha_convert_is_lossless(mat)
+		# Glass keeps its authored material too (2026-09-13). The dielectric
+		# conversion was gated on _glb_alpha_convert_is_lossless(), and for these
+		# tanks it is not lossless: the artist authored a 10% white MIRROR over
+		# 90% pass-through (alpha 0.098, metallic 1, roughness 0.08), which is
+		# what Blender renders -- a faint sheen on every pane, visible edges and
+		# corner seams. The conversion replaced that with clear IOR-1.2 glass,
+		# which reflects under 1% at these angles: the panes vanished and the
+		# starfish read as glued to the wall. The mirror-like side panels that
+		# used to give the tank "presence" were an engine defect (roadmap Gap
+		# #24, total internal reflection on a thin wall), not the conversion
+		# working. Measured on replay192 against the Blender render: authored
+		# glass through the Transparent BSDF closure brings the edges and sheen
+		# back on every side; restoring lamp specular on top changed the tank by
+		# +3% and nothing visible. _glb_alpha_convert_is_lossless() is left in
+		# place for the report only.
+		return true
 	return false
 
 # What did the asset actually author on this pane? Returns the effective base
@@ -5076,6 +5164,43 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 	if not day_render:
 		final_emission_energy *= 1.5 * mood_emission_scale
 
+	# Which surface in this fixture is the REAL emitter.
+	#
+	# Three of the six fixtures in the reference scene light TWO surfaces at
+	# full energy each - Tripod 'plastic'+'metal', Bell 'metal.005'+
+	# 'plastic.002', Modern tall 'plastic'+'metal.010' - because both carry
+	# emission=(1,1,1). That is 9 emitting surfaces for 6 fixtures, it is
+	# roughly 40% more emissive energy than intended, and it lights the pole
+	# and socket as well as the shade: exactly the "light the whole fixture,
+	# flattening it into one blob" this function's emitter-detection comment
+	# warns about.
+	#
+	# The discriminator is the authored emissive TEXTURE. In every fixture
+	# that has one, it is on the surface the artist meant to glow: the three
+	# above put it on 'metal', 'metal.005' and 'metal.010'. The fixtures that
+	# already looked right ('light', 'emission_light') carry no texture at
+	# all, so this pre-pass finds nothing and they are left exactly as they
+	# were.
+	# A PLAIN emitter is an emissive surface with NO emission texture.
+	# It is the surface the artist authored to glow uniformly, and in
+	# these GLBs it is the shade: 'plastic', 'plastic.002', 'material',
+	# 'emission_light'. See the block in the loop below for why a
+	# TEXTURED emissive surface is the opposite of an emitter here.
+	var fixture_has_plain_emitter = false
+	var fixture_has_textured_emitter = false
+	for pm in meshes:
+		if not pm.mesh:
+			continue
+		for pi in range(pm.mesh.get_surface_count()):
+			var pmat = pm.get_active_material(pi)
+			if pmat == null:
+				pmat = pm.mesh.surface_get_material(pi)
+			if pmat and pmat is BaseMaterial3D:
+				if pmat.emission_texture != null:
+					fixture_has_textured_emitter = true
+				elif pmat.emission_enabled or pmat.emission != Color(0, 0, 0):
+					fixture_has_plain_emitter = true
+
 	for m in meshes:
 		if not m.mesh:
 			continue
@@ -5099,17 +5224,199 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 				var is_emissive_surface = mat.emission_enabled
 				if not is_emissive_surface and mat.emission != Color(0, 0, 0):
 					is_emissive_surface = true
+				# Whether this surface was identified by the GLB author or
+				# merely by its name. The distinction matters: "shade" and
+				# "lampshade" match the OPAQUE OUTER SHADE of a bell or drum
+				# lamp, which is not the emitter - the emitter is the bulb
+				# behind it. Treating that shade as a full-strength white
+				# emitter is what made the bell lamp lose its shading and
+				# render as transparent.
+				var keyword_only = false
 				if not is_emissive_surface:
 					var strict_keywords = ["bulb", "filament", "led", "emiss", "glow", "neon", "diffuser", "tube", "lampshade", "shade"]
 					for kw in strict_keywords:
 						if kw in mat_name or kw in surface_name:
 							is_emissive_surface = true
+							keyword_only = true
 							break
+
+				# ── Surface scan ──────────────────────────────────────────
+				# Every surface of every light fixture, chosen or not, with the
+				# properties the emitter decision is made from.
+				#
+				# This exists because the [Emission] lines alone cannot tell the
+				# two failure modes apart. When a fixture renders dark, its log
+				# shows emission applied to surfaces named 'plastic' and
+				# 'metal' - which is consistent with EITHER
+				#   (a) the emission landing on the pole and collar while the
+				#       real shade is a third material that matches nothing, or
+				#   (b) the shade genuinely being one of those two and simply
+				#       needing more energy.
+				# Those call for opposite fixes - widen detection, or narrow it -
+				# and nothing in the current output distinguishes them. A surface
+				# this scan reports as skipped, pale and rough is a fabric shade
+				# that should be emitting; one reported as chosen, dark and
+				# metallic is a pole that should not be.
+				var scan_line = "[EmissionScan] '%s' surface='%s' mat='%s' emission_enabled=%s emission=%s emission_texture=%s albedo=%s albedo_lum=%.3f albedo_texture=%s metallic=%.2f roughness=%.2f transparency=%s CHOSEN=%s keyword_only=%s" % [
+					node.name, surface_name, mat_name,
+					mat.emission_enabled, mat.emission, mat.emission_texture,
+					mat.albedo_color, mat.albedo_color.get_luminance(), mat.albedo_texture,
+					mat.metallic, mat.roughness, mat.transparency,
+					is_emissive_surface, keyword_only]
+				print(scan_line)
+				_emission_scan_lines.append(scan_line)
 
 				if not is_emissive_surface:
 					continue
 
+				# ── Trim and bodywork are left alone entirely ─────────────
+				#
+				# The discriminator used here was BACKWARDS, and the scan plus the
+				# render prove it. It assumed the surface carrying an authored
+				# emissive TEXTURE was the one the artist meant to glow, so that
+				# surface had its texture CLEARED and was promoted to a full white
+				# emitter. The result on the tripod and the bell lamp:
+				#
+				#   'plastic'    left alone  -> shade rendered PURE BLACK
+				#   'metal'      promoted    -> metal band rendered WHITE, glowing
+				#
+				# What the scan actually shows (emission_scan.txt):
+				#
+				#   plastic    emission (1,1,1)  texture NONE  albedo (0,0,0)  transp 0
+				#   metal      emission (1,1,1)  texture YES   albedo (1,1,1)  transp 4
+				#
+				# Black albedo with white emission and no texture is the ordinary
+				# way to author a light-emitting surface - the object reflects
+				# nothing and only glows. That is the shade.
+				#
+				# The textured one is the opposite. Its emissive texture is mostly
+				# BLACK (this is the same texture diagnosed in
+				# emission-texture-multiplied-emission-away.md, where it was
+				# multiplying emission away). A mostly-black emissive texture is a
+				# MASK, and its job is to keep that surface from glowing - it is
+				# the metal band, the trim, the collar, and in the original asset
+				# it barely emits at all. Clearing the mask and forcing white
+				# emission is precisely what turned it into a white light source.
+				#
+				# So: when a fixture has BOTH kinds, the plain one is the lamp and
+				# the textured one is bodywork. Skip the textured one entirely -
+				# authored material, authored emissive mask, no promotion. Metal
+				# remains metal.
+				#
+				# A fixture whose ONLY emissive surface is a textured one still
+				# takes the old path below (mask cleared, promoted), because
+				# skipping it would leave that fixture with no light source at all.
+				# A fixture with no textured surface ('material',
+				# 'emission_light') never reaches this branch.
+				if mat.emission_texture != null and fixture_has_plain_emitter:
+					var skip_line = "[Emission] Trim surface left as authored (no emission, mask kept): '%s' surface='%s' mat='%s' metallic=%.2f albedo_lum=%.3f" % [node.name, surface_name, mat_name, mat.metallic, mat.albedo_color.get_luminance()]
+					print(skip_line)
+					_emission_scan_lines.append(skip_line)
+					continue
+
 				var new_mat = mat.duplicate()
+
+				# ── Take full control of this material's emission ─────────
+				#
+				# In BaseMaterial3D the emission that actually reaches the
+				# renderer is `emission * emission_energy_multiplier`, MODULATED
+				# BY `emission_texture` when one is set. Godot's glTF importer
+				# populates emission_texture from the material's emissiveTexture
+				# - and it also sets emission_enabled because of it. So a
+				# material can be picked up here as an emitter, be assigned
+				# emission = white and a healthy multiplier, and still render
+				# black, because a mostly-black emissive texture multiplies the
+				# whole thing away.
+				#
+				# That is what has been happening. In the last render the three
+				# dark fixtures were the ones whose emissive materials carry
+				# generic DCC names ('plastic', 'metal', 'metal.005') - textured
+				# PBR materials - while every fixture that lit correctly used a
+				# purpose-built material named 'light' or 'emission_light'. The
+				# energies were not the difference: the side-table lamp rendered
+				# lit at 0.510 while the Modern tall Lamp rendered dark at
+				# 0.589. It also explains why those same fixtures DID glow when
+				# the multiplier was ~2.1 - enough energy to drag a nearly-black
+				# texture into view - and vanished at 0.5.
+				#
+				# Clearing the texture and forcing ADD is what the block below
+				# already assumes: its own comment says the point of a pure
+				# white emission is that "emission_energy_multiplier alone
+				# drives per-fixture brightness differences". A surviving
+				# emissive texture makes that false. No-op on any material that
+				# has no texture, which is every fixture currently working.
+				# emission_operator is deliberately NOT set here. It only has
+				# any effect when an emission_texture is present, and the line
+				# below has just removed it - so setting it is dead code that can
+				# only introduce risk. It already did: this block first shipped
+				# setting it to a BaseMaterial3D constant that does not exist in
+				# Godot 4 (the enum is spelled EMISSION_OP_*, not
+				# EMISSION_OPERATOR_*), and because a class constant resolves at
+				# PARSE time - unlike the property reads around it, which resolve
+				# at runtime - the entire script failed to load with "Could not
+				# resolve class". Nothing rendered at all.
+				# Plain `var`, not `:=`. new_mat comes from mat.duplicate() on an
+				# untyped variable, so it is a Variant, and asking GDScript to
+				# INFER a type from a Variant property access is resolved at parse
+				# time and can fail there - taking the whole script down rather
+				# than this one line. Nothing here needs a static type.
+				var had_emission_texture = new_mat.emission_texture != null
+				new_mat.emission_texture = null
+
+				# Everything reaching this point is a real light source: either the
+				# fixture's plain (untextured) emitter, or - for a fixture that has
+				# no plain emitter at all - its lone textured one. Trim and bodywork
+				# were skipped above and never arrive here, so the normalisation
+				# below is applied unconditionally again.
+				#
+				# The previous 'is_secondary_emitter' guard is gone. It keyed off the
+				# same backwards assumption as the old skip, and with the skip
+				# corrected it would have fired on exactly the wrong surface - the
+				# shade - leaving it black and unlit at 30% energy.
+
+				# ── Make the surface behave like an emitter ───────────────
+				#
+				# The surface scan settled this. Across six fixtures the split
+				# between the ones that light and the ones that render as grey
+				# props is exact:
+				#
+				#   lit   'emission_light' / 'light':
+				#         transparency=0  metallic=0.00  roughness=0.50
+				#   dark  'metal' / 'metal.005' / 'metal.010':
+				#         transparency=4  metallic=1.00  roughness=1.00
+				#
+				# transparency=4 is TRANSPARENCY_ALPHA_DEPTH_PRE_PASS: those
+				# three shades are alpha-blended materials. That is also the
+				# real explanation for the bell lamp "turning transparent" -
+				# the material was literally in an alpha mode, not washed out
+				# by over-emission as previously assumed.
+				#
+				# metallic=1.0 is the other half. A conductor has no diffuse
+				# response, and a lampshade is not a conductor - these are
+				# exporter defaults, not authored intent. Every surface that
+				# lights correctly is a rough dielectric.
+				#
+				# So a surface promoted to emitter is forced to the shape the
+				# working ones already have: opaque, non-metallic, half-rough.
+				# This changes only surfaces this function has already decided
+				# are light sources; nothing else in the fixture is touched.
+				var had_transparency = new_mat.transparency
+				new_mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+				new_mat.metallic = 0.0
+				new_mat.roughness = 0.5
+
+				# A black albedo emitter reads as a black object with a glow
+				# stuck to it. The three working emitters all sit at 0.906,
+				# while the 'plastic' surfaces of the failing fixtures are at
+				# 0.000. The night branch below already lifts near-black
+				# shades for exactly this reason; the day branch did not,
+				# because in daylight a shade's authored albedo is normally
+				# what makes it read as a physical object. That reasoning does
+				# not hold for an albedo of pure black, which is not a
+				# material description, it is a missing one.
+				if new_mat.albedo_color.get_luminance() < 0.05:
+					new_mat.albedo_color = Color(0.9063, 0.9063, 0.9063)
+
 				# Night only. A near-black shade albedo reads as a dark blob even while
 				# emitting, so it is lifted to neutral grey. In a day frame the shade is
 				# already lit by sun and sky, and its authored albedo is what makes the
@@ -5133,21 +5440,131 @@ func _apply_light_fixture_emission(node: Node3D, light_color: Color, emission_en
 					_:
 						hardcoded_mood_color = mood_color # Fallback to passed mood color
 				if day_render:
-					# Day render: pure white shade so emission_energy_multiplier alone drives
-					# per-fixture brightness differences (same approach as staging engine).
-					# Scaled-color approach was dropping low-intensity shades below the path
-					# tracer GI sampling threshold, making all fixtures look identical.
-					new_mat.emission = Color(1.0, 1.0, 1.0)
+					# Day render: the shade is tinted by the fixture's own colour
+					# temperature, NORMALISED so its brightest channel is 1.0.
+					#
+					# This used to be a flat Color(1,1,1). The reason given was
+					# that emission_energy_multiplier alone should drive
+					# per-fixture brightness, because a "scaled-color approach"
+					# dropped dim shades below the path tracer's GI sampling
+					# threshold and made every fixture look the same. That
+					# constraint is preserved here - normalising to a peak of 1.0
+					# means the tint carries hue but no energy, so brightness is
+					# still the multiplier's job alone.
+					#
+					# What it fixes: light_meta.temperature was reaching this
+					# function as `light_color` and being DISCARDED. Grep the
+					# function - before this change `light_color` appeared exactly
+					# once, in the signature. Every fixture emitted pure white no
+					# matter what Kelvin it was given, so the entire colour
+					# temperature half of the LLM pass - unifying a room spanning
+					# 2000-7500K down to a single 3200K - had no effect on a day
+					# render whatsoever.
+					if keyword_only:
+						# ...but only for surfaces the GLB author marked as
+						# emitters. A surface matched on its NAME alone is
+						# usually the opaque outer shade; forcing that to
+						# pure white destroys its shading and silhouette and
+						# it reads as see-through. Keeping its own albedo
+						# lets it read as a shade that is lit from inside.
+						new_mat.emission = new_mat.albedo_color
+					else:
+						# Normalised to a peak of 1.0, then DESATURATED toward white.
+						#
+						# At full saturation 3200K is (1.00, 0.72, 0.48) - which on a
+						# lampshade does not read as warm light, it reads as orange
+						# plastic, and against a ~6500K daylit room it looks like a
+						# different scene. A real 3200K lamp photographed in daylight
+						# looks pale warm-white, because a bright emitter desaturates
+						# as its channels approach the white point. Mixing 55% of the
+						# way to white reproduces that: 3200K becomes
+						# (1.00, 0.85, 0.72) - clearly warm, clearly a lamp, still
+						# part of the same room.
+						#
+						# Peak stays 1.0 either way, so brightness remains the
+						# multiplier's job alone.
+						var tint_peak = max(light_color.r, max(light_color.g, light_color.b))
+						if tint_peak > 0.001:
+							var tint_mix = 0.55
+							new_mat.emission = Color(
+									lerp(1.0, light_color.r / tint_peak, tint_mix),
+									lerp(1.0, light_color.g / tint_peak, tint_mix),
+									lerp(1.0, light_color.b / tint_peak, tint_mix))
+						else:
+							new_mat.emission = Color(1.0, 1.0, 1.0)
 				else:
 					# At night, use the artist's authored color or the room's mood tint.
 					if mat.emission_enabled and mat.emission != Color(0, 0, 0):
 						new_mat.emission = mat.emission
 					else:
 						new_mat.emission = hardcoded_mood_color
-				new_mat.emission_energy_multiplier = final_emission_energy
-				print("[Emission] Applied: surface='%s' mat='%s' multiplier=%s day=%s" % [surface_name, mat_name, final_emission_energy, day_render])
+				# Keyword-matched shades emit LESS than an authored emitter -
+				# they are lit objects, not light sources - but they must
+				# still emit. At a flat 0.45 multiplier they did not: the
+				# render came back with the tripod, the drum lamp and the bell
+				# at 0.14-0.18 final energy, all three reading as grey plastic
+				# props while every authored emitter in the same frame glowed.
+				#
+				# That render also measured where the boundary is. Lit, same
+				# frame: pendant 0.67, side-table lamp 0.40, sphere 0.36.
+				# Dead: 0.18, 0.17, 0.14. This function's own "switched off"
+				# constant is 0.30, sitting right between the two groups. So a
+				# shade stops reading as lit somewhere near 0.3, and
+				# EMISSION_LIT_MINIMUM is set just above it at 0.40 - the value
+				# the side-table lamp actually rendered at, which is the
+				# closest thing to a measured confirmation available.
+				#
+				# The reduction INTERPOLATES TOWARDS that minimum instead of
+				# multiplying through it:
+				#
+				#     out = min + (in - min) * 0.70
+				#
+				# A plain multiplier plus a max() floor drove all three shades
+				# onto the floor at exactly 0.40 - lit, but identical, throwing
+				# away the per-fixture differences the LLM pass had just
+				# computed. Interpolating cannot underflow and keeps them
+				# distinct.
+				#
+				# Reducing a shade is correct. Reducing it below the point
+				# where it emits at all is not a dimmer lamp, it is a broken
+				# one.
+				var EMISSION_LIT_MINIMUM = 0.40
+				var surface_energy = final_emission_energy
+
+				# The x0.30 'secondary emitter' reduction was removed with the
+				# is_secondary_emitter flag. Trim no longer emits at all, so there is
+				# no second surface left in the fixture to hold down.
+				if keyword_only:
+					if surface_energy > EMISSION_LIT_MINIMUM:
+						surface_energy = EMISSION_LIT_MINIMUM + (surface_energy - EMISSION_LIT_MINIMUM) * 0.70
+					else:
+						surface_energy = EMISSION_LIT_MINIMUM
+				new_mat.emission_energy_multiplier = surface_energy
+				var applied_line = "[Emission] Applied: '%s' surface='%s' mat='%s' multiplier=%s keyword_only=%s plain_emitter=%s cleared_emission_texture=%s was_transparency=%s day=%s" % [node.name, surface_name, mat_name, surface_energy, keyword_only, not had_emission_texture, had_emission_texture, had_transparency, day_render]
+				print(applied_line)
+				_emission_scan_lines.append(applied_line)
 				m.set_surface_override_material(i, new_mat)
 				applied = true
+
+	# Flush the scan to its own file, rewritten after every fixture.
+	#
+	# The godot stdout log is only written when the job finishes, so stopping
+	# a render - which is the sensible thing to do the moment the preview
+	# shows a lamp unlit - destroys exactly the diagnostic needed to explain
+	# why. Four jobs in a row (emission_added_6 through _9) produced Python
+	# logs and no engine log at all for that reason.
+	#
+	# Emission is applied during scene build, long before the path tracer
+	# starts, so this file is complete and on disk within seconds of launch.
+	# Stop the render whenever you like; the scan survives.
+	var scan_text = ""
+	for scan_entry in _emission_scan_lines:
+		scan_text += str(scan_entry) + "\n"
+	var scan_file = FileAccess.open("res://logs/emission_scan.txt", FileAccess.WRITE)
+	if scan_file:
+		scan_file.store_string(scan_text)
+		scan_file.close()
+
 	return applied
 
 func _node_has_emissive_material(node: Node3D) -> bool:
@@ -5366,10 +5783,63 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 
 	if day_render and _night_light_on and has_light_meta:
 		var base_intensity = float(light_meta.get("intensity", light_energy))
-		light_energy = base_intensity * 0.35
+		# Analytic energy per fixture, 0.35 -> 0.15.
+		#
+		# Measured against the reference render the current output is 1.22x
+		# brighter, and the logs show why it is NOT the illumination: the two
+		# renders have identical sky ambient (8.0) and identical exposure
+		# (1.30), and the OLD one had MORE sun (multiplier 1.20 vs 1.00).
+		# Reducing ambient further can only flatten the room; it is not what
+		# differs.
+		#
+		# What differs is here. The old render skipped the analytic light for
+		# all six fixtures - "analytic light skipped" x6 in its log - so its
+		# lamps contributed nothing to room illumination, and its emissive
+		# shades were the broken alpha-blended metallic ones that emitted
+		# almost nothing either. The current render keeps all six ("keeping
+		# analytic light" x6), adding about 2.0 of energy the reference never
+		# had, concentrated around the lamps - which is why it reads as heavy
+		# rather than as a uniform lift.
+		#
+		# 0.15 keeps a visible pool under each lamp at roughly 0.9 total,
+		# against a sun of 6.0 and a sky ambient of 8.0. This controls ROOM
+		# illumination only; the shade's own brightness is the emission
+		# multiplier below and is deliberately untouched.
+		light_energy = base_intensity * 0.15
 		kelvin = float(light_meta.get("temperature", kelvin))
 		light_color = _kelvin_to_rgb(kelvin)
-		emission_energy = max(0.5, base_intensity * 2.0)
+		# DAY scale, not night scale. This was base_intensity * 2.0, which
+		# put every meta-driven fixture at 1.2-2.5 emission energy - while
+		# the non-meta day branch below uses 0.6, and its own comment
+		# explains exactly why: 2.0 is "a night-scale value" that at day
+		# exposure "renders as a blown-out white blob that lifts everything
+		# around it". That is what it did. Every shade in the render clipped
+		# to flat white, and because they all clipped, the per-fixture
+		# intensities the LLM pass had carefully differentiated became
+		# invisible - a 0.6 lamp and a 1.2 lamp look identical once both are
+		# saturated.
+		#
+		# 0.6 * intensity lands intensity 1.0 on the documented day value
+		# and keeps the spread between fixtures inside the visible range.
+		# The clamp stops a single outlying intensity from reintroducing the
+		# blow-out.
+		# 0.7, and a floor of 0.42 rather than 0.30.
+		#
+		# 0.30 is the value this same function uses for a fixture that is
+		# SWITCHED OFF (see the else branch below). Clamping a LIT fixture
+		# to it puts it at exactly the brightness of an unlit one, which is
+		# how a lamp ends up rendering as a grey prop - lit geometry with no
+		# light in it. At 0.6 the dimmer fixtures were landing at 0.32-0.41,
+		# straddling that line; 0.7 lifts the whole set clear of it while
+		# keeping the brightest well under the 1.2+ where shades blow out.
+		# Floor lowered 0.42 -> 0.36 now that emitter surfaces are forced
+		# opaque and non-metallic. 0.42 was calibrated against alpha-blended
+		# metallic shades that needed far more energy to read as lit; the same
+		# surfaces now light efficiently, and holding the floor that high
+		# compressed the whole set into a narrow band once the room energy
+		# budget scaled it down - flattening every fixture to the same value
+		# again. Still clear of 0.30, which is this function's "switched off".
+		emission_energy = clamp(base_intensity * 0.7, 0.36, 1.10)
 		skip_normalization = true
 		print("[Diagnostics] Daytime META light: item '%s' base_intensity=%s -> light_energy=%s emission_energy=%s (Daytime Meta Logic Active)" % [item.get("name", item.get("id", "Unknown")), light_meta.get("intensity", "?"), light_energy, emission_energy])
 	elif not day_render or _night_light_on:
@@ -5416,10 +5886,32 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 	# light, so nothing goes dark. Returning here skips only the light-creation
 	# chain below; the trailing `if not emissive_surface_found` log could not have
 	# fired on this path anyway.
-	if USE_EMISSIVE_MESH_LIGHTS and emissive_surface_found:
+	# The skip does NOT apply when the day emission is cosmetic.
+	#
+	# `skip_normalization` is set only on the day + light_meta branch, where
+	# emission_energy is deliberately clamped to 0.42-1.10. That is a
+	# "looks switched on" value, not a light: a ~0.1 m2 emissive surface at
+	# 0.5 puts no measurable energy into an 84 m2 room already carrying a
+	# directional at 4.0. So on that path the emissive mesh is not an
+	# authority competing with the analytic light - it is decoration, and
+	# skipping the analytic light left the fixture contributing nothing at
+	# all. light_energy was computed as base_intensity * 0.35, printed in
+	# [Diagnostics], and then discarded unused.
+	#
+	# That is why per-fixture intensity only ever changed how the shades
+	# LOOKED and never put a pool of light under a lamp.
+	#
+	# Night is untouched: there emission reaches 10-15 and genuinely is the
+	# light, so pairing it with an analytic twin would double-count every
+	# fixture - the case the comment above is about.
+	var day_emission_is_cosmetic = day_render and skip_normalization
+	if USE_EMISSIVE_MESH_LIGHTS and emissive_surface_found and not day_emission_is_cosmetic:
 		print("[Emission] Fixture '%s' lit by emissive MESH; analytic light skipped." % [
 				str(item.get("name", item.get("id", "Light")))])
 		return
+	if emissive_surface_found and day_emission_is_cosmetic:
+		print("[Emission] Fixture '%s' keeping analytic light (day emission is cosmetic at %s); light_energy=%s" % [
+				str(item.get("name", item.get("id", "Light"))), emission_energy, light_energy])
 
 	# Tree-safe world position (see video_glb_creation.gd): node.to_global() fails when the
 	# builder root isn't in the tree yet, dumping lights at the origin. node is a direct child
@@ -6338,6 +6830,40 @@ func create_material(mat_data, surface_type: String = "item"):
 			has_explicit_color = true
 		else:
 			print("  Warning: Invalid color string: ", c_str)
+
+	# ── Physical albedo ceiling for architecture ──────────────────────────
+	#
+	# A surface cannot reflect all the light that hits it. The default a few
+	# lines above is 0.82 - a sane value for white paint - but it is only a
+	# FALLBACK: when the editor supplies a colour it is used verbatim, and
+	# the editor's default for walls, ceilings and floors is "#ffffff", which
+	# is albedo 1.00.
+	#
+	# In a closed room that is not a small error. Indirect light compounds
+	# as the sum of albedo^bounce, so over 8 bounces:
+	#
+	#     0.82 -> 4.6x        0.90 -> 6.1x
+	#     0.85 -> 5.1x        1.00 -> 9.0x
+	#
+	# At 1.00 every bounce returns everything and nothing in the room ever
+	# absorbs light. The result is the washed-out render this was found in:
+	# uniformly bright, no corner darkening, no gradient down a wall, no
+	# shading to read the space by - and, critically, almost unaffected by
+	# dimming the lamps, because the room was amplifying the SUN by the same
+	# 9x. Hours were spent reducing fixture output against this.
+	#
+	# Scaling preserves hue and alpha; only the magnitude is capped. Applied
+	# only to architecture, and only when the colour is explicit - a texture
+	# carries its own colour and uses white here as a neutral tint, which
+	# must not be darkened.
+	var architectural_max_albedo = 0.85
+	if has_explicit_color and (surface_type == "wall" or surface_type == "ceiling" or surface_type == "floor"):
+		var base_lum = base_color.get_luminance()
+		if base_lum > architectural_max_albedo:
+			var k = architectural_max_albedo / base_lum
+			print("[Albedo] %s surface at %.3f exceeds the physical ceiling; scaled to %.3f" % [
+					surface_type, base_lum, architectural_max_albedo])
+			base_color = Color(base_color.r * k, base_color.g * k, base_color.b * k, base_color.a)
 
 	mat.albedo_color = base_color
 
