@@ -13,6 +13,23 @@ var _has_authored_lights_cache: bool = false
 # "Compression 0%" writes. 16-bit data barely compresses at any level anyway (the low
 # byte of each channel is near-random), so the levels above cost time and save little.
 const PNG16_COMPRESSION: int = 0
+# Write the still as RGBA rather than RGB, matching Blender's default PNG layout
+# (its output format defaults to RGBA planes, so format_png.cc always emits
+# PNG_COLOR_TYPE_RGB_ALPHA). Three things to know before reading anything into it:
+#   1. The alpha is 1.0 at every pixel. Blender's alpha is Cycles' film
+#      transparency (film_write_transparent, PATH_RAY_TRANSPARENT_BACKGROUND),
+#      which only runs with Film > Transparent on. A Blender still rendered with
+#      it off -- blender_renders/blender_dining.png -- measures one distinct
+#      alpha value across all 8.3 M pixels. Ours has no film-transparent mode,
+#      so ours is the same constant channel.
+#   2. It costs 16.6 MB per 4K file (66.4 MB vs 49.8 MB, both stored at level 0);
+#      the entire size difference to Blender's file is this fourth channel.
+#   3. It changes no RGB byte. The channel is added after shading, by
+#      Image.convert(FORMAT_RGBAH), and the engine writer never sRGB-encodes it.
+#      It has no effect on how glass or anything else renders.
+# It exists for parity with Blender's file layout and for downstream tools that
+# expect four channels. See docs/superpowers/specs/2026-09-13-png16-rgba-output-design.md.
+const PNG16_WRITE_ALPHA: bool = true
 
 func _ready():
 	print("Godot Renderer Started (Split Architecture)")
@@ -517,10 +534,18 @@ func render_image(data, output_path):
 	var _save_err: int = FAILED
 	var _used_16bit: bool = false
 	if get_viewport().use_hdr_2d and img.has_method("save_png16"):
+		# The HDR readback is FORMAT_RGBH. Widening it to RGBAH makes the engine
+		# writer emit PNG_COLOR_TYPE_RGB_ALPHA (it derives has_alpha from the
+		# format); Godot's RGBH->RGBAH convert fills the new channel with 1.0.
+		# Gated on == RGBH, not "lacks alpha": any other format here means the
+		# readback changed upstream, and the writer should see it unmodified.
+		if PNG16_WRITE_ALPHA and img.get_format() == Image.FORMAT_RGBH:
+			img.convert(Image.FORMAT_RGBAH)
+		var _png_layout := "RGBA" if img.get_format() == Image.FORMAT_RGBAH else "RGB"
 		_save_err = img.call("save_png16", output_path, PNG16_COMPRESSION, true)
 		_used_16bit = (_save_err == OK)
 		if _used_16bit:
-			print("[Render] Wrote 16-bit RGB PNG (zlib level %d, sRGB-encoded from the linear HDR buffer)." % PNG16_COMPRESSION)
+			print("[Render] Wrote 16-bit %s PNG (zlib level %d, sRGB-encoded from the linear HDR buffer)." % [_png_layout, PNG16_COMPRESSION])
 		else:
 			printerr("[Render] save_png16 failed with error %d — falling back to 8-bit." % _save_err)
 	if not _used_16bit:

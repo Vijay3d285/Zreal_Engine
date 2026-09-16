@@ -80,36 +80,22 @@ const GLB_KEEP_ALPHA_KEYWORDS = [
 	"cloud", "dust", "spray", "bubble", "foam", "caustic", "glow",
 	"screen", "display", "hologram", "flame", "fire", "particle",
 ]
-# Refractive index for converted surfaces. DELIBERATELY UNPHYSICAL: soda-lime
-# glass is 1.5 and water is 1.33; both are set to 1.2 here.
+# Refractive index for converted glass. 1.5 (soda-lime) since 2026-09-15.
 #
-# WHY. A camera ray that has entered a tank or a double-glazed unit strikes the
-# far pane from INSIDE. That is a back-face hit, and
-# raytracing_closest_hit_common_inc.glsl:1504 inverts eta there
-# (`h.is_front_face ? resolved_eta : 1.0 / resolved_eta`), which is the
-# dense-to-thin case. Past the critical angle reflectance is exactly 1.0: the
-# pane becomes a perfect mirror and reflects the interior back at the camera,
-# stretched by the grazing geometry. Real aquarium glass does this. It is absent
-# from the Blender reference only because Blender's alpha path is a constant-
-# weight Transparent BSDF -- no Fresnel, no critical angle, no TIR at any angle.
+# HISTORY. This was 1.2, "deliberately unphysical", to push the critical angle
+# out from 41.8 to 56.4 deg because a tank's far pane, hit from inside, turned
+# into a perfect mirror past that angle. That mirror was roadmap Gap #24 -- the
+# engine flipped eta on the back face of a THIN-WALLED surface, which a thin
+# wall must never do -- and it is fixed. With the flip gone, and with Gap #26
+# (a face 0.14 mm behind a pane was skipped by the ray restart) also fixed, the
+# reasons for 1.2 no longer exist, and 1.5 buys back the head-on reflectance
+# (F0 0.040 vs 0.0083) that makes glass read as glass.
 #
-# 1.2 moves the critical angle from asin(1/1.5) = 41.8 deg out to
-# asin(1/1.2) = 56.4 deg, so most grazing views stay transmissive and the pane
-# reads clear. Chosen for the reference look, not for correctness.
-#
-# WHAT IT COSTS. Head-on reflectance falls with it: F0 = ((n-1)/(n+1))^2 goes
-# from 0.040 at 1.5 to 0.0083 at 1.2, a ~5x weaker front-surface reflection, and
-# that reflection is much of what makes glass read as glass.
-#
-# MEASURED, not assumed: on urbantestdark180 the converted bedroom window is
-# indistinguishable between 1.5 and 1.2 -- pane mean 193.1/194.0/194.3 vs
-# 193.2/194.1/194.3, detail stddev 47.1 vs 46.9. A ~3% absolute reflectance
-# change simply does not register against a bright exterior at near-normal
-# incidence. NOT yet checked: a window viewed at a steep angle, and night
-# renders, where the reflection is the only cue that a pane is there at all.
-# Raise back toward 1.5 if glazing starts reading as an open hole.
-const GLB_CONVERTED_GLASS_IOR = 1.2
-const GLB_CONVERTED_WATER_IOR = 1.2
+# Water is not converted (GLB_WATER_KEEPS_ALPHA); its constant is kept for the
+# kind == "water" branch of _apply_glb_transmissive_glass, which is currently
+# unreachable.
+const GLB_CONVERTED_GLASS_IOR = 1.5
+const GLB_CONVERTED_WATER_IOR = 1.33
 # Water keeps its alphaMode BLEND material instead of being converted to an
 # opaque transmissive one. Set false to restore the old conversion.
 #
@@ -142,11 +128,11 @@ const GLB_CONVERTED_WATER_IOR = 1.2
 # 0.2 * (teal metal) + 0.8 * straight-through; the closure now does the same,
 # which is the "blue reflection in the water" the reference render shows.
 #
-# Glass now keeps its alpha too -- see _glb_alpha_kind_keeps_alpha() for the
-# measurement. The "lossless" argument was wrong: a white 10% mirror is not the
-# same surface as sub-1% Fresnel on clear IOR-1.2 glass, and the earlier "clear
-# panes" verdict was made against side panels that an engine bug had turned
-# into mirrors (roadmap Gap #24).
+# Glass does NOT keep its alpha (2026-09-15): every glass-classified material
+# is converted to a real solid dielectric -- see _glb_alpha_kind_keeps_alpha()
+# for the reasoning and the measurements. Water stays on the alpha route: its
+# authored material (teal metal at 20% alpha) is exactly what Cycles renders,
+# and the match is good since roadmap Gap #26.
 const GLB_WATER_KEEPS_ALPHA = true
 # Repair the asset's metallic channel on water. DIVERGES FROM BLENDER -- off by
 # default, and read this before turning it on.
@@ -1513,22 +1499,35 @@ func _glb_alpha_kind_keeps_alpha(mat: BaseMaterial3D, kind: String) -> bool:
 	if kind == "water":
 		return GLB_WATER_KEEPS_ALPHA
 	if kind == "glass":
-		# Glass keeps its authored material too (2026-09-13). The dielectric
-		# conversion was gated on _glb_alpha_convert_is_lossless(), and for these
-		# tanks it is not lossless: the artist authored a 10% white MIRROR over
-		# 90% pass-through (alpha 0.098, metallic 1, roughness 0.08), which is
-		# what Blender renders -- a faint sheen on every pane, visible edges and
-		# corner seams. The conversion replaced that with clear IOR-1.2 glass,
-		# which reflects under 1% at these angles: the panes vanished and the
-		# starfish read as glued to the wall. The mirror-like side panels that
-		# used to give the tank "presence" were an engine defect (roadmap Gap
-		# #24, total internal reflection on a thin wall), not the conversion
-		# working. Measured on replay192 against the Blender render: authored
-		# glass through the Transparent BSDF closure brings the edges and sheen
-		# back on every side; restoring lamp specular on top changed the tank by
-		# +3% and nothing visible. _glb_alpha_convert_is_lossless() is left in
-		# place for the report only.
-		return true
+		# Glass is CONVERTED, always (2026-09-15): a real solid dielectric with
+		# its real geometry, IOR 1.5 (_apply_glb_transmissive_glass). No
+		# lossless test, no per-asset list.
+		#
+		# WHY NOT THE AUTHORED MATERIAL. These libraries author "glass" as an
+		# alpha-blended white METAL (alpha 0.098, metallic 1, roughness 0.08):
+		# a 10% mirror over 90% pass-through. Rendered as authored it is a faint
+		# ghost -- in this engine AND in Cycles (the Blender reference shows the
+		# hobnail vase in 11d67c66_ModularDisplayGrid as the same frosted ghost).
+		# Every Blender automation pipeline carries the same fix-up ("material
+		# called glass -> Glass BSDF"); this is that fix-up, keyed on the
+		# material's own name via GLB_GLASS_MATERIAL_KEYWORDS, never on an asset.
+		#
+		# WHY IT IS SAFE NOW AND WAS NOT ON 2026-09-13. The conversion was
+		# switched off that day because converted tanks showed mirror side
+		# panels and a vanished starfish. Both were ENGINE defects, since fixed:
+		# roadmap Gap #24 (thin-walled back face flipped eta -> total internal
+		# reflection) and Gap #26 (a face 0.14 mm behind a pane was skipped by
+		# the ray restart). With those closed the geometry decides the look --
+		# flat panes barely refract, curved bodies do -- which is the principled
+		# distinction a name list can only imitate.
+		#
+		# MEASURED 2026-09-15 (replay192 and urbantestdark217 at FHD, production
+		# route): frameless tank -> real glass box with dark refracting edges,
+		# sides see-through, water teal; framed tank -> clear panes with edge
+		# reflections; hobnail vase -> faceted glass. Window glass unchanged
+		# (154.3 -> 154.2). Whole frames -3..-4%, all of it inside the tanks
+		# where the 10% white sheen had been adding light.
+		return false
 	return false
 
 # What did the asset actually author on this pane? Returns the effective base
@@ -1629,10 +1628,16 @@ func _apply_glb_transmissive_glass(mat: BaseMaterial3D, kind: String) -> void:
 	# LOAD-BEARING -- 0.5 is the no-op that keeps eta == ior. At any other value
 	# the engine re-derives eta from the modified F0.
 	mat.metallic_specular = 0.5
-	# Thin-walled: no bend, no medium, no absorption. The only safe choice on
-	# geometry we have not proven closed, and it matches what Cycles produces
-	# from an alpha mix -- a straight-through ray.
-	mat.thickness = 0.0
+	# SOLID, not thin-walled (2026-09-15): thickness > 0 makes the tracer enter
+	# the medium at this face and leave at the next real face of the mesh, so
+	# a curved body refracts and a flat pane barely does -- the geometry decides.
+	# Thin-walled (0.0) was chosen earlier "on geometry we have not proven
+	# closed"; an unclosed mesh costs nothing here -- a ray that enters and never
+	# exits keeps going with no absorption (attenuation_distance stays 0 =
+	# infinite), so the safety argument bought nothing while the no-bend model
+	# turned every vase into a ghost. The value itself is only a flag to the
+	# tracer (any > 0); it is not a physical wall thickness.
+	mat.thickness = 0.05
 
 	# The base colour texture on an alpha-blended pane is there to carry the
 	# ALPHA channel. Transmission mode ignores alpha, and leaving the texture
@@ -1643,13 +1648,20 @@ func _apply_glb_transmissive_glass(mat: BaseMaterial3D, kind: String) -> void:
 	mat.albedo_texture = null
 	mat.albedo_color = Color(1.0, 1.0, 1.0, 1.0)
 
-	# Roughness is left exactly as authored. ROUGHNESS = roughness_tex * roughness
-	# and glTF's roughnessFactor defaults to 1.0, so when a texture is bound it
-	# already carries the artist's value (0.08 on these tanks, the same number
-	# Cycles uses). Clamping the scalar on top would multiply, not clamp, and
-	# drive it to 0.008. Only clamp when there is no texture to read.
-	if mat.roughness_texture == null:
-		mat.roughness = min(mat.roughness, 0.10)
+	# OPTICALLY CLEAR (2026-09-15): roughness 0, texture dropped. The authored
+	# 0.08 (in the metallicRoughness texture's G channel on these libraries'
+	# "glass") was authored for a 10% METAL SHEEN -- a mild blur on a reflection.
+	# On a real refracting dielectric the same 0.08 blurs the TRANSMISSION at
+	# every face the ray crosses (glass in, glass out, water in, water out), and
+	# over a 30 cm tank that stacks into a frosted fog: urbantestdark220 rendered
+	# the aquarium interior smeared. Real glass and water are optically smooth;
+	# a Blender fix-up script sets its Glass BSDF roughness to 0 for the same
+	# reason. Measured on replay192 (both tanks) and 217 (hobnail vase) at FHD:
+	# interiors sharp, edges/refraction/teal water unchanged, vase unchanged.
+	# ROUGHNESS = roughness_tex * roughness, so the texture must go too or the
+	# scalar would multiply into it instead of replacing it.
+	mat.roughness_texture = null
+	mat.roughness = 0.0
 
 	# An emissive pane would double-count once it starts bouncing.
 	mat.emission_enabled = false
