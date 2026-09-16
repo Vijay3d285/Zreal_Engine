@@ -2550,6 +2550,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	bool using_sss = rb_data.is_valid() && !is_reflection_probe && scene_state.used_sss && ss_effects->sss_get_quality() != RSE::SUB_SURFACE_SCATTERING_QUALITY_DISABLED;
 
+	// The path tracer owns colour (the opaque pass is skipped and the traced
+	// image is copied into internal_texture), and it renders subsurface itself
+	// (E3, raytracing_sss_inc.glsl). The raster screen-space SSS is a blur over
+	// the colour buffer keyed on a diffuse-buffer alpha the skipped opaque pass
+	// never wrote, followed by merge_specular adding a specular buffer nobody
+	// filled this frame: on a traced frame it softened every edge and added a
+	// +4.7% veil. Same rule as the SSIL/SSAO/SSR cleanup above.
+	if (scene_features.rt) {
+		using_sss = false;
+	}
+
 	if (using_sss && p_render_data->transparent_bg) {
 		WARN_PRINT_ONCE("Sub-surface scattering is not supported in viewports with a transparent background. Disabling SSS in transparent viewport.");
 		using_sss = false;

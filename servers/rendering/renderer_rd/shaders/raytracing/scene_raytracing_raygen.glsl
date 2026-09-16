@@ -61,6 +61,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	ps.skip_geom = RT_SKIP_NONE;
 	ps.skip_prim = RT_SKIP_NONE;
 	ps.sss_restart = vec3(0.0);
+	ps.sss_exit = false;
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
@@ -129,7 +130,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 		// historical path unchanged.
 		const bool skip_active = (ps.skip_geom != RT_SKIP_NONE);
 #ifdef RT_SSS_ENABLED
-		if (is_sss_exit(ps.packed_bounces_flags)) {
+		if (ps.sss_exit) {
 			// E3: the random walk's exit is not on this ray. Restart from the
 			// point the hit shader computed, 2 mm outside the exit face, aimed
 			// back at it, with the historical t_min (the face is 2 mm away).

@@ -1309,14 +1309,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	ps.skip_geom = RT_SKIP_NONE;
 	ps.skip_prim = RT_SKIP_NONE;
 #ifdef RT_SSS_ENABLED
-	// E3: this hit is the EXIT of a random walk (SSS_EXIT_FLAG). Cycles'
+	// E3: this hit is the EXIT of a random walk (ps.sss_exit). Cycles'
 	// subsurface_shader_data_setup replaces the whole shader with a diffuse
 	// closure of weight 1 on the bump-mapped normal: no emission, no specular,
 	// no coat/sheen/transmission, no second subsurface here. The walk already
 	// paid the albedo; the exit is a WHITE Lambertian.
-	const bool sss_exit_hit = is_sss_exit(ps.packed_bounces_flags);
+	const bool sss_exit_hit = ps.sss_exit;
 	if (sss_exit_hit) {
-		ps.packed_bounces_flags = clear_sss_exit(ps.packed_bounces_flags);
+		ps.sss_exit = false;
 		m.albedo = vec3(1.0);
 		m.alpha = 1.0;
 		m.blends = false;
@@ -2335,13 +2335,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// Re-aim: the next ray starts 2 mm past the exit point along the walk
 		// direction and points back at it (Cycles: P += D*tmax*2; D = -D), so
 		// the exit face is the next closest hit, from outside, and is shaded
-		// as a white Lambertian under SSS_EXIT_FLAG.
+		// as a white Lambertian under ps.sss_exit.
 		const float SSS_EXIT_DELTA = 0.002;
 		ps.sss_restart = exit_pos + exit_dir * SSS_EXIT_DELTA;
 		ps.next_ray_dir = -exit_dir;
 		ps.offset_normal = exit_dir;
 		ps.hit_t = gl_HitTEXT;
-		ps.packed_bounces_flags = set_sss_exit(inc_diffuse_bounce(ps.packed_bounces_flags));
+		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
+		ps.sss_exit = true;
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
 		ps.rng_packed = rng_pack(rng_next_bounce(rng));
 		path_pack(payload, ps);

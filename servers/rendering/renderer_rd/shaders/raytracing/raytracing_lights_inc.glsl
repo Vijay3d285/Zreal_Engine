@@ -314,6 +314,15 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
 	shadow_ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+	// Every field, or the any-hit stage reads whatever the registers held:
+	// an uninitialised skip id that happened to be (0, 0) made shadow rays
+	// skip instance 0 / triangle 0, and which garbage you get moved with the
+	// payload layout (pt_transmission_gate probe 6 went 4.07 -> 5.04 when the
+	// E3 payload grew by four bytes).
+	shadow_ps.skip_geom = RT_SKIP_NONE;
+	shadow_ps.skip_prim = RT_SKIP_NONE;
+	shadow_ps.sss_restart = vec3(0.0);
+	shadow_ps.sss_exit = false;
 	path_pack(payload, shadow_ps);
 
 	traceRayEXT(tlas,

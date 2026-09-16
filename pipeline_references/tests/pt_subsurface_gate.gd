@@ -18,6 +18,12 @@ extends "res://tests/pt_validation.gd"
 ##   S2 Cycles: albedo 0.8 sphere, radius (1,0.2,0.1)*0.05, ior 1.4, within 5%
 ##      of CYCLES_REF_S2 per channel.
 ##   S4 fallback: S2's material with radius 0 equals plain diffuse to 0.5%.
+##   S5 isolation: a plain diffuse sphere seen THROUGH a glass pane must read
+##      the same whether or not an off-screen SSS cube turns the feature bit
+##      on (RT_SSS_ENABLED). Added after the first cut put the exit flag on
+##      bit 27 of packed_bounces_flags -- the transmission counter's low bit --
+##      and every path with an odd number of glass crossings restarted from
+##      the origin. S1-S4 have no glass and cannot see that class of fault.
 ##
 ## The translucent share is BSDF-owned: no NEE strategy draws a direction
 ## below the horizon (the transmissive-lobe rule), so S3's light arrives by the
@@ -32,6 +38,7 @@ const S_BOUNCES := 12
 const S1_TOL := 0.03
 const S2_TOL := 0.05
 const S4_TOL := 0.005
+const S5_TOL := 0.01
 # tools/cycles_comparison/cycles_sss_sphere.py, Blender 5.2.1, 2048 spp,
 # 12 bounces, 2026-09-15.
 const CYCLES_REF_S2 := Vector3(0.82585410, 0.77649382, 0.77084864)
@@ -99,6 +106,18 @@ func _ready() -> void:
 	if absf(m4 / maxf(m4d, 1e-9) - 1.0) > S4_TOL:
 		_failures.append("S4 fallback: %.6f vs diffuse %.6f" % [m4, m4d])
 
+	print("
+=== S5: diffuse sphere through glass, feature bit off vs on ===")
+	var plain := _sss_material(0.8, 0.0, Color(1, 1, 1), 0.05)
+	var s5_off := await _sphere_mean(plain, true, _sss_material(0.8, 0.0, Color(1, 1, 1), 0.05))
+	var s5_on := await _sphere_mean(plain, true, _sss_material(0.8, 1.0, Color(1.0, 0.2, 0.1), 0.05))
+	var m5o := (s5_off.x + s5_off.y + s5_off.z) / 3.0
+	var m5n := (s5_on.x + s5_on.y + s5_on.z) / 3.0
+	print("  bit off %.6f  bit on %.6f" % [m5o, m5n])
+	_checks += 1
+	if absf(m5n / maxf(m5o, 1e-9) - 1.0) > S5_TOL:
+		_failures.append("S5 isolation: through glass, feature bit on %.6f vs off %.6f" % [m5n, m5o])
+
 	_finish()
 
 
@@ -106,11 +125,41 @@ func _ready() -> void:
 ## tools/cycles_comparison/cycles_sss_sphere.py: unit sphere, camera at
 ## normalize(1,1,1) * 2.5, FOV 20, constant sky radiance 1.0, mean over the
 ## whole 256x256 image (the sphere overfills it).
-func _sphere_mean(p_mat: StandardMaterial3D) -> Vector3:
+## p_pane: a solid glass pane (the pipeline's converted-glass recipe: IOR 1.5,
+## thickness 0.05, roughness 0) 0.5 m in front of the sphere, filling the view.
+## p_offscreen: material of a 20 cm cube 6 m behind the camera -- out of frame,
+## a negligible fraction of the sphere's hemisphere, but its material decides
+## whether the tracer compiles with RT_SSS_ENABLED.
+func _sphere_mean(p_mat: StandardMaterial3D, p_pane: bool = false, p_offscreen: StandardMaterial3D = null) -> Vector3:
 	for c in get_children():
 		c.queue_free()
 	var env := _new_env(Color(1, 1, 1))
 	env.set_pathtracing_max_bounces(S_BOUNCES)
+	if p_pane:
+		var pane := MeshInstance3D.new()
+		var pm := BoxMesh.new()
+		pm.size = Vector3(3.0, 3.0, 0.02)
+		pane.mesh = pm
+		var pmat := StandardMaterial3D.new()
+		pmat.albedo_color = Color(1, 1, 1)
+		pmat.metallic = 0.0
+		pmat.metallic_specular = 0.5
+		pmat.roughness = 0.0
+		pmat.transmission = 1.0
+		pmat.ior = 1.5
+		pmat.thickness = 0.05
+		pane.material_override = pmat
+		pane.position = Vector3(1.4433757, 1.4433757, 1.4433757).normalized() * 1.5
+		pane.look_at(Vector3.ZERO, Vector3.UP)
+		add_child(pane)
+	if p_offscreen != null:
+		var cube := MeshInstance3D.new()
+		var cm := BoxMesh.new()
+		cm.size = Vector3(0.2, 0.2, 0.2)
+		cube.mesh = cm
+		cube.material_override = p_offscreen
+		cube.position = Vector3(1.4433757, 1.4433757, 1.4433757).normalized() * 8.5
+		add_child(cube)
 	var sphere := MeshInstance3D.new()
 	var sm := SphereMesh.new()
 	sm.radius = 1.0

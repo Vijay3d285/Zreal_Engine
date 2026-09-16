@@ -67,10 +67,15 @@ struct PathPayload {
 	// behind a pane is hit instead of being skipped by a distance margin.
 	uint skip_geom; //  4 bytes - gl_InstanceCustomIndexEXT, or RT_SKIP_NONE
 	uint skip_prim; //  4 bytes - gl_PrimitiveID within that geometry
-	// E3. Where the next ray starts when SSS_EXIT_FLAG is set: the walk's exit
+	// E3. xyz: where the next ray starts after a random walk -- the walk's exit
 	// is not on the current ray, so origin + dir * hit_t cannot express it.
-	// 12 bytes; vec3 alignment pads the struct to 80.
-	vec3 sss_restart;
+	// w: 1.0 while that restart is pending (the "SSS exit" flag), else 0.0.
+	// The flag lives HERE and not in packed_bounces_flags because that word
+	// has no free bit: [total:8][diffuse:8][glossy:8] then 24 sample-zero,
+	// 25 shadow, 26 terminated, 27-30 the transmission counter, 31 inside-
+	// medium. A first cut put it at bit 27 and every path with an odd number
+	// of glass crossings restarted from (0,0,0). 16 bytes; the struct is 80.
+	vec4 sss_restart;
 };
 
 /// Sentinel: this ray has no meaningful BSDF pdf, so anything it hits takes the
@@ -142,6 +147,7 @@ struct PathState {
 	uint skip_geom;
 	uint skip_prim;
 	vec3 sss_restart;
+	bool sss_exit;
 };
 
 PathState path_unpack(PathPayload p) {
@@ -156,7 +162,8 @@ PathState path_unpack(PathPayload p) {
 	s.mis_ray_pdf = p.mis_ray_pdf;
 	s.skip_geom = p.skip_geom;
 	s.skip_prim = p.skip_prim;
-	s.sss_restart = p.sss_restart;
+	s.sss_restart = p.sss_restart.xyz;
+	s.sss_exit = p.sss_restart.w > 0.5;
 	return s;
 }
 
@@ -171,7 +178,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.mis_ray_pdf = s.mis_ray_pdf;
 	p.skip_geom = s.skip_geom;
 	p.skip_prim = s.skip_prim;
-	p.sss_restart = s.sss_restart;
+	p.sss_restart = vec4(s.sss_restart, s.sss_exit ? 1.0 : 0.0);
 }
 
 // Bounce count helpers.
@@ -257,15 +264,8 @@ bool is_shadow_ray(uint packed) {
 
 const uint PATH_TERMINATED_FLAG = (1u << 26);
 
-// E3 subsurface exit (bit 27). Set by the hit shader after a random walk
-// found its exit point; the next ray is aimed back AT that point from
-// outside (raygen starts it at sss_restart), and the hit that results is
-// shaded as a white Lambertian -- Cycles' subsurface_shader_data_setup --
-// then the flag is cleared.
-const uint SSS_EXIT_FLAG = (1u << 27);
-uint set_sss_exit(uint packed) { return packed | SSS_EXIT_FLAG; }
-uint clear_sss_exit(uint packed) { return packed & ~SSS_EXIT_FLAG; }
-bool is_sss_exit(uint packed) { return (packed & SSS_EXIT_FLAG) != 0u; }
+// E3's subsurface-exit flag is PathState.sss_exit / PathPayload.sss_restart.w,
+// not a bit here -- bits 27-30 are the transmission counter below.
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;
 }
