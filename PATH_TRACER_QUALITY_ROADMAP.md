@@ -110,7 +110,7 @@ Ranked by impact on offline still quality.
 | 10 | **No firefly clamp** | absent | `data_template.h:202-203` (`sample_clamp_direct/indirect`) | Medium |
 | 11 | **Sky/IBL sampled uniformly** — no env importance sampling | `raygen.glsl:232` | `light/background.h:29,118` (marginal/conditional CDF) | Medium |
 | 12 | **glTF PBR extensions dropped at import** | only `_pbr`, `_unlit`, `_emissive_strength` | Cycles Principled BSDF carries all | High (blocks #13) |
-| 13 | **Missing BSDFs** — transmission (E1, §7.5), anisotropy (E2b, §7.8), clearcoat (E2d, §7.10) and sheen (E2e, §7.11) now all ship; **SSS is what remains** | `closest_hit_common:474-475` | `subsurface_random_walk.h`, Principled | Medium |
+| 13 | **Missing BSDFs** — transmission (E1, §7.5), anisotropy (E2b, §7.8), clearcoat (E2d, §7.10), sheen (E2e, §7.11) and **subsurface (E3, §11.23, shipped 2026-09-15)** all ship: Cycles' random walk (van de Hulst remap, Dwivedi guiding, channel MIS, 256 steps) for solids and the OpenPBR thin-wall split for sheets; gate S1 energy / S2 vs Cycles / S3 thin-wall / S4 fallback; pipeline keyword rule (marble, wax, shade/paper, leaf). Skin mode deferred (a render_mode, invisible to the upload). **Gap #13 complete** | `closest_hit_common:474-475` | `subsurface_random_walk.h`, Principled | Medium |
 | 14 | **fp16 radiance/throughput payload** | `raytracing_inc.glsl:75-87` | fp32 throughout | Medium |
 | 15 | **Biased bump-map mirror recovery** | `brdf_inc.glsl:998-1009` | offset/position normals, no bias | Low-Med |
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
@@ -6357,3 +6357,99 @@ Doctest 1558/1558. replay192 and urbantestdark217 at FHD, production route:
 −0.01% and −0.10% whole-frame (mean |diff| 0.06 and 0.19 of 255) — as
 predicted, BLEND glass is the alpha share in both engines and job 217 has no
 traced-dielectric material for the rule to bite on.
+
+## 11.23 E3 — subsurface scattering, and the two things that broke on the first real asset
+
+**2026-09-15. Gap #13 is complete.** Every Principled lobe Cycles has now has a
+counterpart: subsurface joins transmission, anisotropy, clearcoat and sheen.
+Spec: `docs/superpowers/specs/2026-09-15-e3-subsurface-scattering-design.md`.
+
+### What shipped
+
+- **Solids** — Cycles' `subsurface_random_walk` transcribed at anisotropy 0
+  (`raytracing_sss_inc.glsl`): albedo → σt/σs by the van de Hulst remap,
+  Dwivedi-guided steps with the 256-step cap and the 0.2 guiding floor,
+  per-channel MIS over the throughput, `VOLUME_THROUGHPUT_EPSILON 1e-6`,
+  self-intersection by `rayQuery` confirming only the same instance. Entry is
+  a GGX-VNDF microfacet refracted at 1/ior, direction only, as Cycles does.
+  The exit re-aims the next ray 2 mm outside the exit point back at the
+  surface; that hit is shaded as a white Lambertian — Cycles'
+  `subsurface_shader_data_setup`.
+- **Sheets** — the OpenPBR thin-wall split: a `transmittance_depth` of 0
+  makes the lobe diffuse + translucent (cosine about −N), no volume.
+- **Materials** — `subsurface_scattering_strength` → weight,
+  `transmittance_color` → radius, `transmittance_depth` → scale; fifth
+  registry lobe `LOBE_SUBSURFACE` sliding after sheen; feature bit
+  `RT_FLAG_SSS_ENABLED` so scenes without an SSS material compile the tracer
+  exactly as before (job 217 with the rule off: **0.00%**, max diff 0).
+- **Pipeline** — `GLB_SUBSURFACE_PRESETS` in `image_glb_creation.gd`, keyed on
+  the material/surface name: marble (solid, 3 cm), candle/wax (solid, 5 cm),
+  lampshade/shade/paper (thin, 0.7), leaf (thin, 0.3). Glass, water and the
+  keep-alpha names are left to their own rules. Skin mode is deferred: it is
+  a `render_mode`, invisible to the material upload.
+
+### Against Cycles (`tools/cycles_comparison/cycles_sss_sphere.py`, 2048 spp)
+
+| probe | Cycles | ours | |
+|---|---|---|---|
+| S1 white solid SSS sphere, furnace | 0.975268 | **0.975508** | +0.02% (≤ 1.0; the 2.4% below white diffuse is the walk's own cap+floor loss, in both) |
+| S2 albedo 0.8, radius (1, 0.2, 0.1) × 0.05, ior 1.4 | (0.825854, 0.776494, 0.770849) | **(0.826034, 0.776343, 0.771062)** | +0.02% / −0.02% / +0.03% |
+| S3 thin sheet albedo 0.8 over an emitter | theory 0.400 | **0.399891** | |
+| S4 radius 0 falls back to diffuse | 0.799746 | **0.799888** vs our diffuse 0.799888 | exact |
+| S5 diffuse sphere through glass, feature bit off vs on | — | **0.825474 / 0.825505** | +0.004% |
+
+### The two things the first real asset found
+
+Both invisible to S1–S4, both found by rendering job 217 with the rule on.
+
+1. **The exit flag sat on the transmission counter.** `packed_bounces_flags`
+   is `[total:8][diffuse:8][glossy:8]` then bits 24 sample-zero, 25 shadow,
+   26 terminated, **27–30 transmission bounces**, 31 inside-medium — no free
+   bit. The first cut put `SSS_EXIT_FLAG` at bit 27, so every path with an
+   odd number of glass crossings "exited a walk" and restarted from (0, 0, 0):
+   the fish tank rendered as a white slab, the sheer curtain went see-through,
+   +16% whole-frame. The flag now lives in `PathPayload.sss_restart.w`, the
+   four bytes the `vec3` padding already cost. S5 is the probe that catches
+   this class (0.825 → 0.115 on the broken build) — through glass, with the
+   feature bit on.
+2. **The raster screen-space SSS ran over the traced frame.** Any material
+   with `subsurf_scatter_enabled` sets `scene_state.used_sss`, which forces
+   the forward renderer's separate-specular route: `_process_sss` (a blur over
+   the colour buffer keyed on a diffuse-buffer alpha the skipped opaque pass
+   never wrote) and `merge_specular` (adding a specular buffer nobody filled).
+   On a traced frame that was a halo on every edge and a +4.7% veil.
+   `render_forward_clustered.cpp` now clears `using_sss` when the tracer owns
+   colour, beside the SSIL/SSAO/SSR cleanup that already existed.
+
+### Job 217 at FHD, production route, rule off → on (final build)
+
+Whole frame **+0.30%**. Marble table top −5.55% and its veins soften under the
+3 cm walk (Cycles' 0.8-albedo SSS sphere reads 1.1% under its diffuse twin for
+the same reason); plant leaves light up as thin translucent; the rest of the
+room −0.6…−0.7% because a darker table bounces less onto the walls and
+ceiling. The `[SSS]` log lines name what matched: `Marble_01`, `Paper`, `leaf`
+on the dining ensemble; `Candles`, `leaf.003` on the display grid. The preset
+radii are starting points — 3 cm is generous for marble — and are the one
+knob to turn if the table reads too soft.
+
+### Suite on the final build
+
+14 of 15 gates green, doctest 1558/1558. `pt_transmission_gate` probe 6 (the
+single-trajectory TIR probe, reference 4.069) reads **5.044** on every build
+tried after ~19:00 on 2026-09-15 — including the committed Task 4 shaders
+that read 4.0695 at 18:58, and the **09-13 live-pipeline binary** that read
+4.0698 on 09-13. Same reading at 60 fps and at 1429 fps; window, viewport and
+accumulation image all 256×256; the glass furnace matches the earlier run to
+8 digits. The one thing that changed on the machine in that hour is the
+desktop session (disconnected; the WASAPI audio endpoint vanished in the same
+minute). This is the machine's state, not this branch — re-run the gate in a
+connected session before reading anything into it, and if it still reads
+5.04 there, probe 6 has a hidden dependency worth its own investigation.
+Probe 10's sample-fraction counters moved by the same ×1.23 in the same runs.
+
+### Deviations from Cycles, on record
+
+- Anisotropy fixed at 0 (Cycles exposes `Subsurface Anisotropy`).
+- Skin mode (`sss_mode_skin`) not read — a `render_mode`, not a parameter.
+- Payload +16 bytes (`vec4 sss_restart`), paid by every scene; the 0.00%
+  no-SSS render above shows no image cost, frame time within noise.

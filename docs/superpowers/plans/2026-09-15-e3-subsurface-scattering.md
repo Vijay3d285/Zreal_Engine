@@ -37,7 +37,7 @@
 - Produces (C++): `RT_MaterialData::sss_scale` (offset 188), `sss_radius[3]` (192), `sss_weight` (204); `RT_MAT_FLAG_SSS_THIN = 32u`; `SceneShaderRaytracing::RT_FLAG_SSS_ENABLED = (1 << 19)`.
 - Produces (GLSL): `MaterialData.sss_scale`, `.sss_radius` (vec3), `.sss_weight`; `#define RT_MAT_FLAG_SSS_THIN 32u`; `#define RT_SSS_ENABLED` when the scene has SSS; vis modes 41 (`sss_radius`) and 42 (`(sss_weight, sss_scale, thin ? 1 : 0)`).
 
-- [ ] **Step 1: Extend the material-data gate (red first)**
+- [x] **Step 1: Extend the material-data gate (red first)**
 
 In `pipeline_references/tests/pt_material_data_gate.gd`, after `const MODE_SHEEN_COLOR := 29`:
 
@@ -77,7 +77,7 @@ and after the last existing `await _check_mode(...)`:
 
 Update the PASS line's count from 25 to 31 fields wherever the file states it (grep `25`).
 
-- [ ] **Step 2: Run the gate, expect the two new checks red**
+- [x] **Step 2: Run the gate, expect the two new checks red**
 
 ```bash
 ./bin/godot.windows.editor.x86_64.console.exe --rendering-driver vulkan --path pipeline_references res://tests/pt_material_data_gate_scene.tscn 2>&1 | grep -E "sss|PASS|FAIL"
@@ -85,7 +85,7 @@ Update the PASS line's count from 25 to 31 fields wherever the file states it (g
 
 Expected: the two `sss` checks FAIL (mode 41/42 do not exist; the read is 0), everything else passes.
 
-- [ ] **Step 3: C++ struct and flags**
+- [x] **Step 3: C++ struct and flags**
 
 `render_raytracing.h`: replace `float _pad0;` at the struct tail with
 
@@ -118,7 +118,7 @@ In the material flag enum after `RT_MAT_FLAG_ANYHIT_SKIP_ONLY = 16u,`:
 
 Update the comment `// Must match GLSL MaterialData (std430, 192 bytes).` to 208.
 
-- [ ] **Step 4: GLSL mirror**
+- [x] **Step 4: GLSL mirror**
 
 `raytracing_data_inc.glsl`: replace `float _pad0;` at the end of `MaterialData` with
 
@@ -134,7 +134,7 @@ update the `(matches C++ layout, 192 bytes)` comment to 208, and after the `RT_M
 #define RT_MAT_FLAG_SSS_THIN 32u // Bit 5. MIRRORS render_raytracing.h (E3).
 ```
 
-- [ ] **Step 5: Upload**
+- [x] **Step 5: Upload**
 
 `render_raytracing.cpp`, directly after the `attenuation_color` block (before the `// E3 detection` comment), add:
 
@@ -181,7 +181,7 @@ In the `// E3 detection` block, after the sheen predicate:
 
 In the verbose print add `sss=%d` with `(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SSS_ENABLED) != 0)`.
 
-- [ ] **Step 6: Feature bit and define**
+- [x] **Step 6: Feature bit and define**
 
 `scene_shader_raytracing.h`, after `RT_FLAG_TRANSMISSIVE_GEOMETRY = (1 << 18),`:
 
@@ -202,7 +202,7 @@ Add `RT_FLAG_SSS_ENABLED` to both static_assert lists (the min-bounce one at `:1
 
 Find where `scene_mask` is folded into the pipeline flags for coat/sheen (grep `RT_FLAG_SHEEN_ENABLED` in `render_raytracing.cpp` around `:2660-2700` and in `scene_shader_raytracing.cpp`) and add `RT_FLAG_SSS_ENABLED` at every site the sheen bit appears, so the bit reaches the define table the same way.
 
-- [ ] **Step 7: Vis modes 41 and 42**
+- [x] **Step 7: Vis modes 41 and 42**
 
 `raytracing_closest_hit_common_inc.glsl`, after the `vis_mode == 29` arm:
 
@@ -216,7 +216,7 @@ Find where `scene_mask` is folded into the pipeline flags for coat/sheen (grep `
 
 `environment.cpp:1616`: append `,Mat: SSS Radius,Mat: SSS Weight/Scale/Thin` to the enum hint string (positions 41 and 42 — count the existing entries: "Aniso PDF Parity" is 35; add five spacer names first? **No**: check how modes 36–40 are named in that string; if the string ends at 35 while the shader has modes up to 40, append entries for 36–40 with the names used in the shader comments so 41/42 land at the right index. The gate sets the mode by integer, so only the integer matters for correctness; the names are for the Inspector.)
 
-- [ ] **Step 8: Build, run the gate, expect green**
+- [x] **Step 8: Build, run the gate, expect green**
 
 ```bash
 python -m SCons platform=windows target=editor tests=yes -j8 2>&1 | tail -2
@@ -225,7 +225,7 @@ python -m SCons platform=windows target=editor tests=yes -j8 2>&1 | tail -2
 
 Expected: `PASS: all 31 material fields arrived in the shader intact.` Then the doctest suite (`--test`): 1558/1558 (no C++ mirror test reads the struct size).
 
-- [ ] **Step 9: Spec amendment and commit**
+- [x] **Step 9: Spec amendment and commit**
 
 Append to the spec under `## Not in scope`: `- Skin mode (Cycles RANDOM_WALK_SKIN): Godot's sss_mode_skin is a shader render_mode, not a uniform, so process_material cannot read it; deferred with probe S5. No library material needs it.` Remove `RT_MAT_FLAG_SSS_SKIN` and S5 from the spec's tables.
 
@@ -250,7 +250,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: Task 1's `MaterialData.sss_*` and `RT_MAT_FLAG_SSS_THIN`, `RT_SSS_ENABLED`.
 - Produces: `MaterialProperties.sssWeight` (float), `.sssThin` (bool), `.sssRadius` (float3), `.sssScale` (float); `LOBE_SUBSURFACE`, `SUBSURFACE_TYPE` brdf type; `evalCombinedBRDFSeparate` gains a fifth out `outTranslucent` (float3) — every existing caller passes a dummy. Task 4 relies on `LOBE_SUBSURFACE` selection and `brdfType == SUBSURFACE_TYPE`.
 
-- [ ] **Step 1: The gate, probe S3 only (red)**
+- [x] **Step 1: The gate, probe S3 only (red)**
 
 `pipeline_references/tests/pt_subsurface_gate.gd`:
 
@@ -442,7 +442,7 @@ script = ExtResource("1_gate")
 
 Run it. Expected on the Task 1 build: S3 reads **0.0** (a plain diffuse sheet in front of a black sky passes nothing) → FAIL. Note: the backdrop is *behind* the sheet, so the diffuse share contributes nothing and the translucent share alone is measured.
 
-- [ ] **Step 2: MaterialProperties fields**
+- [x] **Step 2: MaterialProperties fields**
 
 `brdf_inc.glsl` `struct MaterialProperties`, after `float sheenRoughness;`:
 
@@ -479,7 +479,7 @@ Run it. Expected on the Task 1 build: S3 reads **0.0** (a plain diffuse sheet in
 
 Every other site that builds a `MaterialProperties` by hand (grep `MaterialProperties dbg_mat` and `dbg_mat40`) sets `sssWeight = 0.0; sssThin = false; sssRadius = float3(0); sssScale = 0.0;` so those instruments are unchanged.
 
-- [ ] **Step 3: Registry**
+- [x] **Step 3: Registry**
 
 `brdf_inc.glsl` after the sheen block, before `LOBE_COUNT`:
 
@@ -527,7 +527,7 @@ Add a brdf type constant next to `SHEEN_TYPE` (grep `#define SHEEN_TYPE`): `#def
 #endif
 ```
 
-- [ ] **Step 4: Selection weights**
+- [x] **Step 4: Selection weights**
 
 `raytracing_closest_hit_common_inc.glsl` selection block: replace
 
@@ -559,7 +559,7 @@ and in the selection chain, before the trailing `} else {` (diffuse):
 #endif
 ```
 
-- [ ] **Step 5: Thin-wall sampling**
+- [x] **Step 5: Thin-wall sampling**
 
 In `evalIndirectCombinedBRDF` (`brdf_inc.glsl:~3850`), add an arm:
 
@@ -598,7 +598,7 @@ In `shade_and_bounce`'s post-sample bookkeeping (`:~2214`, `brdfType == DIFFUSE_
 
 (`INSIDE_MEDIUM` untouched: a sheet has no interior; the transmission counter is incremented in the same branch that increments it for `took_transmissive_lobe` — extend that `if` with `|| sss_thin_through`.)
 
-- [ ] **Step 6: NEE — the translucent share lit from behind**
+- [x] **Step 6: NEE — the translucent share lit from behind**
 
 `evalCombinedBRDFSeparate` gains `OUT_PARAMETER(float3) outTranslucent`; every existing caller (three in `raytracing_lights_inc.glsl`, any in `raytracing_closest_hit_common_inc.glsl`) passes a new local `brdf_translucent`. Inside:
 
@@ -626,11 +626,11 @@ placed AFTER the existing diffuse evaluation. Use the file's own name for `1/π`
 
 At each NEE consumer, `brdf_translucent` is added to the contribution exactly where `brdf_sheen` is, **but its shadow ray must start on the far side of the sheet**: the three sites compute `hit_pos` offset along the front normal; for the translucent term evaluate a second shadow ray from `offset_ray_origin(hit_pos, -h.geometry_normal)` only when `brdf_translucent` is non-zero. Read `lights_trace_shadow_ray`'s call at each site and duplicate it for the back side under `#ifdef RT_SSS_ENABLED`, guarded by `rt_max_component(brdf_translucent) > 0.0`.
 
-- [ ] **Step 7: Build, run S3**
+- [x] **Step 7: Build, run S3**
 
 Expected: S3 ratio ≈ `0.5 × 0.8 = 0.40` within 2%. If it reads ≈ 0.80, the translucent lobe is being counted by both the sample and the NEE without MIS — check the MIS pdf for the translucent direction at the emissive-hit site (the emissive backdrop is hit by the BSDF ray *and* sampled by emissive NEE; the cosine pdf about `−N` must be what `mis_ray_pdf` carries for the translucent sample — set it exactly as the diffuse arm sets it, with `side` as the normal).
 
-- [ ] **Step 8: Isolation check and commit**
+- [x] **Step 8: Isolation check and commit**
 
 Run `pt_energy_gate`, `pt_sheen_gate`, `pt_coat_gate`, `pt_glass_energy_gate`: all green, no numbers moved (none has an SSS material, so `RT_SSS_ENABLED` is not defined and the shader is byte-identical).
 
@@ -651,7 +651,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: printed `@@@` lines with per-channel means for `sss_a0.8` (S2) and `diffuse_a0.8` (the fallback/diffuse control) — pasted into the gate in Task 4 as `CYCLES_REF_S2` and `CYCLES_REF_DIFFUSE`.
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 ```python
 # Subsurface sphere against Cycles -- E3 (spec 2026-09-15-e3-subsurface-scattering).
@@ -777,7 +777,7 @@ print("@@@ DONE")
 
 Note `Specular IOR Level = 0` removes the dielectric specular lobe so the sphere is diffuse + subsurface only, matching the gate's `metallic_specular = 0.0`.
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 ```bash
 "/c/Program Files/Blender Foundation/Blender 5.2/blender.exe" -b -P tools/cycles_comparison/cycles_sss_sphere.py -- "<scratchpad>/e3/cycles" 2>&1 | grep "@@@"
@@ -785,7 +785,7 @@ Note `Specular IOR Level = 0` removes the dielectric specular lobe so the sphere
 
 Expected: three `@@@` lines. `sss_white` should read ≤ 1.0 and close to `diffuse` at albedo 1 would (a white furnace reads 1.0 for a lossless sphere; Cycles at 12 bounces reads a little under). Record all three.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tools/cycles_comparison/cycles_sss_sphere.py
@@ -809,7 +809,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: Task 2's `SUBSURFACE_TYPE`, `MaterialProperties.sss*`; Task 3's reference numbers.
 - Produces: `SSS_EXIT_FLAG = (1u << 27)` with `set_sss_exit / clear_sss_exit / is_sss_exit`; `bool sss_random_walk(vec3 P, vec3 D, vec3 N, MaterialProperties material, inout vec3 throughput, uint seed, out vec3 exit_pos, out vec3 exit_dir)`.
 
-- [ ] **Step 1: Gate probes S1, S2, S4 (red)**
+- [x] **Step 1: Gate probes S1, S2, S4 (red)**
 
 Add to `pt_subsurface_gate.gd` (constants after `S3_TOL`):
 
@@ -913,7 +913,7 @@ Probes, inserted in `_ready()` before `_finish()`:
 
 Run on the Task 2 build. Expected: S1 passes vacuously (the solid SSS lobe is unimplemented → selected lobe falls through to a diffuse bounce ONLY if the `SUBSURFACE_TYPE` arm returns something — it returns `false` today, so the path terminates and S1 reads *low* → FAIL), S2 FAIL, S4 PASS (radius 0 → weight forced to 0 by Task 2 → diffuse). Record the readings.
 
-- [ ] **Step 2: Payload flag**
+- [x] **Step 2: Payload flag**
 
 `raytracing_inc.glsl`, after `PATH_TERMINATED_FLAG`:
 
@@ -928,7 +928,7 @@ uint clear_sss_exit(uint packed) { return packed & ~SSS_EXIT_FLAG; }
 bool is_sss_exit(uint packed) { return (packed & SSS_EXIT_FLAG) != 0u; }
 ```
 
-- [ ] **Step 3: The walk include**
+- [x] **Step 3: The walk include**
 
 `servers/rendering/renderer_rd/shaders/raytracing/raytracing_sss_inc.glsl` (new; included from the closest-hit stage after `brdf_inc.glsl`; `raytracing_common_inc.glsl`'s `tlas` and `GL_EXT_ray_query` are already available there — pass B uses them):
 
@@ -1186,7 +1186,7 @@ bool sss_random_walk(vec3 P, vec3 D, vec3 N, MaterialProperties material, inout 
 
 `fetch_position(geom, index)` — use the name the hit include actually exposes for a vertex position fetch (grep `fetch_` in `raytracing_hit_inc.glsl`); if only a combined fetch exists, use it. Confirm `PI` is defined in the closest-hit stage (grep); otherwise use the constant the BRDF file defines.
 
-- [ ] **Step 4: Restart at an arbitrary point (payload)**
+- [x] **Step 4: Restart at an arbitrary point (payload)**
 
 The raygen rebuilds the next origin as `ray_origin + ray_dir * hit_t`, which cannot express the SSS restart point. Add to `PathPayload` / `PathState` a `vec3 sss_restart` (12 bytes; payload 56 → 68, padded to 80 by vec3 alignment — acceptable; note it in the size comment) copied by `path_pack`/`path_unpack`, initialised to `vec3(0)`, and in the raygen restart block:
 
@@ -1206,7 +1206,7 @@ The raygen rebuilds the next origin as `ray_origin + ray_dir * hit_t`, which can
 
 Read the loop's structure first: the restart block assigns `ray_origin`, `t_min` and `ray_dir` then loops; write the SSS branch as an `if/else` around exactly those three assignments (no `continue_to_trace` variable exists — that line is illustrative; the branch just must skip the offset/skip-id logic).
 
-- [ ] **Step 5: Entry and exit in `shade_and_bounce`**
+- [x] **Step 5: Entry and exit in `shade_and_bounce`**
 
 Exit shading first — at the top of `shade_and_bounce`, right after the Gap #26 skip clear:
 
@@ -1308,11 +1308,11 @@ Entry — in the SUBSURFACE_TYPE branch of the sampling code (where `evalIndirec
 #endif
 ```
 
-- [ ] **Step 6: Build and run the gate**
+- [x] **Step 6: Build and run the gate**
 
 Expected: S3 unchanged (≈ 0.40), S1 `sss` within 2% of `diffuse` and ≤ 1.0, S2 within 5% of Cycles per channel, S4 unchanged. If S1 reads high: the throughput at entry is being multiplied by the base colour twice (selection division already includes `w`; check `ps.throughput /= weights[LOBE_SUBSURFACE]` in Task 2 and the `* baseColor` here — Cycles' closure weight is `base_color * w * layering` and its `sample_weight` normalisation divides by `w`, so the net factor is `base_color * layering`, which is what the line applies). If S1 reads low by a constant factor: the walk is dividing by `albedo` before the throughput had it — verify the multiply-then-divide order. If S1 is ~0: `sss_intersect_self` never confirms — print `gl_InstanceID` vs `rayQueryGetIntersectionInstanceIdEXT` once via a vis mode if needed.
 
-- [ ] **Step 7: Doctest, isolation, commit**
+- [x] **Step 7: Doctest, isolation, commit**
 
 `--test`: 1558/1558. `pt_glass_energy_gate`, `pt_transmission_gate`, `pt_thin_layer_gate`: unchanged (no SSS material → identical shader).
 
@@ -1331,7 +1331,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `pipeline_references/image_glb_creation.gd` (user's file — NOT staged)
 - Modify: `PATH_TRACER_QUALITY_ROADMAP.md` (row 13, §11.23)
 
-- [ ] **Step 1: The keyword table**
+- [x] **Step 1: The keyword table**
 
 In `image_glb_creation.gd`, next to `GLB_GLASS_MATERIAL_KEYWORDS`:
 
@@ -1380,19 +1380,19 @@ Call it from the same per-surface loop that runs the glass classification (`_con
 
 Parse check: `--headless --path pipeline_references --check-only -s image_glb_creation.gd`.
 
-- [ ] **Step 2: Isolation render — rule off**
+- [x] **Step 2: Isolation render — rule off**
 
 Scratch copy of the live project with the reference `image_glb_creation.gd` but `GLB_SUBSURFACE_PRESETS = []`, render `d217_fhd.json` on the Task 4 build to `<scratchpad>/e3/d217_off.png`; compare to `<scratchpad>/g26/d217_g22.png` (last pre-E3 render on the same route): whole-frame change must be **0.00%** (no SSS material → the feature is compiled out).
 
-- [ ] **Step 3: Rule on**
+- [x] **Step 3: Rule on**
 
 Same copy with the presets in; render to `<scratchpad>/e3/d217_on.png`. Expected: the log shows `[SSS]` lines for the marble table and the candles; the marble table's mean moves (record by how much) and the rest of the frame is within 1%. Crop the table and the candle for the roadmap and for the user.
 
-- [ ] **Step 4: Suite and doctest**
+- [x] **Step 4: Suite and doctest**
 
 Every `pt_*_gate_scene.tscn` (with `.tscn` in the path!) green; `pt_subsurface_gate` included. Doctest 1558/1558.
 
-- [ ] **Step 5: Roadmap**
+- [x] **Step 5: Roadmap**
 
 Row 13: replace `**SSS is what remains**` with `**SSS shipped 2026-09-xx (E3, §11.23)**: Cycles random walk (van de Hulst remap, Dwivedi guiding, channel MIS, 256 steps) for solids and the OpenPBR thin-wall split for sheets; gate S1 energy / S2 vs Cycles / S3 thin-wall / S4 fallback; pipeline keyword rule (marble, wax, shade/paper, leaf). Skin mode deferred (render_mode invisible to the upload).` Add §11.23 with the Cycles numbers, the gate table before/after, the 217 off/on measurements, and the deviation list (skin, anisotropy 0, payload +12 bytes).
 
@@ -1412,3 +1412,23 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - **Spec coverage:** material mapping + struct + feature gate (T1); registry lobe, weights, layer depth, thin-wall sampling and NEE (T2); Cycles script (T3); entry/coefficients/walk/self-intersection/exit/termination + payload flag (T4); pipeline table + isolation + asset check + roadmap (T5); gates S1–S4 (T2, T4). Skin mode / S5: deferred with the reason in T1 Step 9. Spec's "DLSS-RR guides unchanged": nothing touches them.
 - **Placeholders:** `CYCLES_REF_*` zero vectors are filled from Task 3's measured run (T4 Step 1 says so); no other TODO/TBD.
 - **Type consistency:** `sssWeight/sssThin/sssRadius/sssScale` (T2) read by T4; `SUBSURFACE_TYPE`, `LOBE_SUBSURFACE` (T2) used by T4; `SSS_EXIT_FLAG` helpers (T4 Step 2) used in T4 Steps 4–5; `sss_random_walk` signature (T4 Step 3) matches its call (Step 4); `outTranslucent`/`brdf_translucent` (T2 Step 6) consistent across the three NEE sites.
+
+---
+
+## Execution notes (2026-09-15)
+
+All five tasks executed inline. Two departures from the plan as written, both
+found by Task 5 Step 3 (job 217 with the rule on) and recorded in roadmap
+§11.23:
+
+- Task 4 Step 2 put `SSS_EXIT_FLAG` at bit 27 of `packed_bounces_flags`; that
+  is the transmission counter's low bit. The flag moved to
+  `PathPayload.sss_restart.w` (`PathState.sss_exit`). A fifth gate probe, S5
+  (diffuse sphere through glass, feature bit off vs on), was added and shown
+  red on the broken build before the fix.
+- Godot's raster screen-space SSS (`using_sss` in
+  `render_forward_clustered.cpp`) ran over the traced frame once any material
+  enabled subsurface. It is now cleared when the tracer owns colour.
+
+S1 uses a 3% bar against Cycles' white SSS sphere (0.97527) rather than the
+plan's 2% against white diffuse: Cycles itself sits 2.4% under diffuse there.
