@@ -1308,6 +1308,27 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// through-events below set it again.
 	ps.skip_geom = RT_SKIP_NONE;
 	ps.skip_prim = RT_SKIP_NONE;
+#ifdef RT_SSS_ENABLED
+	// E3: this hit is the EXIT of a random walk (SSS_EXIT_FLAG). Cycles'
+	// subsurface_shader_data_setup replaces the whole shader with a diffuse
+	// closure of weight 1 on the bump-mapped normal: no emission, no specular,
+	// no coat/sheen/transmission, no second subsurface here. The walk already
+	// paid the albedo; the exit is a WHITE Lambertian.
+	const bool sss_exit_hit = is_sss_exit(ps.packed_bounces_flags);
+	if (sss_exit_hit) {
+		ps.packed_bounces_flags = clear_sss_exit(ps.packed_bounces_flags);
+		m.albedo = vec3(1.0);
+		m.alpha = 1.0;
+		m.blends = false;
+		m.metalness = 0.0;
+		m.specular = 0.0;
+		m.emissive = vec3(0.0);
+		m.transmission = 0.0;
+		m.roughness = 1.0;
+	}
+#else
+	const bool sss_exit_hit = false;
+#endif
 
 	// Beer-Lambert absorption through a solid (roadmap E1).
 	//
@@ -1677,6 +1698,13 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.sssRadius = max(raw_mat.sss_radius * brdf_mat.sssScale, vec3(0.0));
 	if (!brdf_mat.sssThin && max(max(brdf_mat.sssRadius.r, brdf_mat.sssRadius.g), brdf_mat.sssRadius.b) < 1e-8) {
 		brdf_mat.sssWeight = 0.0;
+	}
+	if (sss_exit_hit) {
+		brdf_mat.coatWeight = 0.0;
+		brdf_mat.sheenColor = vec3(0.0);
+		brdf_mat.sssWeight = 0.0;
+		brdf_mat.transmissivness = 0.0;
+		brdf_mat.dielectricF0 = vec3(0.0);
 	}
 #else
 	brdf_mat.sssWeight = 0.0;
@@ -2263,6 +2291,61 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		}
 		transmissive_sample_ok = true; // skip evalIndirectCombinedBRDF below
 		sss_thin_through = true;
+	} else if (brdfType == SUBSURFACE_TYPE) {
+		// E3 solid: Cycles subsurface_entry_bounce + subsurface_random_walk.
+		// Entry direction: a GGX VNDF microfacet at alpha = roughness^2,
+		// refracted at 1/ior -- direction only, no BSDF/pdf factor (Cycles'
+		// own note: "we only really care about the directional distribution").
+		float sss_ior = clamp(brdf_mat.eta > 0.0 ? brdf_mat.eta : 1.4, 1.01, 3.8);
+		float ent_alpha = brdf_mat.roughness * brdf_mat.roughness;
+		float4 qRot = getRotationToZAxis(N);
+		float3 V_local = rotatePoint(qRot, V);
+		float3 H_local = sampleGGXVNDF(V_local, float2(ent_alpha, ent_alpha), u);
+		float3 H = normalize(rotatePoint(invertRotation(qRot), H_local));
+		float neta = 1.0 / sss_ior;
+		float cos_HI = dot(H, V);
+		float arg = 1.0 - neta * neta * (1.0 - cos_HI * cos_HI);
+		bool entry_ok = (cos_HI > 0.0) && (arg >= 0.0);
+		vec3 wo = vec3(0.0);
+		if (entry_ok) {
+			float dnp = max(sqrt(arg), 1e-7);
+			float nK = neta * cos_HI - dnp;
+			wo = -(neta * V) + nK * H;
+			entry_ok = dot(h.geometry_normal, wo) < 0.0;
+		}
+		if (!entry_ok) {
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+		// Closure weight over selection probability: the base colour (Cycles'
+		// closure weight is base_color * w * layering; the w cancelled against
+		// the selection division above), then the walk divides the albedo back
+		// out and re-adds it through scattering.
+		ps.throughput *= brdf_mat.baseColor;
+		vec3 exit_pos;
+		vec3 exit_dir;
+		uint seed = ps.rng_packed ^ (uint(gl_PrimitiveID) * 0x9E3779B9u) ^ floatBitsToUint(h.hit_pos.x + h.hit_pos.z);
+		if (!sss_random_walk(h.hit_pos, wo, N, brdf_mat.baseColor, brdf_mat.sssRadius, ps.throughput, seed,
+					uint(gl_InstanceID), uint(gl_PrimitiveID), exit_pos, exit_dir)) {
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+		// Re-aim: the next ray starts 2 mm past the exit point along the walk
+		// direction and points back at it (Cycles: P += D*tmax*2; D = -D), so
+		// the exit face is the next closest hit, from outside, and is shaded
+		// as a white Lambertian under SSS_EXIT_FLAG.
+		const float SSS_EXIT_DELTA = 0.002;
+		ps.sss_restart = exit_pos + exit_dir * SSS_EXIT_DELTA;
+		ps.next_ray_dir = -exit_dir;
+		ps.offset_normal = exit_dir;
+		ps.hit_t = gl_HitTEXT;
+		ps.packed_bounces_flags = set_sss_exit(inc_diffuse_bounce(ps.packed_bounces_flags));
+		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+		ps.rng_packed = rng_pack(rng_next_bounce(rng));
+		path_pack(payload, ps);
+		return;
 	}
 #else
 	const bool sss_thin_through = false;

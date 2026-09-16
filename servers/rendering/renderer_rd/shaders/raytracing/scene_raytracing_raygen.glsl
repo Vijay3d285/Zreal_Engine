@@ -60,6 +60,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	ps.mis_ray_pdf = RT_MIS_PDF_NONE;
 	ps.skip_geom = RT_SKIP_NONE;
 	ps.skip_prim = RT_SKIP_NONE;
+	ps.sss_restart = vec3(0.0);
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
@@ -127,8 +128,19 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 		// bounce cap (the black window). Every ray WITHOUT a skip id takes the
 		// historical path unchanged.
 		const bool skip_active = (ps.skip_geom != RT_SKIP_NONE);
-		ray_origin = skip_active ? hit_pos : offset_ray_origin(hit_pos, ps.offset_normal);
-		t_min = skip_active ? 0.0 : 0.001;
+#ifdef RT_SSS_ENABLED
+		if (is_sss_exit(ps.packed_bounces_flags)) {
+			// E3: the random walk's exit is not on this ray. Restart from the
+			// point the hit shader computed, 2 mm outside the exit face, aimed
+			// back at it, with the historical t_min (the face is 2 mm away).
+			ray_origin = ps.sss_restart;
+			t_min = 0.001;
+		} else
+#endif
+		{
+			ray_origin = skip_active ? hit_pos : offset_ray_origin(hit_pos, ps.offset_normal);
+			t_min = skip_active ? 0.0 : 0.001;
+		}
 		ray_dir = ps.next_ray_dir;
 	}
 
@@ -472,6 +484,7 @@ layout(set = 0, binding = 8) uniform sampler radiance_sampler;
 
 // clang-format off
 #include "raytracing_material_eval_inc.glsl"
+#include "raytracing_sss_inc.glsl"
 #include "raytracing_closest_hit_common_inc.glsl"
 // clang-format on
 

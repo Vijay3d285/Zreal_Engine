@@ -10,12 +10,14 @@ extends "res://tests/pt_validation.gd"
 ##      and an emissive backdrop, camera side black. The translucent half of
 ##      the OpenPBR split lets 0.5 * A * L_backdrop through; the diffuse half
 ##      sees only black. Ratio sheet/backdrop = 0.5 * A within 2%.
-##   S1 energy (Task 4): white solid SSS sphere in a uniform furnace <= 1.0 and
-##      within 2% of a white diffuse sphere.
-##   S2 Cycles (Task 4): albedo 0.8 sphere, radius (1,0.2,0.1)*0.05, ior 1.4,
-##      within 5% of CYCLES_REF per channel.
-##   S4 fallback (Task 4): S2's material with radius 0 equals plain diffuse
-##      to 0.5%.
+##   S1 energy: white solid SSS sphere in a uniform furnace reads <= 1.0 and
+##      within 3% of Cycles' white SSS sphere (0.97527). NOT "within 2% of a
+##      white diffuse sphere": Cycles itself reads 0.97527 against its own white
+##      diffuse 0.99967 -- the walk's 256-step cap and the 0.2 alpha floor cost
+##      it 2.4%, and matching Cycles means carrying the same loss.
+##   S2 Cycles: albedo 0.8 sphere, radius (1,0.2,0.1)*0.05, ior 1.4, within 5%
+##      of CYCLES_REF_S2 per channel.
+##   S4 fallback: S2's material with radius 0 equals plain diffuse to 0.5%.
 ##
 ## The translucent share is BSDF-owned: no NEE strategy draws a direction
 ## below the horizon (the transmissive-lobe rule), so S3's light arrives by the
@@ -25,6 +27,16 @@ extends "res://tests/pt_validation.gd"
 const FRAMES := 128
 const SHEET_ALBEDO := 0.8
 const S3_TOL := 0.02
+const S_FRAMES := 256
+const S_BOUNCES := 12
+const S1_TOL := 0.03
+const S2_TOL := 0.05
+const S4_TOL := 0.005
+# tools/cycles_comparison/cycles_sss_sphere.py, Blender 5.2.1, 2048 spp,
+# 12 bounces, 2026-09-15.
+const CYCLES_REF_S2 := Vector3(0.82585410, 0.77649382, 0.77084864)
+const CYCLES_REF_DIFFUSE := 0.79974588
+const CYCLES_REF_SSS_WHITE := 0.97526848
 
 const CAM_POS := Vector3(0, 0, 5)
 const CAM_TARGET := Vector3(0, 0, -5)
@@ -55,7 +67,91 @@ func _ready() -> void:
 		_failures.append("S3 thin-wall: %.6f vs %.4f (%.1f%% off, max %.0f%%)"
 				% [s3, s3_theory, (s3 / s3_theory - 1.0) * 100.0, S3_TOL * 100.0])
 
+	print("
+=== S1: white solid SSS sphere, furnace ===")
+	var s1_sss := await _sphere_mean(_sss_material(1.0, 1.0, Color(1, 1, 1), 0.05))
+	var s1_dif := await _sphere_mean(_sss_material(1.0, 0.0, Color(1, 1, 1), 0.05))
+	var m1s := (s1_sss.x + s1_sss.y + s1_sss.z) / 3.0
+	var m1d := (s1_dif.x + s1_dif.y + s1_dif.z) / 3.0
+	print("  sss %.6f  diffuse %.6f  Cycles sss %.6f" % [m1s, m1d, CYCLES_REF_SSS_WHITE])
+	_checks += 1
+	if m1s > 1.0 + 1e-3 or absf(m1s / CYCLES_REF_SSS_WHITE - 1.0) > S1_TOL:
+		_failures.append("S1 energy: sss %.6f vs Cycles %.6f (diffuse control %.6f)" % [m1s, CYCLES_REF_SSS_WHITE, m1d])
+
+	print("
+=== S2: albedo 0.8, radius (1,0.2,0.1)*0.05 vs Cycles ===")
+	var s2 := await _sphere_mean(_sss_material(0.8, 1.0, Color(1.0, 0.2, 0.1), 0.05))
+	print("  ours RGB %s  Cycles %s" % [s2, CYCLES_REF_S2])
+	for i in range(3):
+		_checks += 1
+		var off := absf(s2[i] / maxf(CYCLES_REF_S2[i], 1e-9) - 1.0)
+		if off > S2_TOL:
+			_failures.append("S2 channel %d: %.6f vs Cycles %.6f (%.2f%%)" % [i, s2[i], CYCLES_REF_S2[i], off * 100.0])
+
+	print("
+=== S4: radius 0 falls back to diffuse ===")
+	var s4 := await _sphere_mean(_sss_material(0.8, 1.0, Color(0, 0, 0), 0.05))
+	var s4_dif := await _sphere_mean(_sss_material(0.8, 0.0, Color(1, 1, 1), 0.05))
+	var m4 := (s4.x + s4.y + s4.z) / 3.0
+	var m4d := (s4_dif.x + s4_dif.y + s4_dif.z) / 3.0
+	print("  radius-0 %.6f  diffuse %.6f  (Cycles diffuse %.6f)" % [m4, m4d, CYCLES_REF_DIFFUSE])
+	_checks += 1
+	if absf(m4 / maxf(m4d, 1e-9) - 1.0) > S4_TOL:
+		_failures.append("S4 fallback: %.6f vs diffuse %.6f" % [m4, m4d])
+
 	_finish()
+
+
+## Sphere furnace, framing matched to pt_glass_energy_gate.gd and
+## tools/cycles_comparison/cycles_sss_sphere.py: unit sphere, camera at
+## normalize(1,1,1) * 2.5, FOV 20, constant sky radiance 1.0, mean over the
+## whole 256x256 image (the sphere overfills it).
+func _sphere_mean(p_mat: StandardMaterial3D) -> Vector3:
+	for c in get_children():
+		c.queue_free()
+	var env := _new_env(Color(1, 1, 1))
+	env.set_pathtracing_max_bounces(S_BOUNCES)
+	var sphere := MeshInstance3D.new()
+	var sm := SphereMesh.new()
+	sm.radius = 1.0
+	sm.height = 2.0
+	sm.radial_segments = 64
+	sm.rings = 32
+	sphere.mesh = sm
+	sphere.material_override = p_mat
+	add_child(sphere)
+	var cam := Camera3D.new()
+	add_child(cam)
+	cam.make_current()
+	cam.fov = 20.0
+	cam.position = Vector3(1.4433757, 1.4433757, 1.4433757)
+	cam.look_at(Vector3.ZERO, Vector3.UP)
+	await get_tree().create_timer(2.0).timeout
+	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), S_FRAMES)
+	var acc := Vector3.ZERO
+	var n := 0
+	for y in range(img.get_height()):
+		for x in range(img.get_width()):
+			var c := img.get_pixel(x, y)
+			acc += Vector3(c.r, c.g, c.b)
+			n += 1
+	return acc / float(maxi(n, 1))
+
+
+func _sss_material(p_albedo: float, p_weight: float, p_radius: Color, p_scale: float) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = Color(p_albedo, p_albedo, p_albedo).linear_to_srgb()
+	m.metallic = 0.0
+	m.metallic_specular = 0.0
+	m.roughness = 1.0
+	m.ior = 1.4
+	if p_weight > 0.0:
+		m.subsurf_scatter_enabled = true
+		m.subsurf_scatter_strength = p_weight
+		m.subsurf_scatter_transmittance_enabled = true
+		m.subsurf_scatter_transmittance_color = p_radius.linear_to_srgb()
+		m.subsurf_scatter_transmittance_depth = p_scale
+	return m
 
 
 func _finish() -> void:

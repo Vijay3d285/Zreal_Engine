@@ -67,6 +67,10 @@ struct PathPayload {
 	// behind a pane is hit instead of being skipped by a distance margin.
 	uint skip_geom; //  4 bytes - gl_InstanceCustomIndexEXT, or RT_SKIP_NONE
 	uint skip_prim; //  4 bytes - gl_PrimitiveID within that geometry
+	// E3. Where the next ray starts when SSS_EXIT_FLAG is set: the walk's exit
+	// is not on the current ray, so origin + dir * hit_t cannot express it.
+	// 12 bytes; vec3 alignment pads the struct to 80.
+	vec3 sss_restart;
 };
 
 /// Sentinel: this ray has no meaningful BSDF pdf, so anything it hits takes the
@@ -137,6 +141,7 @@ struct PathState {
 	float mis_ray_pdf;
 	uint skip_geom;
 	uint skip_prim;
+	vec3 sss_restart;
 };
 
 PathState path_unpack(PathPayload p) {
@@ -151,6 +156,7 @@ PathState path_unpack(PathPayload p) {
 	s.mis_ray_pdf = p.mis_ray_pdf;
 	s.skip_geom = p.skip_geom;
 	s.skip_prim = p.skip_prim;
+	s.sss_restart = p.sss_restart;
 	return s;
 }
 
@@ -165,6 +171,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.mis_ray_pdf = s.mis_ray_pdf;
 	p.skip_geom = s.skip_geom;
 	p.skip_prim = s.skip_prim;
+	p.sss_restart = s.sss_restart;
 }
 
 // Bounce count helpers.
@@ -249,6 +256,16 @@ bool is_shadow_ray(uint packed) {
 }
 
 const uint PATH_TERMINATED_FLAG = (1u << 26);
+
+// E3 subsurface exit (bit 27). Set by the hit shader after a random walk
+// found its exit point; the next ray is aimed back AT that point from
+// outside (raygen starts it at sss_restart), and the hit that results is
+// shaded as a white Lambertian -- Cycles' subsurface_shader_data_setup --
+// then the flag is cleared.
+const uint SSS_EXIT_FLAG = (1u << 27);
+uint set_sss_exit(uint packed) { return packed | SSS_EXIT_FLAG; }
+uint clear_sss_exit(uint packed) { return packed & ~SSS_EXIT_FLAG; }
+bool is_sss_exit(uint packed) { return (packed & SSS_EXIT_FLAG) != 0u; }
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;
 }
