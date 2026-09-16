@@ -130,7 +130,7 @@ func _ready() -> void:
 	var sym := absf((d75 - d50) - (d50 - d25))
 	var mean := total / float(w * h)
 
-	print("\n=== F1: edge-spread 10-90%% ramp ===")
+	print("\n=== F1: edge-spread 10-90% ramp ===")
 	print("  ramp %.4f px  (expected %.3f +- %.3f; +-1.0 window would read 0.721)" % [ramp, F1_EXPECTED, F1_TOL])
 	_checks += 1
 	if absf(ramp - F1_EXPECTED) > F1_TOL:

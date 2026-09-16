@@ -122,16 +122,23 @@ Godot default that would bite the moment anyone flips the route back.
 New gate, `pipeline_references/tests/pt_pixel_filter_gate.gd` + `_scene.tscn`,
 extending `pt_validation.gd` like the others.
 
-Scene: an orthographic camera, `size = 2.0` at 256×256 (1 px = 2/256 world
-units), looking at a flat black quad (albedo 0, max bounces 1) whose right
-edge sits **on a pixel centre** — half a pixel past a pixel boundary — against
-a white sky of radiance 1.
+Scene: a perspective camera (FOV 10°, 10 units back, 256×256) looking at a
+flat black quad (albedo 0, max bounces 1) against a white sky of radiance 1.
+The quad's right edge passes through the image centre and is tilted by
+atan(1/128), so it drifts one pixel every 128 rows: sorting every pixel by
+its known signed distance to the edge sweeps out the CONTINUOUS edge-spread
+function (the filter's CDF). An edge on a pixel centre cannot discriminate
+the widths — both windows then read 0 / 0.5 / 1, because the Blackman-Harris
+tails at ±1 px are 0.6% and 0%. The gate turns `use_taa` off and the scaling
+mode to BILINEAR, as `render.gd` does: the project's `use_taa=true` default
+adds a 16-phase Halton jitter to the projection, and with it on the ±1.0
+window read 1.06 px instead of 0.72.
 Accumulate 256 frames (`_render_accum`). The gate reads the horizontal
 luminance profile through the edge, averaged over 200 rows, and derives:
 
 - **F1 ramp width**: 10–90% width in pixels. Expected `1.081 ± 0.08` (the
-  analytic CDF of the 1.5-wide window, sampled at pixel centres, ±0.08 for the
-  pixel-centre quantisation and 256-sample noise). The current build reads
+  analytic CDF of the 1.5-wide window; ±0.08 for 0.05 px binning and
+  256-sample noise). The current build reads
   `0.72` — the gate is red before the change and green after (falsifiable).
 - **F2 symmetry**: the profile's 25% and 75% crossings are equidistant from
   the 50% crossing within 0.05 px (the filter is symmetric; a sign or offset
