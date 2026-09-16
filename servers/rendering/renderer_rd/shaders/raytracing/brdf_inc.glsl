@@ -117,6 +117,9 @@ V mul(const M &m, const V &v) {
 // than incidental: LOBE_SHEEN is 3 with the coat compiled in and 2 without it
 // (:1870-1876), while these tags are fixed constants that no variant changes.
 #define SHEEN_TYPE 4
+// E3. The subsurface share of the diffuse closure: thin-wall translucent
+// sample (about -N) or the solid random walk. Never evaluated by NEE.
+#define SUBSURFACE_TYPE 5
 
 // PIs
 #ifndef PI
@@ -369,6 +372,12 @@ struct MaterialProperties {
 	// gate on it.
 	float3 sheenColor;
 	float sheenRoughness;
+	// E3 subsurface (Cycles Principled: subsurface_weight, radius * scale).
+	// sssThin selects the OpenPBR thin-wall split; otherwise the random walk.
+	float sssWeight;
+	bool sssThin;
+	float3 sssRadius;
+	float sssScale;
 };
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
@@ -2154,12 +2163,28 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 #endif
 #endif
 
+// E3. APPENDS after sheen; slides like the coat and sheen do. Registry
+// position is not layer depth: layerTransmittanceAbove maps LOBE_SUBSURFACE
+// to LOBE_DIFFUSE's depth (it IS the diffuse share, Cycles svm/closure.h:479).
+#ifdef RT_SSS_ENABLED
 #if defined(RT_COAT_ENABLED) && defined(RT_SHEEN_ENABLED)
-#define LOBE_COUNT 4
+#define LOBE_SUBSURFACE 4
 #elif defined(RT_COAT_ENABLED) || defined(RT_SHEEN_ENABLED)
-#define LOBE_COUNT 3
+#define LOBE_SUBSURFACE 3
 #else
-#define LOBE_COUNT 2
+#define LOBE_SUBSURFACE 2
+#endif
+#define LOBE_SSS_EXTRA 1
+#else
+#define LOBE_SSS_EXTRA 0
+#endif
+
+#if defined(RT_COAT_ENABLED) && defined(RT_SHEEN_ENABLED)
+#define LOBE_COUNT (4 + LOBE_SSS_EXTRA)
+#elif defined(RT_COAT_ENABLED) || defined(RT_SHEEN_ENABLED)
+#define LOBE_COUNT (3 + LOBE_SSS_EXTRA)
+#else
+#define LOBE_COUNT (2 + LOBE_SSS_EXTRA)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -2205,6 +2230,21 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 // So unifying now makes the desync structurally IMPOSSIBLE and still
 // DETECTABLE. Do not restore the duplication on the strength of the old
 // comment.
+#ifdef RT_SSS_ENABLED
+// E3. The share of the diffuse closure that goes to LOBE_SUBSURFACE, used by
+// the sampler's selection, combinedPdf and evalCombinedBRDFSeparate -- ONE
+// function so the three cannot desync (the lobeWeight precedent, E2c).
+//
+// Solid: Cycles splits diffuse by subsurface_weight (svm/closure.h:479/:515).
+// Thin-wall: bsdf_thin_subsurface_setup splits the SSS weight into a diffuse
+// half (about +N) and a translucent half (about -N) at anisotropy 0; the
+// diffuse half is a plain Lambertian and is folded back into LOBE_DIFFUSE, so
+// only the translucent half is drawn through LOBE_SUBSURFACE.
+float sssSelectShare(MaterialProperties material) {
+	return material.sssThin ? 0.5f * material.sssWeight : material.sssWeight;
+}
+#endif
+
 float lobeWeight(MaterialProperties material) {
 	float3 specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
 	float3 diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness, material.transmissivness);
@@ -3341,6 +3381,11 @@ float3 evalSheen(float3 N, float3 L, float3 V, MaterialProperties material) {
 // alone; sheenLayerAlbedo takes N and V and derives its own.
 float3 layerTransmittanceAbove(MaterialProperties material, float3 N, float3 V, int lobeIndex) {
 	float3 t = float3(1.0f, 1.0f, 1.0f);
+#ifdef RT_SSS_ENABLED
+	if (lobeIndex == LOBE_SUBSURFACE) {
+		lobeIndex = LOBE_DIFFUSE; // the diffuse share: same layer depth.
+	}
+#endif
 #ifdef RT_SHEEN_ENABLED
 	if (lobeIndex < LOBE_SHEEN) {
 		t *= sheenLayeringTransmittance(material, sheenLayerAlbedo(material, N, V));
@@ -3692,7 +3737,17 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 
 	float weights[LOBE_COUNT];
 	weights[LOBE_SPECULAR] = baseShare * pSpec;
+#ifdef RT_SSS_ENABLED
+	// E3: the diffuse share splits by sssSelectShare -- the same function the
+	// sampler's selection uses. The subsurface strategy never produces an
+	// above-horizon direction at THIS vertex (thin: about -N; solid: exits
+	// elsewhere), so its density here is 0 and NEE cannot reach it -- the BSDF
+	// strategy owns it with weight 1, the same rule as the transmissive lobe.
+	weights[LOBE_DIFFUSE] = baseShare * (1.0f - pSpec) * (1.0f - sssSelectShare(material));
+	weights[LOBE_SUBSURFACE] = baseShare * (1.0f - pSpec) * sssSelectShare(material);
+#else
 	weights[LOBE_DIFFUSE] = baseShare * (1.0f - pSpec);
+#endif
 #ifdef RT_COAT_ENABLED
 	weights[LOBE_COAT] = coatShare;
 #endif
@@ -3703,6 +3758,9 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float pdfs[LOBE_COUNT];
 	pdfs[LOBE_SPECULAR] = specularContribution * transmitScale;
 	pdfs[LOBE_DIFFUSE] = pdfDiffuse;
+#ifdef RT_SSS_ENABLED
+	pdfs[LOBE_SUBSURFACE] = 0.0f;
+#endif
 #ifdef RT_COAT_ENABLED
 	pdfs[LOBE_COAT] = coatPdf(material.coatRoughness, NdotH, NdotV, LdotH);
 #endif
@@ -3757,6 +3815,12 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// Eval specular and diffuse BRDFs
 	outSpecular = evalSpecular(data);
 	outDiffuse = evalDiffuse(data);
+#ifdef RT_SSS_ENABLED
+	// E3: NEE lights only the diffuse share that stays diffuse. The subsurface
+	// share is lit at the walk's exit (solid) or by BSDF sampling alone (thin
+	// translucent half, below the horizon where no NEE strategy draws).
+	outDiffuse *= (1.0f - sssSelectShare(material));
+#endif
 
 #if COMBINE_BRDFS_WITH_FRESNEL
 	// Specular is already multiplied by F, just attenuate diffuse

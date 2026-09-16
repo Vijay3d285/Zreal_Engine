@@ -47,9 +47,10 @@ const MODE_ANISOTROPY_ROTATION := 26
 const MODE_ATTENUATION_COLOR := 27
 const MODE_SPECULAR_TINT := 28
 const MODE_SHEEN_COLOR := 29
-# E3 subsurface: sss_radius (41) and (sss_weight, sss_scale, thin ? 1 : 0) (42).
-const MODE_SSS_RADIUS := 41
-const MODE_SSS_WEIGHT_SCALE_THIN := 42
+# E3 subsurface: sss_radius (43) and (sss_weight, sss_scale, thin ? 1 : 0) (44).
+# 41 belongs to pt_sheen_gate (MODE_SHEEN_LTC); 42 is left free beside it.
+const MODE_SSS_RADIUS := 43
+const MODE_SSS_WEIGHT_SCALE_THIN := 44
 
 ## Values are distinct EXCEPT for one pair: V_CLEARCOAT and the blue channel of
 ## V_SPECULAR_TINT are both 0.55. That collision means this fixture set cannot
@@ -146,7 +147,7 @@ func _ready() -> void:
 	await _check_mode(env, MODE_SHEEN_COLOR,
 			"sheen_color",
 			Vector3(V_SHEEN_COLOR.r, V_SHEEN_COLOR.g, V_SHEEN_COLOR.b))
-	# E3: the subsurface fields, read back through vis modes 41/42. thin is 0
+	# E3: the subsurface fields, read back through vis modes 43/44. thin is 0
 	# here because transmittance_depth > 0 (a solid, not a sheet).
 	await _check_mode(env, MODE_SSS_RADIUS,
 			"sss_radius (transmittance_color)",

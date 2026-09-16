@@ -482,6 +482,10 @@ void debug_visualize(
 		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
+		dbg_mat.sssWeight = 0.0;
+		dbg_mat.sssThin = false;
+		dbg_mat.sssRadius = vec3(0.0);
+		dbg_mat.sssScale = 0.0;
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -530,10 +534,14 @@ void debug_visualize(
 		ps.radiance = dbg_material.specular_tint;
 	} else if (vis_mode == 29) {
 		ps.radiance = dbg_material.sheen_color;
-	} else if (vis_mode == 41) {
+	} else if (vis_mode == 43) {
 		// E3 arrival gate: the subsurface radius (transmittance_color), raw.
+		// 43/44, NOT 41/42: 41 is pt_sheen_gate's MODE_SHEEN_LTC (its arm sits
+		// later in this chain and was shadowed for one build -- the sheen gate
+		// caught it). Vis-mode numbers are claimed by the gates, not by an
+		// enum; grep `:= 4` in pipeline_references/tests before taking one.
 		ps.radiance = dbg_material.sss_radius;
-	} else if (vis_mode == 42) {
+	} else if (vis_mode == 44) {
 		// E3 arrival gate: r = sss_weight, g = sss_scale, b = thin-wall flag.
 		ps.radiance = vec3(dbg_material.sss_weight, dbg_material.sss_scale,
 				((dbg_material.flags & RT_MAT_FLAG_SSS_THIN) != 0u) ? 1.0 : 0.0);
@@ -625,6 +633,10 @@ void debug_visualize(
 		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
+		dbg_mat.sssWeight = 0.0;
+		dbg_mat.sssThin = false;
+		dbg_mat.sssRadius = vec3(0.0);
+		dbg_mat.sssScale = 0.0;
 
 		// E2d Task 5b. This used to emit the bare lobeWeight(dbg_mat), but since
 		// E2d the sampler's actual weights[LOBE_SPECULAR] is `baseShare * pSpec`
@@ -716,6 +728,10 @@ void debug_visualize(
 		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
+		dbg_mat.sssWeight = 0.0;
+		dbg_mat.sssThin = false;
+		dbg_mat.sssRadius = vec3(0.0);
+		dbg_mat.sssScale = 0.0;
 
 		vec3 dbg_specularF0 = baseColorToSpecularF0(dbg_mat.baseColor, dbg_mat.metalness, dbg_mat.dielectricF0);
 		float dbg_alpha = dbg_mat.roughness * dbg_mat.roughness;
@@ -880,6 +896,10 @@ void debug_visualize(
 		// produce; skipping it here changes nothing.
 		dbg_mat.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat.sheenRoughness = dbg_material.sheen_roughness;
+		dbg_mat.sssWeight = 0.0;
+		dbg_mat.sssThin = false;
+		dbg_mat.sssRadius = vec3(0.0);
+		dbg_mat.sssScale = 0.0;
 
 		// Same clamped shading normal shade_and_bounce actually bounces from
 		// (mirrors vis mode 33's dbg_N) -- on a sphere this is well away from
@@ -1137,6 +1157,10 @@ void debug_visualize(
 		// combinedPdf below, and both now read the sheen fields.
 		dbg_mat40.sheenColor = max(dbg_material.sheen_color, vec3(0.0));
 		dbg_mat40.sheenRoughness = dbg_material.sheen_roughness;
+		dbg_mat40.sssWeight = 0.0;
+		dbg_mat40.sssThin = false;
+		dbg_mat40.sssRadius = vec3(0.0);
+		dbg_mat40.sssScale = 0.0;
 
 		// Same clamped shading normal shade_and_bounce bounces from (mirrors vis
 		// modes 33/35). On a sphere this is well away from world Z almost
@@ -1643,6 +1667,23 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// scene-wide.
 	brdf_mat.sheenColor = max(raw_mat.sheen_color, vec3(0.0));
 	brdf_mat.sheenRoughness = clamp(raw_mat.sheen_roughness, 0.0, 1.0);
+#ifdef RT_SSS_ENABLED
+	// E3. Cycles bssrdf_setup: a channel whose radius (after scale) is below
+	// BSSRDF_MIN_RADIUS is diffuse for that channel; if all three are, the
+	// material has no subsurface closure at all. Anisotropy is fixed at 0.
+	brdf_mat.sssWeight = clamp(raw_mat.sss_weight, 0.0, 1.0);
+	brdf_mat.sssThin = (raw_mat.flags & RT_MAT_FLAG_SSS_THIN) != 0u;
+	brdf_mat.sssScale = max(raw_mat.sss_scale, 0.0);
+	brdf_mat.sssRadius = max(raw_mat.sss_radius * brdf_mat.sssScale, vec3(0.0));
+	if (!brdf_mat.sssThin && max(max(brdf_mat.sssRadius.r, brdf_mat.sssRadius.g), brdf_mat.sssRadius.b) < 1e-8) {
+		brdf_mat.sssWeight = 0.0;
+	}
+#else
+	brdf_mat.sssWeight = 0.0;
+	brdf_mat.sssThin = false;
+	brdf_mat.sssRadius = vec3(0.0);
+	brdf_mat.sssScale = 0.0;
+#endif
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
 	// Fix round 1, I2: the transmission weight used to be applied to THIS
@@ -1970,10 +2011,18 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// it so the existing short-circuit prefix is untouched; at sheenColor == 0
 	// sheenLobeWeight returns literal 0.0, the added conjunct is true, and the
 	// identical arm is taken on the identical evaluation order.
-	if (coatMass <= 0.0 && sheenMass <= 0.0 && diffuseLum < 0.0001) {
+	// E3 adds `sssMass <= 0.0` to both fast paths for the identical reason
+	// again: a subsurface material with no specular would take the diffuse fast
+	// path and never draw the subsurface lobe.
+#ifdef RT_SSS_ENABLED
+	float sssMass = sssSelectShare(brdf_mat);
+#else
+	const float sssMass = 0.0;
+#endif
+	if (coatMass <= 0.0 && sheenMass <= 0.0 && sssMass <= 0.0 && diffuseLum < 0.0001) {
 		brdfType = SPECULAR_TYPE;
 		lobe = LOBE_SPECULAR;
-	} else if (coatMass <= 0.0 && sheenMass <= 0.0 && specularLum < 0.0001) {
+	} else if (coatMass <= 0.0 && sheenMass <= 0.0 && sssMass <= 0.0 && specularLum < 0.0001) {
 		brdfType = DIFFUSE_TYPE;
 		lobe = LOBE_DIFFUSE;
 	} else {
@@ -2011,7 +2060,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 		float weights[LOBE_COUNT];
 		weights[LOBE_SPECULAR] = baseShare * pSpec;
+#ifdef RT_SSS_ENABLED
+		// E3: the diffuse share splits by sssSelectShare (see brdf_inc.glsl),
+		// the same function combinedPdf and evalCombinedBRDFSeparate use.
+		weights[LOBE_DIFFUSE] = baseShare * (1.0 - pSpec) * (1.0 - sssSelectShare(brdf_mat));
+		weights[LOBE_SUBSURFACE] = baseShare * (1.0 - pSpec) * sssSelectShare(brdf_mat);
+#else
 		weights[LOBE_DIFFUSE] = baseShare * (1.0 - pSpec);
+#endif
 #ifdef RT_COAT_ENABLED
 		weights[LOBE_COAT] = afterSheen * coatMass;
 #endif
@@ -2063,6 +2119,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			// as though coatWeight were 1, so the two halves of the layer did not
 			// balance.
 			ps.throughput *= brdf_mat.coatWeight / weights[LOBE_COAT];
+#endif
+#ifdef RT_SSS_ENABLED
+		} else if (lobe == LOBE_SUBSURFACE) {
+			brdfType = SUBSURFACE_TYPE;
+			ps.throughput /= weights[LOBE_SUBSURFACE];
 #endif
 		} else {
 			brdfType = DIFFUSE_TYPE;
@@ -2176,6 +2237,36 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		}
 	}
 
+#ifdef RT_SSS_ENABLED
+	// E3 thin-wall: the translucent half of bsdf_thin_subsurface_setup, a
+	// Lambertian about -N (bsdf_translucent). Cosine sample about -N, closure
+	// weight 0.5 * w * baseColor, and the ray continues on the far side. No NEE strategy draws below the horizon, so this direction is
+	// BSDF-owned with MIS weight 1 -- mis_ray_pdf is set to NONE below through
+	// sss_thin_through, the same rule as took_transmissive_lobe.
+	bool sss_thin_through = false;
+	if (brdfType == SUBSURFACE_TYPE && brdf_mat.sssThin) {
+		float4 qRot = getRotationToZAxis(N);
+		float3 local_dir = sampleHemisphere(u);
+		local_dir.z = -local_dir.z;
+		next_dir = normalize(rotatePoint(invertRotation(qRot), local_dir));
+		// CLOSURE weight, as every other arm returns it: the translucent lobe's
+		// weight is 0.5 * w * baseColor (bsdf_thin_subsurface_setup), and its
+		// Lambertian eval/pdf is 1. shade_and_bounce has already divided the
+		// throughput by the selection probability (0.5 * w), so the two cancel
+		// to baseColor in expectation -- returning baseColor HERE would pay the
+		// lobe twice (measured: S3 read 0.80 instead of 0.40).
+		brdf_weight = sssSelectShare(brdf_mat) * brdf_mat.baseColor;
+		if (dot(next_dir, h.geometry_normal) >= 0.0 || luminance(brdf_weight) == 0.0) {
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+		transmissive_sample_ok = true; // skip evalIndirectCombinedBRDF below
+		sss_thin_through = true;
+	}
+#else
+	const bool sss_thin_through = false;
+#endif
 	if (!transmissive_sample_ok && !evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
@@ -2218,7 +2309,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 					? set_inside_medium(ps.packed_bounces_flags)
 					: clear_inside_medium(ps.packed_bounces_flags);
 		}
-	} else if (brdfType == DIFFUSE_TYPE || brdfType == SHEEN_TYPE) {
+	} else if (brdfType == DIFFUSE_TYPE || brdfType == SHEEN_TYPE || brdfType == SUBSURFACE_TYPE) {
 		// E2e: sheen counts as a DIFFUSE bounce, not a glossy one. Cycles labels
 		// the sheen closure LABEL_REFLECT | LABEL_DIFFUSE (bsdf_sheen.h:110), and
 		// the LTC is a wide, near-cosine lobe -- classifying it as glossy would
@@ -2292,7 +2383,8 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// surface, so it must be offset the other way or it restarts outside the
 	// glass and immediately re-hits the face it just crossed. Negating here
 	// costs no payload space -- the field is already oct-packed.
-	ps.offset_normal = took_transmissive_lobe ? -h.geometry_normal : h.geometry_normal;
+	// E3: a thin-wall translucent sample restarts on the FAR side, like a refraction.
+	ps.offset_normal = (took_transmissive_lobe || sss_thin_through) ? -h.geometry_normal : h.geometry_normal;
 	ps.next_ray_dir = next_dir;
 	// Next bounce gets its own dimension block, so decision k at depth d always
 	// draws from the same dimension across every path in the frame.
@@ -2375,7 +2467,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	//     mirror coat would report a mixture pdf built only from the base lobes --
 	//     a density that does not describe how the direction was actually drawn.
 	//     Unreachable while clearcoat is 0, since brdfType is never COAT_TYPE then.
-	if (took_transmissive_lobe || recovered_sample || dot(N, V) <= 0.0 ||
+	if (took_transmissive_lobe || sss_thin_through || recovered_sample || dot(N, V) <= 0.0 ||
 			(brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS) ||
 			(brdfType == COAT_TYPE && brdf_mat.coatRoughness < RT_MIS_DELTA_ROUGHNESS)) {
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;

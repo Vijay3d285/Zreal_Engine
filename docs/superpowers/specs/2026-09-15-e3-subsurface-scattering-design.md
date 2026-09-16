@@ -239,7 +239,7 @@ inspected by eye against the Blender render of the same scene.
 - Skin mode (Cycles `RANDOM_WALK_SKIN`): Godot's `sss_mode_skin` is a shader
   `render_mode`, not a uniform, so `process_material` cannot read it;
   deferred with probe S5. No library material needs it. (Task 1, 2026-09-15.)
-- Debug modes 41/42 follow the precedent of modes 36–40: shader-side only,
+- Debug modes 43/44 (41 is the sheen gate's) follow the precedent of modes 36–40: shader-side only,
   set by integer from the gates, no `PathtracingDebugMode` enum entry.
 
 - Subsurface anisotropy as a material input (fixed 0).
