@@ -35,7 +35,7 @@
 
 Method (slanted edge): a black quad's right edge is tilted by `atan(1/128)` so it drifts exactly one pixel every 128 rows. For every pixel we know the signed distance `d` (in pixels) from its centre to the edge; sorting all pixels by `d` and binning at 0.05 px gives the continuous edge-spread function, which for filter importance sampling is exactly the filter's CDF. The 10–90% width of that curve is 0.721 px for the ±1.0 window and 1.081 px for the ±1.5 window.
 
-- [ ] **Step 1: Write the gate**
+- [x] **Step 1: Write the gate**
 
 `pipeline_references/tests/pt_pixel_filter_gate.gd`:
 
@@ -239,7 +239,7 @@ func _new_env(p_bg: Color) -> Environment:
 script = ExtResource("1_gate")
 ```
 
-- [ ] **Step 2: Run it on the current build — F1 must be red, F2/F3 green**
+- [x] **Step 2: Run it on the current build — F1 must be red, F2/F3 green**
 
 ```bash
 bin/godot.windows.editor.x86_64.console.exe --rendering-driver vulkan --path pipeline_references res://tests/pt_pixel_filter_gate_scene.tscn
@@ -249,7 +249,7 @@ Expected: `F1 ramp 0.72 ± 0.05` → `FAIL - F1 ramp`, F2 asym < 0.05, F3 mean 0
 
 If F1 reads ~1.6 the profile is being sampled at pixel centres, i.e. the slant is not taking effect — check that `pivot.rotation` is applied (the quad must be a child of the pivot, and the pivot's rotation set before `add_child`). If F3 is off by more than 0.2%, the edge does not pass through the image centre — check `quad.position = (-20, 0, 0)` and that the camera is at `(0, 0, 10)` looking down −Z (Godot's default camera orientation), not rotated. If F1 is NAN, `_cross` found no crossing — print the `esf` array and check the sky reads 1.0 and the quad 0.0.
 
-- [ ] **Step 3: Amend the spec's gate section**
+- [x] **Step 3: Amend the spec's gate section**
 
 In `docs/superpowers/specs/2026-09-16-still-route-pixel-filter-design.md`, replace the paragraph starting `Scene: an orthographic camera` through `a white sky of radiance 1.` with:
 
@@ -266,7 +266,7 @@ tails at ±1 px are 0.6% and 0%.
 
 and replace `Expected `1.081 ± 0.08` (the analytic CDF of the 1.5-wide window, sampled at pixel centres, ±0.08 for the pixel-centre quantisation and 256-sample noise)` with `Expected `1.081 ± 0.08` (the analytic CDF of the 1.5-wide window; ±0.08 for 0.05 px binning and 256-sample noise)`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add pipeline_references/tests/pt_pixel_filter_gate.gd pipeline_references/tests/pt_pixel_filter_gate_scene.tscn docs/superpowers/specs/2026-09-16-still-route-pixel-filter-design.md
@@ -290,7 +290,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: gate from Task 1.
 - Produces: `const float RT_PIXEL_FILTER_WIDTH = 1.5;` — the only knob; `bh_filter_1d(u)` now returns offsets in `[-1.5, 1.5]`.
 
-- [ ] **Step 1: Rewrite the comment block and add the constant**
+- [x] **Step 1: Rewrite the comment block and add the constant**
 
 Replace, in `raytracing_inc.glsl`, the text from `// Blackman-Harris pixel reconstruction filter, matching Blender Cycles.` through `// generated from the same formula Cycles uses.` with:
 
@@ -319,7 +319,7 @@ Replace, in `raytracing_inc.glsl`, the text from `// Blackman-Harris pixel recon
 const float RT_PIXEL_FILTER_WIDTH = 1.5;
 ```
 
-- [ ] **Step 2: Scale the offset**
+- [x] **Step 2: Scale the offset**
 
 Replace the body of `bh_filter_1d`:
 
@@ -332,7 +332,7 @@ float bh_filter_1d(float u) {
 
 and its doc comment's `offset in [-1, 1]` → `offset in [-RT_PIXEL_FILTER_WIDTH, RT_PIXEL_FILTER_WIDTH]`.
 
-- [ ] **Step 3: Build**
+- [x] **Step 3: Build**
 
 ```bash
 python -m SCons platform=windows target=editor tests=yes -j8 2>&1 | tail -3
@@ -340,13 +340,13 @@ python -m SCons platform=windows target=editor tests=yes -j8 2>&1 | tail -3
 
 Expected: exit 0. (No `.gen.h` is hand-edited; the build regenerates it.)
 
-- [ ] **Step 4: Gate green, three times**
+- [x] **Step 4: Gate green, three times**
 
 Run the Task 1 command three times; record all three F1 values. Expected: each `1.081 ± 0.08`, F2 asym < 0.05, F3 mean 0.500 ± 0.002, `PASS: all 3`. The spread across the three runs is what justifies `F1_TOL`; if it exceeds 0.03, raise `FRAMES` to 512 rather than the tolerance.
 
 If F1 reads ~1.08 but F2 fails: the offset sign differs between axes — `bh_filter_1d` is 1-D and applied to both, so look at `camera_ray`'s `pixel_center = vec2(p_pixel) + p_jitter`. If F1 reads ~1.6: the multiplication landed on `u` instead of on the returned radius.
 
-- [ ] **Step 5: Isolation gates and doctest**
+- [x] **Step 5: Isolation gates and doctest**
 
 Every gate whose reference was captured on the accumulate route with the 1.0 window could move if it measures an edge; none does by design (furnaces, crops away from edges, ratios). Run the full suite anyway:
 
@@ -357,7 +357,7 @@ bin/godot.windows.editor.x86_64.console.exe --test 2>&1 | grep "test cases:"
 
 Expected: 16/16 green (15 existing + pixel-filter), doctest 1558/1558. A gate that goes red here and measures a crop touching a silhouette (check its `_measure_crop` bounds) has a legitimately moved reference — re-derive it from the new build with the same three-run spread rule, and say so in the commit; anything else red is a bug in this task.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl pipeline_references/tests/pt_pixel_filter_gate.gd
@@ -388,7 +388,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 Patch in bytes with newline detection and exact-count asserts (the memory note on CRLF copies); never launch a render on a `;` after a patch script — chain with `&&`.
 
-- [ ] **Step 1: Route constants and select**
+- [x] **Step 1: Route constants and select**
 
 In `image_glb_creation.gd`:
 
@@ -439,7 +439,7 @@ with
 
 Also update the tuning comment's `256 is a preview, 1024 a hero shot.` to `256 matches the Blender reference; 512 halves the grain again at double the time.`
 
-- [ ] **Step 2: No sharpener on stills**
+- [x] **Step 2: No sharpener on stills**
 
 In `render.gd`, after `	get_viewport().scaling_3d_scale = 1.0` (the one in the viewport setup, directly before `print("[Render] DLSS viewport mode enabled`), insert:
 
@@ -453,7 +453,7 @@ In `render.gd`, after `	get_viewport().scaling_3d_scale = 1.0` (the one in the v
 	get_viewport().fsr_sharpness = 0.0
 ```
 
-- [ ] **Step 3: Parse checks**
+- [x] **Step 3: Parse checks**
 
 ```bash
 bin/godot.windows.editor.x86_64.console.exe --headless --path pipeline_references --check-only -s image_glb_creation.gd 2>&1 | grep -iE "error|parse" ; echo "exit=${PIPESTATUS[0]}"
@@ -462,7 +462,7 @@ bin/godot.windows.editor.x86_64.console.exe --headless --path pipeline_reference
 
 Expected: no error lines, exit 0 for both.
 
-- [ ] **Step 4: Asset check — job 217 at FHD, Phase A, filter 1.0 vs 1.5**
+- [x] **Step 4: Asset check — job 217 at FHD, Phase A, filter 1.0 vs 1.5**
 
 Scratch project: copy `<scratchpad>/e3/proj_e3` to `<scratchpad>/aa/proj_pa`, then copy the reference `image_glb_creation.gd` and `render.gd` over it. Two renders of `input_json/d217_fhd.json`, same pipeline, engine differing only by Task 2:
 
@@ -495,7 +495,7 @@ for p in sys.argv[1:]:
 
 Expected: ramp mean rises from ~1.76 (w1.0) toward ~2.1 (w1.5) and the hard-step count (bin 0) falls; the whole-frame mean moves under 0.5% (a wider filter redistributes, it does not add). Cut the chair-leg crop pair for the roadmap.
 
-- [ ] **Step 5: Do not commit; hand over**
+- [x] **Step 5: Do not commit; hand over**
 
 `git status` must show `pipeline_references/image_glb_creation.gd` and `pipeline_references/render.gd` modified and unstaged. Tell the user both files are ready to carry over, together with the Task 2 `bin/` build, and that the first 4K run's Godot log line `[Render] Accumulating 256 frames` … `Image saved` gives the wall time to read against `TIMEOUT = 1500` s.
 
@@ -507,7 +507,7 @@ Expected: ramp mean rises from ~1.76 (w1.0) toward ~2.1 (w1.5) and the hard-step
 - Modify: `PATH_TRACER_QUALITY_ROADMAP.md` (gap table: new row 28; new §11.24)
 - Modify: `docs/superpowers/plans/2026-09-16-still-route-pixel-filter.md` (tick boxes, execution notes)
 
-- [ ] **Step 1: Row 28**
+- [x] **Step 1: Row 28**
 
 Append to the gap table (after row 27):
 
@@ -515,11 +515,11 @@ Append to the gap table (after row 27):
 | 28 | **Still route: DLSS-RR reconstruction, NIS sharpen, 1.0 px filter** — 4K stills had a one-pixel staircase on every edge and a checkerboard on flat walls. **Closed 2026-09-16 (§11.24)**: stills go through Phase A (accumulate 256 × BH filter, OIDN), the filter widened to Cycles' 1.5 px, `fsr_sharpness` 0. `pt_pixel_filter_gate` F1 0.72 → 1.08 px. | `raytracing_inc.glsl camera_filter_jitter`, `render.gd`, `image_glb_creation.gd` | `film.cpp filter_table`, `properties.py filter_width` | High |
 ```
 
-- [ ] **Step 2: §11.24**
+- [x] **Step 2: §11.24**
 
 Append a section `## 11.24 Gap #28 — the still route was a game denoiser` with: the Blender-vs-ours edge table (3.6 / 1.0 px), the six-row route experiment table from the spec with the measured numbers, the analytic filter-width table, the three changes, the gate's three F1 readings from Task 2, the Task 3 before/after numbers and wall times, and a "what is still open" line: the checkerboard's mechanism inside DLSS-RR (jitter-zero doubles it, 64 phases reduce it) is recorded, not pursued; the 4K wall time is to be read from the user's first production run.
 
-- [ ] **Step 3: Tick the plan and commit**
+- [x] **Step 3: Tick the plan and commit**
 
 ```bash
 sed -i 's/^- \[ \] /- [x] /' docs/superpowers/plans/2026-09-16-still-route-pixel-filter.md
@@ -536,3 +536,13 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - **Spec coverage:** route flip + `or` + comments (T3 S1); filter constant + comment rewrite + tent sentence dropped (T2 S1–2); `fsr_sharpness` (T3 S2); gate F1/F2/F3 with falsifiability run (T1 S2, T2 S4); three-run tolerance justification (T2 S4); asset check before/after + 4K wall time via the user (T3 S4–5); roadmap (T4). Spec's pixel-centre gate design replaced by the slanted edge and the spec amended (T1 S3).
 - **Placeholders:** the T2 commit message's `<value>` is filled from Step 4; T4 S2 lists the exact contents the section must carry. No TODO/TBD.
 - **Type consistency:** `RT_PIXEL_FILTER_WIDTH` (T2) is the only new identifier; `F1_EXPECTED`/`F1_TOL`/`FRAMES` names match between the gate code and T2 S4's instruction; `_render_accum` signature as in `pt_validation.gd:88`.
+
+---
+
+## Execution notes (2026-09-16)
+
+All four tasks executed inline. Task 1's gate was green on the first run
+(1.06 px) because the project's `use_taa=true` added a Halton projection
+jitter to the gate viewport; the gate now disables TAA and temporal scaling as
+`render.gd`'s still route does, and read 0.7243 px red / 1.0831 px green. The
+spec's gate section was amended for both the slanted edge and the TAA point.
