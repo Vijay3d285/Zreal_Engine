@@ -98,25 +98,22 @@ Video and the realtime DLSS-RR route: unchanged (they never call this).
 
 ### 3. Gate: `pt_oidn_guide_gate`
 
-Scene: a flat quad filling the frame, textured with a black/white checker whose
-period at the image plane is **1.3 px** (aliasing-prone: no single sample can
-represent it, the filtered mean can), plus a 64×64 px region of the quad with
-a plain 0.5 grey; white sky, max bounces 1, 256 accumulated frames, OIDN final
-on. Read (a) the raw accumulation via `viewport_get_pathtracing_accum_image`
-and (b) the OIDN result via the viewport texture.
+One quad fills the 256×256 frame, textured 1:1 with a checker: **period 4 px
+on the left half, period 32 px on the right**; uniform white sky, one bounce
+(a furnace, so the raw 256-frame accumulation is the pixel-filtered checker
+with no noise), OIDN final on, `use_hdr_2d` so the viewport image is linear.
+Detail retention = std-dev of OIDN's output over a region ÷ std-dev of the raw
+accumulation over it. The mechanism is texture frequency *per pixel*, not
+distance, so fine-vs-coarse on one quad is the near/far difference of job 224
+without a second quad.
 
-- **G1 detail retention**: std-dev of (b) over the checker region ÷ std-dev of
-  (a) over the same region ≥ **0.85** — a filtered 1.3 px checker is a low-
-  contrast but real pattern, and a denoiser with matching guides keeps it.
-- **G2 flat region**: std-dev of (b) over the grey region ≤ that of (a) (the
-  denoiser must still denoise), and the region's mean within 1% of (a)'s.
-- **G3 near/far parity**: the same G1 ratio measured on a second quad at 4× the
-  distance (checker period 1.3 px there too, by scaling the UV) is within 0.1
-  of the first — "no blur that grows with distance" stated as a number.
+- **G1 fine**: retention on the period-4 half ≥ **0.85**.
+- **G2 coarse**: retention on the period-32 half ≥ **0.85**.
+- **G3 parity**: |G1 − G2| ≤ **0.10** — "no blur that grows with texture
+  frequency", which is what blur with distance is.
 
-Task 1 of the plan runs the gate on the current build first and records the
-red reading; the exact thresholds are set from that red/green pair, with the
-three-run spread rule used by the pixel-filter gate.
+On the build before this change: G1 **0.0836**, G2 0.9877 — red on G1 and G3.
+The thresholds are confirmed against three runs of the fixed build.
 
 ### 4. Asset check
 
