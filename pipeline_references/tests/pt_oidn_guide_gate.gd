@@ -39,10 +39,17 @@ func _ready() -> void:
 	get_window().size = Vector2i(256, 256)
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	Engine.max_fps = 0
-	# Same viewport contract as render.gd's still route: no TAA / temporal
-	# jitter on top of the pixel filter, and an HDR 2D target so the viewport
-	# image comes back linear (FORMAT_RGBH) for a like-for-like std-dev.
+	# Same viewport contract as render.gd's still route, ALL of it: the project
+	# defaults are msaa_3d=2, screen_space_aa=1 (FXAA), use_taa=true and
+	# use_debanding=true, and every one of them is a post-process on the image
+	# this gate reads back. With FXAA left on, the fine checker read 0.64
+	# retention while OIDN's own output at the same pixels was intact -- the
+	# blur was the gate's, not the denoiser's. HDR 2D so the viewport image
+	# comes back linear (FORMAT_RGBH) for a like-for-like std-dev.
+	get_viewport().msaa_3d = Viewport.MSAA_DISABLED
+	get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
 	get_viewport().use_taa = false
+	get_viewport().use_debanding = false
 	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
 	get_viewport().scaling_3d_scale = 1.0
 	get_viewport().use_hdr_2d = true
@@ -100,6 +107,13 @@ func _ready() -> void:
 		_finish()
 		return
 
+	# Diagnostic dump (ZR_GATE_DUMP=<dir>): raw accumulation and OIDN output as
+	# PFM, for running oidnDenoise.exe offline with synthetic guides.
+	var dump_dir := OS.get_environment("ZR_GATE_DUMP")
+	if dump_dir != "":
+		_save_pfm(raw, dump_dir.path_join("raw.pfm"))
+		_save_pfm(out, dump_dir.path_join("out.pfm"))
+
 	var fine_raw := _std(raw, 24, 40, 104, 216)
 	var fine_out := _std(out, 24, 40, 104, 216)
 	var coarse_raw := _std(raw, 152, 40, 232, 216)
@@ -125,6 +139,29 @@ func _ready() -> void:
 	if absf(g1 - g2) > PARITY_MAX:
 		_failures.append("G3 parity |%.4f - %.4f| > %.2f" % [g1, g2, PARITY_MAX])
 	_finish()
+
+
+## Little-endian float32 RGB PFM (rows bottom-up), the format oidnDenoise reads.
+func _save_pfm(p_img: Image, p_path: String) -> void:
+	var w := p_img.get_width()
+	var h := p_img.get_height()
+	var f := FileAccess.open(p_path, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_string("PF
+%d %d
+-1.0
+" % [w, h])
+	var buf := StreamPeerBuffer.new()
+	buf.big_endian = false
+	for y in range(h - 1, -1, -1):
+		for x in range(w):
+			var c := p_img.get_pixel(x, y)
+			buf.put_float(c.r)
+			buf.put_float(c.g)
+			buf.put_float(c.b)
+	f.store_buffer(buf.data_array)
+	f.close()
 
 
 ## Population std-dev of the mean-of-RGB over [x0,x1) x [y0,y1).

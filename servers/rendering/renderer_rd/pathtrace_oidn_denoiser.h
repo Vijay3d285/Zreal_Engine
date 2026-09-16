@@ -77,8 +77,8 @@ public:
 	// has the raw converged image.
 	virtual bool denoise_rt(int p_width, int p_height,
 			float *p_color,
-			const float *p_albedo,
-			const float *p_normal,
+			float *p_albedo,
+			float *p_normal,
 			int p_input_spp) = 0;
 
 	// Whether this implementation is ready to denoise at all (device created, weights loaded).

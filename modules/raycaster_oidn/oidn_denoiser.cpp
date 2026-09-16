@@ -60,14 +60,37 @@ bool OIDNDenoiser::ensure_device() {
 	return committed_available;
 }
 
+// Cycles' DENOISER_PREFILTER_ACCURATE (intern/cycles/integrator/denoiser_oidn_gpu.cpp):
+// each guide is run through its own RT filter -- the guide image as the only input,
+// output in place -- before the colour pass, which then trusts them (cleanAux = true).
+static bool oidn_prefilter_guide(OIDNDevice p_device, const char *p_name, float *p_buf, int p_width, int p_height) {
+	OIDNFilter filter = oidnNewFilter(p_device, "RT");
+	ERR_FAIL_COND_V_MSG(!filter, false, "oidnNewFilter(\"RT\") for guide prefilter returned null.");
+	oidnSetSharedFilterImage(filter, p_name, p_buf, OIDN_FORMAT_FLOAT3, (size_t)p_width, (size_t)p_height, 0, 0, 0);
+	oidnSetSharedFilterImage(filter, "output", p_buf, OIDN_FORMAT_FLOAT3, (size_t)p_width, (size_t)p_height, 0, 0, 0);
+	oidnCommitFilter(filter);
+	oidnExecuteFilter(filter);
+	const OIDNError err = oidnGetDeviceError(p_device, nullptr);
+	oidnReleaseFilter(filter);
+	ERR_FAIL_COND_V_MSG(err != OIDN_ERROR_NONE, false, vformat("OIDN %s prefilter failed (error %d).", p_name, (int)err));
+	return true;
+}
+
 bool OIDNDenoiser::denoise_rt(int p_width, int p_height,
 		float *p_color,
-		const float *p_albedo,
-		const float *p_normal,
+		float *p_albedo,
+		float *p_normal,
 		int p_input_spp) {
 	ERR_FAIL_NULL_V_MSG(p_color, false, "OIDN denoise: color buffer is null.");
 	ERR_FAIL_COND_V_MSG(p_width <= 0 || p_height <= 0, false, "OIDN denoise: invalid dimensions.");
 	if (!ensure_device()) {
+		return false;
+	}
+
+	if (p_albedo && !oidn_prefilter_guide(device, "albedo", p_albedo, p_width, p_height)) {
+		return false;
+	}
+	if (p_normal && !oidn_prefilter_guide(device, "normal", p_normal, p_width, p_height)) {
 		return false;
 	}
 
@@ -96,21 +119,13 @@ bool OIDNDenoiser::denoise_rt(int p_width, int p_height,
 
 	// Scene-linear HDR radiance: input and output are untonemapped, may exceed 1.0.
 	oidnSetFilterBool(filter, "hdr", true);
-	// cleanAux=true means "trust the albedo/normal guides as-is (they are clean, no prefilter)."
-	// cleanAux=false means "guides may be noisy/aliased, prefilter them first."
-	//
-	// Our guides ARE deterministic G-buffers from an UN-JITTERED primary ray (scene_raytracing_
-	// raygen.glsl uses pixel_center = pixel + 0.5 with inv_view/inv_projection directly, no TAA
-	// jitter). So per-frame they are stable — but they are a SINGLE sample per pixel with no
-	// anti-aliasing: a high-frequency texture (sofa fabric, TV wall panel weave) sampled at one
-	// sub-pixel uv produces ALIASED/stair-stepped guide albedo + normal-map-perturbed normals.
-	// Feeding that raw to OIDN (cleanAux=true) made run-32 WORSE than run-27 — OIDN over-smoothed
-	// the color where the aliased guide looked ambiguous, flattening the TV panel fabric.
-	// Keeping cleanAux=false lets OIDN prefilter the aliased guides, which looked better (run-27).
-	// The remaining over-smoothing in run-27 is the COLOR noise at low SPP, fixed by raising the
-	// accumulation target (less radiance residual → OIDN preserves more detail). See memory note
-	// pt-oidn-cleanaux-worldspace-normal.
-	oidnSetFilterBool(filter, "cleanAux", false);
+	// cleanAux = true: the guides are the accumulated primary albedo / normal -- every sample
+	// at its pixel-filter jitter, the same average as the colour (Cycles' denoising passes) --
+	// and were just prefiltered by OIDN's own albedo / normal filters above. That is Cycles'
+	// DENOISER_PREFILTER_ACCURATE, its default. The earlier cleanAux = false was a mitigation
+	// for guides that were one point sample per pixel (the DLSS-RR G-buffers); those made
+	// OIDN erase any texture finer than a pixel -- the far half of a 4K still (job 224).
+	oidnSetFilterBool(filter, "cleanAux", true);
 
 	(void)p_input_spp; // OIDN RT filter has no per-call SPP parameter; reserved for future calibration.
 

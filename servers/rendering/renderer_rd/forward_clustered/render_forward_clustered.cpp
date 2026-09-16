@@ -2003,30 +2003,28 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		Vector<uint8_t> accum_bytes = RD::get_singleton()->texture_get_data(accum_rid, v);
 		ERR_CONTINUE(accum_bytes.size() != (int64_t)width * height * 16);
 
-		// --- diffuse albedo AOV: R8G8B8A8_UNORM (4 bytes/pixel), optional ---
+		// --- guides: the accumulated primary albedo / normal, R16G16B16A16_SFLOAT (8 bytes/pixel).
+		// These are the running means of every accumulated sample at its pixel-filter jitter
+		// (rt_accum_guide_sample, raytracing_common_inc.glsl) -- Cycles' denoising passes --
+		// NOT the DLSS-RR G-buffers, which are one point sample per frame and made OIDN erase
+		// every texture that is fine per pixel (job 224: blur growing with distance).
 		Vector<uint8_t> albedo_bytes;
-		bool has_albedo = p_rb->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO);
+		bool has_albedo = p_rb_data->rt_has_accum_albedo_texture();
 		if (has_albedo) {
-			const RID albedo_rid = p_rb->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_DIFFUSE_ALBEDO);
-			if (RD::get_singleton()->texture_is_valid(albedo_rid)) {
-				albedo_bytes = RD::get_singleton()->texture_get_data(albedo_rid, v);
-				if (albedo_bytes.size() != (int64_t)width * height * 4) {
-					has_albedo = false;
-				}
+			const RID rid = p_rb_data->rt_get_accum_albedo_texture();
+			if (RD::get_singleton()->texture_is_valid(rid)) {
+				albedo_bytes = RD::get_singleton()->texture_get_data(rid, v);
 			}
+			has_albedo = albedo_bytes.size() == (int64_t)width * height * 8;
 		}
-
-		// --- normal AOV: R8G8B8A8_SNORM (4 bytes/pixel, RGB length-normalized world normal), optional ---
 		Vector<uint8_t> normal_bytes;
-		bool has_normal = p_rb->has_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS);
+		bool has_normal = p_rb_data->rt_has_accum_normal_texture();
 		if (has_normal) {
-			const RID normal_rid = p_rb->get_texture(RB_SCOPE_DLSS_RR, RB_TEX_DLSS_RR_NORMAL_ROUGHNESS);
-			if (RD::get_singleton()->texture_is_valid(normal_rid)) {
-				normal_bytes = RD::get_singleton()->texture_get_data(normal_rid, v);
-				if (normal_bytes.size() != (int64_t)width * height * 4) {
-					has_normal = false;
-				}
+			const RID rid = p_rb_data->rt_get_accum_normal_texture();
+			if (RD::get_singleton()->texture_is_valid(rid)) {
+				normal_bytes = RD::get_singleton()->texture_get_data(rid, v);
 			}
+			has_normal = normal_bytes.size() == (int64_t)width * height * 8;
 		}
 
 		const size_t pixel_count = (size_t)width * (size_t)height;
@@ -2052,26 +2050,32 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 				// alpha (src[i*4+3]) unused by OIDN color (RGB only).
 			}
 		}
-		// Convert albedo R8G8B8A8_UNORM -> RGB float3 in [0,1].
+		// Convert albedo RGBA16F -> RGB float3.
 		if (has_albedo) {
-			const uint8_t *s = reinterpret_cast<const uint8_t *>(albedo_bytes.ptr());
+			const uint16_t *s16 = reinterpret_cast<const uint16_t *>(albedo_bytes.ptr());
 			float *d = albedo_f.ptrw();
 			for (size_t i = 0; i < pixel_count; i++) {
-				const float inv = 1.0f / 255.0f;
-				d[i * 3 + 0] = float(s[i * 4 + 0]) * inv;
-				d[i * 3 + 1] = float(s[i * 4 + 1]) * inv;
-				d[i * 3 + 2] = float(s[i * 4 + 2]) * inv;
+				d[i * 3 + 0] = CLAMP(Math::half_to_float(s16[i * 4 + 0]), 0.0f, 1.0f);
+				d[i * 3 + 1] = CLAMP(Math::half_to_float(s16[i * 4 + 1]), 0.0f, 1.0f);
+				d[i * 3 + 2] = CLAMP(Math::half_to_float(s16[i * 4 + 2]), 0.0f, 1.0f);
 			}
 		}
-		// Convert normal R8G8B8A8_SNORM -> RGB float3 length-normalized.
+		// Convert normal RGBA16F -> RGB float3, re-normalised: an averaged normal is shorter
+		// than 1 wherever the samples disagreed (silhouettes, bump maps); OIDN wants unit length.
 		if (has_normal) {
-			const int8_t *s = reinterpret_cast<const int8_t *>(normal_bytes.ptr());
+			const uint16_t *s16 = reinterpret_cast<const uint16_t *>(normal_bytes.ptr());
 			float *d = normal_f.ptrw();
-			const float inv = 1.0f / 127.0f;
 			for (size_t i = 0; i < pixel_count; i++) {
-				d[i * 3 + 0] = float(s[i * 4 + 0]) * inv;
-				d[i * 3 + 1] = float(s[i * 4 + 1]) * inv;
-				d[i * 3 + 2] = float(s[i * 4 + 2]) * inv;
+				Vector3 nrm(Math::half_to_float(s16[i * 4 + 0]), Math::half_to_float(s16[i * 4 + 1]), Math::half_to_float(s16[i * 4 + 2]));
+				const float len = nrm.length();
+				if (len > 1e-6f) {
+					nrm /= len;
+				} else {
+					nrm = Vector3(0, 0, 1);
+				}
+				d[i * 3 + 0] = nrm.x;
+				d[i * 3 + 1] = nrm.y;
+				d[i * 3 + 2] = nrm.z;
 			}
 		}
 
@@ -2087,8 +2091,8 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 				(int)accum_bytes.size(), (int)albedo_bytes.size(), (int)normal_bytes.size()));
 		bool ok = denoiser->denoise_rt(width, height,
 				color_f.ptrw(),
-				has_albedo ? albedo_f.ptr() : nullptr,
-				has_normal ? normal_f.ptr() : nullptr,
+				has_albedo ? albedo_f.ptrw() : nullptr,
+				has_normal ? normal_f.ptrw() : nullptr,
 				(int)p_accum_target);
 
 		const float diag_out_r = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 0] : -1.0f;
