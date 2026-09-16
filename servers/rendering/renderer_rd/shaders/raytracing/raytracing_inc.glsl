@@ -490,17 +490,22 @@ uint rt_next_pow2_ge(uint p_n) {
 // builds an inverted CDF from it, and looks the sub-pixel offset up from that
 // table (intern/cycles/scene/film.cpp: filter_func_blackman_harris +
 // util_cdf_inverted; applied in kernel/camera/camera.h: raster += lookup_table_read).
-// With Cycles' default filter_width of 1.0 the window is widened x2 internally,
-// so offsets span +/-1 pixel around the pixel centre.
+// Cycles' DEFAULT filter_width is 1.5 (intern/cycles/blender/addon/properties.py,
+// `filter_width ... default=1.5`), and filter_table() widens it x2, so offsets
+// span +/-1.5 pixels around the pixel centre. RT_PIXEL_FILTER_WIDTH below is
+// that 1.5. (It was 1.0 until 2026-09-16 on the belief that Cycles' default
+// was 1.0; the pixel-filter gate's 10-90% edge ramp read 0.72 px against
+// Cycles' 1.08.)
 //
-// That is the same RADIUS a tent filter has, but a very different SHAPE: the
-// Blackman-Harris window is strongly centre-weighted, placing half its samples
-// within +/-0.19px of the centre where a tent puts them within +/-0.29px. The
-// tent therefore smears more energy into neighbouring pixels and reads visibly
-// softer — which is why matching the window matters for detail retention.
+// The window is strongly centre-weighted: half the samples land within
+// +/-0.29 px of the centre (+/-0.19 at width 1.0), the rest fall away
+// smoothly to the +/-1.5 px edge. That shape, not the radius alone, is what
+// keeps fine detail while still ramping a hard edge over ~1.1 px.
 //
 // Table below is the inverse CDF of the half-profile sampled at 33 points,
-// generated from the same formula Cycles uses.
+// generated from the same formula Cycles uses, on a NORMALISED radius [0, 1];
+// bh_filter_1d scales it by RT_PIXEL_FILTER_WIDTH, so the shape is width-free.
+const float RT_PIXEL_FILTER_WIDTH = 1.5;
 const float BH_INV_CDF_HALF[33] = float[33](
 		0.000000, 0.011217, 0.022451, 0.033716, 0.045031, 0.056412,
 		0.067877, 0.079445, 0.091136, 0.102972, 0.114976, 0.127173,
@@ -517,12 +522,13 @@ float bh_inv_cdf_half(float a) {
 	return mix(BH_INV_CDF_HALF[i], BH_INV_CDF_HALF[i + 1], t - float(i));
 }
 
-/// Blackman-Harris filter offset in [-1, 1] for u in [0,1). Filter importance
-/// sampling: the sample may land outside the pixel footprint but still
-/// accumulates into this pixel, which is what performs the reconstruction.
+/// Blackman-Harris filter offset in [-RT_PIXEL_FILTER_WIDTH, RT_PIXEL_FILTER_WIDTH]
+/// for u in [0,1). Filter importance sampling: the sample may land outside the
+/// pixel footprint but still accumulates into this pixel, which is what
+/// performs the reconstruction.
 float bh_filter_1d(float u) {
 	float s = 2.0 * u - 1.0;
-	return sign(s) * bh_inv_cdf_half(abs(s));
+	return sign(s) * bh_inv_cdf_half(abs(s)) * RT_PIXEL_FILTER_WIDTH;
 }
 
 /// Sub-pixel offset for accumulation/loop sample `p_sample`.
