@@ -47,6 +47,9 @@ const MODE_ANISOTROPY_ROTATION := 26
 const MODE_ATTENUATION_COLOR := 27
 const MODE_SPECULAR_TINT := 28
 const MODE_SHEEN_COLOR := 29
+# E3 subsurface: sss_radius (41) and (sss_weight, sss_scale, thin ? 1 : 0) (42).
+const MODE_SSS_RADIUS := 41
+const MODE_SSS_WEIGHT_SCALE_THIN := 42
 
 ## Values are distinct EXCEPT for one pair: V_CLEARCOAT and the blue channel of
 ## V_SPECULAR_TINT are both 0.55. That collision means this fixture set cannot
@@ -77,6 +80,9 @@ const V_ANISOTROPY := 0.83
 const V_ATTENUATION_COLOR := Color(0.9, 0.4, 0.15)   # linear
 const V_SPECULAR_TINT := Color(0.8, 0.7, 0.55)       # linear
 const V_SHEEN_COLOR := Color(0.25, 0.5, 0.75)        # linear
+const V_SSS_STRENGTH := 0.65
+const V_SSS_RADIUS := Color(0.9, 0.3, 0.12)   # linear; transmittance_color
+const V_SSS_DEPTH := 0.037                     # transmittance_depth, metres
 
 ## Debug modes write the material value straight to radiance with no shading, so
 ## the only error is float storage. This is generous enough for that and far
@@ -104,6 +110,11 @@ func _ready() -> void:
 	mat.clearcoat_roughness = V_CLEARCOAT_ROUGHNESS
 	mat.anisotropy_enabled = true
 	mat.anisotropy = V_ANISOTROPY
+	mat.subsurf_scatter_enabled = true
+	mat.subsurf_scatter_strength = V_SSS_STRENGTH
+	mat.subsurf_scatter_transmittance_enabled = true
+	mat.subsurf_scatter_transmittance_color = V_SSS_RADIUS.linear_to_srgb()
+	mat.subsurf_scatter_transmittance_depth = V_SSS_DEPTH
 	mesh_instance.material_override = mat
 
 	var env: Environment = $WorldEnvironment.environment
@@ -135,6 +146,14 @@ func _ready() -> void:
 	await _check_mode(env, MODE_SHEEN_COLOR,
 			"sheen_color",
 			Vector3(V_SHEEN_COLOR.r, V_SHEEN_COLOR.g, V_SHEEN_COLOR.b))
+	# E3: the subsurface fields, read back through vis modes 41/42. thin is 0
+	# here because transmittance_depth > 0 (a solid, not a sheet).
+	await _check_mode(env, MODE_SSS_RADIUS,
+			"sss_radius (transmittance_color)",
+			Vector3(V_SSS_RADIUS.r, V_SSS_RADIUS.g, V_SSS_RADIUS.b))
+	await _check_mode(env, MODE_SSS_WEIGHT_SCALE_THIN,
+			"sss_weight/sss_scale/thin",
+			Vector3(V_SSS_STRENGTH, V_SSS_DEPTH, 0.0), true)
 
 	# FEATURE-OFF CASE.
 	#

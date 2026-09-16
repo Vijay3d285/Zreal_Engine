@@ -118,10 +118,11 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 192 bytes)
+// MATERIAL DATA (matches C++ layout, 208 bytes)
 // ============================================================================
 #define RT_MAT_FLAG_BLEND 8u // Bit 3. MIRRORS RT_MAT_FLAG_BLEND in render_raytracing.h.
 #define RT_MAT_FLAG_ANYHIT_SKIP_ONLY 16u // Bit 4. MIRRORS render_raytracing.h (Gap #26).
+#define RT_MAT_FLAG_SSS_THIN 32u // Bit 5. MIRRORS render_raytracing.h (E3).
 
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -161,5 +162,7 @@ struct MaterialData {
 	float anisotropy;
 	float clearcoat_ior; // E2d. Was _pad0.
 	vec3 clearcoat_tint; // E2d. std430 aligns this to offset 176.
-	float _pad0;
+	float sss_scale; // E3. Was _pad0. Cycles subsurface_scale; <= 0 = thin-wall.
+	vec3 sss_radius; // E3. std430 aligns this to offset 192; struct is 208 bytes.
+	float sss_weight; // E3. Cycles subsurface_weight.
 };

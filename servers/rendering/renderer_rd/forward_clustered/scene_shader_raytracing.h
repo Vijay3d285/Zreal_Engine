@@ -104,6 +104,10 @@ public:
 		// set from SCENE CONTENT: any material with transmission > 0. It exists so
 		// a scene with no glass folds the pass-B loop away at specialization.
 		RT_FLAG_TRANSMISSIVE_GEOMETRY = (1 << 18),
+		// E3 subsurface. Bit 19. Scene content: any material with
+		// sss_weight > 1e-5 (process_material). Folds the random walk, the
+		// fifth registry lobe and the exit shading away for every other scene.
+		RT_FLAG_SSS_ENABLED = (1 << 19),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
@@ -147,7 +151,7 @@ public:
 	// alias the Russian Roulette min_bounce field, corrupt the readback, and leave
 	// the rendered image merely plausible instead of visibly wrong. Keep this in
 	// sync whenever RT_FLAG_* gains a member.
-	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED | RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED | RT_FLAG_TRANSMISSIVE_GEOMETRY) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
+	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED | RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED | RT_FLAG_TRANSMISSIVE_GEOMETRY | RT_FLAG_SSS_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
 			"RT_FLAG_* bit overlaps the Russian Roulette min_bounce field (bits 4-8)");
 
 	// The transmission cap field must miss every neighbouring field. A collision
@@ -162,7 +166,8 @@ public:
 								  RT_FLAG_TRANSMISSION_ENABLED |
 								  RT_FLAG_ANISOTROPY_ENABLED |
 								  RT_FLAG_COAT_ENABLED |
-								  RT_FLAG_SHEEN_ENABLED)) == 0,
+								  RT_FLAG_SHEEN_ENABLED |
+								  RT_FLAG_SSS_ENABLED)) == 0,
 			"RT_MAX_TRANSMISSION_BOUNCE field (bits 11-14) overlaps another RT_FLAGS field");
 
 	// RT pipeline limits (must match GLSL payload/hit attribute struct sizes).

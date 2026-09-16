@@ -70,6 +70,7 @@ static constexpr RaygenShaderOption RAYGEN_SHADER_OPTIONS[] = {
 	{ SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED, "#define RT_ANISOTROPY_ENABLED\n" },
 	{ SceneShaderRaytracing::RT_FLAG_COAT_ENABLED, "#define RT_COAT_ENABLED\n" },
 	{ SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED, "#define RT_SHEEN_ENABLED\n" },
+	{ SceneShaderRaytracing::RT_FLAG_SSS_ENABLED, "#define RT_SSS_ENABLED\n" },
 };
 
 static constexpr uint32_t RAYGEN_SHADER_OPTION_COUNT = sizeof(RAYGEN_SHADER_OPTIONS) / sizeof(RAYGEN_SHADER_OPTIONS[0]);

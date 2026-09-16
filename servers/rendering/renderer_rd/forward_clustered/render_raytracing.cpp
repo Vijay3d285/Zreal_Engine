@@ -1540,7 +1540,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.clearcoat_tint[0] = 1.0f;
 	mat.clearcoat_tint[1] = 1.0f;
 	mat.clearcoat_tint[2] = 1.0f;
-	mat._pad0 = 0.0f;
+	// E3: defaults set again below where the uniforms are read; zeroed here so
+	// an early return leaves no garbage in the row.
+	mat.sss_scale = 0.05f;
+	mat.sss_radius[0] = 1.0f;
+	mat.sss_radius[1] = 0.2f;
+	mat.sss_radius[2] = 0.1f;
+	mat.sss_weight = 0.0f;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -1891,6 +1897,34 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.anisotropy = CLAMP((float)anisotropy_var, -1.0f, 1.0f);
 	}
 
+	// E3 subsurface. Read from BaseMaterial3D's existing subsurface uniforms:
+	// the raster path's screen-space SSS and the tracer's random walk now share
+	// one authoring surface. A material without the feature has no such
+	// uniforms and material_get_param returns NIL -> weight 0, nothing else read.
+	mat.sss_weight = 0.0f;
+	mat.sss_scale = 0.05f; // Cycles' default Subsurface Scale.
+	mat.sss_radius[0] = 1.0f; // Cycles' default Subsurface Radius (1, 0.2, 0.1).
+	mat.sss_radius[1] = 0.2f;
+	mat.sss_radius[2] = 0.1f;
+	Variant sss_strength_var = material_storage->material_get_param(p_material_rid, "subsurface_scattering_strength");
+	if (sss_strength_var.get_type() == Variant::FLOAT) {
+		mat.sss_weight = CLAMP((float)sss_strength_var, 0.0f, 1.0f);
+	}
+	Variant sss_radius_var = material_storage->material_get_param(p_material_rid, "transmittance_color");
+	if (sss_radius_var.get_type() == Variant::COLOR) {
+		Color c = ((Color)sss_radius_var).srgb_to_linear();
+		mat.sss_radius[0] = MAX(0.0f, c.r);
+		mat.sss_radius[1] = MAX(0.0f, c.g);
+		mat.sss_radius[2] = MAX(0.0f, c.b);
+	}
+	Variant sss_depth_var = material_storage->material_get_param(p_material_rid, "transmittance_depth");
+	if (sss_depth_var.get_type() == Variant::FLOAT) {
+		mat.sss_scale = (float)sss_depth_var; // <= 0 selects thin-wall below.
+	}
+	if (mat.sss_weight > 0.0f && mat.sss_scale <= 0.0f) {
+		mat.flags |= RT_MAT_FLAG_SSS_THIN;
+	}
+
 	// E3 detection. Each predicate mirrors the shader guard cited beside it.
 	mat_data->feature_bits = 0;
 	if (mat.anisotropy != 0.0f) {
@@ -1906,6 +1940,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	if (MAX(mat.sheen_color[0], MAX(mat.sheen_color[1], mat.sheen_color[2])) > 0.00001f) {
 		// brdf_inc.glsl:2631 sheenMaxTint.
 		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED;
+	}
+	if (mat.sss_weight > 0.00001f) {
+		// Cycles CLOSURE_WEIGHT_CUTOFF on subsurface_weight (svm/closure.h:477).
+		mat_data->feature_bits |= SceneShaderRaytracing::RT_FLAG_SSS_ENABLED;
 	}
 	if (mat.transmission > 0.0f) {
 		// The SAME predicate the shadow loop's per-hit attenuation uses
@@ -2687,11 +2725,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// pass concluded, and it is how E3's acceptance was measured. It fires once
 	// per build_tlas -- ~128 times per capture -- so it lives behind --verbose.
 	if (OS::get_singleton()->is_stdout_verbose()) {
-		print_line(vformat("[E3] scene feature mask: aniso=%d coat=%d sheen=%d trans=%d",
+		print_line(vformat("[E3] scene feature mask: aniso=%d coat=%d sheen=%d trans=%d sss=%d",
 				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_ANISOTROPY_ENABLED) != 0),
 				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_COAT_ENABLED) != 0),
 				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SHEEN_ENABLED) != 0),
-				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) != 0)));
+				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) != 0),
+				(int)((scene_mask & SceneShaderRaytracing::RT_FLAG_SSS_ENABLED) != 0)));
 	}
 
 	// -----------------------------------------------------------------------

@@ -530,6 +530,13 @@ void debug_visualize(
 		ps.radiance = dbg_material.specular_tint;
 	} else if (vis_mode == 29) {
 		ps.radiance = dbg_material.sheen_color;
+	} else if (vis_mode == 41) {
+		// E3 arrival gate: the subsurface radius (transmittance_color), raw.
+		ps.radiance = dbg_material.sss_radius;
+	} else if (vis_mode == 42) {
+		// E3 arrival gate: r = sss_weight, g = sss_scale, b = thin-wall flag.
+		ps.radiance = vec3(dbg_material.sss_weight, dbg_material.sss_scale,
+				((dbg_material.flags & RT_MAT_FLAG_SSS_THIN) != 0u) ? 1.0 : 0.0);
 	} else if (vis_mode == 30 || vis_mode == 31) {
 		// Resolved dielectric F0 (30) and resolved eta (31) after the E1
 		// arbitration, RAW and unscaled.

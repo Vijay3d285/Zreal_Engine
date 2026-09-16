@@ -102,7 +102,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 192 bytes).
+// Must match GLSL MaterialData (std430, 208 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -141,9 +141,19 @@ struct alignas(16) RT_MaterialData {
 	// E2d: coat tint, Beer's-law absorption through the coat. A vec3 aligns
 	// to 16 in std430, so it starts at 176 and the struct grows to 192.
 	float clearcoat_tint[3];
-	float _pad0;
+	// E3 subsurface. sss_scale takes the old _pad0 slot (offset 188, no growth);
+	// radius+weight are one 16-byte row at 192 (vec3 aligns to 16 in std430),
+	// so the struct grows 192 -> 208. Cycles: bssrdf->radius = radius * scale.
+	// sss_scale <= 0 means THIN-WALL (OpenPBR sheet), decided at upload into
+	// RT_MAT_FLAG_SSS_THIN so the shader tests one bit.
+	float sss_scale;
+	float sss_radius[3];
+	float sss_weight;
 };
-static_assert(sizeof(RT_MaterialData) == 192, "RT_MaterialData must be 192 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 208, "RT_MaterialData must be 208 bytes for std430");
+static_assert(offsetof(RT_MaterialData, sss_scale) == 188, "sss_scale must occupy the old _pad0 slot");
+static_assert(offsetof(RT_MaterialData, sss_radius) == 192, "sss_radius must be 16-byte aligned for std430 vec3");
+static_assert(offsetof(RT_MaterialData, sss_weight) == 204, "sss_weight must follow sss_radius");
 // A vec3 aligns to 16 bytes in std430, so reordering members around one shifts
 // the GPU's view of every subsequent field WITHOUT changing sizeof. The size
 // assert alone passes on a broken layout; these four are what catch it.
@@ -231,6 +241,9 @@ enum {
 	// gather must keep treating them as opaque emitters. MIRRORED IN
 	// raytracing_data_inc.glsl.
 	RT_MAT_FLAG_ANYHIT_SKIP_ONLY = 16u,
+	// Bit 5 (E3): thin-wall subsurface (transmittance_depth <= 0). MIRRORED IN
+	// raytracing_data_inc.glsl.
+	RT_MAT_FLAG_SSS_THIN = 32u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).
