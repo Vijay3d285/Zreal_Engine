@@ -90,7 +90,6 @@ parameters by shader-uniform name via `material_get_param`) maps them:
 | `subsurface_scattering_strength` (0 when the feature is off / uniform absent) | `sss_weight` | Subsurface Weight |
 | `transmittance_color` (default when absent: `(1, 0.2, 0.1)`, Cycles' default radius) | `sss_radius[3]` | Subsurface Radius |
 | `transmittance_depth` (default when absent: `0.05`) | `sss_scale` | Subsurface Scale, metres; **`<= 0` selects thin-wall mode** |
-| `subsurface_scattering_strength` present *and* the material's `subsurf_scatter_skin_mode` | flag `RT_MAT_FLAG_SSS_SKIN` | Random Walk (Skin) |
 | `ior` (already uploaded) | — | subsurface IOR, clamped `[1.01, 3.8]` at use |
 
 Anisotropy is fixed at 0 (Cycles' default). The pipeline is the only author
@@ -101,9 +100,8 @@ pipeline table and at the upload site.
 
 `RT_MaterialData` grows 192 → 208 bytes: `float sss_radius[3]; float
 sss_weight;` at offset 192 (a 16-aligned vec3 row), `sss_scale` takes the
-existing `_pad0` at 188. New flags: `RT_MAT_FLAG_SSS_SKIN = 32u`,
-`RT_MAT_FLAG_SSS_THIN = 64u` (thin-wall decided at upload from `sss_scale <=
-0`, so the shader tests one bit). `static_assert`s on size and on the new
+existing `_pad0` at 188. New flag: `RT_MAT_FLAG_SSS_THIN = 32u` (thin-wall
+decided at upload from `sss_scale <= 0`, so the shader tests one bit). `static_assert`s on size and on the new
 offsets; the GLSL `MaterialData` mirror and `raytracing_data_inc.glsl`
 defines updated in the same commit; `tests/servers/rendering/
 test_pt_material_data.cpp` (the layout mirror) extended.
@@ -225,11 +223,10 @@ gate as `CYCLES_REF`.
 | S2 Cycles | sphere albedo 0.8, radius (1, 0.2, 0.1)×0.05, weight 1, ior 1.4, same framing as `cycles_glass_furnace.py` | within 5% of `CYCLES_REF` per channel |
 | S3 thin-wall | a thin-wall sheet (weight 1) between the camera and an emissive backdrop, camera side black | reads `0.5 × albedo × backdrop` within 2% (the translucent share) |
 | S4 fallback | S2's material with radius 0 | equals the plain diffuse reference to 0.5% |
-| S5 skin | S2 with skin mode | within 5% of its own `CYCLES_REF` entry |
 
-S1, S2, S3 and S5 are red before the feature exists (an SSS material renders
+S1, S2 and S3 are red before the feature exists (an SSS material renders
 as plain diffuse today, which reads ≈ 1.0 on S1 — so S1 alone would pass;
-S2/S3/S5 carry the falsifiability). S4 holds the fallback rule.
+S2/S3 carry the falsifiability). S4 holds the fallback rule.
 
 Whole-suite: every other gate unchanged with no re-baselining; doctest
 green (the material-layout mirror test extended). Assets: job 217 at FHD
@@ -238,6 +235,12 @@ with it on, the marble table and the candles measurably change and are
 inspected by eye against the Blender render of the same scene.
 
 ## Not in scope
+
+- Skin mode (Cycles `RANDOM_WALK_SKIN`): Godot's `sss_mode_skin` is a shader
+  `render_mode`, not a uniform, so `process_material` cannot read it;
+  deferred with probe S5. No library material needs it. (Task 1, 2026-09-15.)
+- Debug modes 41/42 follow the precedent of modes 36–40: shader-side only,
+  set by integer from the gates, no `PathtracingDebugMode` enum entry.
 
 - Subsurface anisotropy as a material input (fixed 0).
 - Path-guiding records, light passes, volume-stack interaction.
