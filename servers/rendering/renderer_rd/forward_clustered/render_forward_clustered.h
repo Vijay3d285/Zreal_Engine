@@ -178,6 +178,10 @@ public:
 		RID rt_get_accum_n_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_N); }
 		bool rt_has_variance_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_VARIANCE); }
 		RID rt_get_variance_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_VARIANCE); }
+		bool rt_has_accum_albedo_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_ALBEDO); }
+		RID rt_get_accum_albedo_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_ALBEDO); }
+		bool rt_has_accum_normal_texture() const { return render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_NORMAL); }
+		RID rt_get_accum_normal_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_NORMAL); }
 
 		// DLSS Ray Reconstruction output buffers
 		void dlss_rr_ensure_buffers();

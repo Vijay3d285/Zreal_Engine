@@ -1744,6 +1744,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
 
 		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
+		rt_accum_guide_sample(pixel, diffuse_albedo, N);
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;

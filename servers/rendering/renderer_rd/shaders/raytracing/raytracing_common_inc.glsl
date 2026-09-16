@@ -139,6 +139,37 @@ layout(set = 0, binding = 12, r16f) uniform image2D dlss_rr_specular_hit_dist;
 layout(set = 0, binding = 28, rg16f) uniform image2D rt_velocity_image;
 layout(set = 0, binding = 15, r32f) uniform image2D rt_depth_image;
 
+// Phase A per-pixel sample count (R32_SFLOAT). Declared here, not in raygen,
+// because the hit and miss shaders read it for the guide accumulators below.
+layout(set = 0, binding = 30, r32f) uniform image2D rt_accum_n;
+
+#ifdef DLSS_RR_ENABLED
+// OIDN guides accumulated like the colour (spec 2026-09-16-oidn-accumulated-
+// guides): Cycles writes its denoising_albedo / denoising_normal passes with
+// film_write_pass_* -- an accumulation over every sample at its pixel-filter
+// jitter. The DLSS-RR G-buffers are the opposite: one point sample per frame,
+// which is what DLSS-RR wants and what made OIDN blur every surface whose
+// texture is fine per pixel (the far half of a 4K still).
+layout(set = 0, binding = 39, rgba16f) uniform image2D rt_accum_albedo;
+layout(set = 0, binding = 40, rgba16f) uniform image2D rt_accum_normal;
+
+// Blend this frame's primary-sample albedo / normal into the running means
+// with the colour's weight. n is the count BEFORE this frame (raygen writes
+// n + 1 after the trace), so w matches the colour blend exactly. A pixel the
+// adaptive sampler froze never traces, so it never reaches here -- consistent.
+void rt_accum_guide_sample(ivec2 px, vec3 albedo, vec3 normal) {
+	if (get_rt_param(RT_PARAM_ACCUM_FLAG) <= 0.5) {
+		return;
+	}
+	float n = max(imageLoad(rt_accum_n, px).x, 0.0);
+	float w = 1.0 / (n + 1.0);
+	vec3 a = mix(imageLoad(rt_accum_albedo, px).rgb, albedo, w);
+	vec3 nr = mix(imageLoad(rt_accum_normal, px).rgb, normal, w);
+	imageStore(rt_accum_albedo, px, vec4(a, 1.0));
+	imageStore(rt_accum_normal, px, vec4(nr, 1.0));
+}
+#endif
+
 #endif // !RT_STAGE_ANY_HIT
 
 // Shared hitAttributeEXT layout for all hit-group stages.

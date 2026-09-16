@@ -50,6 +50,11 @@
 #define RB_TEX_RAYTRACING_ACCUM SNAME("rt_accum")       // running-average radiance (R32G32B32A32_SFLOAT)
 #define RB_TEX_RAYTRACING_ACCUM_N SNAME("rt_accum_n") // sample count per pixel (R32_SFLOAT)
 #define RB_TEX_RAYTRACING_VARIANCE SNAME("rt_variance") // Welford (mean_luma, M2) per pixel (R32G32_SFLOAT)
+// OIDN guides accumulated like the colour (spec 2026-09-16-oidn-accumulated-guides):
+// running-average primary albedo and world normal, one sample per frame at the
+// pixel filter's jitter -- Cycles' denoising_albedo / denoising_normal passes.
+#define RB_TEX_RAYTRACING_ACCUM_ALBEDO SNAME("rt_accum_albedo") // R16G16B16A16_SFLOAT
+#define RB_TEX_RAYTRACING_ACCUM_NORMAL SNAME("rt_accum_normal") // R16G16B16A16_SFLOAT
 
 #define RB_SCOPE_DLSS_RR SNAME("dlss_rr")
 #define RB_TEX_DLSS_RR_DIFFUSE_ALBEDO SNAME("diffuse_albedo")

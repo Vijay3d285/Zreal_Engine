@@ -148,6 +148,26 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 				usage_bits_oidn, // CAN_COPY_TO_BIT: cleared alongside the accumulator on reset.
 				RD::TEXTURE_SAMPLES_1);
 	}
+	// OIDN guides, accumulated with the colour. RGBA16F: albedo in [0,1] and a
+	// unit normal sit well inside half precision, and the running mean is
+	// rewritten from the stored value each step, so the 1/257 weight at the
+	// last frame does not accumulate error. Cleared with rt_accum on reset.
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_ALBEDO)) {
+		render_buffers->create_texture(
+				RB_SCOPE_FORWARD_CLUSTERED,
+				RB_TEX_RAYTRACING_ACCUM_ALBEDO,
+				RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				usage_bits_oidn,
+				RD::TEXTURE_SAMPLES_1);
+	}
+	if (!render_buffers->has_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_NORMAL)) {
+		render_buffers->create_texture(
+				RB_SCOPE_FORWARD_CLUSTERED,
+				RB_TEX_RAYTRACING_ACCUM_NORMAL,
+				RD::DATA_FORMAT_R16G16B16A16_SFLOAT,
+				usage_bits_oidn,
+				RD::TEXTURE_SAMPLES_1);
+	}
 }
 
 void RenderForwardClustered::RenderBufferDataForwardClustered::dlss_rr_ensure_buffers() {
@@ -2877,6 +2897,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
 			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_n_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
 			RD::get_singleton()->texture_clear(rb_data->rt_get_variance_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
+			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_albedo_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
+			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_normal_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
 			rt_state->accum_reset_pending = false;
 		}
 

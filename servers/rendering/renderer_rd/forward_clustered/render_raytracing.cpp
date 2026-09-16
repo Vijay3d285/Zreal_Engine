@@ -4445,6 +4445,25 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// Bindings 39 & 40: OIDN guide accumulators (running-average primary albedo /
+	// world normal), blended in the hit and miss shaders at the primary sample.
+	// 34-38 are the env-NEE, emissive and coat-albedo buffers. Bound
+	// unconditionally like 29/30/33.
+	{
+		RD::Uniform u;
+		u.binding = 39;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rb_data->rt_get_accum_albedo_texture());
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 40;
+		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
+		u.append_id(rb_data->rt_get_accum_normal_texture());
+		uniforms.push_back(u);
+	}
+
 	// Binding 34: environment sampling distribution (env NEE).
 	{
 		RD::Uniform u;

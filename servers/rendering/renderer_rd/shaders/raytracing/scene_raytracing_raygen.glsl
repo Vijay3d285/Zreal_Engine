@@ -27,9 +27,10 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 // Phase A accumulation buffers (bound by render_raytracing.cpp update_uniform_set).
 // `accum` holds the running-average radiance; `accum_n` the per-pixel sample count.
 // `rt_accum` is R32G32B32A32_SFLOAT and `rt_accum_n` is R32_SFLOAT on the C++ side
-// (mirrors the existing `image` <-> RB_TEX_RAYTRACING R16F bind).
+// (mirrors the existing `image` <-> RB_TEX_RAYTRACING R16F bind). `rt_accum_n`
+// (binding 30) is declared in raytracing_common_inc.glsl: the hit and miss
+// shaders read it too, for the OIDN guide accumulators.
 layout(set = 0, binding = 29, rgba32f) uniform image2D rt_accum;
-layout(set = 0, binding = 30, r32f) uniform image2D rt_accum_n;
 // Adaptive sampling (Task 6): Welford (running mean luminance, M2) per pixel.
 // Bound at 33, not 31 -- binding 31 is IES_BUFFER_BINDING (ies_lookup_inc.glsl)
 // and 32 is the motion-transforms SSBO (declared further down in this file); both
@@ -364,6 +365,7 @@ void main() {
 			imageStore(dlss_rr_specular_albedo, pixel, vec4(0.0));
 			imageStore(dlss_rr_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 0.0));
 			imageStore(dlss_rr_specular_hit_dist, pixel, vec4(-1.0));
+			rt_accum_guide_sample(pixel, sky_color, -gl_WorldRayDirectionEXT);
 		}
 	}
 #endif
