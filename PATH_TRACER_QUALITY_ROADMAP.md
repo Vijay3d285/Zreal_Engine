@@ -122,6 +122,7 @@ Ranked by impact on offline still quality.
 | 26 | **CLOSED 2026-09-13.** After a through-event (Transparent BSDF pass-through, transmissive-lobe sample) the next ray restarted with two distance margins -- `t_min` 1 mm and a 256-ulp origin offset (0.24-0.49 mm at room scale) -- and any surface inside either was never hit. The aquarium water's front face sits 0.14 mm behind the glass: clear tank where Cycles shows teal, and the source of the "ghost" tank. Fixed Cycles' way: exact restart, `t_min` 0, skip the crossed triangle by id in any-hit; transmissive instances now run any-hit (skip-only, `RT_MAT_FLAG_ANYHIT_SKIP_ONLY`). Opaque bounces byte-identical. Gate `pt_thin_layer_gate` (T1 1.093 → 0.500002, T4b 2.168 → 0.991734; controls unchanged). replay192 water B−R −1.3 → +6.4, window −0.05%; 217 frame outside the tank +0.2%. See §11.20. | `raytracing_inc.glsl` (payload), `scene_raytracing_raygen.glsl` (restart, any-hit), `raytracing_closest_hit_common_inc.glsl` (two through-sites), `render_raytracing.cpp` (FORCE_OPAQUE, emissive gather) | `intern/cycles/kernel/bvh/util.h` (`intersection_skip_self`) | **High** |
 | 27 | **Sky radiance map was a point downsample of the panorama — CLOSED 2026-09-13**, with a residual filed. `PanoramaSkyMaterial` sampled with `filter_linear` (mip 0 only) while the sky pass renders it once per radiance-map texel: 8:1 point downsample at the gate's 2048→256 and at production's 8192→1024. `pt_sky_energy_gate` probe C swung 9.34% between radiance 256 and 2048 on a 1-row band (HIGH at 256 — aliasing, not loss; the gate's FAIL text said "losing energy" regardless of sign). Fix: `filter_linear_mipmap` — swing 0.56%. **Production effect: 0.00%** on replay192 and 217 (a hazy HDRI has no sub-texel energy; the sun is a DirectionalLight) — correct, gate-closing, not a look difference. **Residual (open):** probe B reads 1.5–2.2% low at *every* size and band width on a peaked sky, not on a uniform one — env-NEE/MIS weighting vs the CDF; gate tolerance for B set to 3% with the numbers recorded so it can still newly fail. See §11.21. | `scene/resources/3d/sky_material.cpp` (panorama shader filter), `pt_sky_energy_gate.gd` | Cycles samples the source image at the ray direction, never a downsampled map | Medium (residual: Low) |
 | 28 | **Still route: DLSS-RR reconstruction, NIS sharpen, 1.0 px filter** — 4K stills had a one-pixel staircase on every edge and a checkerboard on flat walls. **Closed 2026-09-16 (§11.24)**: stills go through Phase A (accumulate 256 × BH filter, OIDN), the filter widened to Cycles' 1.5 px, `fsr_sharpness` 0. `pt_pixel_filter_gate` F1 0.72 → 1.08 px. | `raytracing_inc.glsl camera_filter_jitter`, `render.gd`, `image_glb_creation.gd` | `film.cpp filter_table`, `properties.py filter_width` | High |
+| 29 | **OIDN guides were one 8-bit point sample per pixel** — the Phase A still blurred more with distance. **Closed 2026-09-16 (§11.25)**: albedo/normal accumulated with the colour (Cycles' denoising passes), ACCURATE prefilter, `cleanAux` on. `pt_oidn_guide_gate` fine-checker retention 0.62 → 0.999 (Cycles 0.998). | `raytracing_common_inc.glsl rt_accum_guide_sample`, `render_forward_clustered.cpp _oidn_final_denoise_accumulator`, `oidn_denoiser.cpp` | `kernel/film/denoising_passes.h`, `integrator/denoiser_oidn_gpu.cpp` | High |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
 | 22 | **CLOSED 2026-09-13 (decision A).** Shadow rays now follow Cycles' rule (`surface_shader_transparency()`): a BLEND material's (1−alpha) Transparent share passes, and the dielectric share — any refractive pane, any transmission factor — **blocks**. Pass B's `transmission·(1−F)` pass-through double-counted the sky with the refracted BSDF path (+2.4/+7.3/+8.6% at r0.3/0.6/0.9). With it gone the white glass furnace reads **0.99211 / 0.96440 / 0.97451** with NEE on — the recorded NEE-off values to four decimals, within 1.7% of Cycles — and `pt_glass_energy_gate`'s bar drops 10% → 3%. `pt_transparent_shadow_gate` probes 1–4 read 0.0 (glass casts a solid shadow, as in Blender); probe 5 (alpha share, 0.25) unchanged. Light inside glass now arrives only via refracted bounces; a delta lamp cannot light it — Cycles' behaviour (its opt-in Shadow Caustics is out of scope). Production: BLEND glass is the alpha share in both engines; job 217 has zero traced-dielectric materials. See §11.22. | `raytracing_lights_inc.glsl` (pass B), `pt_transparent_shadow_gate.gd`, `pt_glass_energy_gate.gd` | `intern/cycles/kernel/integrator/surface_shader.h:1053` | Medium |
@@ -6535,3 +6536,69 @@ mean +0.16% (a wider filter redistributes, it does not add); 190 s → 195 s.
 - The first production 4K run through Phase A gives the wall time to read
   against `main.py`'s 1500 s timeout (FHD 195 s × 4 ≈ 13 min expected), and
   the like-for-like picture-frame edge crop against the Blender still.
+
+## 11.25 Gap #29 — the denoiser's map of the scene was one sample wide
+
+**2026-09-16.** Job 224, the first 4K still on the Phase A route, was sharp
+near the camera and increasingly painterly with distance; the DLSS-RR route
+(223) and Blender's OIDN stills were not. Spec:
+`docs/superpowers/specs/2026-09-16-oidn-accumulated-guides-design.md`.
+
+### Mechanism
+
+OIDN keeps the colour detail its albedo guide explains and removes the rest.
+Cycles' guides are the `denoising_albedo` / `denoising_normal` passes —
+`film_write_pass_*`, an accumulation over every sample at its pixel-filter
+jitter, the same average as the colour (`kernel/film/denoising_passes.h`),
+prefiltered ACCURATE (`integrator/denoiser_oidn_gpu.cpp`). Ours were the
+DLSS-RR G-buffers: one 8-bit primary sample from the last frame, at that
+frame's jitter. Where a texture is coarse per pixel the two agree; where it
+is fine per pixel (far) they disagree everywhere and OIDN erases it. The
+`oidn_denoiser.cpp` comment had recorded the symptom two runs earlier
+("flattening the TV panel fabric") and mitigated it with `cleanAux = false`.
+
+### Change
+
+`rt_accum_albedo` / `rt_accum_normal` (RGBA16F, bindings 39/40) blended in
+the hit and miss shaders at the primary sample with the colour's `1/(n+1)`
+weight (`rt_accum_guide_sample`), cleared with the accumulator; OIDN reads
+them (normal renormalised), prefilters each with its own RT filter, and runs
+the colour with `cleanAux = true`. DLSS-RR's G-buffers are untouched.
+
+### Gate: `pt_oidn_guide_gate` — fine (period 4 px) vs coarse (period 32 px) checker through OIDN
+
+| | fine retention | coarse retention |
+|---|---|---|
+| old guides (DLSS-RR G-buffers) | **0.6214** | 0.9996 |
+| accumulated guides, runs 1–3 | **0.9991** ×3 | 0.9994 |
+| Cycles 5.2.1 + OIDN, same checker (`tools/cycles_comparison/cycles_oidn_checker.py`) | 0.9980 | 0.9996 |
+
+Cycles' raw checker contrast (0.2333 / 0.3792) matches the analytic
+"Blackman-Harris 1.5 px, point-sampled texture" (0.2326 / 0.3791) to three
+digits — an independent confirmation of Gap #28's filter width. Ours is
+softer (0.169 / 0.360): the tracer samples material textures bilinearly
+whatever the material's filter says; Cycles' real-asset default is Linear
+too, so this is a stimulus difference, not an asset gap.
+
+### What the gate caught on the way
+
+Its first reading on the fixed engine was 0.64, with OIDN's own output at
+the same pixels intact (`oidnDenoise.exe` on the engine's dumped inputs:
+0.9996 CPU, 0.9999 CUDA). The project's `screen_space_aa=1` (FXAA) was
+blurring the gate's viewport readback; `render.gd`'s still route disables
+FXAA, MSAA, TAA and debanding, and the gate now does the same. The 0.0836
+first recorded was old guides plus that FXAA.
+
+### Job 217 at FHD, Phase A, old → new guides
+
+The far picture's boat, punt pole and foliage return; the sheer curtain's
+weave returns; the brown curtain's pleats lose their grain. Whole-frame mean
+−0.19%; 207 s. (A Laplacian-variance statistic cannot separate recovered
+detail from removed noise here and was not used for the verdict.)
+
+### Open
+
+- Job 224's scene at 4K by the user, and the like-for-like far-picture crop
+  against the Blender still.
+- Cycles' `denoising_depth` guide and feature deferral through specular
+  surfaces are not ported.

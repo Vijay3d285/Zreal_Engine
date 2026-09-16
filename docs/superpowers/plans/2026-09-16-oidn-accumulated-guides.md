@@ -33,7 +33,7 @@
 
 Design change against the spec, recorded in Step 3: the mechanism is texture frequency *per pixel*, not distance, so the stimulus is one quad filling the frame with a **fine checker (period 4 px) on its left half and a coarse checker (period 32 px) on its right half**. Detail retention = std-dev of the OIDN result over a region ÷ std-dev of the raw accumulation over the same region. A point-sampled guide is a noisy binary pattern on the fine checker and a clean one on the coarse checker — which is the near/far difference in job 224, on one quad.
 
-- [ ] **Step 1: Write the gate**
+- [x] **Step 1: Write the gate**
 
 `pipeline_references/tests/pt_oidn_guide_gate.gd`:
 
@@ -233,7 +233,7 @@ func _new_env(p_bg: Color) -> Environment:
 script = ExtResource("1_gate")
 ```
 
-- [ ] **Step 2: Run on the current build — G1 (and therefore G3) must be red**
+- [x] **Step 2: Run on the current build — G1 (and therefore G3) must be red**
 
 ```bash
 bin/godot.windows.editor.x86_64.console.exe --rendering-driver vulkan --path pipeline_references res://tests/pt_oidn_guide_gate_scene.tscn
@@ -243,11 +243,11 @@ Expected: the log carries `[OIDN-DIAG] FIRE:` (OIDN ran — if absent, `set_path
 
 If G1 is *also* ≥ 0.85 on the current build, the stimulus is not aliasing-prone enough for a single point sample to disagree with the mean: drop `FINE_PERIOD` to 2 (1-px cells) and re-run — but at period 2 the filtered raw contrast is small, so check `fine_raw` is still > 0.02 or the ratio is noise. If `out` reads identical to `raw` everywhere (retention 1.000 on both), the viewport image was taken before OIDN landed — add two more `process_frame` awaits.
 
-- [ ] **Step 3: Amend the spec's gate section**
+- [x] **Step 3: Amend the spec's gate section**
 
 Replace the spec's "### 3. Gate" bullets G1–G3 with the fine/coarse design above (one quad, period 4 and 32, retention ≥ 0.85 each, parity ≤ 0.10), keeping the sentence that thresholds are set from the red/green pair.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add pipeline_references/tests/pt_oidn_guide_gate.gd pipeline_references/tests/pt_oidn_guide_gate_scene.tscn docs/superpowers/specs/2026-09-16-oidn-accumulated-guides-design.md
@@ -274,7 +274,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 The blend lives in the **hit and miss shaders**, right where the DLSS-RR G-buffer is written for the primary sample, not in raygen: the hit shader already has the sample's albedo and normal in registers, and reading `rt_accum_n` there gives the same `n` raygen uses this frame (raygen writes `n + 1` only after the trace returns). No cross-stage image read-after-write is needed.
 
-- [ ] **Step 1: Defines and accessors**
+- [x] **Step 1: Defines and accessors**
 
 `render_raytracing.h`, after the `RB_TEX_RAYTRACING_VARIANCE` line:
 
@@ -295,7 +295,7 @@ The blend lives in the **hit and miss shaders**, right where the DLSS-RR G-buffe
 		RID rt_get_accum_normal_texture() const { return render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RAYTRACING_ACCUM_NORMAL); }
 ```
 
-- [ ] **Step 2: Create and clear**
+- [x] **Step 2: Create and clear**
 
 `render_forward_clustered.cpp`, after the `RB_TEX_RAYTRACING_VARIANCE` creation block (ends `RD::TEXTURE_SAMPLES_1);\n\t}` before `}` of `rt_ensure_textures`):
 
@@ -329,7 +329,7 @@ In the reset block, after the `rt_get_variance_texture()` clear:
 			RD::get_singleton()->texture_clear(rb_data->rt_get_accum_normal_texture(), Color(0, 0, 0, 0), 0, 1, 0, 1);
 ```
 
-- [ ] **Step 3: Bind at 39 and 40**
+- [x] **Step 3: Bind at 39 and 40**
 
 `render_raytracing.cpp`, directly after the binding-33 block:
 
@@ -354,7 +354,7 @@ In the reset block, after the `rt_get_variance_texture()` clear:
 	}
 ```
 
-- [ ] **Step 4: Declarations and helper (GLSL)**
+- [x] **Step 4: Declarations and helper (GLSL)**
 
 In `scene_raytracing_raygen.glsl`, delete the line `layout(set = 0, binding = 30, r32f) uniform image2D rt_accum_n;` and change the comment above it to say `rt_accum_n` is declared in `raytracing_common_inc.glsl` (every stage reads it). In `raytracing_common_inc.glsl`, after the `rt_depth_image` declaration (line ~140):
 
@@ -391,7 +391,7 @@ void rt_accum_guide_sample(ivec2 px, vec3 albedo, vec3 normal) {
 #endif
 ```
 
-- [ ] **Step 5: Call it at both primary-sample write sites**
+- [x] **Step 5: Call it at both primary-sample write sites**
 
 `raytracing_closest_hit_common_inc.glsl`, inside the `#ifdef DLSS_RR_ENABLED` / `total_bounces == 0u && is_sample_zero` block, directly after `imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));`:
 
@@ -405,11 +405,11 @@ void rt_accum_guide_sample(ivec2 px, vec3 albedo, vec3 normal) {
 			rt_accum_guide_sample(pixel, sky_color, -gl_WorldRayDirectionEXT);
 ```
 
-- [ ] **Step 6: Build and run the guide gate — still red, for the right reason**
+- [x] **Step 6: Build and run the guide gate — still red, for the right reason**
 
 Build. Run the Task 1 gate. Expected: no shader error in the log, `[OIDN-DIAG] FIRE:` present, G1 unchanged (OIDN still reads the old G-buffers — Task 3 switches it). Any `SHADER ERROR`/`Vulkan` validation line means a binding collision or a declaration in the wrong stage: check `rt_accum_n` is declared exactly once per stage (grep `binding = 30` in the raytracing shaders → only `raytracing_common_inc.glsl`).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add servers/rendering/renderer_rd/forward_clustered/render_raytracing.h servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp servers/rendering/renderer_rd/shaders/raytracing/raytracing_common_inc.glsl servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl
@@ -431,7 +431,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `rt_get_accum_albedo_texture()` / `rt_get_accum_normal_texture()` from Task 2.
 - Produces: `denoise_rt(int w, int h, float *color, float *albedo, float *normal, int spp)` — guides are now non-const (prefiltered in place).
 
-- [ ] **Step 1: Read the accumulated guides**
+- [x] **Step 1: Read the accumulated guides**
 
 In `_oidn_final_denoise_accumulator`, replace the two readback blocks (`// --- diffuse albedo AOV: R8G8B8A8_UNORM ...` through the end of the normal block) with:
 
@@ -496,11 +496,11 @@ and the two conversion loops with:
 
 Update the `denoise_rt` call to pass `albedo_f.ptrw()` / `normal_f.ptrw()`. `Math::half_to_float` is in `core/math/math_funcs.h` (already included through the RD headers; add the include if the build says otherwise).
 
-- [ ] **Step 2: Signature**
+- [x] **Step 2: Signature**
 
 `pathtrace_oidn_denoiser.h` and `oidn_denoiser.h`: `const float *p_albedo, const float *p_normal` → `float *p_albedo, float *p_normal` (both declaration and override).
 
-- [ ] **Step 3: ACCURATE prefilter and cleanAux = true**
+- [x] **Step 3: ACCURATE prefilter and cleanAux = true**
 
 `oidn_denoiser.cpp`: add above `denoise_rt`:
 
@@ -545,15 +545,15 @@ Replace the `cleanAux` comment block and line with:
 	oidnSetFilterBool(filter, "cleanAux", true);
 ```
 
-- [ ] **Step 4: Build, gate green three times**
+- [x] **Step 4: Build, gate green three times**
 
 Build; run the guide gate three times. Expected: G1 ≥ 0.85, G2 ≥ 0.85, |G1 − G2| ≤ 0.10, `PASS: all 3`. Record the three G1/G2 readings; if the spread is above 0.02 the thresholds stay, if G1 sits below 0.85 with G2 above, the guide is still not matching the colour — check that the gate log's `[OIDN-DIAG] ... albedo_bytes=` is `width*height*8` (the accumulated texture), not `*4` (the old G-buffer).
 
-- [ ] **Step 5: Suite and doctest**
+- [x] **Step 5: Suite and doctest**
 
 Run every `pt_*_gate_scene.tscn` (17 now) and `--test`. Expected all green, 1558/1558. The pixel-filter and subsurface gates are the ones that touch the accumulate path; a red there means the `rt_accum_n` move broke raygen's read — the declaration must be visible before `trace_one_sample`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp servers/rendering/renderer_rd/pathtrace_oidn_denoiser.h modules/raycaster_oidn/oidn_denoiser.h modules/raycaster_oidn/oidn_denoiser.cpp
@@ -571,7 +571,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `docs/superpowers/plans/2026-09-16-oidn-accumulated-guides.md` (ticks, notes)
 - Modify: memory `pt-oidn-cleanaux-worldspace-normal.md` (the cleanAux advice is now wrong)
 
-- [ ] **Step 1: Job 217 at FHD, Phase A, before/after**
+- [x] **Step 1: Job 217 at FHD, Phase A, before/after**
 
 `<scratchpad>/aa/proj_pa` already carries the Phase A pipeline. "Before" is `<scratchpad>/aa/d217_pa_w15.png` (rendered on the 1.5 px build with the old guides — same shaders except this plan's). Render "after" to `<scratchpad>/aa/d217_pa_guides.png`. Measure with variance of the Laplacian (a sharpness statistic) on the far picture (crop `1530,690 → 1770,850` in the 217 FHD framing — verify by eye on the half-size preview first) and on a near region (`1200,760 → 1500,1000`), before/after; whole-frame mean within 0.5%.
 
@@ -588,7 +588,7 @@ for p in ("d217_pa_w15.png","d217_pa_guides.png"):
 
 Expected: far Laplacian variance rises markedly, near barely; mean within 0.5%.
 
-- [ ] **Step 2: Roadmap**
+- [x] **Step 2: Roadmap**
 
 Row 29 after row 28:
 
@@ -598,11 +598,11 @@ Row 29 after row 28:
 
 §11.25 "Gap #29 — the denoiser's map of the scene was one sample wide": the mechanism in two paragraphs, the Cycles citations, the gate's red/green readings (three green runs), the 217 numbers from Step 1, and "open": job 224's scene at 4K by the user (like-for-like far picture against the Blender still); `denoising_depth` and feature deferral through specular not ported.
 
-- [ ] **Step 3: Memory**
+- [x] **Step 3: Memory**
 
 Rewrite `C:\Users\aiadmin\.claude\projects\...\memory\pt-oidn-cleanaux-worldspace-normal.md` so it says: guides must be accumulated with the colour; with accumulated guides `cleanAux = true` + ACCURATE prefilter (Cycles); `cleanAux = false` was a mitigation for point-sampled guides and is wrong once they are accumulated; normals stay world-space. Update its `MEMORY.md` hook line.
 
-- [ ] **Step 4: Tick and commit**
+- [x] **Step 4: Tick and commit**
 
 ```bash
 sed -i 's/^- \[ \] /- [x] /' docs/superpowers/plans/2026-09-16-oidn-accumulated-guides.md
@@ -619,3 +619,15 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - **Spec coverage:** accumulate textures + bindings + blend at the primary sample (T2); OIDN reads them, renormalised normal, ACCURATE prefilter, cleanAux true, comment rewrite (T3); gate red/green with thresholds from the pair (T1, T3 S4); asset check + roadmap (T4); DLSS-RR untouched (no task touches `RB_TEX_DLSS_RR_*` reads on the realtime path). Spec's near/far G3 replaced by fine/coarse parity — amended in T1 S3.
 - **Placeholders:** row 29's `<red>`/`<green>` are filled from T1 S2 / T3 S4 readings. None else.
 - **Type consistency:** `rt_get_accum_albedo_texture()` / `rt_get_accum_normal_texture()` (T2 S1) used in T2 S2–3 and T3 S1; `rt_accum_guide_sample(ivec2, vec3, vec3)` (T2 S4) called in T2 S5 with `pixel` (ivec2) at both sites; `denoise_rt` non-const guides (T3 S2) match the `ptrw()` call (T3 S1) and the in-place prefilter (T3 S3).
+
+---
+
+## Execution notes (2026-09-16)
+
+All four tasks executed inline. The gate's first green reading was 0.64
+because the project's FXAA (`screen_space_aa=1`) blurred the viewport
+readback; the gate now disables msaa / FXAA / TAA / debanding like
+`render.gd`. The honest red control (old guides, FXAA off) is 0.6214; the fix
+reads 0.9991; Cycles + OIDN on the same checker 0.9980. Task 4's
+Laplacian-variance statistic could not separate detail from noise on the
+asset and was replaced by crops in the roadmap.
