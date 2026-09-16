@@ -6442,10 +6442,12 @@ that read 4.0695 at 18:58, and the **09-13 live-pipeline binary** that read
 accumulation image all 256×256; the glass furnace matches the earlier run to
 8 digits. The one thing that changed on the machine in that hour is the
 desktop session (disconnected; the WASAPI audio endpoint vanished in the same
-minute). This is the machine's state, not this branch — re-run the gate in a
-connected session before reading anything into it, and if it still reads
-5.04 there, probe 6 has a hidden dependency worth its own investigation.
-Probe 10's sample-fraction counters moved by the same ×1.23 in the same runs.
+minute). This is the machine's state, not this branch: the user re-ran the gate on
+the shipped build (`ac67c00d8` binary) after reconnecting on 2026-09-16 and
+probe 6 read **4.069846**, probe 10's sample fraction 0.112479 — all 45
+checks green, so the suite is **15/15**. Why a disconnected session moves a
+single-trajectory probe by ×1.24 (probe 10's counters moved by the same
+factor) is still unexplained; run gates only in a connected session.
 
 ### Deviations from Cycles, on record
 
