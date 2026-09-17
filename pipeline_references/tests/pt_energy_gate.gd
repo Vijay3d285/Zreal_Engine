@@ -59,11 +59,13 @@ extends "res://tests/pt_validation.gd"
 ##             Reported over the full disc AND over a silhouette annulus, where
 ##             grazing angles concentrate the effect.
 ##   bumpy   - the same rough metal plus a steep normal map. Drives the shading
-##             normal far off the geometry normal, so below-geometry rejection and
-##             the mirrored-sample recovery path fire constantly, and dot(N,V) <= 0
-##             becomes common. This is the ONLY surface here that reacts to the
-##             recovery / backfacing-V policies: it moved 1.415 -> 0.836 (-41%)
-##             when they were mishandled.
+##             normal far off the geometry normal, so the true-face rejection
+##             (F1) and Cycles' ensure_valid_specular_reflection fire constantly,
+##             and dot(N,V) <= 0 becomes common. This is the ONLY surface here
+##             that reacts to the bump-correction / backfacing-V policies: it
+##             moved 1.415 -> 0.836 (-41%) when they were mishandled, and
+##             1.411 -> 1.079 when F1 replaced the mirror recovery with
+##             Cycles' rules (roadmap 11.29).
 ##   plastic - a rough DIELECTRIC sphere (roughness 0.4, metallic 0). Every other
 ##             surface here is either metallic = 1, which makes pSpec = 1 and kills
 ##             the diffuse lobe outright, or near-Lambertian, which leaves the
@@ -130,7 +132,16 @@ const REF_SMOOTH := 1.48883
 const REF_DIFFUSE := 0.37281
 const REF_ROUGH := 1.63024 # full disc
 const REF_ROUGH_RIM := 1.25141 # silhouette annulus
-const REF_BUMPY := 1.41124 # normal-mapped rough metal
+# RE-CAPTURED 2026-09-17 for Phase F1 (roadmap 11.29): the mirror recovery
+# this surface was named for is gone -- a below-face sample now ends the path
+# (Cycles' LABEL_NONE) -- and the shading normal is corrected by Cycles'
+# ensure_valid_specular_reflection instead of the 0.4 clamp, on the TRUE face
+# normal rather than the smooth one. Three readings on the final F1 binary:
+# 1.07918 / 1.07863 / 1.07905, median taken. `rough` did not move (ratio 1.0001
+# over the whole F1 sequence, so the true-face rejection band on a smooth-shaded
+# sphere is below this gate's noise); `smooth`, `diffuse` and `plastic` are
+# unchanged (< 0.05%). Previous value: 1.41124.
+const REF_BUMPY := 1.07905 # normal-mapped rough metal
 # Rough DIELECTRIC (roughness 0.4, metallic 0), added in Task 5.
 #
 # THIS SURFACE CARRIES THE MEASUREMENT THAT CLOSED THE COMBINE_BRDFS_WITH_FRESNEL
@@ -341,10 +352,10 @@ func _gate_directional(p_frames: int) -> void:
 	print("  [rough  ] metal sphere mean  : %.5f   (silhouette annulus %.5f over %d px)"
 			% [rough["mean"], rough_rim["mean"], rough_rim["n"]])
 
-	# Bumpy pass: the recovery probe. Same rough metal plus a steep tangent-space
-	# normal map, so the shading normal tilts far off the geometry normal and
-	# evalIndirectCombinedBRDF's below-geometry rejection (and therefore
-	# recoverBelowHemisphereSample) fires constantly. That is the case that
+	# Bumpy pass: the bump-correction probe. Same rough metal plus a steep
+	# tangent-space normal map, so the shading normal tilts far off the geometry
+	# normal and evalIndirectCombinedBRDF's below-face rejection (F1: the path
+	# ends, as in Cycles) fires constantly. That is the case that
 	# actually carries throughput into the combinedPdf() == 0 path -- the plain
 	# rough sphere does not, because there the specular sample weight vanishes on
 	# the same NdotL -> 0 limit that drives the pdf to zero.
