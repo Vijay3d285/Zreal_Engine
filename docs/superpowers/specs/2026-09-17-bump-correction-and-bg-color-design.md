@@ -91,10 +91,13 @@ line transcription of `bsdf_util.h:322-395` (threshold
 `safe_sqrt` guards). `shade_and_bounce` computes
 
 ```
-vec3 N = (m has normal map && N != Ng) ? ensureValidSpecularReflection(h.face_normal, V, m.normal) : m.normal;
+vec3 N = ensureValidSpecularReflection(h.face_normal, V, m.normal); // returns m.normal unchanged when N == Ng or the mirror already clears Ng
 ```
 
-and that `N` feeds everything the clamped normal fed before: sampling, NEE,
+Cycles' gate is `N != Ng` (`maybe_ensure_valid_specular_reflection`,
+`bsdf_util.h:399`), not "has a normal map": a smooth-shaded mesh without a
+normal map also has N ≠ Ng and also gets the correction. That `N` feeds
+everything the clamped normal fed before: sampling, NEE,
 env NEE, emissive NEE, the MIS pdf, the SSS entry normal, the DLSS-RR and
 OIDN guide normals. (Divergence, from approach C: Cycles' diffuse closure
 keeps the raw bump normal; ours takes the corrected one.)
@@ -117,17 +120,21 @@ unchanged.
 
 ### 4. `bump_shadowing_term` in the BRDF library
 
-`MaterialProperties` gains `float3 smoothNormal` (world space, flipped like
-`geometry_normal`; zero-length disables the term, the same convention as
-`tangent`). Every construction site sets it from `h.geometry_normal` (the
-`brdf_mat` at `:1660` and the four `dbg_mat` blocks). `brdf_inc.glsl` gains
+`MaterialProperties` gains `float3 smoothNormal` (Cycles' `sd->N`, world
+space, flipped like `geometry_normal`; zero-length disables the term, the
+same convention as `tangent`) and `float3 bumpNormal` (the raw `m.normal`,
+*before* §2's correction — Cycles' diffuse closure carries exactly this
+normal, so the term keys on it, and a plain smooth-shaded surface where
+`bumpNormal == smoothNormal` reads 1 exactly even where §2 rotated the
+lobe normal). Every construction site sets both (the `brdf_mat` at `:1660`
+and the four `dbg_mat` blocks). `brdf_inc.glsl` gains
 
 ```
 float bumpShadowingTerm(float3 Ns, float3 N, float3 I, bool isDiffuse, bool isEval)
 ```
 
 transcribed from `bsdf.h:86-140`: returns 1 when `Ns == N` or `Ns` is
-zero; returns 0 when `dot(Ns,I)·dot(Ns,N)·dot(N,I) < 0` and
+zero; returns 0 when `dot(Ns,I)·dot(Ns,N)·dot(N,I) < 0` (with `N = bumpNormal`) and
 (`isEval || isDiffuse`); for a diffuse lobe returns
 `G1_GGX(saturate(0.125·tan²θd), |dot(Ns,I)|)` with `cosθd = |dot(Ns,N)|`
 (`bsdf_G<GGX>` = `1 / (1 + Λ)`, `Λ = ½(√(1 + α²tan²θ) − 1)`), else 1.
@@ -149,7 +156,7 @@ changes; no new plumbing outside the two BRDF entry points.
 
 In `render_raytracing.cpp`'s binding-7 block: when the Environment has no
 `Sky` and its background is `BG_COLOR` or `BG_CLEAR_COLOR`, bind a 1×1
-`R16G16B16A16_SFLOAT` texture owned by `RenderRaytracing` holding the linear
+`R32G32B32A32_SFLOAT` texture owned by `RenderRaytracing` holding the linear
 colour the rasteriser would clear to — `bg_color.srgb_to_linear()` (or the
 viewport's default clear colour for `BG_CLEAR_COLOR`) `× bg_energy_multiplier
 × bg_intensity` — scaled by whatever the `BG_SKY` radiance map carries that the
