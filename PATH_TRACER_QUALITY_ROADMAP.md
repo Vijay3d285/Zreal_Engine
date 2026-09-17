@@ -124,6 +124,7 @@ Ranked by impact on offline still quality.
 | 28 | **Still route: DLSS-RR reconstruction, NIS sharpen, 1.0 px filter** — 4K stills had a one-pixel staircase on every edge and a checkerboard on flat walls. **Closed 2026-09-16 (§11.24)**: stills go through Phase A (accumulate 256 × BH filter, OIDN), the filter widened to Cycles' 1.5 px, `fsr_sharpness` 0. `pt_pixel_filter_gate` F1 0.72 → 1.08 px. | `raytracing_inc.glsl camera_filter_jitter`, `render.gd`, `image_glb_creation.gd` | `film.cpp filter_table`, `properties.py filter_width` | High |
 | 29 | **OIDN guides were one 8-bit point sample per pixel** — the Phase A still blurred more with distance. **Closed 2026-09-16 (§11.25)**: albedo/normal accumulated with the colour (Cycles' denoising passes), ACCURATE prefilter, `cleanAux` on. `pt_oidn_guide_gate` fine-checker retention 0.62 → 0.999 (Cycles 0.998). | `raytracing_common_inc.glsl rt_accum_guide_sample`, `render_forward_clustered.cpp _oidn_final_denoise_accumulator`, `oidn_denoiser.cpp` | `kernel/film/denoising_passes.h`, `integrator/denoiser_oidn_gpu.cpp` | High |
 | 30 | **Daylight could not enter: the tracer ignored `cast_shadow = OFF`; indirect clamp off** — a "day" interior was lit by 17 artificial lights, sun + sky alone rendered black, fireflies at 36× fed OIDN's blotches. **Closed 2026-09-16 (§11.26)**: `RT_INSTANCE_MASK_NO_SHADOW` (Cycles' shadow visibility) honours `cast_shadow = OFF`; window glass gets it in the pipeline; `PHASE_A_CLAMP_INDIRECT` 10 (Cycles' default). `pt_shadow_visibility_gate` V2 0 → 1.0. Lighting rig: user's decision, three renders delivered. | `render_raytracing.cpp rt_instance_mask`, `renderer_geometry_instance.h`, `image_glb_creation.gd` | `kernel/light/light.h` visibility, `scene.cycles.sample_clamp_indirect` | High |
+| 31 | **PIPELINE — day renders are lit by a lamp rig, not by daylight.** A "day" interior gets ~3% of its light from sun + sky (the sky reads ~0.5 linear, exposure is tuned for 17 artificial fills and portal spots that paint hard stripes and half the wall grain). Blender's reference is a *daylight design*: physical sun and sky, exposure set for the interior, a film tone curve, the room's own fixtures, and an artist-placed fill only where daylight cannot reach. **OPEN — spec in §11.27, parked 2026-09-16.** | `image_glb_creation.gd` lighting rig (`_create_window_portal_lights`, fill grid, `_auto_ambient_boost`), `render.gd` exposure/tonemap | Cycles sun/world strength, Filmic/AgX, archviz practice | High (look) |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
 | 22 | **CLOSED 2026-09-13 (decision A).** Shadow rays now follow Cycles' rule (`surface_shader_transparency()`): a BLEND material's (1−alpha) Transparent share passes, and the dielectric share — any refractive pane, any transmission factor — **blocks**. Pass B's `transmission·(1−F)` pass-through double-counted the sky with the refracted BSDF path (+2.4/+7.3/+8.6% at r0.3/0.6/0.9). With it gone the white glass furnace reads **0.99211 / 0.96440 / 0.97451** with NEE on — the recorded NEE-off values to four decimals, within 1.7% of Cycles — and `pt_glass_energy_gate`'s bar drops 10% → 3%. `pt_transparent_shadow_gate` probes 1–4 read 0.0 (glass casts a solid shadow, as in Blender); probe 5 (alpha share, 0.25) unchanged. Light inside glass now arrives only via refracted bounces; a delta lamp cannot light it — Cycles' behaviour (its opt-in Shadow Caustics is out of scope). Production: BLEND glass is the alpha share in both engines; job 217 has zero traced-dielectric materials. See §11.22. | `raytracing_lights_inc.glsl` (pass B), `pt_transparent_shadow_gate.gd`, `pt_glass_energy_gate.gd` | `intern/cycles/kernel/integrator/surface_shader.h:1053` | Medium |
@@ -6676,7 +6677,90 @@ daylight design (sun strength, sky strength, exposure) — is the user's.
 
 ### Open
 
-- The lighting design above.
+- The lighting design above — specified as Gap #31, §11.27, parked.
 - `SHADOW_CASTING_SETTING_SHADOWS_ONLY` (Cycles' camera visibility off) is
   not honoured; its only pipeline user is disabled.
 - A light tree for the artificial lights' remaining grain, if the rig stays.
+
+## 11.27 Gap #31 (pipeline, OPEN) — a daylight design for day renders
+
+**Parked 2026-09-16 at the user's request; to be picked up later.** This is a
+pipeline gap, not an engine gap: after Gaps #28–#30 the tracer renders
+daylight the way Cycles does; the pipeline does not yet *design* with it.
+
+### Where we are
+
+From §11.26, job 225's scene at FHD: with sun + sky only the frame reads
+0.0175 (sky ~0.5 linear through the mirror, walls ~0.008, windows behind the
+camera); the room's light is the pipeline's 17 fills, portal spots and IES
+lamps, tuned together with the exposure. The portal spots alone add hard
+stripes on the walls and double the wall grain (15.3% vs 7.8% without them).
+Blender's reference dining still is exposed for daylight and lit through
+openings in view. The two images differ in light *design* before any shader
+is reached.
+
+### Why "turn up the sun" is not enough
+
+Daylight is physics. A room far from its windows, a north-facing room, a
+windowless bathroom render dark in Cycles as they do in life; a daylit
+Blender interior is three things working together, and only one is the sun:
+
+1. **Physical intensities and an interior exposure.** Sun and sky at real
+   strengths make the window 50–100× brighter than the walls; the exposure
+   is set for the interior and a film tone curve (AgX / Filmic) compresses
+   the window. Ours is the inverse: a dim sky and an exposure tuned for
+   lamps.
+2. **Bounces.** A light-walled room carries a window's light around corners
+   in 5–10 bounces. The tracer already does 12.
+3. **Lights the artist places** where daylight cannot reach. No renderer
+   avoids this; an automated pipeline must replace that judgement with a
+   rule.
+
+### The design (proposed)
+
+A layered rule with a measurement in it, applied per job:
+
+- **Layer 1 — daylight, physical.** Sun: real irradiance (Cycles' sun
+  strength is W/m²; a clear-sky sun is ~3–5 after atmosphere in scene
+  units), 0.5° angular diameter; sky: the HDRI at real strength (measure
+  `day.exr`'s zenith / horizon radiance and scale so the sky sits in the
+  physical ratio to the sun, not at 0.5); window glass `cast_shadow = OFF`
+  (Gap #30); no portal spots.
+- **Layer 2 — the room's own fixtures** at a modest daytime level (real
+  interior photographs usually have the lamps on); the JSON's `sceneLights`
+  and fixture emission already carry them for night renders.
+- **Layer 3 — a fallback fill, only when measured necessary.** A 16-sample,
+  quarter-resolution probe render of the job before the still: from its
+  luminance distribution the pipeline (a) sets the exposure so the frame's
+  median lands at mid-grey (a camera's auto-exposure), and (b) only if the
+  darkest occupied quarter of the frame is still below a threshold after
+  that exposure, adds **one** large soft area fill at the room's centre
+  (not seventeen spots). The probe costs seconds; it replaces
+  `_auto_ambient_boost`, `_illum_ambient_factor`, the 1.25× fill grid and
+  the portal spots, all of which exist to guess what the probe measures.
+- **Tone curve:** AgX (Godot 4.7 has it) or Filmic on the still route, so a
+  window in frame does not clip when the interior is exposed correctly;
+  `_tonemapExposureScale` becomes the probe's output rather than a job
+  constant.
+
+### How it would be validated
+
+A fixed set of four test jobs, each rendered by the rule at FHD and judged
+against numbers, not feelings: window in view; window behind the camera
+(job 225); a deep room (window at one end, camera at the other); a
+windowless room. Per job: frame median within 0.15–0.35 after the rule's
+exposure, no region of the occupied frame below 0.02, window in view not
+clipped in more than 2% of its pixels, wall grain ≤ 10% at 256 samples, and
+for the dining scene a like-for-like against the Blender reference still.
+The rule is written once; the four jobs are what prove it holds across
+geometry.
+
+### Engine dependencies (all met or small)
+
+- Shadow visibility (Gap #30): done.
+- Indirect clamp 10 (Gap #30): done.
+- Sun angular diameter and soft shadows: present (`[Sun] ... angular=0.8`).
+- AgX / Filmic on the still route: check `render.gd`'s tonemap mode; Godot
+  4.7 ships AgX.
+- Many-light sampling (a light tree) becomes unnecessary once the rig is
+  one fill plus the room's fixtures.
