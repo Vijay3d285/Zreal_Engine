@@ -112,7 +112,7 @@ Ranked by impact on offline still quality.
 | 12 | **glTF PBR extensions dropped at import** | only `_pbr`, `_unlit`, `_emissive_strength` | Cycles Principled BSDF carries all | High (blocks #13) |
 | 13 | **Missing BSDFs** — transmission (E1, §7.5), anisotropy (E2b, §7.8), clearcoat (E2d, §7.10), sheen (E2e, §7.11) and **subsurface (E3, §11.23, shipped 2026-09-15)** all ship: Cycles' random walk (van de Hulst remap, Dwivedi guiding, channel MIS, 256 steps) for solids and the OpenPBR thin-wall split for sheets; gate S1 energy / S2 vs Cycles / S3 thin-wall / S4 fallback; pipeline keyword rule (marble, wax, shade/paper, leaf). Skin mode deferred (a render_mode, invisible to the upload). **Gap #13 complete** | `closest_hit_common:474-475` | `subsurface_random_walk.h`, Principled | Medium |
 | 14 | **fp16 radiance/throughput payload** | `raytracing_inc.glsl:75-87` | fp32 throughout | Medium |
-| 15 | **Biased bump-map mirror recovery** | `brdf_inc.glsl:998-1009` | offset/position normals, no bias | Low-Med |
+| 15 | **Biased bump-map mirror recovery — CLOSED 2026-09-17 (§11.29).** The roadmap's "offset normals" never existed in Cycles; it handles a bumped surface with three rules on the TRUE face normal — `ensure_valid_specular_reflection` (rotate the glossy normal only as far as the mirror direction needs), reject below-face samples outright, `bump_shadowing_term` on the diffuse lobe — and gives the diffuse closure the raw bump normal. All four ported; the 0.4 clamp and the mirror deleted. `pt_bump_correction_gate`: furnace 1.063 → 0.564 (Cycles 0.557), vs Cycles B0 +91% → +1.2%, B1 +60% → +1.7%, B2 +5% → +0.1%. Cost +3.7% frame time. | `brdf_inc.glsl` (`ensureValidSpecularReflection`, `bumpShadowingTerm`, `diffuseLobeNormal`), `HitData.face_normal` | `bsdf_util.h:322`, `bsdf.h:86`, `bsdf_microfacet.h:863`, `svm/closure.h` | **Closed** |
 | 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
 | 17 | **Multi-scatter energy compensation over-shoot** — **FIXED 2026-09-10, see §10.** `evalEmsApprox`/`evalMultiScatterApproximation` over-corrected the true single-scatter GGX energy loss by 3.4–8.1pp. Replaced by `evalMultiScatterEnergy`, a transcription of Cycles' `microfacet_ggx_preserve_energy` reading the `GGX_E`/`GGX_EAVG` tables E2d already ships. The white furnace's isotropic control went **1.059535 → 1.000549**. Two things this did *not* fix are now separate rows: #19 and #20. | `brdf_inc.glsl` (`evalMultiScatterEnergy`, `evalMultiScatterFactor`, `RT_MS_COMPENSATION`), call sites in `brdf_inc.glsl` (sampler), `raytracing_closest_hit_common_inc.glsl` and `raytracing_emissive_inc.glsl` (NEE) | `intern/cycles/kernel/closure/bsdf_microfacet.h:466-485` | **Fixed** |
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
@@ -934,15 +934,15 @@ Random-walk BSSRDF following `subsurface_random_walk.h`.
 
 ### Phase F — Precision & robustness *(rolling)*
 
-**F1. Offset normals replacing the biased bump mirror** — *Gap #15*
-Remove `recoverBelowHemisphereSample` (`brdf_inc.glsl:998-1009`); its own comment concedes it is energy-non-conserving. Keep debug vis mode 22 for comparison.
-*Accept:* grazing angles on a high-frequency normal-mapped surface stay energy-flat; no over-bright, no speckle.
+**F1. ~~Offset normals replacing~~ Cycles' bump-map correction replacing the biased bump mirror** — *Gap #15* — ✅ **DONE 2026-09-17 (§11.29)**
+*Corrected 2026-09-17:* Cycles has no "offset normals". It applies `ensure_valid_specular_reflection` to glossy/coat/SSS closures, rejects samples below the true face, and shadows the diffuse lobe with `bump_shadowing_term`, with the diffuse closure on the raw bump normal. All ported; `recoverBelowHemisphereSample` and `clampShadingNormal` deleted; vis mode 22 kept (now raw vs corrected).
+*Accept (met):* a normal-mapped furnace no longer exceeds 1 (1.063 → 0.564); vs Cycles within 1.7% on the two dielectric probes and 0.1% on the metal.
 
 **F2. Volumetrics** — *Gap #16*
 Homogeneous fog/god-rays via a volume integrator (`shade_volume.h`), with `max_volume_bounce` from B3.
 
 **F3. `Environment.BG_COLOR` silently produces a black world for the path
-tracer.** *(Found authoring Phase E1 Task 7's transmission gate;
+tracer.** — ✅ **DONE 2026-09-17 (§11.29)**: a 1×1 flat-colour radiance map is bound when there is no Sky; and `radiance_inverse_xform` — which the tracer's env sampling reads for every environment — is now stored unconditionally (it was gated on the sky being the ambient/reflection source, which cost every non-sky environment 18% of its lighting). *(Found authoring Phase E1 Task 7's transmission gate;
 `pipeline_references/tests/pt_transmission_gate.gd`'s `_new_env` header
 comment has the full writeup.)* `env_sky_radiance()` / `env_sample()`
 (`raytracing_lights_inc.glsl` / the env-sampling headers) read
@@ -6870,3 +6870,134 @@ Either gap alone fixes the reported defect on this scene; #31 changes the
 look toward Blender's daylight references and costs pipeline work, #32 keeps
 any look and costs engine work. Both are recorded so the choice is made with
 the numbers above rather than re-derived.
+
+## 11.29 Phase F1 + F3 closeout — Cycles' bump-map correction, and a flat-colour world
+
+Spec `docs/superpowers/specs/2026-09-17-bump-correction-and-bg-color-design.md`,
+plan `docs/superpowers/plans/2026-09-17-bump-correction-and-bg-color.md`.
+Gate `pipeline_references/tests/pt_bump_correction_gate.gd` (suite now 20),
+Cycles half `tools/cycles_comparison/cycles_bump_grazing.py`.
+
+### What the roadmap claimed, and what the source says
+
+F1 was written as *"offset normals replacing the biased bump mirror … Cycles:
+offset/position normals, no bias."* Cycles (5.3.0-alpha, re-read 2026-09-17)
+has no such thing. A normal-mapped surface at a grazing angle is handled by
+four separate rules, and the tracer implemented none of them:
+
+| | Cycles | Ours, before |
+|---|---|---|
+| Shading normal | `ensure_valid_specular_reflection` (`bsdf_util.h:322`): rotate N toward the **true face** Ng only as far as the mirror direction needs; glossy / coat / SSS closures only; whenever N ≠ Ng | `clampShadingNormal`: lerp *every* lobe's normal toward the **smooth** normal once geometry NdotV < 0.4 |
+| Sample below the surface | rejected, path ends (`bsdf_microfacet.h:863`, `bsdf_diffuse.h:65`); tested against Ng | mirrored across the smooth normal, **keeping the rejected sample's weight** |
+| Light through a bump | `bump_shadowing_term` (`bsdf.h:86`): reject the far side of the smooth normal; soften the diffuse lobe by a GGX G1 keyed to the bump's tilt | none |
+| Which normal the diffuse lobe uses | the raw bump normal (`svm/closure.h`'s diffuse setup takes N straight) | the same clamped normal as every other lobe |
+
+And the tracer never computed the true face normal at all: `HitData.geometry_normal`
+is the smooth, vertex-interpolated normal (Cycles' `sd->N`), so every
+"geometry" test in the integrator was a smooth-normal test.
+
+### What landed, in the order it was measured
+
+The gate is a 200 × 200 quad tilted to a known angle under the sheen gate's
+4° camera, with the energy gate's sine normal map (65° tilts) tiled 10×, no
+mipmaps, in both engines. Readings are the crop mean; Cycles 5.2.1 at 256 spp.
+
+| step | A furnace (10°, ≤ 1) | B0 vs Cycles (10°, dielectric) | B1 (80°, dielectric) | B2 (80°, metal) |
+|---|---|---|---|---|
+| before | **1.063** | +90.8% | +59.5% | +5.1% |
+| Task 2: `HitData.face_normal` from the three vertex positions; the transmissive guard, the SSS entry test and the sampler's below-surface test move onto it | — | — | — | — |
+| Task 3: `ensureValidSpecularReflection` replaces the 0.4 clamp (all sites incl. six vis modes) | 1.047 | +87.8% | +66.1% | +6.2% |
+| Task 4: below-face samples terminate; mirror recovery and its MIS sentinel deleted | 0.889 | +59.6% | +45.9% | +1.6% |
+| Task 5: `bumpShadowingTerm` in `evalCombinedBRDFSeparate` and the diffuse sample | 0.652 | +16.9% | +9.5% | −1.4% |
+| Task 5b, approach C: the diffuse lobe evaluates, samples and reports its pdf around the raw bump normal (`diffuseLobeNormal`, keyed on the new `MaterialProperties.bumpNormal`); sign tests per closure with that closure's normal | **0.564** | **+1.16%** | **+1.69%** | **+0.14%** |
+
+Cycles' own furnace on this map reads 0.557 (its rules *cost* energy on 65°
+bumps; the point of probe A is only that a furnace never exceeds 1). The spec
+had deferred approach C "unless the diffuse arm reads outside the bar"; it
+read +16.9%, so it was built inside the BRDF library through the field that
+Task 5 had already added — no NEE signature changed, and every surface where
+the two normals coincide is bit-identical (sheen, coat, emissive, light-energy
+gates unchanged to the digit). Probe B0's bar went 1% → 2% with the reason
+recorded: on this map the correction fires face-on (a 65° bump puts the mirror
+direction 120° off the face), so B0 is a parity probe, not a "does not fire"
+probe. The ~1.2% residual on the dielectric is not explained; the metal at
++0.14% says the specular lobe is not where it lives.
+
+Probe A was moved from 80° to 10° before any engine work: at 80° the old
+binary's furnace read 0.985 and could not see the defect, while at 10° it read
+1.063 — the mirror's extra energy shows where the cosine lobe around a tilted
+bump normal dips below the face most often, which is near-normal view.
+
+### Two references re-captured, both with the reason written into the gate
+
+- `pt_energy_gate` `bumpy` 1.41124 → 1.07905: the surface named for the mirror.
+  `rough` (smooth-shaded metal sphere) did **not** move (1.0001) — the
+  true-face rejection band on a well-tessellated sphere is below the gate's
+  noise. Everything else < 0.05%.
+- `pt_transmission_gate` probe 10 (the transmissive hemisphere-guard firing
+  rate on a normal-mapped thin glass quad, near-grazing): correct code 0.0019
+  → 0.0625, because the deleted clamp had been flattening exactly that
+  fixture's normal map. Defect c re-measured on the new binary drives the rate
+  to 0.000000 (the override runs before the guard), so the LOW bound is what
+  catches it now. Band [0.0005, 0.02] → [0.02, 0.12]; vis mode 33 passes
+  `face_normal` like production.
+
+Whole suite: old hand-over binary 18 green + the two designed reds; new
+binary 20/20. Doctest 1558/1558. Frame time on the opaque timing scene, best
+of three: 1.2287 → 1.2738 ms/frame (+3.7%) — the three vertex-position BDA
+reads per closest hit; Cycles gets Ng from its intersector for free.
+
+### F3 — the flat world, and the defect under it
+
+`render_raytracing.cpp`'s binding-7 block binds a 1×1 `R32G32B32A32_SFLOAT`
+texture holding `srgb_to_linear(bg_color) × bg_energy_multiplier ×
+bg_intensity × exposure normalisation` (the rasteriser's clear-colour chain,
+`render_forward_clustered.cpp` `_render_scene`) whenever the Environment has
+no Sky and its background is `BG_COLOR` / `BG_CLEAR_COLOR`; its version feeds
+the env CDF as the sky's does. Probe C (a Lambertian sphere under `BG_COLOR`
+vs the same linear colour as a `BG_SKY` flat panorama) went 0.0 → 0.823 —
+not 1.0.
+
+The 0.823 was uniform across the frame, colour-independent, and linear in the
+energy multiplier; the sky seen *directly* read 0.300 / 0.500 / 0.700 exactly;
+the CDF dumped from both arms was numerically identical; and a scratch build
+with environment NEE compiled out read 1.0003. The cause was in scene data:
+`radiance_inverse_xform` — the world→sky rotation `env_sample` and `env_pdf`
+both use — was only written to the UBO when the sky was the ambient or
+reflection source (`render_scene_data_rd.cpp:204`). For any other environment
+the tracer read a zero matrix: `env_sample` returned a zero direction (NEE
+never contributed) while `env_pdf` still returned a positive density for the
+BSDF-hit sky path, whose MIS weight then discarded exactly NEE's share. It is
+stored unconditionally now; probe C reads 1.0001. Every gate so far used
+`BG_SKY` with the default reflection source, which is why none of them saw it.
+
+### Asset check
+
+Job 225/226's scene (FHD, still route) rendered by the previous hand-over
+binary and by this one from the same scratch copy of the reference project.
+Frame mean −1.1%; 8.7% of pixels moved by more than 0.02 and the change is
+local:
+
+- **The fish tank's side panel, +12%: a dark slab became the refracted room
+  behind it.** That tank is a smooth-shaded box, so its interpolated normal
+  leans off the real face across the *whole* panel, and the transmissive
+  hemisphere guard — tested against the smooth normal until Task 2 — was
+  terminating refracted paths there. Cycles tests Ng; now so do we. No gate
+  had this because every glass gate fixture is a flat quad or a
+  well-tessellated sphere, where the two normals agree.
+- The curtain (fine normal-mapped weave), −5.5%: Cycles' bump shadowing on
+  a bumped diffuse surface costs energy, as the gate's furnace showed.
+- Everything else within 0.5% of the previous binary.
+
+### Not fixed, stated so this cannot overclaim
+
+- The ~1.2–1.7% residual on the bumped dielectric vs Cycles. Candidates, none
+  tested: 8-bit vs float normal-map quantisation in the gate's own stimulus,
+  the layering withdrawal's normal under a bump, Godot's vs Blender's tangent
+  frame at the texel level.
+- Cycles' `shadow_terminator_shading_offset` / geometry offset (`shift_cos_in`)
+  — separate object-level settings, not bump correction.
+- A per-material "Bump Map Correction" switch — Cycles' is on by default and
+  glTF has no such flag; the tracer applies the rules whenever N ≠ Ng.
+- F2 volumetrics (Gap #16) — its own spec next; the pipeline already asks for
+  `volumetric_fog` on day renders and the tracer ignores it.
