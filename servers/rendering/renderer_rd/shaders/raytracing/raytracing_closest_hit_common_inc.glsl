@@ -15,7 +15,18 @@
 
 struct HitData {
 	vec3 hit_pos;
-	vec3 geometry_normal; // World space, flipped for back-face hits.
+	// The SMOOTH, vertex-interpolated normal -- Cycles' sd->N, NOT its Ng. World
+	// space, flipped toward the incoming ray on back-face hits. Ray-origin
+	// offsets and the shading frame are built on it. (The name predates F1; it
+	// is kept because ~40 sites read it and its meaning has not changed.)
+	vec3 geometry_normal;
+	// F1: the triangle's TRUE plane normal -- Cycles' sd->Ng. World space, unit
+	// length, oriented so dot(face_normal, -ray_dir) > 0. Every "is this
+	// direction inside the surface" test in the integrator is against THIS
+	// (bsdf_microfacet.h:863, bsdf_diffuse.h:65 test Ng), and
+	// ensure_valid_specular_reflection rotates toward it. For procedural
+	// (intersection-shader) geometry it equals geometry_normal.
+	vec3 face_normal;
 	vec3 tangent; // World space.
 	vec3 bitangent; // World space.
 	vec2 uv; // Raw UV (no material scale/offset applied).
@@ -60,6 +71,7 @@ HitData compute_hit_data() {
 		if (!h.is_front_face) {
 			h.geometry_normal = -h.geometry_normal;
 		}
+		h.face_normal = h.geometry_normal;
 	} else
 #endif
 	{
@@ -72,6 +84,30 @@ HitData compute_hit_data() {
 		h.is_front_face = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT);
 		if (!h.is_front_face) {
 			h.geometry_normal = -h.geometry_normal;
+		}
+
+		// F1: true face normal from the three vertex positions. Three extra BDA
+		// reads per closest hit; Cycles gets Ng free from its intersector, we do
+		// not. Edges are transformed by the full object-to-world rotation/scale
+		// (NOT the normalised normal_matrix) so a non-uniformly scaled instance
+		// still gets the plane of the world-space triangle.
+		{
+			uint fi0, fi1, fi2;
+			get_triangle_indices(geom, fi0, fi1, fi2);
+			vec3 p0 = rt_fetch_vertex_position(geom, fi0);
+			vec3 p1 = rt_fetch_vertex_position(geom, fi1);
+			vec3 p2 = rt_fetch_vertex_position(geom, fi2);
+			vec3 e1 = model_rotation * (p1 - p0);
+			vec3 e2 = model_rotation * (p2 - p0);
+			vec3 ng = cross(e1, e2);
+			float ng_len2 = dot(ng, ng);
+			// Degenerate triangle: fall back to the smooth normal rather than NaN.
+			h.face_normal = (ng_len2 > 1e-20) ? ng * inversesqrt(ng_len2) : h.geometry_normal;
+			// Orient toward the ray, as Cycles flips Ng for back-facing hits
+			// (shader_setup_from_ray). Independent of winding convention.
+			if (dot(h.face_normal, -gl_WorldRayDirectionEXT) < 0.0) {
+				h.face_normal = -h.face_normal;
+			}
 		}
 	}
 
@@ -2249,7 +2285,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// possible.
 		bool isTransmit;
 		bool wrongHemisphere;
-		if (sampleTransmissiveLobe(V, N, h.geometry_normal, alpha, alpha * alpha, specularF0,
+		// F1: the hemisphere guard inside is Cycles' dot(Ng, wo) test
+		// (bsdf_microfacet.h:863) -- against the TRUE face, not the smooth normal.
+		if (sampleTransmissiveLobe(V, N, h.face_normal, alpha, alpha * alpha, specularF0,
 					brdf_mat.eta, brdf_mat.transmissivness, m.thickness == 0.0,
 #ifdef RT_ANISOTROPY_ENABLED
 					transData.ax, transData.ay, transData.anisoPhi, transData.anisoActive,
@@ -2312,7 +2350,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 			float dnp = max(sqrt(arg), 1e-7);
 			float nK = neta * cos_HI - dnp;
 			wo = -(neta * V) + nK * H;
-			entry_ok = dot(h.geometry_normal, wo) < 0.0;
+			entry_ok = dot(h.face_normal, wo) < 0.0; // F1: Cycles tests Ng here (bsdf_microfacet.h:863).
 		}
 		if (!entry_ok) {
 			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
@@ -2352,7 +2390,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 #else
 	const bool sss_thin_through = false;
 #endif
-	if (!transmissive_sample_ok && !evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
+	if (!transmissive_sample_ok && !evalIndirectCombinedBRDF(u, N, h.face_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
 		//   2) Sampled direction is below the geometry plane. Recover by

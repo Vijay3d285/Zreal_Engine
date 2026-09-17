@@ -4091,9 +4091,10 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		return false;
 	}
 
-	// Prevent tracing direction "under" the hemisphere (behind the triangle).
-	// The caller is expected to handle this case: either terminate the path,
-	// or mirror the direction across the geometry plane to keep it above.
+	// Prevent tracing direction "under" the surface. F1: `geometryNormal` is the
+	// TRUE face normal (HitData.face_normal, Cycles' Ng) -- bsdf_microfacet.h:863
+	// and bsdf_diffuse.h:65 make exactly this test and return LABEL_NONE. The
+	// caller terminates the path on false.
 	if (dot(geometryNormal, rayDirection) <= 0.0f) {
 		return false;
 	}
