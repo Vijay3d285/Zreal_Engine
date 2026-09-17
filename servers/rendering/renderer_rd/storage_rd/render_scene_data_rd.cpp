@@ -201,7 +201,18 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 			ubo.flags |= SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP;
 		}
 
-		if ((ubo.flags & SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP) || (ubo.flags & SCENE_DATA_FLAGS_USE_REFLECTION_CUBEMAP)) {
+		// Stored unconditionally (was gated on the two cubemap flags). The raster
+		// shaders only read radiance_inverse_xform under those flags, but the
+		// path tracer's environment sampling (env_sample / env_pdf,
+		// raytracing_env_sampling_inc.glsl) reads it for EVERY environment --
+		// and with a BG_COLOR / BG_CLEAR_COLOR world (Phase F3) neither flag is
+		// set, so the tracer saw a zero matrix: env_sample returned a zero
+		// direction (environment NEE never contributed) while env_pdf still
+		// returned a positive density for the BSDF-hit sky path, whose MIS
+		// weight then discarded exactly NEE's share. pt_bump_correction_gate
+		// probe C read 0.823 of the BG_SKY reference with the flat world before
+		// this line moved out of the guard.
+		{
 			Basis sky_transform = render_scene_render->environment_get_sky_orientation(p_env);
 			sky_transform = sky_transform.inverse() * cam_transform.basis;
 			RendererRD::MaterialStorage::store_transform_3x3(sky_transform, ubo.radiance_inverse_xform);

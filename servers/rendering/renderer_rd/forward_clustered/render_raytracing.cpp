@@ -85,6 +85,11 @@ RenderRaytracing::~RenderRaytracing() {
 		env_dist_fallback_buffer = RID();
 	}
 
+	if (flat_world_texture.is_valid()) {
+		RD::get_singleton()->free_rid(flat_world_texture);
+		flat_world_texture = RID();
+	}
+
 	if (emissive_fallback_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(emissive_fallback_buffer);
 		emissive_fallback_buffer = RID();
@@ -120,6 +125,28 @@ RID RenderRaytracing::_get_env_dist_fallback_buffer() {
 	const uint8_t zeros[16] = {};
 	env_dist_fallback_buffer = RD::get_singleton()->storage_buffer_create(sizeof(zeros), Span<uint8_t>(zeros, sizeof(zeros)));
 	return env_dist_fallback_buffer;
+}
+
+RID RenderRaytracing::_get_flat_world_texture(const Color &p_linear) {
+	if (flat_world_texture.is_null()) {
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R32G32B32A32_SFLOAT;
+		tf.width = 1;
+		tf.height = 1;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_UPDATE_BIT;
+		tf.texture_type = RD::TEXTURE_TYPE_2D;
+		flat_world_texture = RD::get_singleton()->texture_create(tf, RD::TextureView());
+	}
+	if (p_linear != flat_world_color) {
+		const float px[4] = { p_linear.r, p_linear.g, p_linear.b, 1.0f };
+		Vector<uint8_t> data;
+		data.resize(sizeof(px));
+		memcpy(data.ptrw(), px, sizeof(px));
+		RD::get_singleton()->texture_update(flat_world_texture, 0, data);
+		flat_world_color = p_linear;
+		flat_world_version++;
+	}
+	return flat_world_texture;
 }
 
 RID RenderRaytracing::_get_emissive_fallback_buffer() {
@@ -4321,7 +4348,32 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			}
 		}
 
-		// Fall back to default black texture if no sky
+		// F3: no Sky, but a flat background colour -- Cycles' constant world.
+		// Mirrors the rasteriser's clear colour chain exactly
+		// (render_forward_clustered.cpp _render_scene: srgb_to_linear() of the
+		// property, times bg_energy_multiplier, bg_intensity and the camera's
+		// exposure normalisation). pt_bump_correction_gate probe C asserts
+		// equality with a BG_SKY flat panorama of the same linear colour.
+		if (!radiance_texture.is_valid() && p_render_data && p_render_data->environment.is_valid()) {
+			const RID env = p_render_data->environment;
+			const RSE::EnvironmentBG bg = owner->environment_get_background(env);
+			if (bg == RSE::ENV_BG_COLOR || bg == RSE::ENV_BG_CLEAR_COLOR) {
+				Color c = (bg == RSE::ENV_BG_COLOR) ? owner->environment_get_bg_color(env) : RSG::texture_storage->get_default_clear_color();
+				c = c.srgb_to_linear();
+				float energy = owner->environment_get_bg_energy_multiplier(env) * owner->environment_get_bg_intensity(env);
+				if (p_render_data->camera_attributes.is_valid()) {
+					energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+				}
+				c.r *= energy;
+				c.g *= energy;
+				c.b *= energy;
+				radiance_texture = _get_flat_world_texture(c);
+				sky_source_version = flat_world_version;
+				sky_uv_border_size = 0.0f;
+			}
+		}
+
+		// Fall back to default black texture if no sky and no flat colour.
 		if (!radiance_texture.is_valid()) {
 			radiance_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		}

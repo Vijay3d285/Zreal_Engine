@@ -513,6 +513,18 @@ class RenderRaytracing {
 	RID env_dist_fallback_buffer;
 	RID _get_env_dist_fallback_buffer();
 
+	// F3: a 1x1 radiance map holding the Environment's flat background colour,
+	// bound at binding 7 when the background is BG_COLOR / BG_CLEAR_COLOR and
+	// there is no Sky. Before F3 that case bound the default black texture and
+	// every ray that missed geometry saw a black world, while the rasteriser
+	// cleared to bg_color * energy (render_forward_clustered.cpp, _render_scene).
+	// Linear, energy already applied -- the same value the sky pass bakes into a
+	// BG_SKY radiance map (brightness_multiplier in sky.glsl).
+	RID flat_world_texture;
+	Color flat_world_color = Color(-1.0f, -1.0f, -1.0f, -1.0f);
+	uint64_t flat_world_version = 0;
+	RID _get_flat_world_texture(const Color &p_linear);
+
 	// Power-weighted sampling distribution over emissive mesh instances (C1).
 	//
 	// Owned here alongside `env_cdf` so the shader and pipeline are shared. Note
