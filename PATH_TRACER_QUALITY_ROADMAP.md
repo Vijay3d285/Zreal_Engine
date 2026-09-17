@@ -6675,6 +6675,41 @@ in view. The dimness is the scene's light design, not the tracer.
 The decision — keep the rig, drop the portals, or move to a Blender-style
 daylight design (sun strength, sky strength, exposure) — is the user's.
 
+### Follow-up 2026-09-17 — job 226 (clamp 10): the pendant wire still breaks up
+
+The clamp removed the fireflies and the wire's ceiling looked the same, so the
+user's hypothesis (fireflies → blur) was tested and is not it. Three
+measurements settle where the grain comes from:
+
+1. **Our sampler vs Cycles on a lamp rig** — the same 6×4×2.8 m box, 16 hard
+   point lights, same camera, 256 samples, no denoiser
+   (`tools/cycles_comparison/cycles_manylight_noise.py`,
+   `pipeline_references/tests/pt_manylight_noise_probe.gd`):
+
+   | | ceiling noise | wall noise |
+   |---|---|---|
+   | Cycles 5.2.1, light tree | 3.4% | 8.2% |
+   | ours | **1.6%** | **3.6%** |
+
+   Our light sampling is not behind Cycles'. (Aside: Cycles shows the point
+   lights' inverse-square hot spots on the walls, ours is flatter — Godot's
+   omni attenuation model is not physical. Small, separate.)
+2. **Bias or noise?** Two 256-sample renders of 225's ceiling with
+   independent sample sequences (`ZR_SEED_OFFSET`, a kept debug env var):
+   residual correlation 0.09 on clean patches → fixed pattern ~3.7%, sample
+   noise ~12%; 256 → 1024 samples lowers the residual 1.8× (2.0 ideal). The
+   estimator converges normally. (A first cut read 0.6–0.7 correlation and
+   looked like a bias; it was the shared per-pixel seed and the wire's own
+   edge inside the patch — recorded so it is not repeated.)
+3. **Samples.** 1024 instead of 256: ceiling 15.1% → 10.4%, the wire survives
+   OIDN further, at 465 s FHD (≈ 31 min at 4K, over the timeout).
+
+So the wire breaks because a one-pixel line ~25% darker than its ceiling sits
+in 12% grain, and OIDN cannot tell it from a fluctuation; Cycles fed the same
+rig at 256 samples would show the same. The grain is the rig's (Gap #31), not
+the engine's: daylight through openings is a large soft source with a fraction
+of the variance, which is why Blender references are clean at 256.
+
 ### Open
 
 - The lighting design above — specified as Gap #31, §11.27, parked.

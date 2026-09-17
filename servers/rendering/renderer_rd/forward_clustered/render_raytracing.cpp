@@ -2550,6 +2550,14 @@ static uint32_t zr_lights_skip_flags() {
 	return flags;
 }
 
+static uint32_t zr_seed_offset() {
+	static int64_t v = -1;
+	if (v < 0) {
+		v = MAX((int64_t)0, OS::get_singleton()->get_environment("ZR_SEED_OFFSET").to_int());
+	}
+	return (uint32_t)v;
+}
+
 static _FORCE_INLINE_ uint32_t rt_instance_mask(const RenderGeometryInstanceBase *p_inst, uint32_t p_feature_bits, bool p_uses_blend) {
 	if (p_inst && p_inst->data && p_inst->data->cast_shadows_setting == RSE::SHADOW_CASTING_SETTING_OFF) {
 		return SceneShaderRaytracing::RT_INSTANCE_MASK_NO_SHADOW;
@@ -4208,7 +4216,12 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			p_state->dlss_rr_final_done = false;
 		}
 
-		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame);
+		// Debug: ZR_SEED_OFFSET=<n> shifts the accumulate route's sample indices so a
+		// second render of the same frame uses an independent sequence. The
+		// correlation of the two renders' high-pass residuals then separates a
+		// fixed per-pixel pattern (bias, real detail) from sample noise; used for
+		// the Gap #30 follow-up (roadmap 11.26). Production never sets it.
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame + zr_seed_offset());
 		p_state->accum_enabled = accum_enabled;
 		// accum_frame is incremented post-trace in the dispatch site
 		// (render_forward_clustered.cpp) so it only advances after a real launch.
