@@ -1957,7 +1957,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		// blending (a per-surface signal this function cannot see). The invariant
 		// that must hold across both sites: the scene-level bit is set whenever ANY
 		// surface in the scene is routed onto RT_INSTANCE_MASK_TRANSMISSIVE by
-		// rt_instance_mask_from_features() -- a scene can never enable pass B while
+		// rt_instance_mask() -- a scene can never enable pass B while
 		// its glass sits outside the transmissive mask, or vice versa. Widening the
 		// mask predicate (rt_instance_mask_from_features, ~:2470) to also catch
 		// blend surfaces without widening the scene bit here is exactly the bug that
@@ -2530,7 +2530,25 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 // B) can find it and attenuate through it, rather than pass A treating it as a
 // solid wall. Pass B's own attenuation for a blend surface is Task 4's; what
 // this decides is only which pass gets to see it.
-static _FORCE_INLINE_ uint32_t rt_instance_mask_from_features(uint32_t p_feature_bits, bool p_uses_blend) {
+//
+// Gap #30: an instance with cast_shadows OFF is Cycles' "shadow visibility
+// off" -- camera and bounce rays (RT_INSTANCE_MASK_ALL) hit it, no shadow ray
+// does, whatever its material. SHADOWS_ONLY and DOUBLE_SIDED behave as ON here.
+static _FORCE_INLINE_ uint32_t rt_instance_mask(const RenderGeometryInstanceBase *p_inst, uint32_t p_feature_bits, bool p_uses_blend) {
+	if (p_inst && p_inst->data && p_inst->data->cast_shadows_setting == RSE::SHADOW_CASTING_SETTING_OFF) {
+		return SceneShaderRaytracing::RT_INSTANCE_MASK_NO_SHADOW;
+	}
+	return ((p_feature_bits & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) || p_uses_blend)
+			? SceneShaderRaytracing::RT_INSTANCE_MASK_TRANSMISSIVE
+			: SceneShaderRaytracing::RT_INSTANCE_MASK_OPAQUE;
+}
+
+// Same rule for the deferred MultiMesh sites, which carry the setting in
+// PendingMMSurface because the instance is out of scope there.
+static _FORCE_INLINE_ uint32_t rt_instance_mask_deferred(RSE::ShadowCastingSetting p_setting, uint32_t p_feature_bits, bool p_uses_blend) {
+	if (p_setting == RSE::SHADOW_CASTING_SETTING_OFF) {
+		return SceneShaderRaytracing::RT_INSTANCE_MASK_NO_SHADOW;
+	}
 	return ((p_feature_bits & SceneShaderRaytracing::RT_FLAG_TRANSMISSIVE_GEOMETRY) || p_uses_blend)
 			? SceneShaderRaytracing::RT_INSTANCE_MASK_TRANSMISSIVE
 			: SceneShaderRaytracing::RT_INSTANCE_MASK_OPAQUE;
@@ -2691,7 +2709,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				// feature_bits are 0 -- no special case needed.
 				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
 				scene_mask |= process_material(material_rid, material_counter)->feature_bits;
-				// rt_instance_mask_from_features() (below) masks a blend surface
+				// rt_instance_mask() (below) masks a blend surface
 				// TRANSMISSIVE regardless of its material's transmission value --
 				// but process_material() only sets RT_FLAG_TRANSMISSIVE_GEOMETRY from
 				// transmission > 0 (see the E3 detection block above), because it is
@@ -2774,6 +2792,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		// keyed by material RID and shared across every surface using it; the two
 		// Phase 2 push sites OR this into a local copy instead of the cached struct.
 		bool mat_uses_blend;
+		// Gap #30: the instance's cast_shadows setting, captured here because the
+		// instance is out of scope at the deferred push sites.
+		RSE::ShadowCastingSetting cast_shadows_setting;
 		// Gap #26: RT_MAT_FLAG_ANYHIT_SKIP_ONLY for this surface, same reasoning.
 		bool anyhit_skip_only;
 	};
@@ -2869,7 +2890,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				// blends = false regardless. Claiming TRANSMISSIVE here would move it
 				// out of the pass A shadow mask while nothing in the closure ever
 				// treats it as translucent, which would just delete its shadow.
-				instance_masks.push_back(rt_instance_mask_from_features(proc_mat_data->feature_bits, false));
+				instance_masks.push_back(rt_instance_mask(inst, proc_mat_data->feature_bits, false));
 			}
 			continue;
 		}
@@ -2967,6 +2988,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 				PendingMMSurface pending;
 				pending.mm_rid = mm_rid;
+				pending.cast_shadows_setting = inst->data ? inst->data->cast_shadows_setting : RSE::SHADOW_CASTING_SETTING_ON;
 				pending.mm_gpu_buffer = mm_gpu_buffer;
 				pending.mm_surf = mm_surf;
 				pending.mesh_surface = mesh_surface;
@@ -3158,7 +3180,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// Site 2 of 4, the triangle-mesh path. `surf` is in scope, so this reads
 			// the SAME per-surface predicate that set RT_MAT_FLAG_BLEND on the pushed
 			// material a few lines above -- the mask and the flag cannot disagree.
-			instance_masks.push_back(rt_instance_mask_from_features(
+			instance_masks.push_back(rt_instance_mask(inst,
 					mat_data->feature_bits, surf->shader && surf->shader->rt_uses_alpha_blending()));
 
 			surf = surf->next;
@@ -3216,7 +3238,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// same value pushed into RT_MAT_FLAG_BLEND immediately above, captured in
 			// Phase 1 from mm_surf->shader (which is out of scope here -- this is why
 			// PendingMMSurface carries the bool rather than the surface pointer).
-			instance_masks.push_back(rt_instance_mask_from_features(
+			instance_masks.push_back(rt_instance_mask_deferred(pending.cast_shadows_setting,
 					pending.mat_data->feature_bits, pending.mat_uses_blend));
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
@@ -3304,7 +3326,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				// the same mask that material's RT_MAT_FLAG_BLEND implies. Same
 				// pending.mat_uses_blend as site 3, hoisted out of this per-instance
 				// loop by the push_mat_data computation above.
-				instance_masks.push_back(rt_instance_mask_from_features(
+				instance_masks.push_back(rt_instance_mask_deferred(pending.cast_shadows_setting,
 						pending.mat_data->feature_bits, pending.mat_uses_blend));
 			}
 
@@ -3549,7 +3571,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	positional_lights.sort_custom<LightScoreComparator>();
 
 	// Fill remaining slots with top positional lights.
-	for (uint32_t i = 0; i < positional_lights.size() && rt_light_count < p_max_lights; i++) {
+	for (uint32_t i = 0; i < positional_lights.size() && rt_light_count < p_max_lights ; i++) {
 		RID light_instance = positional_lights[i].light_instance;
 		RID base = ls->light_instance_get_base_light(light_instance);
 		RSE::LightType type = ls->light_get_type(base);

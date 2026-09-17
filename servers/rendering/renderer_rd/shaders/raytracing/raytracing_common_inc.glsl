@@ -91,6 +91,7 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // MIRRORS scene_shader_raytracing.h RT_INSTANCE_MASK_* -- change both together.
 #define RT_INSTANCE_MASK_OPAQUE 0x01u
 #define RT_INSTANCE_MASK_TRANSMISSIVE 0x02u
+#define RT_INSTANCE_MASK_NO_SHADOW 0x04u // cast_shadow OFF: camera/bounce rays only (Gap #30)
 // Primary, indirect and DLSS-RR probe rays keep seeing everything.
 #define RT_INSTANCE_MASK_ALL 0xFFu
 

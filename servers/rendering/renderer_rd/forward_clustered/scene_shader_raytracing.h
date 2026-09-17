@@ -141,8 +141,16 @@ public:
 	// MIRRORED IN raytracing_common_inc.glsl -- change both together.
 	constexpr static uint32_t RT_INSTANCE_MASK_OPAQUE = 0x01;
 	constexpr static uint32_t RT_INSTANCE_MASK_TRANSMISSIVE = 0x02;
+	// Cycles' per-object shadow visibility (Gap #30): an instance whose
+	// cast_shadows is SHADOW_CASTING_SETTING_OFF gets ONLY this bit. Camera and
+	// bounce rays trace with RT_INSTANCE_MASK_ALL and still hit it; shadow pass A
+	// (OPAQUE) and pass B (TRANSMISSIVE) never do. Window glass with cast_shadow
+	// off lets the sky and the sun in, as it does in Blender archviz.
+	constexpr static uint32_t RT_INSTANCE_MASK_NO_SHADOW = 0x04;
 	// Primary, indirect and DLSS-RR probe rays keep seeing everything.
 	constexpr static uint32_t RT_INSTANCE_MASK_ALL = 0xFF;
+	static_assert((RT_INSTANCE_MASK_NO_SHADOW & (RT_INSTANCE_MASK_OPAQUE | RT_INSTANCE_MASK_TRANSMISSIVE)) == 0,
+			"NO_SHADOW must be invisible to both shadow passes");
 	static_assert((RT_INSTANCE_MASK_OPAQUE & RT_INSTANCE_MASK_TRANSMISSIVE) == 0,
 			"Opaque and transmissive instance masks must be disjoint, or pass A would "
 			"see glass and occlude behind it while pass B attenuates it a second time");
