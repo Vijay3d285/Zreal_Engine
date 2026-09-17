@@ -1032,6 +1032,19 @@ float bumpShadowingTerm(float3 Ns, float3 N, float3 I, bool isDiffuse, bool isEv
 	return Smith_G1_GGX(0.0f, cos_i, bump_alpha2, cos_i * cos_i);
 }
 
+// F1 approach C: the normal the DIFFUSE lobe shades around. Cycles gives its
+// diffuse closure the raw bump normal (svm/closure.h's diffuse setup takes N
+// straight; only glossy, coat and SSS go through
+// maybe_ensure_valid_specular_reflection), so the diffuse lobe keeps the full
+// relief while the specular lobe is corrected. Measured on
+// pt_bump_correction_gate before this split: B0 +16.9% and B1 +9.5% over
+// Cycles with every lobe on the corrected normal. Falls back to N when no bump
+// normal was recorded, and equals N exactly wherever the correction did not
+// fire, so every non-bumped surface is bit-identical.
+float3 diffuseLobeNormal(float3 N, MaterialProperties material) {
+	return (dot(material.bumpNormal, material.bumpNormal) > 0.5f) ? material.bumpNormal : N;
+}
+
 // Smith G1 term (masking function) optimized for Beckmann distribution (by substituting G_Lambda_Beckmann_Walter into G1)
 // Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al.
 float Smith_G1_Beckmann_Walter(float a) {
@@ -3498,7 +3511,14 @@ float combineLobePdf(float weights[LOBE_COUNT], float pdfs[LOBE_COUNT]) {
 // inconsistent with how directions are actually generated.
 float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float NdotL = dot(N, L);
-	if (NdotL <= 0.0f) {
+	// F1 approach C: the diffuse lobe is a cosine lobe around ITS normal, so a
+	// direction below the corrected normal's horizon but above the bump
+	// normal's still carries diffuse density -- and the specular/coat/sheen
+	// densities below are zero there (the guard on `specSide`).
+	const float3 Nd = diffuseLobeNormal(N, material);
+	const float NdotLd = dot(Nd, L);
+	const bool specSide = NdotL > 0.0f;
+	if (!specSide && NdotLd <= 0.0f) {
 		return 0.0f;
 	}
 
@@ -3520,8 +3540,8 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// impossible to reintroduce, not merely re-synced by hand a second time.
 	float pSpec = lobeWeight(material);
 
-	// Diffuse lobe: cosine-weighted hemisphere.
-	float pdfDiffuse = diffusePdf(NdotL);
+	// Diffuse lobe: cosine-weighted hemisphere around the diffuse lobe's normal.
+	float pdfDiffuse = (NdotLd > 0.0f) ? diffusePdf(NdotLd) : 0.0f;
 
 	// Specular lobe: VNDF reflection pdf. Built in the local frame where N = +Z,
 	// matching how sampleSpecular generates directions.
@@ -3603,7 +3623,7 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	// applies when it actually draws the direction -- that agreement is the
 	// entire point of this task.
 	float specularContribution;
-	if (material.roughness < RT_MIS_DELTA_ROUGHNESS) {
+	if (!specSide || material.roughness < RT_MIS_DELTA_ROUGHNESS) {
 		specularContribution = 0.0f;
 #ifdef RT_ANISOTROPY_ENABLED
 	} else if (data.anisoActive) {
@@ -3760,10 +3780,10 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	pdfs[LOBE_SUBSURFACE] = 0.0f;
 #endif
 #ifdef RT_COAT_ENABLED
-	pdfs[LOBE_COAT] = coatPdf(material.coatRoughness, NdotH, NdotV, LdotH);
+	pdfs[LOBE_COAT] = specSide ? coatPdf(material.coatRoughness, NdotH, NdotV, LdotH) : 0.0f;
 #endif
 #ifdef RT_SHEEN_ENABLED
-	pdfs[LOBE_SHEEN] = sheenPdfValue;
+	pdfs[LOBE_SHEEN] = specSide ? sheenPdfValue : 0.0f;
 #endif
 
 	return combineLobePdf(weights, pdfs);
@@ -3796,7 +3816,15 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	outSheen = float3(0.0f, 0.0f, 0.0f);
 	// Prepare data needed for BRDF evaluation (uses shading normal N for all BRDF math).
 	const BrdfData data = prepareBRDFData(N, L, V, material);
-	// Ignore L rays "below" the hemisphere.
+	// F1 approach C: the diffuse lobe evaluates around Cycles' diffuse-closure
+	// normal (the raw bump normal); specular, coat and sheen stay on the
+	// corrected N. dataDiff IS data wherever the two coincide.
+	const float3 Nd = diffuseLobeNormal(N, material);
+	BrdfData dataDiff = data;
+	if (any(notEqual(Nd, N))) {
+		dataDiff = prepareBRDFData(Nd, L, V, material);
+	}
+	// Ignore L rays "below" the hemisphere -- of BOTH lobe normals.
 	//
 	// E2d: this early-out zeroes the COAT too, and that is required, not
 	// incidental. combinedPdf's own first early-out returns 0.0 for NdotL <= 0
@@ -3805,33 +3833,45 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// MIS weight, and the BSDF strategy can never reach that direction to balance
 	// it. It is also unphysical -- a coat cannot reflect light arriving from
 	// beneath the surface it sits on. Leaving outCoat at its initialiser here is
-	// what makes value and density agree.
-	if (data.Lbackfacing) {
+	// what makes value and density agree. (F1: combinedPdf keys its specular,
+	// coat and sheen densities on the same dot(N, L) as `data.Lbackfacing`, and
+	// its diffuse density on dot(Nd, L) as `dataDiff.Lbackfacing` -- value and
+	// density still agree lobe by lobe.)
+	if (data.Lbackfacing && dataDiff.Lbackfacing) {
 		return;
 	}
 
 	// F1, Cycles bsdf_eval:556-559 -- light through the smooth surface is
-	// rejected for every lobe; then the diffuse lobe alone is softened (:639).
-	const float bumpReject = bumpShadowingTerm(material.smoothNormal, material.bumpNormal, L, false, true);
-	if (bumpReject == 0.0f) {
+	// rejected per closure, each tested with ITS OWN normal (the glossy closure
+	// carries the corrected N, the diffuse closure the raw bump normal Nd);
+	// then the diffuse lobe alone is softened (:639).
+	const float bumpRejectSpec = bumpShadowingTerm(material.smoothNormal, N, L, false, true);
+	const float bumpDiffuse = bumpShadowingTerm(material.smoothNormal, Nd, L, true, true);
+	if (bumpRejectSpec == 0.0f && bumpDiffuse == 0.0f) {
 		return;
 	}
-	const float bumpDiffuse = bumpShadowingTerm(material.smoothNormal, material.bumpNormal, L, true, true);
 
-	// Eval specular and diffuse BRDFs
-	outSpecular = evalSpecular(data);
-	outDiffuse = evalDiffuse(data) * bumpDiffuse;
+	// Eval specular and diffuse BRDFs, each above its own normal's horizon.
+	if (!data.Lbackfacing && bumpRejectSpec != 0.0f) {
+		outSpecular = evalSpecular(data);
+	}
+	if (!dataDiff.Lbackfacing && bumpDiffuse != 0.0f) {
+		outDiffuse = evalDiffuse(dataDiff) * bumpDiffuse;
 #ifdef RT_SSS_ENABLED
-	// E3: NEE lights only the diffuse share that stays diffuse. The subsurface
-	// share is lit at the walk's exit (solid) or by BSDF sampling alone (thin
-	// translucent half, below the horizon where no NEE strategy draws).
-	outDiffuse *= (1.0f - sssSelectShare(material));
+		// E3: NEE lights only the diffuse share that stays diffuse. The subsurface
+		// share is lit at the walk's exit (solid) or by BSDF sampling alone (thin
+		// translucent half, below the horizon where no NEE strategy draws).
+		outDiffuse *= (1.0f - sssSelectShare(material));
 #endif
 
 #if COMBINE_BRDFS_WITH_FRESNEL
-	// Specular is already multiplied by F, just attenuate diffuse
-	outDiffuse = baseLayerAttenuation(data, material) * outDiffuse;
+		// Specular is already multiplied by F, just attenuate diffuse. The
+		// attenuation is the SPECULAR layer's albedo at the specular normal's
+		// NdotV (`data`, not `dataDiff`) -- the same quantity the sampler's
+		// diffuse branch applies, so the two describe one BRDF (the B2 rule).
+		outDiffuse = baseLayerAttenuation(data, material) * outDiffuse;
 #endif
+	}
 
 	// E2d fix round 1. The layer, both halves.
 	//
@@ -3904,12 +3944,12 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 		outDiffuse *= baseTransmittance;
 		outSpecular *= baseTransmittance;
 #ifdef RT_COAT_ENABLED
-		if (hasCoat) {
+		if (hasCoat && !data.Lbackfacing && bumpRejectSpec != 0.0f) {
 			outCoat = evalCoat(N, L, V, material) * layerTransmittanceAbove(material, N, V, LOBE_COAT);
 		}
 #endif
 #ifdef RT_SHEEN_ENABLED
-		if (hasSheen) {
+		if (hasSheen && !data.Lbackfacing && bumpRejectSpec != 0.0f) {
 			outSheen = evalSheen(N, L, V, material);
 		}
 #endif
@@ -3943,14 +3983,34 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 #endif
 
 	float3 rayDirectionLocal = float3(0.0f, 0.0f, 0.0f);
+	// The frame rayDirectionLocal is rotated back out of. The diffuse branch
+	// below may swap it for the diffuse lobe's own frame (F1 approach C).
+	float4 qBack = qRotationToZ;
 
 	if (brdfType == DIFFUSE_TYPE) {
 		// Sample diffuse ray using cosine-weighted hemisphere sampling
 		rayDirectionLocal = sampleHemisphere(u);
-		const BrdfData data = prepareBRDFData(Nlocal, rayDirectionLocal, Vlocal, materialLocal);
+		// F1 approach C: the cosine lobe sits around the diffuse lobe's normal
+		// (the raw bump normal, Cycles' diffuse closure); when that differs from
+		// the corrected shading normal, sample in ITS frame and evaluate the
+		// layer attenuation in the SPECULAR frame, exactly as
+		// evalCombinedBRDFSeparate pairs `dataDiff` with `data`. The split
+		// branch is taken only when the two normals differ, so every non-bumped
+		// surface stays bit-identical.
+		const float3 Nd = diffuseLobeNormal(shadingNormal, material);
+		BrdfData data;
+		if (any(notEqual(Nd, shadingNormal))) {
+			qBack = getRotationToZAxis(Nd);
+			const BrdfData dataDiff = prepareBRDFData(Nlocal, rayDirectionLocal, rotatePoint(qBack, V), materialLocal);
+			const float3 Lworld = normalize(rotatePoint(invertRotation(qBack), rayDirectionLocal));
+			data = prepareBRDFData(Nlocal, rotatePoint(qRotationToZ, Lworld), Vlocal, materialLocal);
+			sampleWeight = dataDiff.diffuseReflectance * diffuseTerm(dataDiff);
+		} else {
+			data = prepareBRDFData(Nlocal, rayDirectionLocal, Vlocal, materialLocal);
 
-		// Function 'diffuseTerm' is predivided by PDF of sampling the cosine weighted hemisphere
-		sampleWeight = data.diffuseReflectance * diffuseTerm(data);
+			// Function 'diffuseTerm' is predivided by PDF of sampling the cosine weighted hemisphere
+			sampleWeight = data.diffuseReflectance * diffuseTerm(data);
+		}
 
 #if COMBINE_BRDFS_WITH_FRESNEL
 		// B2 FIX -- the open +2.4% converged-mean shift on dielectric specular
@@ -4090,14 +4150,14 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	// Transform sampled direction Llocal back to V vector space.
 	// Done before the early-out checks so the caller always receives a valid
 	// direction in 'rayDirection' (e.g. for below-hemisphere mirroring).
-	rayDirection = normalize(rotatePoint(invertRotation(qRotationToZ), rayDirectionLocal));
+	rayDirection = normalize(rotatePoint(invertRotation(qBack), rayDirectionLocal));
 
 	// F1, Cycles bsdf_sample:314 -- only the diffuse draw is shadowed here
 	// (bump_shadowing_term with is_eval false returns 1 for non-diffuse
 	// closures); eval-side rejection for the other lobes lives in
 	// evalCombinedBRDFSeparate. Multiplies the WEIGHT only, never the pdf.
 	if (brdfType == DIFFUSE_TYPE) {
-		sampleWeight *= bumpShadowingTerm(material.smoothNormal, material.bumpNormal, rayDirection, true, false);
+		sampleWeight *= bumpShadowingTerm(material.smoothNormal, diffuseLobeNormal(shadingNormal, material), rayDirection, true, false);
 	}
 
 	// Prevent tracing direction with no contribution

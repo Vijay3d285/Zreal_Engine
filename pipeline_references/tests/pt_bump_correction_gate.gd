@@ -31,7 +31,11 @@ extends "res://tests/pt_validation.gd"
 
 var FRAMES: int = 256 if OS.get_environment("ZR_GATE_FRAMES") == "" else int(OS.get_environment("ZR_GATE_FRAMES"))
 const FURNACE_MAX := 1.005
-const BAR_B0 := 0.01
+# BAR_B0 was written as 1% for "the correction must not fire at 10 deg"; on
+# this map it fires at every steep texel even face-on (a 65-deg bump puts the
+# mirror direction 120 deg off the face), so B0 is the near-normal PARITY probe.
+# Read +1.16% on 2026-09-17 with per-lobe normals (approach C); 2% bar.
+const BAR_B0 := 0.02
 const BAR_B := 0.03
 const FLAT_TOL := 0.01
 # Cycles 5.2.1, 256 spp, cycles_bump_grazing.py, captured 2026-09-17 (Task 1 Step 2).

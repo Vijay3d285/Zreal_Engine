@@ -448,7 +448,7 @@ bool emissive_sample(vec3 p_hit_pos, vec3 p_N, vec3 p_V, MaterialProperties p_ma
 	if (cos_light <= EMISSIVE_MIN_COS_LIGHT) {
 		return false; // Back of the emitter, or edge-on.
 	}
-	if (dot(p_N, L) <= 0.0) {
+	if (dot(p_N, L) <= 0.0 && dot(diffuseLobeNormal(p_N, p_mat), L) <= 0.0) { // F1 approach C
 		return false; // Below the shading hemisphere.
 	}
 

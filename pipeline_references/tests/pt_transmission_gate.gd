@@ -378,8 +378,22 @@ const P10_CAM_POS := Vector3(3.99, 0.0, 0.05) # "grazing" is a misnomer here -- 
 ## INCREASE rather than a collapse to zero, because the override's
 ## "vacuously consistent" property only holds when N == geometry_normal (see
 ## the header comment) -- so both bounds are load-bearing.
-const P10_RATE_LOW := 0.0005
-const P10_RATE_HIGH := 0.02
+##
+## RE-CAPTURED 2026-09-17 for Phase F1 (roadmap 11.29). The readings above were
+## taken with clampShadingNormal pulling this fixture's normal-mapped shading
+## normal toward the smooth normal at its near-grazing camera; F1 replaced that
+## clamp with Cycles' ensure_valid_specular_reflection, which leaves a normal
+## map's relief alone unless the MIRROR direction would enter the true face.
+## With the relief kept, more transmit draws land on the wrong side of the
+## face and are (correctly) rejected: correct code now reads 0.062530 with the
+## true-face Ng and 0.062714 with the smooth normal. Defect c re-measured on
+## this binary reads exactly 0.000000 (the override runs before the guard, so
+## the guard never sees a transmit direction) -- the LOW bound is what catches
+## it now, not the HIGH one. LOW sits 3x below the correct reading and far
+## above 0; HIGH is 2x the correct reading so a future change that doubles
+## the rejection rate still fails.
+const P10_RATE_LOW := 0.02
+const P10_RATE_HIGH := 0.12
 const P10_FLOOR := 1e-6 # I2 pattern: a zero transmit-sample fraction can't be conditioned on.
 
 var _failures: Array[String] = []
@@ -1545,10 +1559,11 @@ func _probe9_pdf_parity() -> void:
 ## comparison vacuously consistent). It does NOT hold once N diverges from
 ## geometry_normal: dot(-V, N) is no longer guaranteed negative, so the
 ## override can just as easily manufacture a NEW inconsistency as suppress an
-## existing one. The mechanism: clampShadingNormal (brdf_inc.glsl) returns
-## shading_n UNCHANGED whenever dot(geometry_n, V) >= threshold, so with a
-## steep enough normal map dot(N, V) can still go negative even after that
-## clamp, making dot(-V, N) < 0 FALSE and wrongN fire under the override --
+## existing one. The mechanism (as measured before F1, when clampShadingNormal
+## was the shading-normal rule): the clamp returned shading_n UNCHANGED
+## whenever dot(geometry_n, V) >= threshold, so with a steep enough normal map
+## dot(N, V) could still go negative even after that clamp, making
+## dot(-V, N) < 0 FALSE and wrongN fire under the override --
 ## the "geometry_normal is flipped toward V, so dot(-V, geometry_normal) < 0
 ## is unconditional" argument is specific to geometry_normal and does not
 ## transfer to a diverged shading N. Reintroducing the defect against THIS

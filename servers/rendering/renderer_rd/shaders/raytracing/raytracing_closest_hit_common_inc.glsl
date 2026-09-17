@@ -813,7 +813,7 @@ void debug_visualize(
 		vec3 dbg_weight;
 		bool dbg_is_transmit;
 		bool dbg_wrong_hemisphere;
-		bool dbg_ok = sampleTransmissiveLobe(V, dbg_N, geometry_normal, dbg_alpha, dbg_alpha * dbg_alpha,
+		bool dbg_ok = sampleTransmissiveLobe(V, dbg_N, face_normal, dbg_alpha, dbg_alpha * dbg_alpha, // F1: production passes h.face_normal
 				dbg_specularF0, dbg_mat.eta, dbg_mat.transmissivness, dbg_material.thickness == 0.0,
 #ifdef RT_ANISOTROPY_ENABLED
 				dbg_transData.ax, dbg_transData.ay, dbg_transData.anisoPhi, dbg_transData.anisoActive,
@@ -1859,7 +1859,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// would trace into a direction whose pdf is the one reported for a
 		// different direction, which is exactly the silent MIS bias the env
 		// sampling header warns about.
-		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && dot(env_dir, N) > 0.0) {
+		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && (dot(env_dir, N) > 0.0 || dot(env_dir, diffuseLobeNormal(N, brdf_mat)) > 0.0)) { // F1 approach C
 			vec3 env_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
 			vec3 env_shadow_atten = lights_trace_shadow_ray(env_origin, env_dir, 10000.0);
 			if (rt_max_component(env_shadow_atten) > 0.0) {

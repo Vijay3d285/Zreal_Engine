@@ -513,8 +513,8 @@ vec3 lights_eval_rect_light(
 		return vec3(0.0);
 	}
 
-	// 4. Check shading normal
-	float NdotL = dot(N, L);
+	// 4. Check shading normal -- F1 approach C: either lobe normal's hemisphere.
+	float NdotL = max(dot(N, L), dot(diffuseLobeNormal(N, material), L));
 	if (NdotL <= 0.0) {
 		return vec3(0.0);
 	}
@@ -742,7 +742,7 @@ vec3 lights_evaluate_direct_lighting(
 		// cheap shadowless fill lights, so few samples reached a traversal at all;
 		// power-weighted selection concentrates on the few bright lights, which in a
 		// typical interior are exactly the ones with shadow_enabled = true.
-		if (dot(N, L) <= 0.0) {
+		if (dot(N, L) <= 0.0 && dot(diffuseLobeNormal(N, material), L) <= 0.0) { // F1 approach C
 			return vec3(0.0);
 		}
 
@@ -802,7 +802,7 @@ vec3 lights_evaluate_direct_lighting(
 		float light_pdf;
 		vec3 L = lights_sample_cone(ls, u, light_pdf);
 
-		float NdotL = dot(N, L);
+		float NdotL = max(dot(N, L), dot(diffuseLobeNormal(N, material), L)); // F1 approach C
 		if (NdotL <= 0.0) {
 			return vec3(0.0);
 		}
