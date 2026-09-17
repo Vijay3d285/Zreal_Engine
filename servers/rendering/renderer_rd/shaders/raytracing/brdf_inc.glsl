@@ -323,6 +323,16 @@ struct MaterialProperties {
 	// stack_valid(data.tangent_offset) (closure.h:309).
 	float3 tangent;
 
+	// F1, Cycles' bump_shadowing_term (bsdf.h:86). smoothNormal is the
+	// vertex-interpolated normal (sd->N); bumpNormal is the normal-mapped normal
+	// BEFORE ensureValidSpecularReflection (the normal Cycles' diffuse closure
+	// carries). The term keys on these two, never on the corrected lobe normal,
+	// so a surface without a normal map (bumpNormal == smoothNormal exactly)
+	// reads 1.0 even where the correction rotated the lobe normal. Zero-length
+	// smoothNormal disables the term (same convention as tangent).
+	float3 smoothNormal;
+	float3 bumpNormal;
+
 	// E2d coat. coatWeight 0 disables the layer entirely -- it is the ONLY field
 	// that says so. clearcoat/clearcoat_roughness are feature-gated and forced to
 	// 0 when FEATURE_CLEARCOAT is off (scene/resources/material.cpp:2270,2277),
@@ -979,6 +989,47 @@ float Smith_G1_GGX(float a) {
 // Smith G1 term (masking function) further optimized for GGX distribution (by substituting G_a into G1_GGX)
 float Smith_G1_GGX(float alpha, float NdotS, float alphaSquared, float NdotSSquared) {
 	return 2.0f / (sqrt(((alphaSquared * (1.0f - NdotSSquared)) + NdotSSquared) / NdotSSquared) + 1.0f);
+}
+
+// F1: Cycles' bump_shadowing_term, transcribed from
+// intern/cycles/kernel/closure/bsdf.h:86-140. Ns = smooth normal (sd->N),
+// N = bump-mapped normal (the closure's N), I = the direction being evaluated
+// or sampled (wo). Two jobs:
+//   1. A direction on the far side of the SMOOTH surface from the bump normal
+//      is light leaking through opaque geometry, not around a terminator:
+//      rejected (0) for every closure in eval, and for diffuse closures in
+//      sampling too.
+//   2. Diffuse closures are softened by a GGX G1 whose roughness grows with the
+//      bump normal's tilt off the smooth normal (alpha2 = saturate(tan2/8)),
+//      so the discontinuity at the perpendicular angle is smoothed.
+// Cycles applies it in bsdf_eval (:556, isEval true) and bsdf_sample (:314,
+// isEval false); the pdf is never touched. Glossy closures get only job 1.
+float bumpShadowingTerm(float3 Ns, float3 N, float3 I, bool isDiffuse, bool isEval) {
+	if (dot(Ns, Ns) < 0.5f || all(equal(Ns, N))) {
+		return 1.0f;
+	}
+	const float cosNsI = dot(Ns, I);
+	const float cosNsN = dot(Ns, N);
+	const float cosNI = dot(N, I);
+	if (cosNsI * cosNsN * cosNI < 0.0f && (isEval || isDiffuse)) {
+		return 0.0f;
+	}
+	if (!isDiffuse) {
+		return 1.0f;
+	}
+	const float cos_i = abs(cosNsI);
+	const float cos_d = abs(cosNsN);
+	if (cos_d >= 1.0f || cos_i >= 1.0f) {
+		return 1.0f;
+	}
+	if (cos_i < 1e-6f) {
+		return 0.0f;
+	}
+	const float tan2_d = 1.0f / (cos_d * cos_d) - 1.0f;
+	const float bump_alpha2 = clamp(0.125f * tan2_d, 0.0f, 1.0f);
+	// bsdf_G<GGX>(alpha2, cos) == 1 / (1 + 0.5 (sqrt(1 + alpha2 tan2) - 1)) ==
+	// 2 / (sqrt(1 + alpha2 tan2) + 1), which is this overload's closed form.
+	return Smith_G1_GGX(0.0f, cos_i, bump_alpha2, cos_i * cos_i);
 }
 
 // Smith G1 term (masking function) optimized for Beckmann distribution (by substituting G_Lambda_Beckmann_Walter into G1)
@@ -3759,9 +3810,17 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 		return;
 	}
 
+	// F1, Cycles bsdf_eval:556-559 -- light through the smooth surface is
+	// rejected for every lobe; then the diffuse lobe alone is softened (:639).
+	const float bumpReject = bumpShadowingTerm(material.smoothNormal, material.bumpNormal, L, false, true);
+	if (bumpReject == 0.0f) {
+		return;
+	}
+	const float bumpDiffuse = bumpShadowingTerm(material.smoothNormal, material.bumpNormal, L, true, true);
+
 	// Eval specular and diffuse BRDFs
 	outSpecular = evalSpecular(data);
-	outDiffuse = evalDiffuse(data);
+	outDiffuse = evalDiffuse(data) * bumpDiffuse;
 #ifdef RT_SSS_ENABLED
 	// E3: NEE lights only the diffuse share that stays diffuse. The subsurface
 	// share is lit at the walk's exit (solid) or by BSDF sampling alone (thin
@@ -4032,6 +4091,14 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	// Done before the early-out checks so the caller always receives a valid
 	// direction in 'rayDirection' (e.g. for below-hemisphere mirroring).
 	rayDirection = normalize(rotatePoint(invertRotation(qRotationToZ), rayDirectionLocal));
+
+	// F1, Cycles bsdf_sample:314 -- only the diffuse draw is shadowed here
+	// (bump_shadowing_term with is_eval false returns 1 for non-diffuse
+	// closures); eval-side rejection for the other lobes lives in
+	// evalCombinedBRDFSeparate. Multiplies the WEIGHT only, never the pdf.
+	if (brdfType == DIFFUSE_TYPE) {
+		sampleWeight *= bumpShadowingTerm(material.smoothNormal, material.bumpNormal, rayDirection, true, false);
+	}
 
 	// Prevent tracing direction with no contribution
 	if (luminance(sampleWeight) == 0.0f) {
