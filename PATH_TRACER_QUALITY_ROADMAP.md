@@ -123,6 +123,7 @@ Ranked by impact on offline still quality.
 | 27 | **Sky radiance map was a point downsample of the panorama — CLOSED 2026-09-13**, with a residual filed. `PanoramaSkyMaterial` sampled with `filter_linear` (mip 0 only) while the sky pass renders it once per radiance-map texel: 8:1 point downsample at the gate's 2048→256 and at production's 8192→1024. `pt_sky_energy_gate` probe C swung 9.34% between radiance 256 and 2048 on a 1-row band (HIGH at 256 — aliasing, not loss; the gate's FAIL text said "losing energy" regardless of sign). Fix: `filter_linear_mipmap` — swing 0.56%. **Production effect: 0.00%** on replay192 and 217 (a hazy HDRI has no sub-texel energy; the sun is a DirectionalLight) — correct, gate-closing, not a look difference. **Residual (open):** probe B reads 1.5–2.2% low at *every* size and band width on a peaked sky, not on a uniform one — env-NEE/MIS weighting vs the CDF; gate tolerance for B set to 3% with the numbers recorded so it can still newly fail. See §11.21. | `scene/resources/3d/sky_material.cpp` (panorama shader filter), `pt_sky_energy_gate.gd` | Cycles samples the source image at the ray direction, never a downsampled map | Medium (residual: Low) |
 | 28 | **Still route: DLSS-RR reconstruction, NIS sharpen, 1.0 px filter** — 4K stills had a one-pixel staircase on every edge and a checkerboard on flat walls. **Closed 2026-09-16 (§11.24)**: stills go through Phase A (accumulate 256 × BH filter, OIDN), the filter widened to Cycles' 1.5 px, `fsr_sharpness` 0. `pt_pixel_filter_gate` F1 0.72 → 1.08 px. | `raytracing_inc.glsl camera_filter_jitter`, `render.gd`, `image_glb_creation.gd` | `film.cpp filter_table`, `properties.py filter_width` | High |
 | 29 | **OIDN guides were one 8-bit point sample per pixel** — the Phase A still blurred more with distance. **Closed 2026-09-16 (§11.25)**: albedo/normal accumulated with the colour (Cycles' denoising passes), ACCURATE prefilter, `cleanAux` on. `pt_oidn_guide_gate` fine-checker retention 0.62 → 0.999 (Cycles 0.998). | `raytracing_common_inc.glsl rt_accum_guide_sample`, `render_forward_clustered.cpp _oidn_final_denoise_accumulator`, `oidn_denoiser.cpp` | `kernel/film/denoising_passes.h`, `integrator/denoiser_oidn_gpu.cpp` | High |
+| 30 | **Daylight could not enter: the tracer ignored `cast_shadow = OFF`; indirect clamp off** — a "day" interior was lit by 17 artificial lights, sun + sky alone rendered black, fireflies at 36× fed OIDN's blotches. **Closed 2026-09-16 (§11.26)**: `RT_INSTANCE_MASK_NO_SHADOW` (Cycles' shadow visibility) honours `cast_shadow = OFF`; window glass gets it in the pipeline; `PHASE_A_CLAMP_INDIRECT` 10 (Cycles' default). `pt_shadow_visibility_gate` V2 0 → 1.0. Lighting rig: user's decision, three renders delivered. | `render_raytracing.cpp rt_instance_mask`, `renderer_geometry_instance.h`, `image_glb_creation.gd` | `kernel/light/light.h` visibility, `scene.cycles.sample_clamp_indirect` | High |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
 | 22 | **CLOSED 2026-09-13 (decision A).** Shadow rays now follow Cycles' rule (`surface_shader_transparency()`): a BLEND material's (1−alpha) Transparent share passes, and the dielectric share — any refractive pane, any transmission factor — **blocks**. Pass B's `transmission·(1−F)` pass-through double-counted the sky with the refracted BSDF path (+2.4/+7.3/+8.6% at r0.3/0.6/0.9). With it gone the white glass furnace reads **0.99211 / 0.96440 / 0.97451** with NEE on — the recorded NEE-off values to four decimals, within 1.7% of Cycles — and `pt_glass_energy_gate`'s bar drops 10% → 3%. `pt_transparent_shadow_gate` probes 1–4 read 0.0 (glass casts a solid shadow, as in Blender); probe 5 (alpha share, 0.25) unchanged. Light inside glass now arrives only via refracted bounces; a delta lamp cannot light it — Cycles' behaviour (its opt-in Shadow Caustics is out of scope). Production: BLEND glass is the alpha share in both engines; job 217 has zero traced-dielectric materials. See §11.22. | `raytracing_lights_inc.glsl` (pass B), `pt_transparent_shadow_gate.gd`, `pt_glass_energy_gate.gd` | `intern/cycles/kernel/integrator/surface_shader.h:1053` | Medium |
@@ -6602,3 +6603,80 @@ detail from removed noise here and was not used for the verdict.)
   against the Blender still.
 - Cycles' `denoising_depth` guide and feature deferral through specular
   surfaces are not ported.
+
+## 11.26 Gap #30 — the daylight was outside the window
+
+**2026-09-16.** Job 225's ceiling around the pendant wire was painted in
+streaks with the wire breaking up. Spec:
+`docs/superpowers/specs/2026-09-16-shadow-visibility-and-clamp-design.md`.
+
+### The raw image, and one light class removed at a time (FHD, 256 samples, no denoiser)
+
+| run | frame mean | ceiling noise (MAD/median) | ceiling brightest/median |
+|---|---|---|---|
+| baseline | 0.388 | 15.1% | 36× |
+| sun removed | 0.386 | 12.9% | 8× |
+| emissive meshes removed | 0.388 | — | — |
+| omni/spot lights removed | 0.013, 63% of pixels black | — | — |
+| sun + sky only | 0.013 | 34% | 7× |
+| `clamp_indirect = 10` | 0.387 | 15.0% | **2×**, fireflies 0.00% |
+
+The "day" interior is lit by the pipeline's 17 artificial lights; sun and
+sky alone render black although the mirror and the fish tank reflect a
+bright window behind the camera. The fireflies are the sun's caustic paths
+and Cycles' default clamp removes them at no cost to the medians.
+
+### Two causes, two changes
+
+1. **The tracer ignored `cast_shadow`.** Cycles' per-object shadow
+   visibility (`object.visibility & PATH_RAY_SHADOW`) is what Blender archviz
+   sets off on every window pane; Godot's switch is `cast_shadow = OFF`.
+   `RT_INSTANCE_MASK_NO_SHADOW` (0x04): camera and bounce rays (0xFF) hit the
+   instance, neither shadow pass (0x01 / 0x02) does. The setting travels
+   `RendererSceneCull → RenderGeometryInstanceBase::Data::cast_shadows_setting`
+   → the four mask sites in `build_tlas` (`rt_instance_mask`,
+   `rt_instance_mask_deferred` for the MultiMesh sites). The spec claimed the
+   pipeline already set the flag on window glass; it did not —
+   `_disable_shadow_casting_recursive` existed with no caller. The reference
+   copy now calls it for window holes (frames keep their shadows; doors are
+   untouched).
+2. **`PHASE_A_CLAMP_INDIRECT := 10.0`**, Cycles' `sample_clamp_indirect`
+   default.
+
+### Gate: `pt_shadow_visibility_gate`
+
+| probe | before | after |
+|---|---|---|
+| V1 opaque card, shadow on (control) | 0.000 | 0.000 |
+| V2 opaque card, shadow off | **0.000** | **1.000** |
+| V3 glass pane, shadow on (Gap #22 guard) | 0.000 | 0.000 |
+| V4 shadow-off card in view (camera guard) | 0.000 | 0.000 |
+
+Suite 18/18, doctest 1558/1558.
+
+### What daylight alone looks like, and why
+
+With the pane shadow-off, sun + sky only rose from 0.0132 to 0.0175 — still
+dark. The sky the tracer sees reads ~0.5 in linear radiance (through the
+mirror), the windows are behind the camera, and a wall lit only by a window
+of that sky reads 0.008: physically consistent, and ~50× below the walls of
+the Blender reference, which is exposed for daylight and lit through openings
+in view. The dimness is the scene's light design, not the tracer.
+
+### The three renders for the rig decision (FHD, Phase A + OIDN, clamp 10, windows shadow-off)
+
+| render | frame mean | ceiling noise | wall noise | note |
+|---|---|---|---|---|
+| current rig | 0.146 | 15.1% | 15.3% | portal spots paint hard stripes on the right wall; OIDN strokes around them |
+| rig without the window portal spots | 0.087 | 19.3% | **7.8%** | even, clean walls; darker ceiling |
+| daylight only | 0.005 | 35% | 30% | black at this sky/sun intensity |
+
+The decision — keep the rig, drop the portals, or move to a Blender-style
+daylight design (sun strength, sky strength, exposure) — is the user's.
+
+### Open
+
+- The lighting design above.
+- `SHADOW_CASTING_SETTING_SHADOWS_ONLY` (Cycles' camera visibility off) is
+  not honoured; its only pipeline user is disabled.
+- A light tree for the artificial lights' remaining grain, if the rig stays.

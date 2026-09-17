@@ -38,7 +38,7 @@ Four probes, each a ratio "floor crop with the card ÷ floor crop without it", b
 - **V3 Gap #22 guard** — thin glass pane (transmission 1, thickness 0), `cast_shadow = ON`: ratio ≤ `BLOCK_MAX`.
 - **V4 camera guard** — opaque card with `cast_shadow = OFF` placed at y = 0, **between** camera and floor, covering the crop: ratio ≤ `BLOCK_MAX` because camera rays still hit the black card (proves the mask only hides it from shadow rays).
 
-- [ ] **Step 1: Write the gate**
+- [x] **Step 1: Write the gate**
 
 `pipeline_references/tests/pt_shadow_visibility_gate.gd`:
 
@@ -250,7 +250,7 @@ func _measure_crop(p_img: Image, p_lo: float, p_hi: float) -> Dictionary:
 script = ExtResource("1_gate")
 ```
 
-- [ ] **Step 2: Run on the current build — V2 red, V1/V3/V4 green**
+- [x] **Step 2: Run on the current build — V2 red, V1/V3/V4 green**
 
 ```bash
 bin/godot.windows.editor.x86_64.console.exe --rendering-driver vulkan --path pipeline_references res://tests/pt_shadow_visibility_gate_scene.tscn
@@ -258,7 +258,7 @@ bin/godot.windows.editor.x86_64.console.exe --rendering-driver vulkan --path pip
 
 Expected: V1 ≈ 0, **V2 ≈ 0 → FAIL**, V3 ≈ 0, V4 ≈ 0, `FAIL: 1 of 4`. If V1 is not ≈ 0, the card is not covering the crop's light path — the light is straight down, so check the card is at y = 1 and 30 units wide. If the control reads black, the floor is unlit: the light's `rotation_degrees = (-90, 0, 0)` points −Z down… Godot's DirectionalLight3D shines along its local −Z, and `(-90,0,0)` turns −Z to −Y (down); verify with `light.rotation_degrees` printed.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add pipeline_references/tests/pt_shadow_visibility_gate.gd pipeline_references/tests/pt_shadow_visibility_gate_scene.tscn
@@ -280,7 +280,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Interfaces:**
 - Produces: `RenderGeometryInstanceBase::Data::cast_shadows_setting` (`RSE::ShadowCastingSetting`, default `SHADOW_CASTING_SETTING_ON`), set by `set_cast_shadows_setting()`.
 
-- [ ] **Step 1: Virtual, field, base override, stub**
+- [x] **Step 1: Virtual, field, base override, stub**
 
 `renderer_geometry_instance.h` — after `virtual void set_cast_double_sided_shadows(bool p_enable) = 0;`:
 
@@ -319,7 +319,7 @@ void RenderGeometryInstanceBase::set_cast_shadows_setting(RSE::ShadowCastingSett
 		virtual void set_cast_shadows_setting(RSE::ShadowCastingSetting p_setting) override {}
 ```
 
-- [ ] **Step 2: Call it from the cull layer**
+- [x] **Step 2: Call it from the cull layer**
 
 `renderer_scene_cull.cpp`, in `instance_geometry_set_cast_shadows_setting`, directly after `geom->geometry_instance->set_cast_double_sided_shadows(...)`:
 
@@ -327,11 +327,11 @@ void RenderGeometryInstanceBase::set_cast_shadows_setting(RSE::ShadowCastingSett
 		geom->geometry_instance->set_cast_shadows_setting(instance->cast_shadows);
 ```
 
-- [ ] **Step 3: Build**
+- [x] **Step 3: Build**
 
 Expected: exit 0. A "cannot instantiate abstract class" error names a `RenderGeometryInstance` subclass missing the override — add the stub there (grep `set_cast_double_sided_shadows` for every implementer).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add servers/rendering/renderer_geometry_instance.h servers/rendering/renderer_geometry_instance.cpp servers/rendering/dummy/rasterizer_scene_dummy.h servers/rendering/renderer_scene_cull.cpp
@@ -353,7 +353,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `inst->data->cast_shadows_setting` (Task 2); `inst` is the loop variable at all four sites (`render_raytracing.cpp:2784`).
 - Produces: `RT_INSTANCE_MASK_NO_SHADOW = 0x04`; `rt_instance_mask(inst, feature_bits, uses_blend)`.
 
-- [ ] **Step 1: Constants**
+- [x] **Step 1: Constants**
 
 `scene_shader_raytracing.h`, after `RT_INSTANCE_MASK_TRANSMISSIVE`:
 
@@ -379,7 +379,7 @@ and extend the static_assert block:
 #define RT_INSTANCE_MASK_NO_SHADOW 0x04u // cast_shadow OFF: camera/bounce rays only (Gap #30)
 ```
 
-- [ ] **Step 2: The helper and the four sites**
+- [x] **Step 2: The helper and the four sites**
 
 Replace `rt_instance_mask_from_features` with:
 
@@ -400,15 +400,15 @@ static _FORCE_INLINE_ uint32_t rt_instance_mask(const RenderForwardClustered::Ge
 
 At each of the four sites change `rt_instance_mask_from_features(` to `rt_instance_mask(inst, ` (the procedural site: `rt_instance_mask(inst, proc_mat_data->feature_bits, false)`). `grep -n rt_instance_mask_from_features` must then return only comments; update the comment at ~1959-1967 that names the old function.
 
-- [ ] **Step 3: Build, gate green**
+- [x] **Step 3: Build, gate green**
 
 Build; run the Task 1 gate. Expected: V1 ≈ 0, **V2 within 0.02 of 1.0**, V3 ≈ 0, V4 ≈ 0, `PASS: all 4`. If V2 is still ≈ 0: the mask never reached the TLAS — check `instance_masks` is consumed at `render_raytracing.cpp:2065` (`inst.mask = ...`) for the mesh path, and that the setting arrived (print `inst->data->cast_shadows_setting` for one frame). If V4 lights up: camera rays are also tracing with a mask that excludes 0x04 somewhere — grep `traceRayEXT(` / `hitObjectTraceRayEXT(` for a mask other than `0xFF`.
 
-- [ ] **Step 4: Suite and doctest**
+- [x] **Step 4: Suite and doctest**
 
 All 18 gates green (17 + this one), doctest 1558/1558. `pt_transparent_shadow_gate` is the one that could move — its panes have `cast_shadow` at the default ON, so it must not.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h servers/rendering/renderer_rd/shaders/raytracing/raytracing_common_inc.glsl servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp
@@ -425,7 +425,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp` (directional site ~3494, positional loop ~3552, `emissive_active` read ~2547)
 - Modify: `pipeline_references/image_glb_creation.gd` (`PHASE_A_CLAMP_INDIRECT`; NOT staged)
 
-- [ ] **Step 1: The env var, read once**
+- [x] **Step 1: The env var, read once**
 
 Add near the top of `render_raytracing.cpp` (after the includes; `core/os/os.h` is already included):
 
@@ -465,7 +465,7 @@ After `emissive_active = GLOBAL_GET("rendering/pathtracer/emissive_mesh_lights")
 	}
 ```
 
-- [ ] **Step 2: Clamp 10 in the reference copy**
+- [x] **Step 2: Clamp 10 in the reference copy**
 
 `image_glb_creation.gd`: `const PHASE_A_CLAMP_INDIRECT := 0.0` → `10.0`, and replace the tuning comment line `#   CLAMP_INDIRECT   firefly suppression, 0 = off. Blender's default is 10.0.` with:
 
@@ -479,11 +479,11 @@ After `emissive_active = GLOBAL_GET("rendering/pathtracer/emissive_mesh_lights")
 
 Parse check: `bin/godot.windows.editor.x86_64.console.exe --headless --path pipeline_references --check-only -s image_glb_creation.gd`.
 
-- [ ] **Step 3: Build, run the decomposition again**
+- [x] **Step 3: Build, run the decomposition again**
 
 Copy the reference `image_glb_creation.gd` over `<scratchpad>/proj_225/image_glb_creation.gd`. Re-run the six-render script (`<scratchpad>/run_g30.sh`, outputs now to `g30b_*`) with the new binary, then `python <scratchpad>/g30_stats.py <scratchpad-windows-path> base nosun sunonly clamp10` (add `g30b_` to the script's file pattern or pass names accordingly). Expected: **sun-and-sky-only is no longer black** (frame mean well above 0.013 — the exact value is the finding), the full rig's fireflies are 0.00% at 2×, and the sun's contribution to the ceiling median is now visible. If sun-only is still black: the window asset's glass is not the mesh carrying `cast_shadow = OFF` — read the `[GlassFix]` line for `d0533267_SoftMinimal_Window` and `_disable_shadow_casting_recursive`'s `_is_glass_mesh` predicate; the pane may be classified by name, not material.
 
-- [ ] **Step 4: Commit the engine part**
+- [x] **Step 4: Commit the engine part**
 
 ```bash
 git add servers/rendering/renderer_rd/forward_clustered/render_raytracing.cpp
@@ -502,7 +502,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `PATH_TRACER_QUALITY_ROADMAP.md` (row 30, §11.26)
 - Modify: this plan (ticks, notes)
 
-- [ ] **Step 1: The three renders (FHD, Phase A + OIDN, the deliverable route)**
+- [x] **Step 1: The three renders (FHD, Phase A + OIDN, the deliverable route)**
 
 In `<scratchpad>/proj_225` (reference pipeline, clamp 10):
 
@@ -512,7 +512,7 @@ In `<scratchpad>/proj_225` (reference pipeline, clamp 10):
 
 Each with `ZR_PT_EXR=1`; run `g30_stats.py` on the three EXRs. Deliver the three PNGs (half-size previews) and the noise table to the user with `SendUserFile`. No pipeline change beyond the clamp is made; the rig decision is the user's.
 
-- [ ] **Step 2: Roadmap**
+- [x] **Step 2: Roadmap**
 
 Row 30 after row 29:
 
@@ -522,7 +522,7 @@ Row 30 after row 29:
 
 §11.26 "Gap #30 — the daylight was outside the window": the two noise tables (before/after), the decomposition, the mechanism, the gate's V1–V4 before/after, the three rig renders' numbers, and "open": the rig decision; `SHADOWS_ONLY` camera invisibility; a light tree if the rig stays.
 
-- [ ] **Step 3: Tick and commit**
+- [x] **Step 3: Tick and commit**
 
 ```bash
 sed -i 's/^- \[ \] /- [x] /' docs/superpowers/plans/2026-09-16-shadow-visibility-and-clamp.md
@@ -539,3 +539,22 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - **Spec coverage:** NO_SHADOW mask + abstraction plumbing + four sites (T2, T3); SHADOWS_ONLY out of scope (T3 helper comment); clamp 10 with the measured comment (T4); `ZR_LIGHTS_SKIP` as a kept debug var (T4); gate V1–V4 with V2 red today (T1); asset decomposition re-run and the three rig renders delivered (T4 S3, T5 S1); roadmap (T5).
 - **Placeholders:** none; the "exact value is the finding" in T4 S3 is a measurement to record, not a blank to fill before running.
 - **Type consistency:** `set_cast_shadows_setting(RSE::ShadowCastingSetting)` (T2) read as `data->cast_shadows_setting` (T3); `rt_instance_mask(inst, ...)` signature matches the four call sites; `zr_lights_skip_flags()` bits 1/2/4 used consistently in T4.
+
+---
+
+## Execution notes (2026-09-16)
+
+All five tasks executed inline. Two departures:
+
+- The spec said the pipeline already sets `cast_shadow = OFF` on window
+  glass; `_disable_shadow_casting_recursive` existed but was never called.
+  Task 4 adds the call for window holes in the reference copy of
+  `image_glb_creation.gd` (unstaged, the user's file).
+- The helper takes `const RenderGeometryInstanceBase *` (the derived class is
+  private to `RenderForwardClustered`), and the two deferred MultiMesh sites
+  read the setting from `PendingMMSurface::cast_shadows_setting` captured in
+  Phase 1, since `inst` is out of scope there.
+
+Sun + sky only stayed dark after the fix (0.0132 → 0.0175): the sky reads
+~0.5 and the windows are behind the camera — the scene's light design, recorded
+in roadmap §11.26 with the three rig renders.
