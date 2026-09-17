@@ -15,8 +15,12 @@ extends "res://tests/pt_validation.gd"
 ## ZR_PROBE_OUT when set. Not a gate: it has no pass / fail, it is a
 ## measurement to set beside Cycles' (roadmap Gap #30 follow-up).
 
-const FRAMES := 256
+var FRAMES: int = 256 if OS.get_environment("ZR_PROBE_FRAMES") == "" else int(OS.get_environment("ZR_PROBE_FRAMES"))
 const ROOM := Vector3(6.0, 2.8, 4.0) # Godot: x width, y height, z depth (Blender y -> Godot -z)
+## ZR_PROBE_WIRE=1: the pipeline's kind of rig (wide spots aimed down, the
+## ceiling lit by bounce alone) plus a 3 mm dark cable 5 cm under the ceiling,
+## and the OIDN final pass; writes wire_godot_raw.pfm and wire_godot_oidn.pfm.
+var _wire := OS.get_environment("ZR_PROBE_WIRE") == "1"
 
 
 func _ready() -> void:
@@ -33,8 +37,11 @@ func _ready() -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
 
+	get_viewport().use_hdr_2d = true
 	var env := _new_env(Color(0, 0, 0))
 	env.set_pathtracing_max_bounces(12)
+	if _wire:
+		env.set_pathtracing_oidn_denoise(true)
 
 	var w := ROOM.x
 	var h := ROOM.y
@@ -48,15 +55,48 @@ func _ready() -> void:
 
 	for i in range(4):
 		for j in range(4):
-			var l := OmniLight3D.new()
 			# Blender (x, y, z) -> Godot (x, z, -y).
-			l.position = Vector3(-w * 0.375 + i * w * 0.25, 1.9, -(-d * 0.375 + j * d * 0.25))
-			l.light_energy = 5.0
-			l.omni_range = 14.0
-			l.omni_attenuation = 1.0
-			l.light_size = 0.0
-			l.shadow_enabled = true
-			add_child(l)
+			var pos := Vector3(-w * 0.375 + i * w * 0.25, 1.9, -(-d * 0.375 + j * d * 0.25))
+			if _wire:
+				var sl := SpotLight3D.new()
+				sl.position = pos
+				sl.rotation_degrees = Vector3(-90, 0, 0) # -Z -> down
+				sl.light_energy = 10.0
+				sl.spot_angle = 45.0 # 90 deg cone, as Cycles' spot_size 90
+				sl.spot_angle_attenuation = 1.0
+				sl.spot_range = 14.0
+				sl.spot_attenuation = 1.0
+				sl.light_size = 0.0
+				sl.shadow_enabled = true
+				add_child(sl)
+			else:
+				var l := OmniLight3D.new()
+				l.position = pos
+				l.light_energy = 5.0
+				l.omni_range = 14.0
+				l.omni_attenuation = 1.0
+				l.light_size = 0.0
+				l.shadow_enabled = true
+				add_child(l)
+	if _wire:
+		var cable := MeshInstance3D.new()
+		var cm := CylinderMesh.new()
+		cm.top_radius = 0.0015
+		cm.bottom_radius = 0.0015
+		cm.height = w
+		cm.radial_segments = 12
+		cable.mesh = cm
+		var cmat := StandardMaterial3D.new()
+		cmat.albedo_color = Color(0.1, 0.1, 0.1)
+		cmat.roughness = 1.0
+		cmat.metallic = 0.0
+		cmat.metallic_specular = 0.0
+		cable.material_override = cmat
+		# Blender: along x at (0, 1.0, h - 0.05) -> Godot (0, h - 0.05, -1.0); a
+		# CylinderMesh stands along Y, so roll it onto X.
+		cable.position = Vector3(0, h - 0.05, -1.0)
+		cable.rotation_degrees = Vector3(0, 0, 90)
+		add_child(cable)
 
 	var cam := Camera3D.new()
 	cam.keep_aspect = Camera3D.KEEP_WIDTH
@@ -71,7 +111,13 @@ func _ready() -> void:
 	var img: Image = await _render_accum(env, get_viewport().get_viewport_rid(), FRAMES)
 	var out := OS.get_environment("ZR_PROBE_OUT")
 	if out != "":
-		_save_pfm(img, out.path_join("manylight_godot.pfm"))
+		_save_pfm(img, out.path_join("wire_godot_raw.pfm" if _wire else "manylight_godot.pfm"))
+	if _wire and out != "":
+		await get_tree().process_frame
+		await get_tree().process_frame
+		await RenderingServer.frame_post_draw
+		var den: Image = get_viewport().get_texture().get_image()
+		_save_pfm(den, out.path_join("wire_godot_oidn.pfm"))
 	print("\n=== MANY-LIGHT NOISE, our tracer, %d spp, 16 point lights ===" % FRAMES)
 	for probe in [["ceiling", 0.35, 0.05, 0.65, 0.25], ["wall", 0.70, 0.55, 0.95, 0.85]]:
 		var st := _robust(img, probe[1], probe[2], probe[3], probe[4])

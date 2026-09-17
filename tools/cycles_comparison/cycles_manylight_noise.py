@@ -18,20 +18,24 @@ import sys
 
 OUT = sys.argv[sys.argv.index("--") + 1]
 RES_X, RES_Y = 512, 288
-SAMPLES = 256
+SAMPLES = int(os.environ.get("SAMPLES", "256"))
 ROOM = (6.0, 4.0, 2.8)  # x (width), y (depth), z (height)
 LIGHT_W = 40.0
 GRID = 4
+WIRE = os.environ.get("WIRE", "0") == "1"  # spots pointing down + a 3 mm cable under the ceiling
 
 
-def build():
+def build(denoise=False):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
     scene.cycles.device = "CPU"
     scene.cycles.samples = SAMPLES
     scene.cycles.use_adaptive_sampling = False
-    scene.cycles.use_denoising = False
+    scene.cycles.use_denoising = denoise
+    scene.cycles.denoiser = "OPENIMAGEDENOISE"
+    scene.cycles.denoising_prefilter = "ACCURATE"
+    scene.cycles.denoising_input_passes = "RGB_ALBEDO_NORMAL"
     scene.cycles.max_bounces = 12
     scene.cycles.diffuse_bounces = 12
     scene.cycles.glossy_bounces = 12
@@ -80,12 +84,32 @@ def build():
 
     for i in range(GRID):
         for j in range(GRID):
-            ld = bpy.data.lights.new("L%d%d" % (i, j), "POINT")
-            ld.energy = LIGHT_W
-            ld.shadow_soft_size = 0.0
-            lo = bpy.data.objects.new(ld.name, ld)
-            scene.collection.objects.link(lo)
-            lo.location = (-w * 0.375 + i * w * 0.25, -d * 0.375 + j * d * 0.25, 1.9)
+            if WIRE:
+                # The pipeline's rig: wide spots aimed into the room, so the ceiling
+                # is lit by bounce alone (the noisy case).
+                ld = bpy.data.lights.new("L%d%d" % (i, j), "SPOT")
+                ld.energy = LIGHT_W * 2.0
+                ld.spot_size = math.radians(90.0)
+                ld.spot_blend = 0.1
+                ld.shadow_soft_size = 0.0
+                lo = bpy.data.objects.new(ld.name, ld)
+                scene.collection.objects.link(lo)
+                lo.location = (-w * 0.375 + i * w * 0.25, -d * 0.375 + j * d * 0.25, 1.9)
+                lo.rotation_euler = (0.0, 0.0, 0.0)  # spot points down its -Z = straight down
+            else:
+                ld = bpy.data.lights.new("L%d%d" % (i, j), "POINT")
+                ld.energy = LIGHT_W
+                ld.shadow_soft_size = 0.0
+                lo = bpy.data.objects.new(ld.name, ld)
+                scene.collection.objects.link(lo)
+                lo.location = (-w * 0.375 + i * w * 0.25, -d * 0.375 + j * d * 0.25, 1.9)
+    if WIRE:
+        # 3 mm dark cable 5 cm under the ceiling, running along x through the
+        # view of the ceiling corner: ~1.7 px wide at the camera's distance.
+        bpy.ops.mesh.primitive_cylinder_add(radius=0.0015, depth=w, location=(0.0, 1.0, h - 0.05), rotation=(0.0, math.pi / 2, 0.0))
+        cyl = bpy.context.object
+        cyl.name = "cable"
+        cyl.data.materials.append(mat("cable", 0.1))
 
     cam_data = bpy.data.cameras.new("Cam")
     cam_data.sensor_fit = "HORIZONTAL"
@@ -121,13 +145,15 @@ def robust(rows, x0, y0, x1, y1):
 
 
 os.makedirs(OUT, exist_ok=True)
-build()
-p = os.path.join(OUT, "manylight_cycles.exr")
-bpy.context.scene.render.filepath = p
-bpy.ops.render.render(write_still=True)
-rows, w, h = load_luma(p)
+tag = "wire" if WIRE else "manylight"
+for label, dn in ((("raw", False), ("oidn", True)) if WIRE else (("raw", False),)):
+    build(dn)
+    p = os.path.join(OUT, "%s_cycles_%s.exr" % (tag, label))
+    bpy.context.scene.render.filepath = p
+    bpy.ops.render.render(write_still=True)
+rows, w, h = load_luma(os.path.join(OUT, "%s_cycles_raw.exr" % tag))
 print("")
-print("@@@ MANY-LIGHT NOISE, Cycles %s, %d spp, %d point lights" % (bpy.app.version_string, SAMPLES, GRID * GRID))
+print("@@@ MANY-LIGHT NOISE, Cycles %s, %d spp, %d lights, wire=%d" % (bpy.app.version_string, SAMPLES, GRID * GRID, WIRE))
 # Blender rows are bottom-up: the ceiling is the top of the frame = last rows.
 # Patches: ceiling (top-centre of frame), wall (mid-right). Printed as the same
 # fractions the Godot probe uses (x, y in [0,1] of the frame, y from the top).

@@ -31,6 +31,8 @@
 #include "render_forward_clustered.h"
 
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
@@ -2089,6 +2091,31 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		print_line(vformat("[OIDN-DIAG] view=%d albedo=%d normal=%d | accum_bytes=%d albedo_bytes=%d normal_bytes=%d",
 				(int)v, (int)has_albedo, (int)has_normal,
 				(int)accum_bytes.size(), (int)albedo_bytes.size(), (int)normal_bytes.size()));
+		// Debug: ZR_OIDN_DUMP=<dir> writes the exact OIDN inputs (colour, albedo,
+		// normal) as little-endian PFM so oidnDenoise.exe can re-run the denoise
+		// offline with any subset of guides. Used for the Gap #30 follow-up
+		// (roadmap 11.26); production never sets it.
+		{
+			const String dump_dir = OS::get_singleton()->get_environment("ZR_OIDN_DUMP");
+			if (!dump_dir.is_empty()) {
+				auto write_pfm = [&](const String &p_name, const float *p_data) {
+					if (!p_data) {
+						return;
+					}
+					Ref<FileAccess> f = FileAccess::open(dump_dir.path_join(p_name), FileAccess::WRITE);
+					if (f.is_null()) {
+						return;
+					}
+					f->store_string(vformat("PF%c%d %d%c-1.0%c", 10, width, height, 10, 10));
+					for (int y = height - 1; y >= 0; y--) {
+						f->store_buffer((const uint8_t *)(p_data + (size_t)y * width * 3), (size_t)width * 3 * sizeof(float));
+					}
+				};
+				write_pfm("oidn_color.pfm", color_f.ptr());
+				write_pfm("oidn_albedo.pfm", has_albedo ? albedo_f.ptr() : nullptr);
+				write_pfm("oidn_normal.pfm", has_normal ? normal_f.ptr() : nullptr);
+			}
+		}
 		bool ok = denoiser->denoise_rt(width, height,
 				color_f.ptrw(),
 				has_albedo ? albedo_f.ptrw() : nullptr,
