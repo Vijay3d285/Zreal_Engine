@@ -2534,6 +2534,22 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 // Gap #30: an instance with cast_shadows OFF is Cycles' "shadow visibility
 // off" -- camera and bounce rays (RT_INSTANCE_MASK_ALL) hit it, no shadow ray
 // does, whatever its material. SHADOWS_ONLY and DOUBLE_SIDED behave as ON here.
+// Debug: ZR_LIGHTS_SKIP=dir,pos,emissive drops whole light classes from the
+// tracer for lighting decomposition renders (roadmap Gap #30 used it to show
+// a "day" interior was lit almost entirely by the pipeline's artificial
+// lights). Read once per process; production never sets it.
+static uint32_t zr_lights_skip_flags() {
+	static uint32_t flags = 0xFFFFFFFFu;
+	if (flags == 0xFFFFFFFFu) {
+		const String v = OS::get_singleton()->get_environment("ZR_LIGHTS_SKIP");
+		flags = (v.contains("dir") ? 1u : 0u) | (v.contains("pos") ? 2u : 0u) | (v.contains("emissive") ? 4u : 0u);
+		if (flags != 0u) {
+			print_line(vformat("[ZR_LIGHTS_SKIP] '%s' -> directional %d, positional %d, emissive %d", v, (int)((flags & 1u) != 0u), (int)((flags & 2u) != 0u), (int)((flags & 4u) != 0u)));
+		}
+	}
+	return flags;
+}
+
 static _FORCE_INLINE_ uint32_t rt_instance_mask(const RenderGeometryInstanceBase *p_inst, uint32_t p_feature_bits, bool p_uses_blend) {
 	if (p_inst && p_inst->data && p_inst->data->cast_shadows_setting == RSE::SHADOW_CASTING_SETTING_OFF) {
 		return SceneShaderRaytracing::RT_INSTANCE_MASK_NO_SHADOW;
@@ -2563,6 +2579,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// benign (emissive_lights.is_valid() and the total_power gate both cover it),
 	// but the reasoning step should not have to exist.
 	emissive_active = GLOBAL_GET("rendering/pathtracer/emissive_mesh_lights");
+	if (zr_lights_skip_flags() & 4u) {
+		emissive_active = false;
+	}
 
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
@@ -3517,6 +3536,9 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		if (type != RSE::LIGHT_DIRECTIONAL) {
 			continue;
 		}
+		if (zr_lights_skip_flags() & 1u) {
+			continue;
+		}
 		if (rt_light_count >= p_max_lights) {
 			break;
 		}
@@ -3571,7 +3593,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	positional_lights.sort_custom<LightScoreComparator>();
 
 	// Fill remaining slots with top positional lights.
-	for (uint32_t i = 0; i < positional_lights.size() && rt_light_count < p_max_lights ; i++) {
+	for (uint32_t i = 0; i < positional_lights.size() && rt_light_count < p_max_lights && !(zr_lights_skip_flags() & 2u); i++) {
 		RID light_instance = positional_lights[i].light_instance;
 		RID base = ls->light_instance_get_base_light(light_instance);
 		RSE::LightType type = ls->light_get_type(base);
