@@ -209,13 +209,6 @@ V mul(const M &m, const V &v) {
 // Enable height correlated version of G2 term. Separable version will be used otherwise
 #define USE_HEIGHT_CORRELATED_G2 1
 
-// Enable below-hemisphere sample recovery.
-// 0 -> disable recovery and terminate the path on rejection instead.
-// 1 -> enable recovery and reuse the original BRDF weight.
-#ifndef RT_BELOW_HEMISPHERE_RECOVERY_ENABLED
-#define RT_BELOW_HEMISPHERE_RECOVERY_ENABLED 1
-#endif
-
 // -------------------------------------------------------------------------
 //    Automatically resolved macros based on preferences (don't edit these)
 // -------------------------------------------------------------------------
@@ -1441,10 +1434,10 @@ float3 sampleMicrofacetDirection(float3 Vlocal, float alpha, float alphaSquared,
 	// assertion that now guards it.
 	//
 	// This is the SHADING hemisphere. It is a different plane from the
-	// GEOMETRY-plane test that drives recoverBelowHemisphereSample
-	// (raytracing_closest_hit_common_inc.glsl) -- that one exists to stop a ray
-	// self-intersecting the surface it left, this one states that the BRDF is
-	// zero. They are complementary and both are needed.
+	// TRUE-FACE test at the end of evalIndirectCombinedBRDF (Cycles' dot(Ng, wo),
+	// F1) -- that one exists to stop a ray entering the surface it left, this
+	// one states that the BRDF is zero. They are complementary and both are
+	// needed.
 	//
 	// The zero-weight ray is still returned and still traced. Terminating the
 	// path here instead would save that trace, but it is an optimisation and is
@@ -1890,50 +1883,6 @@ float3 ensureValidSpecularReflection(float3 Ng, float3 I, float3 N) {
 	const float Nx = sqrt(max(1.0f - Nz2, 0.0f));
 	const float Nz = sqrt(max(Nz2, 0.0f));
 	return Nx * X + Nz * Ng;
-}
-
-// -------------------------------------------------------------------------
-//    Below-hemisphere sample recovery
-// -------------------------------------------------------------------------
-//
-// When BRDF importance sampling against a strongly perturbed shading normal
-// produces a direction that lands below the geometry plane, the direction
-// would self-intersect the surface and cannot be traced as-is.
-//
-// Recovery strategy: mirror the rejected direction across the geometry plane
-// and reuse the original BRDF weight. Cheap, never produces black pixels,
-// but is energy-non-conserving (over-bright at grazing angles) -- a
-// deliberate trade-off vs. terminating the path.
-//
-// Set RT_BELOW_HEMISPHERE_RECOVERY_ENABLED to 0 to disable recovery and
-// terminate the path on rejection instead. Useful for A/B comparison or
-// when investigating energy conservation.
-
-// Mirrors a direction across the geometry plane. No-op if already above.
-float3 mirrorDirectionAcrossPlane(float3 dir, float3 geometry_n) {
-	float c = dot(dir, geometry_n);
-	if (c >= 0.0f) {
-		return dir;
-	}
-	return normalize(dir - 2.0f * c * geometry_n);
-}
-
-// Recover a BRDF sample that landed below the geometry plane.
-// Returns true and writes the recovered (above-plane) direction to
-// 'recovered_dir' when recovery is enabled. Returns false when recovery is
-// disabled at compile time (RT_BELOW_HEMISPHERE_RECOVERY_ENABLED == 0); the
-// caller should then terminate the path.
-bool recoverBelowHemisphereSample(
-		float3 rejected_dir,
-		float3 geometry_n,
-		OUT_PARAMETER(float3) recovered_dir) {
-#if RT_BELOW_HEMISPHERE_RECOVERY_ENABLED
-	recovered_dir = mirrorDirectionAcrossPlane(rejected_dir, geometry_n);
-	return true;
-#else
-	recovered_dir = rejected_dir;
-	return false;
-#endif
 }
 
 // -------------------------------------------------------------------------

@@ -2260,7 +2260,6 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	vec2 u = rng_2d(rng, RT_PRNG_SURFACE_BSDF);
 	vec3 next_dir;
 	vec3 brdf_weight;
-	bool recovered_sample = false;
 
 	bool took_transmissive_lobe = false;
 	bool transmissive_sample_ok = false;
@@ -2391,25 +2390,15 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	const bool sss_thin_through = false;
 #endif
 	if (!transmissive_sample_ok && !evalIndirectCombinedBRDF(u, N, h.face_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
-		// Two failure modes:
-		//   1) Sample weight is zero (no contribution). Terminate.
-		//   2) Sampled direction is below the geometry plane. Recover by
-		//      mirroring across the geometry plane (see brdf_inc.glsl). The
-		//      mirror is gated by RT_BELOW_HEMISPHERE_RECOVERY_ENABLED; when
-		//      disabled, recovery returns false and we terminate the path.
-		vec3 recovered_dir;
-		if (luminance(brdf_weight) == 0.0 ||
-				!recoverBelowHemisphereSample(next_dir, h.geometry_normal, recovered_dir)) {
-			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-			path_pack(payload, ps);
-			return;
-		}
-		// next_dir is now the MIRRORED direction, carrying the REJECTED sample's
-		// brdf_weight. That makes it density-matched to nothing this code can
-		// evaluate, which is why it takes MIS weight 1 -- see the mis_ray_pdf
-		// assignment below, where both candidate policies are measured.
-		next_dir = recovered_dir;
-		recovered_sample = true;
+		// Zero weight, or a direction below the TRUE face. Cycles returns
+		// LABEL_NONE for both (bsdf_microfacet.h:863, bsdf_diffuse.h:65) and the
+		// path ends. F1 removed the mirror-and-keep-the-weight recovery that stood
+		// here: it handed a rejected sample's weight to a direction drawn from no
+		// density this code knows, and was over-bright at grazing angles by its
+		// own admission (pt_bump_correction_gate probe A read > 1 in a furnace).
+		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+		path_pack(payload, ps);
+		return;
 	}
 
 	ps.throughput *= brdf_weight;
@@ -2533,28 +2522,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	//     evalCombinedBRDF's Vbackfacing early-out), so at such a vertex env NEE
 	//     contributes nothing in EVERY direction -- while combinedPdf, which never
 	//     tests V against the hemisphere, returns a positive density that would
-	//     scale this ray down. ensureValidSpecularReflection does not eliminate backfacing V either, it
-	//     not eliminate it, so on strongly normal-mapped geometry this is common:
+	//     scale this ray down. ensureValidSpecularReflection does not eliminate
+	//     backfacing V either, so on strongly normal-mapped geometry this is common:
 	//     without this guard, 0.836 against a reference of 1.415, a 41% loss.
-	//
-	//   - recovered_sample (a mirrored below-hemisphere sample). Task 4 fix round 1
-	//     replaced this sentinel with combinedPdf(next_dir), reasoning that both
-	//     sides must evaluate one function at one direction for w_env + w_bsdf to
-	//     equal 1. That reasoning is sound as far as it goes, and it does remove a
-	//     genuine double count -- but it rests on an assumption that is false here:
-	//     that this ray's estimator is density-matched to combinedPdf and merely
-	//     needs the right weight. It is not. Recovery MIRRORS the direction while
-	//     keeping the REJECTED sample's brdf_weight, so the ray is not drawn from
-	//     combinedPdf(next_dir), nor from any density this code knows. No weight
-	//     function turns it into a correct estimator of its share, so the choice is
-	//     empirical rather than principled -- and it is not close:
-	//         sentinel (full weight)      1.42042 vs reference 1.41451  (+0.42%)
-	//         combinedPdf(next_dir)       0.94549 vs reference 1.41451  (-33%)
-	//     The +0.42% IS the double count, and it is real; it is simply two orders of
-	//     magnitude smaller than the loss incurred by "fixing" it. Reverted to the
-	//     sentinel deliberately. The real repair is to make recovery produce a
-	//     density-matched sample, which is Task 1's mechanism to change, not this
-	//     one's.
 	//
 	//   - combinedPdf() == 0.0. Also full weight, and it is easy to talk yourself
 	//     out of this one: w_bsdf = ph(0, p_env) = 0 supposedly hands the direction
@@ -2590,7 +2560,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	//     mirror coat would report a mixture pdf built only from the base lobes --
 	//     a density that does not describe how the direction was actually drawn.
 	//     Unreachable while clearcoat is 0, since brdfType is never COAT_TYPE then.
-	if (took_transmissive_lobe || sss_thin_through || recovered_sample || dot(N, V) <= 0.0 ||
+	if (took_transmissive_lobe || sss_thin_through || dot(N, V) <= 0.0 ||
 			(brdfType == SPECULAR_TYPE && brdf_mat.roughness < RT_MIS_DELTA_ROUGHNESS) ||
 			(brdfType == COAT_TYPE && brdf_mat.coatRoughness < RT_MIS_DELTA_ROUGHNESS)) {
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
