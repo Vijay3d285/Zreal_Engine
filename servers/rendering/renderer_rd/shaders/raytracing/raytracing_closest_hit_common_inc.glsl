@@ -364,6 +364,7 @@ vec3 env_sky_radiance(vec3 p_world_dir) {
 void debug_visualize(
 		int vis_mode,
 		vec3 geometry_normal,
+		vec3 face_normal,
 		vec3 final_normal,
 		vec3 tangent_space_normal,
 		vec3 world_tangent,
@@ -462,27 +463,22 @@ void debug_visualize(
 	} else if (vis_mode == 21) {
 		ps.radiance = emissive;
 	} else if (vis_mode == 22) {
-		// BRDF below-hemisphere fallback visualization. Reflects the two-layer
-		// recovery applied in shade_and_bounce:
-		//   Layer 1 - shading-normal clamp toward geometry (energy preserving
-		//             but flattens detail at grazing angles)
-		//   Layer 2 - mirror rejected directions across the geometry plane
-		//             (biased; reuses the rejected sample's BRDF weight)
+		// BRDF below-face rejection visualization. Since F1 shade_and_bounce
+		// applies Cycles' ensure_valid_specular_reflection to the shading normal
+		// and REJECTS (terminates) any sample that lands below the true face --
+		// there is no mirror recovery any more.
 		//
-		// We sample both BRDF lobes once with the un-clamped shading normal
-		// and once with the clamped shading normal, reusing the same random
-		// pair so the two passes are directly comparable.
+		// We sample both BRDF lobes once with the raw normal-mapped normal and
+		// once with the corrected normal, reusing the same random pair so the
+		// two passes are directly comparable.
 		//
-		// Color legend (ordered cleanest -> most biased):
-		//   green   = no rejection in either pass (no fallback needed)
-		//   blue    = clamp alone resolves rejection (energy preserving)
-		//   yellow  = clamp + mirror (one lobe still mirrored after clamp)
-		//   red     = clamp + mirror (both lobes mirrored - most biased pixel)
+		// Color legend (ordered cleanest -> most rejected):
+		//   green   = no rejection in either pass (correction not needed)
+		//   blue    = the correction alone resolves the rejection
+		//   yellow  = one lobe still rejected after the correction (path ends)
+		//   red     = both lobes rejected after the correction
 		//
-		// Production output is never black anymore -- yellow/red just indicate
-		// where the cheaper Layer-1 clamp could not catch the bump and the
-		// biased Layer-2 mirror had to step in. Raise
-		// RT_SHADING_NORMAL_CLAMP_THRESHOLD if yellow/red dominate.
+		// Yellow/red is where production terminates paths -- Cycles' LABEL_NONE.
 		MaterialProperties dbg_mat;
 		dbg_mat.baseColor = albedo;
 		dbg_mat.metalness = metalness;
@@ -531,14 +527,14 @@ void debug_visualize(
 		vec2 u_spec_rng = rng_2d(dbg_rng, RT_PRNG_SURFACE_BSDF);
 		vec2 u_diff_rng = rng_2d(dbg_rng, RT_PRNG_LIGHT);
 
-		bool u_spec_ok = evalIndirectCombinedBRDF(u_spec_rng, final_normal, geometry_normal, V, dbg_mat, SPECULAR_TYPE, dbg_dir, dbg_weight, vec4(0.0));
-		bool u_diff_ok = evalIndirectCombinedBRDF(u_diff_rng, final_normal, geometry_normal, V, dbg_mat, DIFFUSE_TYPE, dbg_dir, dbg_weight, vec4(0.0));
+		bool u_spec_ok = evalIndirectCombinedBRDF(u_spec_rng, final_normal, face_normal, V, dbg_mat, SPECULAR_TYPE, dbg_dir, dbg_weight, vec4(0.0));
+		bool u_diff_ok = evalIndirectCombinedBRDF(u_diff_rng, final_normal, face_normal, V, dbg_mat, DIFFUSE_TYPE, dbg_dir, dbg_weight, vec4(0.0));
 
-		// Uses the same threshold as shade_and_bounce so the visualization
-		// stays in sync with production sampling.
-		vec3 N_clamped = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
-		bool c_spec_ok = evalIndirectCombinedBRDF(u_spec_rng, N_clamped, geometry_normal, V, dbg_mat, SPECULAR_TYPE, dbg_dir, dbg_weight, vec4(0.0));
-		bool c_diff_ok = evalIndirectCombinedBRDF(u_diff_rng, N_clamped, geometry_normal, V, dbg_mat, DIFFUSE_TYPE, dbg_dir, dbg_weight, vec4(0.0));
+		// The same correction shade_and_bounce applies (F1); "clamped" below
+		// means "corrected", and the rejection plane is the true face.
+		vec3 N_clamped = ensureValidSpecularReflection(face_normal, V, final_normal);
+		bool c_spec_ok = evalIndirectCombinedBRDF(u_spec_rng, N_clamped, face_normal, V, dbg_mat, SPECULAR_TYPE, dbg_dir, dbg_weight, vec4(0.0));
+		bool c_diff_ok = evalIndirectCombinedBRDF(u_diff_rng, N_clamped, face_normal, V, dbg_mat, DIFFUSE_TYPE, dbg_dir, dbg_weight, vec4(0.0));
 
 		bool all_uncl_ok = u_spec_ok && u_diff_ok;
 		bool all_cl_ok = c_spec_ok && c_diff_ok;
@@ -705,7 +701,7 @@ void debug_visualize(
 		// the phase exists for. At sheenColor == 0 sheenLobeWeight returns literal
 		// 0.0, dbgAfterSheen32 is exactly 1.0f, and `1.0f * x == x` leaves every
 		// existing reading of this mode bit-unchanged.
-		vec3 N_clamped32 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+		vec3 N_clamped32 = ensureValidSpecularReflection(face_normal, V, final_normal);
 		float pSpec = lobeWeight(dbg_mat);
 		float dbgAfterSheen32 = 1.0 - sheenLobeWeight(dbg_mat, N_clamped32, V);
 		float dbgBaseShare32 = dbgAfterSheen32 * (1.0 - coatLobeWeight(dbg_mat, dot(N_clamped32, V)));
@@ -772,9 +768,9 @@ void debug_visualize(
 		vec3 dbg_specularF0 = baseColorToSpecularF0(dbg_mat.baseColor, dbg_mat.metalness, dbg_mat.dielectricF0);
 		float dbg_alpha = dbg_mat.roughness * dbg_mat.roughness;
 
-		// MUST use the CLAMPED shading normal, exactly as shade_and_bounce's
-		// own `N = clampShadingNormal(m.normal, h.geometry_normal, V,
-		// RT_SHADING_NORMAL_CLAMP_THRESHOLD)` does -- fix round 2 self-review
+		// MUST use the CORRECTED shading normal, exactly as shade_and_bounce's
+		// own `N = ensureValidSpecularReflection(h.face_normal, V, m.normal)`
+		// does (F1) -- fix round 2 self-review
 		// caught this: reading the raw final_normal here does not carry the
 		// "always on V's side" guarantee geometry_normal has by construction
 		// (compute_hit_data flips geometry_normal toward V; nothing flips the
@@ -794,7 +790,7 @@ void debug_visualize(
 		// mechanism that matters on production's back-face exit path. This is
 		// a known coverage gap in this detector, not a claim that the guard is
 		// otherwise dead.
-		vec3 dbg_N = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+		vec3 dbg_N = ensureValidSpecularReflection(face_normal, V, final_normal);
 
 		// E2b: ax/ay/anisoPhi for THIS hit's dbg_N, via prepareBRDFData -- the
 		// same tangent-projection formula every other consumer uses, so this
@@ -823,8 +819,8 @@ void debug_visualize(
 		// (isTransmit && thin_walled)`), so only TRANSMIT-lobe rejections are
 		// affected by the ordering bug -- REFLECT-lobe rejections (a
 		// completely separate, unrelated below-hemisphere phenomenon at high
-		// roughness, the same kind clampShadingNormal/recoverBelowHemisphereSample
-		// exist to handle for opaque materials) are untouched either way and,
+		// roughness, the same kind the F1 face-normal rejection handles for
+		// opaque materials) are untouched either way and,
 		// at these settings, turned out to dominate the unconditional rate,
 		// masking the defect entirely (measured identically with and without
 		// the break in early testing). Channels, all as float(ok && ...):
@@ -941,7 +937,7 @@ void debug_visualize(
 		// (mirrors vis mode 33's dbg_N) -- on a sphere this is well away from
 		// world Z almost everywhere, which is what makes this probe able to
 		// see the two frame fixes at all.
-		vec3 dbg_N35 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+		vec3 dbg_N35 = ensureValidSpecularReflection(face_normal, V, final_normal);
 
 		// ax/ay/anisoPhi for THIS hit's dbg_N35, via prepareBRDFData -- the same
 		// tangent-projection formula every other consumer uses (L is unused for
@@ -1201,7 +1197,7 @@ void debug_visualize(
 		// Same clamped shading normal shade_and_bounce bounces from (mirrors vis
 		// modes 33/35). On a sphere this is well away from world Z almost
 		// everywhere, which is what keeps E2b's two frame fixes live here too.
-		vec3 dbg_N40 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+		vec3 dbg_N40 = ensureValidSpecularReflection(face_normal, V, final_normal);
 		// UNCLAMPED dot(N, V), matching shade_and_bounce's cosNI and combinedPdf's
 		// -- data.NdotV is floored at 1e-5 and would silently desync the two.
 		float dbg_cosNI40 = dot(dbg_N40, V);
@@ -1321,7 +1317,7 @@ void debug_visualize(
 		// The other two channels are unaffected: transformA is in [0, 0.879580]
 		// and the albedo in [0, 0.749730], both non-negative over the whole
 		// table, so they are still emitted raw.
-		vec3 dbg_N41 = clampShadingNormal(final_normal, geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+		vec3 dbg_N41 = ensureValidSpecularReflection(face_normal, V, final_normal);
 		SheenData dbg_sheen41 = sheenSetup(dbg_N41, V, dbg_material.sheen_roughness);
 		ps.radiance = vec3(dbg_sheen41.a, 0.5 + 0.5 * dbg_sheen41.b, dbg_sheen41.albedo);
 	}
@@ -1425,8 +1421,12 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 	vec3 V = -gl_WorldRayDirectionEXT;
 
-	// Clamp shading normal toward geometry at grazing view angles to keep BRDF above the geometry hemisphere.
-	vec3 N = clampShadingNormal(m.normal, h.geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
+	// F1: Cycles' bump-map correction (bsdf_util.h:322). Returns m.normal
+	// untouched unless the mirror direction of V would enter the true face; then
+	// rotates it toward h.face_normal by the minimum angle. Everything below --
+	// NEE, env NEE, emissive NEE, the sampler, the MIS pdf, the guide normals --
+	// shades from THIS N.
+	vec3 N = ensureValidSpecularReflection(h.face_normal, V, m.normal);
 	float NdotV = max(dot(N, V), 0.0001);
 
 	uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
@@ -2533,7 +2533,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	//     evalCombinedBRDF's Vbackfacing early-out), so at such a vertex env NEE
 	//     contributes nothing in EVERY direction -- while combinedPdf, which never
 	//     tests V against the hemisphere, returns a positive density that would
-	//     scale this ray down. clampShadingNormal only REDUCES backfacing V, it does
+	//     scale this ray down. ensureValidSpecularReflection does not eliminate backfacing V either, it
 	//     not eliminate it, so on strongly normal-mapped geometry this is common:
 	//     without this guard, 0.836 against a reference of 1.415, a 41% loss.
 	//

@@ -209,23 +209,6 @@ V mul(const M &m, const V &v) {
 // Enable height correlated version of G2 term. Separable version will be used otherwise
 #define USE_HEIGHT_CORRELATED_G2 1
 
-// Master toggle for the shading-normal clamp at grazing angles.
-// 0 -> clampShadingNormal becomes a passthrough; only the mirror fallback in
-//      shade_and_bounce remains active.
-// 1 -> clamp + mirror two-layer fallback (default).
-#ifndef RT_SHADING_NORMAL_CLAMP_ENABLED
-#define RT_SHADING_NORMAL_CLAMP_ENABLED 1
-#endif
-
-// Geometry NdotV below which clampShadingNormal starts pulling the shading
-// normal toward the geometry normal. Higher values flatten normal-mapped
-// detail at grazing angles but reduce BRDF below-hemisphere rejections.
-// Used by both the production indirect-bounce path and the matching debug
-// visualization so they remain in sync.
-#ifndef RT_SHADING_NORMAL_CLAMP_THRESHOLD
-#define RT_SHADING_NORMAL_CLAMP_THRESHOLD 0.4f
-#endif
-
 // Enable below-hemisphere sample recovery.
 // 0 -> disable recovery and terminate the path on rejection instead.
 // 1 -> enable recovery and reuse the original BRDF weight.
@@ -1861,37 +1844,52 @@ float3 evalMicrofacet(const BrdfData data) {
 //    Shading normal clamping
 // -------------------------------------------------------------------------
 
-// Clamps a shading normal toward the geometry normal at grazing view angles.
-// This addresses a Monte-Carlo path tracing failure mode: when a strong normal
-// map perturbs the shading normal far from the geometry normal and the view
-// direction grazes the surface, importance-sampled reflection directions
-// frequently land below the geometry hemisphere. Such samples must be
-// discarded (they would self-intersect the surface), terminating the path
-// before it can collect any environment contribution and producing speckled
-// black pixels. The classic example is water with high-frequency wave normals
-// viewed at distance.
+// F1: Cycles' ensure_valid_specular_reflection, transcribed from
+// intern/cycles/kernel/closure/bsdf_util.h:322-395. If the shading normal N
+// would put the MIRROR direction of I below the true face Ng, rotate N toward
+// Ng -- in the plane spanned by N and Ng -- by exactly the angle that lifts the
+// mirror direction to a threshold just above the surface. Everywhere else N is
+// returned untouched, so a normal map keeps its full relief at every view angle
+// where it can be rendered. Cycles applies this to glossy, coat and SSS
+// closures whenever N != Ng (maybe_ensure_valid_specular_reflection,
+// bsdf_util.h:399) and the material's Bump Map Correction is on (its default);
+// our BRDF library evaluates every lobe from one N, so the rotated normal is
+// used for the diffuse lobe as well -- the divergence recorded in the spec's
+// approach C.
 //
-// The clamp is a smooth lerp between the shading and geometry normals based
-// on the geometry NdotV. Above 'threshold' the shading normal is unchanged.
-// Below it, the lerp factor falls linearly to 0 at NdotV == 0 (full geometry
-// normal). 'threshold' should be small (e.g. 0.10..0.20); higher values flatten
-// detail at glancing angles unnecessarily, lower values still allow rejection
-// black pixels for very aggressive normal maps.
-//
-// The same clamped normal must be used for *all* BRDF math (sampling, eval,
-// direct light NEE, denoiser G-buffers) so the indirect lobe and direct
-// lighting agree.
-float3 clampShadingNormal(float3 shading_n, float3 geometry_n, float3 V, float threshold) {
-#if RT_SHADING_NORMAL_CLAMP_ENABLED
-	float NdotV_geo = dot(geometry_n, V);
-	if (NdotV_geo >= threshold) {
-		return shading_n;
+// This REPLACED clampShadingNormal, which lerped every lobe's normal toward the
+// SMOOTH normal below geometry NdotV 0.4 whether or not any direction would have
+// entered the surface, flattening normal-mapped detail over the outer 66 deg of
+// view angle.
+float3 ensureValidSpecularReflection(float3 Ng, float3 I, float3 N) {
+	const float3 R = 2.0f * dot(N, I) * N - I;
+	const float Iz = dot(I, Ng); // > 0: face_normal is oriented toward the ray.
+
+	// Reflection rays may always be at least as shallow as the incoming ray.
+	const float threshold = min(0.9f * Iz, 0.01f);
+	if (dot(Ng, R) >= threshold) {
+		return N;
 	}
-	float t = max(0.0f, NdotV_geo) * rcp(max(0.0001f, threshold));
-	return normalize(lerp(geometry_n, shading_n, t));
-#else
-	return shading_n;
-#endif
+
+	// Coordinate system with Ng as Z and N in the X-Z plane. X is the component
+	// of N orthogonal to Ng, normalised; safe_normalize_fallback(.., N).
+	float3 X = N - dot(N, Ng) * Ng;
+	const float Xlen2 = dot(X, X);
+	X = (Xlen2 > 1e-12f) ? X * inversesqrt(Xlen2) : N;
+
+	// Solve 4*a*Nz^4 - 2*b*Nz^2 + c = 0 for the N' whose mirror of I sits at
+	// exactly the threshold; see the derivation in bsdf_util.h. Of the four roots
+	// only one is valid; the sign of Ix picks it.
+	const float Ix = dot(I, X);
+	const float a = max(Ix * Ix + Iz * Iz, 1e-12f);
+	const float b = 2.0f * (a + Iz * threshold);
+	const float c = (threshold + Iz) * (threshold + Iz);
+	const float disc = sqrt(max(b * b - 4.0f * a * c, 0.0f)); // safe_sqrtf
+	const float Nz2 = (Ix < 0.0f) ? 0.25f * (b + disc) / a : 0.25f * (b - disc) / a;
+
+	const float Nx = sqrt(max(1.0f - Nz2, 0.0f));
+	const float Nz = sqrt(max(Nz2, 0.0f));
+	return Nx * X + Nz * Ng;
 }
 
 // -------------------------------------------------------------------------
@@ -3554,8 +3552,8 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	const BrdfData data = prepareBRDFData(float3(0.0f, 0.0f, 1.0f), Llocal, Vlocal, materialLocal);
 
 	// V ~= -L (near-mirror-degenerate incident/outgoing pair) leaves no stable
-	// half-vector to normalize. clampShadingNormal only REDUCES backfacing V,
-	// it does not eliminate it, so this is reachable in production, not just a
+	// half-vector to normalize. ensureValidSpecularReflection does not
+	// eliminate backfacing V either, so this is reachable in production, not just a
 	// theoretical edge case. Treat it the same as the NdotL <= 0 early-out
 	// above: return 0.0f rather than a NaN that would poison mis_ray_pdf --
 	// the caller (shade_and_bounce) falls back to RT_MIS_PDF_NONE whenever this
