@@ -13,12 +13,21 @@
 
 #pragma shader_stage(raygen)
 #extension GL_EXT_ray_tracing : enable
+// F2: the scatter-point NEE in raygen uses the same light / geometry / material
+// declarations and helpers the closest-hit stage does (shadow rays are ray
+// queries; the alpha test reads geometry and textures).
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #ifdef USE_SER
 #extension GL_EXT_shader_invocation_reorder : enable
 #endif
 
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
+#include "brdf_inc.glsl" // F2: the NEE code below evaluates MaterialProperties
 #include "raytracing_common_inc.glsl"
 #include "raytracing_volume_inc.glsl"
 
@@ -40,6 +49,20 @@ layout(set = 0, binding = 33, rg32f) uniform image2D rt_variance;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
 
+// F2: declarations for the scatter-point NEE (mirrors the closest-hit stage).
+#include "raytracing_hit_inc.glsl"
+layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+#include "raytracing_samplers_inc.glsl"
+layout(set = 0, binding = 3, std430) readonly buffer GeometryBuffer {
+	GeometryData geometries[];
+};
+layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
+	MaterialData materials[];
+};
+#include "raytracing_lights_inc.glsl"
+layout(set = 0, binding = 7) uniform texture2D radiance_octmap;
+layout(set = 0, binding = 8) uniform sampler radiance_sampler;
+
 // Traces a single camera path and returns the accumulated radiance. Shared by
 // the one-shot SPP loop and the Phase A accumulator. File-scope because GLSL
 // forbids nested function definitions.
@@ -50,11 +73,73 @@ layout(location = 0) rayPayloadEXT PathPayload payload;
 // frame counter and a sample index alone (see rng_init call sites in main()).
 // When `p_is_sample_zero` is true, the primary-ray G-buffer / depth /
 // velocity / DLSS-RR writes fire (matches the original SAMPLE_ZERO_FLAG).
-// F2: a scatter event. Task 3: weight by the single-scattering albedo and end
-// the path (Cycles' volume_bounces = 0 terminates after the first scatter);
-// Task 4 adds the direct light at the scatter point.
+// F2: direct light at a scatter point -- Cycles' volume_integrate direct
+// scatter at its default volume_bounces = 0: NEE through the phase function,
+// then the path ends. Analytic lights go through the same reservoir /
+// shadow-ray / IES / clamp code a surface uses, with the phase function in
+// place of the BRDF (MaterialProperties.phaseG); the sky is one env_sample
+// with MIS weight 1 (no second strategy exists at a scatter point);
+// emissive-mesh NEE is deferred (spec, out of scope).
 void volume_scatter_shade(uvec2 p_pixel, vec3 p_pos, vec3 p_ray_dir, vec3 p_throughput, inout PathState ps) {
-	ps.throughput = p_throughput * volume_albedo();
+	RNGState rng = rng_unpack(ps.rng_packed, p_pixel);
+	const vec3 V = -p_ray_dir;
+	const vec3 throughput = p_throughput * volume_albedo();
+	const float g = volume_g();
+	const bool is_indirect = get_diffuse_bounces(ps.packed_bounces_flags) > 0u || get_glossy_bounces(ps.packed_bounces_flags) > 0u;
+	const float clamp_limit = is_indirect ? get_rt_param(RT_PARAM_CLAMP_INDIRECT) : get_rt_param(RT_PARAM_CLAMP_DIRECT);
+
+	// Every field set: GLSL leaves the rest undefined, and the NEE sites read
+	// material.roughness for the specular multiplier even in volume mode.
+	MaterialProperties vm;
+	vm.baseColor = vec3(1.0);
+	vm.metalness = 0.0;
+	vm.emissive = vec3(0.0);
+	vm.roughness = 1.0;
+	vm.dielectricF0 = vec3(0.0);
+	vm.transmissivness = 0.0;
+	vm.eta = 1.0;
+	vm.opacity = 1.0;
+	vm.anisotropy = 0.0;
+	vm.anisotropyRotation = 0.0;
+	vm.tangent = vec3(0.0);
+	vm.smoothNormal = vec3(0.0);
+	vm.bumpNormal = vec3(0.0);
+	vm.phaseG = g;
+	vm.coatWeight = 0.0;
+	vm.coatRoughness = 0.0;
+	vm.coatIor = 1.5;
+	vm.coatTint = vec3(1.0);
+	vm.sheenColor = vec3(0.0);
+	vm.sheenRoughness = 0.5;
+	vm.sssWeight = 0.0;
+	vm.sssThin = false;
+	vm.sssRadius = vec3(0.0);
+	vm.sssScale = 0.0;
+
+	// Analytic lights.
+	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
+	if (rt_light_count > 0u) {
+		vec3 direct = lights_evaluate_direct_lighting(p_pos, V, V, vm, rng, is_indirect, rt_light_count);
+		ps.radiance += clamp_contribution(throughput * direct, clamp_limit);
+	}
+
+	// Sky.
+	{
+		vec3 env_dir;
+		float env_pdf_val;
+		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && env_pdf_val > 0.0) {
+			vec3 atten = lights_trace_shadow_ray(p_pos, env_dir, RT_RAY_TMAX);
+			if (rt_max_component(atten) > 0.0) {
+				vec2 border = vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0);
+				vec2 sky_uv = vec3_to_oct_with_border(env_world_to_sky() * env_dir, border);
+				vec3 sky_rad = textureLod(sampler2D(radiance_octmap, radiance_sampler), sky_uv, 0.0).rgb * scene_data_block.data.IBL_exposure_normalization;
+				vec3 contrib = throughput * sky_rad * atten * phaseHenyeyGreenstein(dot(p_ray_dir, env_dir), g) / env_pdf_val;
+				ps.radiance += clamp_contribution(contrib, clamp_limit);
+			}
+		}
+	}
+
+	ps.throughput = throughput;
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 }
 

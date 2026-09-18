@@ -333,6 +333,11 @@ struct MaterialProperties {
 	float3 smoothNormal;
 	float3 bumpNormal;
 
+	// F2: RT_PHASE_SURFACE for a surface. A scatter point sets it to the
+	// medium's Henyey-Greenstein g, and the analytic-light NEE sites evaluate
+	// the phase function instead of the BRDF (raytracing_lights_inc.glsl).
+	float phaseG;
+
 	// E2d coat. coatWeight 0 disables the layer entirely -- it is the ONLY field
 	// that says so. clearcoat/clearcoat_roughness are feature-gated and forced to
 	// 0 when FEATURE_CLEARCOAT is off (scene/resources/material.cpp:2270,2277),

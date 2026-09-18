@@ -525,9 +525,12 @@ vec3 lights_eval_rect_light(
 		return vec3(0.0);
 	}
 
+	// F2: at a scatter point there is no hemisphere and the "BRDF" is the phase
+	// function; -V is the ray direction (Cycles' cos_theta = dot(-sd->wi, wo)).
+	const bool in_volume = material.phaseG > RT_PHASE_SURFACE + 0.5;
 	// 4. Check shading normal -- F1 approach C: either lobe normal's hemisphere.
 	float NdotL = max(dot(N, L), dot(diffuseLobeNormal(N, material), L));
-	if (NdotL <= 0.0) {
+	if (!in_volume && NdotL <= 0.0) {
 		return vec3(0.0);
 	}
 
@@ -592,13 +595,18 @@ vec3 lights_eval_rect_light(
 	//     rides with brdf_diffuse for the same reason brdf_diffuse does not take
 	//     the knob either. No near-delta guard and no ms factor, per the rule
 	//     above and because the Zeltner LTC is already a multiple-scattering fit.
-	vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
-	evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
+	vec3 brdf_value;
+	if (in_volume) {
+		brdf_value = vec3(phaseHenyeyGreenstein(dot(-V, L), material.phaseG));
+	} else {
+		vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
+		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
 #if MICROFACET_DISTRIBUTION == GGX
-	brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
+		brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
 #endif
-	float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-	vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
+		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+		brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
+	}
 
 	// 10. Combine — divide by solid angle pdf
 	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
@@ -754,7 +762,8 @@ vec3 lights_evaluate_direct_lighting(
 		// cheap shadowless fill lights, so few samples reached a traversal at all;
 		// power-weighted selection concentrates on the few bright lights, which in a
 		// typical interior are exactly the ones with shadow_enabled = true.
-		if (dot(N, L) <= 0.0 && dot(diffuseLobeNormal(N, material), L) <= 0.0) { // F1 approach C
+		const bool in_volume = material.phaseG > RT_PHASE_SURFACE + 0.5; // F2
+		if (!in_volume && dot(N, L) <= 0.0 && dot(diffuseLobeNormal(N, material), L) <= 0.0) { // F1 approach C
 			return vec3(0.0);
 		}
 
@@ -773,19 +782,23 @@ vec3 lights_evaluate_direct_lighting(
 		// control). E2d fix round 1: see THE ANALYTIC-LIGHT RULE in
 		// lights_eval_rect_light above for why the coat is added plainly here, with
 		// no multiple-scatter factor and no near-delta guard.
-		vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
-		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
+		vec3 brdf_value;
+		if (in_volume) {
+			brdf_value = vec3(phaseHenyeyGreenstein(dot(-V, L), material.phaseG)); // F2
+		} else {
+			vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
+			evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
 #if MICROFACET_DISTRIBUTION == GGX
-		brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
+			brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
 #endif
+			float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+			brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
+		}
 
 		// Distance attenuation.
 		LightSample ls_atten;
 		ls_atten.distance_sq = dist_sq;
 		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation) * spot_atten;
-
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 
@@ -814,8 +827,9 @@ vec3 lights_evaluate_direct_lighting(
 		float light_pdf;
 		vec3 L = lights_sample_cone(ls, u, light_pdf);
 
+		const bool in_volume = material.phaseG > RT_PHASE_SURFACE + 0.5; // F2
 		float NdotL = max(dot(N, L), dot(diffuseLobeNormal(N, material), L)); // F1 approach C
-		if (NdotL <= 0.0) {
+		if (!in_volume && NdotL <= 0.0) {
 			return vec3(0.0);
 		}
 
@@ -829,14 +843,18 @@ vec3 lights_evaluate_direct_lighting(
 		}
 
 		// E2d fix round 1: see THE ANALYTIC-LIGHT RULE in lights_eval_rect_light.
-		vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
-		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
+		vec3 brdf_value;
+		if (in_volume) {
+			brdf_value = vec3(phaseHenyeyGreenstein(dot(-V, L), material.phaseG)); // F2
+		} else {
+			vec3 brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen;
+			evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular, brdf_coat, brdf_sheen);
 #if MICROFACET_DISTRIBUTION == GGX
-		brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
+			brdf_specular *= evalMultiScatterFactorForMaterial(N, V, material); // Gap #23
 #endif
-
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
+			float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+			brdf_value = brdf_diffuse + brdf_specular * spec_mul + brdf_coat * spec_mul + brdf_sheen;
+		}
 
 		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 

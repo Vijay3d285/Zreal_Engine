@@ -497,6 +497,7 @@ void debug_visualize(
 		dbg_mat.tangent = world_tangent;
 		dbg_mat.smoothNormal = geometry_normal;
 		dbg_mat.bumpNormal = final_normal;
+		dbg_mat.phaseG = RT_PHASE_SURFACE;
 		// E2d Task 5, same rule as the E2b note above: uninitialized struct fields
 		// are undefined in GLSL. evalIndirectCombinedBRDF below is only ever called
 		// here with SPECULAR_TYPE/DIFFUSE_TYPE, so the coat is not read -- set them
@@ -653,6 +654,7 @@ void debug_visualize(
 		dbg_mat.tangent = world_tangent;
 		dbg_mat.smoothNormal = geometry_normal;
 		dbg_mat.bumpNormal = final_normal;
+		dbg_mat.phaseG = RT_PHASE_SURFACE;
 		// E2d Task 5. Not consumed by lobeWeight below (the coat has its own
 		// coatLobeWeight), but undefined-if-unset applies here too.
 		dbg_mat.coatWeight = max(dbg_material.clearcoat, 0.0);
@@ -750,6 +752,7 @@ void debug_visualize(
 		dbg_mat.tangent = world_tangent;
 		dbg_mat.smoothNormal = geometry_normal;
 		dbg_mat.bumpNormal = final_normal;
+		dbg_mat.phaseG = RT_PHASE_SURFACE;
 		// E2d Task 5. sampleTransmissiveLobe below never touches the coat, but
 		// undefined-if-unset applies here too.
 		dbg_mat.coatWeight = max(dbg_material.clearcoat, 0.0);
@@ -917,6 +920,7 @@ void debug_visualize(
 		dbg_mat.tangent = world_tangent;
 		dbg_mat.smoothNormal = geometry_normal;
 		dbg_mat.bumpNormal = final_normal;
+		dbg_mat.phaseG = RT_PHASE_SURFACE;
 		// E2d Task 5. LOAD-BEARING here, not merely hygienic: this probe calls
 		// combinedPdf below, and combinedPdf now reads coatWeight/coatRoughness/
 		// coatIor through coatLobeWeight and coatPdf. Left unset these are
@@ -1191,6 +1195,7 @@ void debug_visualize(
 		dbg_mat40.tangent = world_tangent;
 		dbg_mat40.smoothNormal = geometry_normal;
 		dbg_mat40.bumpNormal = final_normal;
+		dbg_mat40.phaseG = RT_PHASE_SURFACE;
 		dbg_mat40.coatWeight = max(dbg_material.clearcoat, 0.0);
 		dbg_mat40.coatRoughness = clamp(dbg_material.clearcoat_roughness, 0.0, 1.0);
 		dbg_mat40.coatIor = max(dbg_material.clearcoat_ior, 1.0);
@@ -1707,6 +1712,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// F1: the two normals bump_shadowing_term keys on; see MaterialProperties.
 	brdf_mat.smoothNormal = h.geometry_normal;
 	brdf_mat.bumpNormal = m.normal;
+	brdf_mat.phaseG = RT_PHASE_SURFACE; // F2: a surface, not a scatter point
 	// E2d coat. Read from raw_mat for the same reason anisotropy is: MaterialResult
 	// carries no clearcoat fields, so the MaterialData binding is the only source.
 	//
