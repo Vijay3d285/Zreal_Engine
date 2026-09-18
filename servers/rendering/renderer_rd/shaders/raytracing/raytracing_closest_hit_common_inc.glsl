@@ -1803,7 +1803,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 
 			rayQueryEXT spec_rq;
 			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
-					0xFF, spec_origin, 0.001, spec_dir, 10000.0);
+					0xFF, spec_origin, 0.001, spec_dir, RT_RAY_TMAX);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 					if (ray_query_alpha_test(
@@ -1861,7 +1861,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// sampling header warns about.
 		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && (dot(env_dir, N) > 0.0 || dot(env_dir, diffuseLobeNormal(N, brdf_mat)) > 0.0)) { // F1 approach C
 			vec3 env_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
-			vec3 env_shadow_atten = lights_trace_shadow_ray(env_origin, env_dir, 10000.0);
+			vec3 env_shadow_atten = lights_trace_shadow_ray(env_origin, env_dir, RT_RAY_TMAX);
 			if (rt_max_component(env_shadow_atten) > 0.0) {
 				// Same fetch the miss stage performs for this direction: bordered
 				// octmap lookup after the shared world -> sky rotation.

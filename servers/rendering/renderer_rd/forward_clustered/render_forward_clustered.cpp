@@ -2503,7 +2503,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				? RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment)
 				: nullptr;
 		const bool fog_enabled = p_render_data && p_render_data->environment.is_valid() && environment_get_fog_enabled(p_render_data->environment);
-		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled);
+		// F2: the Environment's volumetric fog becomes the tracer's bounded medium.
+		const bool volume_enabled = p_render_data && p_render_data->environment.is_valid() &&
+				environment_get_volumetric_fog_enabled(p_render_data->environment) &&
+				environment_get_volumetric_fog_density(p_render_data->environment) > 0.0f;
+		rt_flags = SceneShaderRaytracing::compute_rt_flags(env_params, fog_enabled, volume_enabled);
 
 		// The albedo + normal AOVs the final-denoise passes need are written by the path-tracer
 		// shader only under #ifdef DLSS_RR_ENABLED (raytracing_closest_hit_common_inc.glsl:483),

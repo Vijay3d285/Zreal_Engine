@@ -20,7 +20,10 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_FLAG_FOG_ENABLED (1u << 2)
 
 #define RT_SAMPLE_COUNT_SHIFT 20u
-#define RT_SAMPLE_COUNT_MASK 0xFFu
+// 7 bits since F2 (max 127 samples per dispatch; the pipeline uses 1-3): bit
+// 27 is RT_FLAG_VOLUME_ENABLED. MUST match RT_SAMPLE_COUNT_MASK in
+// scene_shader_raytracing.h.
+#define RT_SAMPLE_COUNT_MASK 0x7Fu
 #define RT_GET_SAMPLE_COUNT() max(1u, (RT_FLAGS >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK)
 
 #define RT_MAX_BOUNCES_SHIFT 28u
@@ -84,6 +87,11 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // RT_FLAG_TRANSMISSIVE_GEOMETRY in scene_shader_raytracing.h.
 #define RT_FLAG_TRANSMISSIVE_GEOMETRY 262144u // 1 << 18
 
+// F2 volumetrics: the Environment's volumetric fog is on with density > 0. Bit
+// 27, taken from the sample-count field's top bit. MUST match
+// RT_FLAG_VOLUME_ENABLED in scene_shader_raytracing.h.
+#define RT_FLAG_VOLUME_ENABLED 134217728u // 1 << 27
+
 // Scene CONTENT, not an Environment toggle: true when any material in the scene
 // has transmission > 0. Folds the pass-B loop away entirely when false.
 #define RT_GET_TRANSMISSIVE_GEOMETRY() ((RT_FLAGS & RT_FLAG_TRANSMISSIVE_GEOMETRY) != 0u)
@@ -112,7 +120,7 @@ global_shader_uniforms;
 #ifndef RT_STAGE_ANY_HIT
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
-	vec4 rt_params[4];
+	vec4 rt_params[10]; // F2: 4 -> 10; indices 16+ are the volume block (raytracing_inc.glsl)
 	mat4 prev_vp_unjittered;
 	mat4 curr_vp_unjittered;
 };

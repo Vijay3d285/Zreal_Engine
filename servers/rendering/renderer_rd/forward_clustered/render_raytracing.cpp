@@ -2855,11 +2855,19 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
 	const PagedArray<RenderGeometryInstance *> &rt_instances = *p_render_data->rt_instances;
+	state->volume_box_valid = false;
 	for (uint32_t i = 0; i < (uint32_t)rt_instances.size(); i++) {
 		const RenderForwardClustered::GeometryInstanceForwardClustered *inst =
 				static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(rt_instances[i]);
 		if (!inst || !inst->data) {
 			continue;
+		}
+		// F2: the fog box is the union of everything the tracer can see.
+		if (!state->volume_box_valid) {
+			state->volume_box = inst->transformed_aabb;
+			state->volume_box_valid = true;
+		} else {
+			state->volume_box = state->volume_box.merge(inst->transformed_aabb);
 		}
 		const Transform3D &instance_transform = inst->transform;
 
@@ -4154,11 +4162,11 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	// Binding 6: Raytracing params + unjittered VP matrices.
 	{
 		struct {
-			float params[16];
+			float params[40]; // F2: 16 -> 40 (vec4 rt_params[10] in the shader)
 			float prev_vp_unjittered[16];
 			float curr_vp_unjittered[16];
 		} rt_ubo = {};
-		static_assert(sizeof(rt_ubo) == 48 * sizeof(float));
+		static_assert(sizeof(rt_ubo) == 72 * sizeof(float));
 
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			const float *env_params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
@@ -4172,6 +4180,35 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// [3] = DLSS_RR_ENABLED, [4] = ACCUM_FLAG, [5] = ACCUM_FRAMES,
 		// [14] = LIGHT_COUNT, [15] = FRAME_INDEX
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FRAME_INDEX] = float(p_state->frame_counter++);
+
+		// F2 volumetrics: the Environment's fog as a bounded homogeneous medium.
+		// sigma_t = density per metre (the raster's exp(-density * depth)),
+		// sigma_s = density * albedo, emission = colour * energy * density
+		// (volumetric_fog_process.glsl:385,393); the colours are sRGB-encoded
+		// properties and the raster converts them (fog.cpp:1107,1113), so this
+		// does too. The box is this frame's TLAS AABB, padded 1 cm.
+		if (p_render_data && p_render_data->environment.is_valid() && owner->environment_get_volumetric_fog_enabled(p_render_data->environment) && p_state->volume_box_valid) {
+			const RID env = p_render_data->environment;
+			const float density = owner->environment_get_volumetric_fog_density(env);
+			const Color albedo = owner->environment_get_volumetric_fog_scattering(env).srgb_to_linear();
+			const Color emission = owner->environment_get_volumetric_fog_emission(env).srgb_to_linear();
+			const float e_energy = owner->environment_get_volumetric_fog_emission_energy(env) * density;
+			const AABB box = p_state->volume_box.grow(0.01f);
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_SIGMA_T] = density;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_G] = owner->environment_get_volumetric_fog_anisotropy(env);
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_ALBEDO_R + 0] = albedo.r;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_ALBEDO_R + 1] = albedo.g;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_ALBEDO_R + 2] = albedo.b;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_EMISSION_R + 0] = emission.r * e_energy;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_EMISSION_R + 1] = emission.g * e_energy;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_EMISSION_R + 2] = emission.b * e_energy;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_BOX_MIN_X + 0] = box.position.x;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_BOX_MIN_X + 1] = box.position.y;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_BOX_MIN_X + 2] = box.position.z;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_BOX_MAX_X + 0] = box.position.x + box.size.x;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_BOX_MAX_X + 1] = box.position.y + box.size.y;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VOLUME_BOX_MAX_X + 2] = box.position.z + box.size.z;
+		}
 
 		// Phase A: accumulation reset detection + per-frame index injection.
 		// When accumulation is enabled (env PT_PARAM_ACCUM_FLAG), reset the

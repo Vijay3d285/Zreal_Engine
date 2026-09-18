@@ -31,6 +31,14 @@
 #define RT_PARAM_MAX_GLOSSY_BOUNCE 13 // rt_params[3].y - Glossy bounce cap (0 = use MAX_BOUNCES)
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
+// F2 volumetrics (roadmap Gap #16). rt_params grew from 4 to 10 vec4s; these
+// live in the second block. All linear, energy applied on the CPU.
+#define RT_PARAM_VOLUME_SIGMA_T 16 // rt_params[4].x - extinction per metre (Environment.volumetric_fog_density)
+#define RT_PARAM_VOLUME_G 17 // rt_params[4].y - Henyey-Greenstein anisotropy
+#define RT_PARAM_VOLUME_ALBEDO_R 20 // rt_params[5].xyz - single-scattering albedo
+#define RT_PARAM_VOLUME_EMISSION_R 24 // rt_params[6].xyz - emission per metre, already x energy x density
+#define RT_PARAM_VOLUME_BOX_MIN_X 28 // rt_params[7].xyz - world-space box (the scene's AABB, padded 1 cm)
+#define RT_PARAM_VOLUME_BOX_MAX_X 32 // rt_params[8].xyz
 
 // ============================================================================
 // PATHTRACING PAYLOAD (48 bytes nominal, fp32 radiance/throughput)
@@ -83,6 +91,16 @@ struct PathPayload {
 /// near-delta specular lobes that environment sampling can never reach.
 /// Mirrors Cycles' PATH_RAY_MIS_SKIP.
 const float RT_MIS_PDF_NONE = -1.0;
+// F2: the miss stage marks a bounded trace that ended inside the fog box (a
+// scatter event) with this sentinel in mis_ray_pdf; raygen shades it.
+const float RT_MIS_PDF_VOLUME_SCATTER = -3.0;
+// F2: MaterialProperties.phaseG below this means "a surface" -- the NEE sites
+// evaluate the BRDF. Above it, the value IS the Henyey-Greenstein g and the
+// sites evaluate the phase function instead.
+const float RT_PHASE_SURFACE = -2.0;
+// The unbounded ray length. Was a bare 10000.0 at every trace and in the miss
+// stage's far-point; F2 needs to compare a ray's tmax against it.
+const float RT_RAY_TMAX = 10000.0;
 
 /// Below this roughness a specular lobe is treated as delta for MIS purposes.
 /// An independent, tighter cutoff than MAX_DENOISER_SPECULAR_HIT_THRESHOLD
@@ -378,6 +396,7 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 #define RT_PRNG_EMISSIVE_POINT 9u // 2D: barycentric point on that triangle (C1).
 #define RT_PRNG_TRANSPARENT 10u // 1D: transparent-vs-shade choice (alpha closure).
 #define RT_PRNG_TRANSMIT 11u // 1D: reflect-vs-transmit choice inside the dielectric closure (E1).
+#define RT_PRNG_VOLUME 12u // 1D: free-flight distance through the fog box (F2).
 // Slots 12-15 are free. Earlier dimensions are better stratified, so the
 // highest-variance decision (the BSDF direction) keeps 0.
 

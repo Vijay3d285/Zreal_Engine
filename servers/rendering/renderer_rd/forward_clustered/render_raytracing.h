@@ -398,6 +398,9 @@ struct RTMaterialCacheEntry {
 /// `build_tlas` for that viewport, freed via `RenderRaytracing::free_viewport_state`
 /// from `RenderBufferDataForwardClustered::free_data()`.
 struct RTViewportState {
+	// F2: union of every TLAS instance's world AABB this frame -- the fog box.
+	AABB volume_box;
+	bool volume_box_valid = false;
 	RID tlas;
 	uint32_t tlas_max_instances = 0;
 

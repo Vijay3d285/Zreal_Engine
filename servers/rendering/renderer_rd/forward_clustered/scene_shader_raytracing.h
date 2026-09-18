@@ -108,10 +108,14 @@ public:
 		// sss_weight > 1e-5 (process_material). Folds the random walk, the
 		// fifth registry lobe and the exit shading away for every other scene.
 		RT_FLAG_SSS_ENABLED = (1 << 19),
+		// F2 volumetrics: the Environment's volumetric fog is on with density > 0.
+		// Bit 27 was the sample-count field's top bit; that field is 7 bits now
+		// (max 127 samples per dispatch). MUST match raytracing_common_inc.glsl.
+		RT_FLAG_VOLUME_ENABLED = (1 << 27),
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
-	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0xFF;
+	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0x7F; // 7 bits since F2; bit 27 is RT_FLAG_VOLUME_ENABLED
 
 	constexpr static uint32_t RT_MAX_BOUNCES_SHIFT = 28;
 	constexpr static uint32_t RT_MAX_BOUNCES_MASK = 0xF;
@@ -161,6 +165,8 @@ public:
 	// sync whenever RT_FLAG_* gains a member.
 	static_assert(((RT_FLAG_DEBUG_VIS_ENABLED | RT_FLAG_DLSS_RR_ENABLED | RT_FLAG_FOG_ENABLED | RT_FLAG_SER_ENABLED | RT_FLAG_EMISSIVE_LIGHTS_ENABLED | RT_FLAG_TRANSMISSION_ENABLED | RT_FLAG_ANISOTROPY_ENABLED | RT_FLAG_COAT_ENABLED | RT_FLAG_SHEEN_ENABLED | RT_FLAG_TRANSMISSIVE_GEOMETRY | RT_FLAG_SSS_ENABLED) & (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT)) == 0,
 			"RT_FLAG_* bit overlaps the Russian Roulette min_bounce field (bits 4-8)");
+	static_assert((RT_FLAG_VOLUME_ENABLED & ((RT_SAMPLE_COUNT_MASK << RT_SAMPLE_COUNT_SHIFT) | (RT_MAX_BOUNCES_MASK << RT_MAX_BOUNCES_SHIFT) | (RT_MAX_TRANSMISSION_BOUNCE_MASK << RT_MAX_TRANSMISSION_BOUNCE_SHIFT) | (RT_MIN_BOUNCE_MASK << RT_MIN_BOUNCE_SHIFT))) == 0,
+			"RT_FLAG_VOLUME_ENABLED overlaps a packed field");
 
 	// The transmission cap field must miss every neighbouring field. A collision
 	// corrupts the neighbour's readback and leaves the render plausible rather
@@ -200,10 +206,19 @@ public:
 	static constexpr int RT_PARAM_MAX_GLOSSY_BOUNCE = RSE::PT_PARAM_MAX_GLOSSY_BOUNCE;
 	static constexpr int RT_PARAM_LIGHT_COUNT = RSE::PT_PARAM_LIGHT_COUNT;
 	static constexpr int RT_PARAM_FRAME_INDEX = RSE::PT_PARAM_FRAME_INDEX;
+	// F2 volumetrics: shader-side rt_params indices 16-34 (raytracing_inc.glsl).
+	static constexpr int RT_PARAM_VOLUME_SIGMA_T = 16;
+	static constexpr int RT_PARAM_VOLUME_G = 17;
+	static constexpr int RT_PARAM_VOLUME_ALBEDO_R = 20;
+	static constexpr int RT_PARAM_VOLUME_EMISSION_R = 24;
+	static constexpr int RT_PARAM_VOLUME_BOX_MIN_X = 28;
+	static constexpr int RT_PARAM_VOLUME_BOX_MAX_X = 32;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces, uint32_t p_min_bounce, uint32_t p_max_transmission_bounce) {
 		uint32_t result = p_flags;
-		result |= (p_sample_count & RT_SAMPLE_COUNT_MASK) << RT_SAMPLE_COUNT_SHIFT;
+		// Clamped, not masked: the field is 7 bits since F2 (bit 27 is
+		// RT_FLAG_VOLUME_ENABLED), and a masked 128 would read as 0 -> 1 sample.
+		result |= MIN(p_sample_count, RT_SAMPLE_COUNT_MASK) << RT_SAMPLE_COUNT_SHIFT;
 		// Max bounces is offset by 1 (0=1 bounce, 15=16 bounces)
 		result |= (MAX(1u, MIN(16u, p_max_bounces)) - 1u) << RT_MAX_BOUNCES_SHIFT;
 		// Min bounce is offset by 1 so stored 0 can mean "unset" -- see above.
@@ -215,7 +230,7 @@ public:
 
 	// Build the full packed rt_flags from pathtracing environment params.
 	// `p_env_params` may be null (RT active with no pathtracing environment).
-	static uint32_t compute_rt_flags(const float *p_env_params, bool p_fog_enabled);
+	static uint32_t compute_rt_flags(const float *p_env_params, bool p_fog_enabled, bool p_volume_enabled);
 
 	struct ShaderSpecialization {
 		union {

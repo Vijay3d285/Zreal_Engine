@@ -288,7 +288,7 @@ float rt_max_component(vec3 v) {
 /// whatever the Environment transmission toggle says: the TLAS mask is a
 /// material property, so pass A still cannot see the pane, and only pass B is
 /// left to occlude it.
-vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
+vec3 lights_trace_shadow_ray_geometry(vec3 origin, vec3 direction, float max_dist) {
 #ifdef USE_SER
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
@@ -477,6 +477,18 @@ vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
 
 	// Cap reached with attenuation left: return what accumulated, so deep glass
 	// dims rather than going black.
+	return atten;
+}
+
+// F2: every shadow ray -- surface NEE, scatter-point NEE, the env shadow ray
+// -- pays the medium's transmittance over its in-box length, as Cycles'
+// volume_shadow_* does for a shadow ray crossing a volume object. Folded to
+// the geometry query alone when the volume is compiled out.
+vec3 lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist) {
+	vec3 atten = lights_trace_shadow_ray_geometry(origin, direction, max_dist);
+	if (volume_active() && rt_max_component(atten) > 0.0) {
+		atten *= volume_transmittance_along(origin, direction, 0.0, max_dist);
+	}
 	return atten;
 }
 

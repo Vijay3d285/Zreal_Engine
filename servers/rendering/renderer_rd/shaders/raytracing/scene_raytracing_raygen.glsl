@@ -20,6 +20,7 @@
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
 #include "raytracing_common_inc.glsl"
+#include "raytracing_volume_inc.glsl"
 
 layout(set = 0, binding = 0, rgba32f) uniform image2D image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
@@ -98,7 +99,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 #ifdef USE_SER
 		hitObjectEXT hitObject;
-		hitObjectTraceRayEXT(hitObject, tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, 10000.0, 0);
+		hitObjectTraceRayEXT(hitObject, tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, RT_RAY_TMAX, 0);
 
 		// Reorder with a coherence hint that has 8 bits
 		uint hint = 0;
@@ -110,7 +111,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 		hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-		traceRayEXT(tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, 10000.0, 0);
+		traceRayEXT(tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, RT_RAY_TMAX, 0);
 #endif
 
 		ps = path_unpack(payload);
@@ -280,6 +281,7 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_volume_inc.glsl"
 // clang-format on
 
 layout(location = 0) rayPayloadInEXT PathPayload payload;
@@ -324,7 +326,7 @@ void main() {
 
 			// Sky velocity: reproject a far-plane point using unjittered VPs.
 			{
-				vec3 far_world = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * 10000.0;
+				vec3 far_world = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * RT_RAY_TMAX;
 				vec2 curr_uv = project_uv(far_world, curr_vp_unjittered);
 				vec2 prev_uv = project_uv(far_world, prev_vp_unjittered);
 				imageStore(rt_velocity_image, pixel, vec4(prev_uv - curr_uv, 0.0, 0.0));
@@ -446,6 +448,7 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_volume_inc.glsl"
 // clang-format on
 
 #define attribs hit_attribs.bary_or_uv
