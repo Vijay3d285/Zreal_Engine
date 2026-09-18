@@ -113,7 +113,7 @@ Ranked by impact on offline still quality.
 | 13 | **Missing BSDFs** — transmission (E1, §7.5), anisotropy (E2b, §7.8), clearcoat (E2d, §7.10), sheen (E2e, §7.11) and **subsurface (E3, §11.23, shipped 2026-09-15)** all ship: Cycles' random walk (van de Hulst remap, Dwivedi guiding, channel MIS, 256 steps) for solids and the OpenPBR thin-wall split for sheets; gate S1 energy / S2 vs Cycles / S3 thin-wall / S4 fallback; pipeline keyword rule (marble, wax, shade/paper, leaf). Skin mode deferred (a render_mode, invisible to the upload). **Gap #13 complete** | `closest_hit_common:474-475` | `subsurface_random_walk.h`, Principled | Medium |
 | 14 | **fp16 radiance/throughput payload** | `raytracing_inc.glsl:75-87` | fp32 throughout | Medium |
 | 15 | **Biased bump-map mirror recovery — CLOSED 2026-09-17 (§11.29).** The roadmap's "offset normals" never existed in Cycles; it handles a bumped surface with three rules on the TRUE face normal — `ensure_valid_specular_reflection` (rotate the glossy normal only as far as the mirror direction needs), reject below-face samples outright, `bump_shadowing_term` on the diffuse lobe — and gives the diffuse closure the raw bump normal. All four ported; the 0.4 clamp and the mirror deleted. `pt_bump_correction_gate`: furnace 1.063 → 0.564 (Cycles 0.557), vs Cycles B0 +91% → +1.2%, B1 +60% → +1.7%, B2 +5% → +0.1%. Cost +3.7% frame time. | `brdf_inc.glsl` (`ensureValidSpecularReflection`, `bumpShadowingTerm`, `diffuseLobeNormal`), `HitData.face_normal` | `bsdf_util.h:322`, `bsdf.h:86`, `bsdf_microfacet.h:863`, `svm/closure.h` | **Closed** |
-| 16 | **No volumetrics** | absent | `integrator/shade_volume.h` | Low |
+| 16 | **No volumetrics — CLOSED 2026-09-18 (§11.30).** The Environment's volumetric fog is a bounded homogeneous medium on the scene's AABB, Cycles' single-scatter default (`volume_bounces` 0): free-flight sampling bounds every trace, a scatter point gets analytic-light and sky NEE through Henyey-Greenstein, every shadow ray pays `exp(-σt·L)`, emission is analog. A *World* volume was deliberately NOT copied — it extinguishes the sun and sky (`FLT_MAX` shadow rays). `pt_volume_gate`: V1/V2/V5 analytic within 0.5%, V3 sun beam +2.5% and V4 sky haze −0.3% vs Cycles. | `raytracing_volume_inc.glsl`, raygen free flight + `volume_scatter_shade`, `lights_trace_shadow_ray`, `MaterialProperties.phaseG` | `shade_volume.h:1716`, `volume_util.h:27`, `sun.h:44`, `path_state.h:162` | **Closed** |
 | 17 | **Multi-scatter energy compensation over-shoot** — **FIXED 2026-09-10, see §10.** `evalEmsApprox`/`evalMultiScatterApproximation` over-corrected the true single-scatter GGX energy loss by 3.4–8.1pp. Replaced by `evalMultiScatterEnergy`, a transcription of Cycles' `microfacet_ggx_preserve_energy` reading the `GGX_E`/`GGX_EAVG` tables E2d already ships. The white furnace's isotropic control went **1.059535 → 1.000549**. Two things this did *not* fix are now separate rows: #19 and #20. | `brdf_inc.glsl` (`evalMultiScatterEnergy`, `evalMultiScatterFactor`, `RT_MS_COMPENSATION`), call sites in `brdf_inc.glsl` (sampler), `raytracing_closest_hit_common_inc.glsl` and `raytracing_emissive_inc.glsl` (NEE) | `intern/cycles/kernel/closure/bsdf_microfacet.h:466-485` | **Fixed** |
 | 18 | **Clear glass reads flat through the Transparent BSDF closure, cause unknown** — a pane's whole shading is weighted by its authored alpha, so a clear pane at `alpha = 0.098` keeps ~10% of its reflection. **That weighting is NOT the defect: Cycles does the identical thing** (`weight *= alpha` before any shader component). So the cause lies elsewhere and is unidentified. Currently masked by a pipeline substitution that converts such panes to opaque transmission; whether that substitution is a divergence to delete or an improvement to keep is itself unanswered. See §9.10. | `raytracing_closest_hit_common_inc.glsl:1383` (closure branch), `pipeline_references/image_glb_creation.gd` (`_glb_alpha_convert_is_lossless`) | `intern/cycles/kernel/svm/closure.h:108-113` — same alpha weighting, verified | Medium |
 | 19 | **Anisotropic GGX energy — FIXED 2026-09-11, see §11.8 and §11.9.** Every measured configuration now agrees with Cycles 5.2.1 to **0.21% or better**, from +53.85% at worst. Two independent causes, both landed: **A**, below-hemisphere VNDF samples clamped into the shading hemisphere rather than rejected (§11.8), and **B**, `ax`/`ay` not clamped to [0,1] as Cycles does in `bsdf_microfacet_ggx_setup` (§11.9). Guarded by probe 1d's eccentricity-monotonicity assertion, which is a physical law rather than a stored reference. *Original entry:* **~~Anisotropic GGX loses energy — and so does Cycles, in the opposite direction, so this is a PARITY gap rather than a correctness one~~** — the white furnace reads 0.976442 at roughness 0.4 / anisotropy 0.9 where it must read 1.0. **Cycles 5.2.1 measured on the identical furnace reads 0.928014** (§11), so the failure is shared, not ours — but the two engines fail *differently*: we over-recover, Cycles under-recovers, and the divergence between them reaches **+5.22% at roughness 0.4 / anisotropy 0.9 and +53.85% at roughness 0.9 / anisotropy 0.9**. **Decomposed in §11.6 into two independent causes, and the larger one is now FIXED.** **A — below-hemisphere VNDF samples were clamped into the shading hemisphere rather than rejected**, handing a finite `G2/G1` weight to directions where the BRDF is identically zero; the error scaled with eccentricity, which is why it read as an anisotropy bug. Landed 2026-09-11 (§11.8), and roughness 0.4 now matches Cycles to **0.04% across the whole anisotropy sweep**, guarded by probe 1d's eccentricity-monotonicity assertion. **B — `ax`/`ay` clamping to [0,1] that Cycles does (`bsdf_microfacet.h:1042-1043`) and we do not** is all that remains, and only where `ax > 1`: roughness 0.9 / anisotropy 0.9 now undershoots Cycles by 28.2% where it previously overshot by 53.85%. Fixing B invalidates the `rough = sqrt(alpha)` identity Gap #17's spec §5.2 relied on (§11.6). `GGX_E_TABLE` has no anisotropy axis in either engine. Isotropically the two agree to ~1e-5 at **both** roughness 0.4 (1.000549 vs 1.000499) and roughness 0.9 (0.999631 vs 0.999645), so **the entire divergence is anisotropy** and Gap #17's fix is complete across the roughness range — independently confirmed from outside this project. **Brushed metal will not match Blender until this is closed.** | `brdf_inc.glsl` (`evalMicrofacet` anisotropic branch, `anisoAspect`, `evalMultiScatterEnergy`), `pipeline_references/tests/pt_anisotropy_gate.gd` probes 1 and 1b | `intern/cycles/kernel/closure/bsdf_microfacet.h:437-447` — single `rough = sqrt(sqrt(ax*ay))` for both axes, same isotropic table | **High** |
@@ -938,8 +938,8 @@ Random-walk BSSRDF following `subsurface_random_walk.h`.
 *Corrected 2026-09-17:* Cycles has no "offset normals". It applies `ensure_valid_specular_reflection` to glossy/coat/SSS closures, rejects samples below the true face, and shadows the diffuse lobe with `bump_shadowing_term`, with the diffuse closure on the raw bump normal. All ported; `recoverBelowHemisphereSample` and `clampShadingNormal` deleted; vis mode 22 kept (now raw vs corrected).
 *Accept (met):* a normal-mapped furnace no longer exceeds 1 (1.063 → 0.564); vs Cycles within 1.7% on the two dielectric probes and 0.1% on the metal.
 
-**F2. Volumetrics** — *Gap #16*
-Homogeneous fog/god-rays via a volume integrator (`shade_volume.h`), with `max_volume_bounce` from B3.
+**F2. Volumetrics** — *Gap #16* — ✅ **DONE 2026-09-18 (§11.30)**
+Homogeneous fog via a bounded medium on the scene's AABB, Cycles' single-scatter default (`volume_bounces` 0 — no volume-bounce counter needed). Equiangular + MIS for lamps, multiple scattering, emissive NEE at scatter points and `FogVolume` objects are the recorded follow-ups.
 
 **F3. `Environment.BG_COLOR` silently produces a black world for the path
 tracer.** — ✅ **DONE 2026-09-17 (§11.29)**: a 1×1 flat-colour radiance map is bound when there is no Sky; and `radiance_inverse_xform` — which the tracer's env sampling reads for every environment — is now stored unconditionally (it was gated on the sky being the ambient/reflection source, which cost every non-sky environment 18% of its lighting). *(Found authoring Phase E1 Task 7's transmission gate;
@@ -7001,3 +7001,103 @@ local:
   glTF has no such flag; the tracer applies the rules whenever N ≠ Ng.
 - F2 volumetrics (Gap #16) — its own spec next; the pipeline already asks for
   `volumetric_fog` on day renders and the tracer ignores it.
+
+## 11.30 Phase F2 closeout — a bounded homogeneous medium, Cycles' way
+
+Spec `docs/superpowers/specs/2026-09-17-volumetrics-design.md`, plan
+`docs/superpowers/plans/2026-09-17-volumetrics.md`. Gate
+`pipeline_references/tests/pt_volume_gate.gd` (suite now 21), Cycles half
+`tools/cycles_comparison/cycles_volume_box.py`.
+
+### Three things the source settled before any design
+
+1. **Cycles' default is single scattering.** `volume_bounces` defaults to 0
+   (`properties.py:779`); the kernel stores `+1` and flags
+   `PATH_RAY_TERMINATE_AFTER_TRANSPARENT` after the first scatter
+   (`path_state.h:162-166`). A scatter point gets direct light through the
+   phase function and the path ends — so no volume-bounce counter had to be
+   found in a payload with no free bits.
+2. **A World volume kills the sun and the sky.** Sun and background shadow
+   rays carry `tmax = FLT_MAX` (`sun.h:44`, `light.h:115`), and the shadow
+   transmittance is `exp(-σt·(tmax − tmin))` — zero for any density. Blender
+   archviz puts haze in a cube around the room for exactly this reason; the
+   tracer's medium is therefore a **box**, and the box is the union of the
+   TLAS instances' AABBs (`RTViewportState::volume_box`, padded 1 cm).
+3. **Godot's fog inputs are Cycles' Volume Scatter inputs.** `density` is σt
+   per metre (the raster's `exp(-density·depth)`), `albedo` the scatter colour,
+   `anisotropy` = g, `emission × energy × density` the emission per metre
+   (`volumetric_fog_process.glsl:385,393`); the two Color properties are
+   sRGB-encoded and converted as the raster converts them (`fog.cpp:1107,1113`).
+
+### The estimator, and why it is written the other way round
+
+Cycles decides scatter-vs-transmit *after* the intersection, with the segment
+length known. Our closest-hit shader shades on the spot, so raygen draws the
+free-flight distance from the box entry **before** the trace and bounds the
+trace by it: a hit inside the bound is a transmit event with throughput
+unchanged (`P(t_free > t) = exp(-σt·t)` *is* the transmittance), a miss inside
+it is a scatter event weighted by the albedo. Same expectation as Cycles'
+`volume_integrate_homogeneous` on a grey extinction; Godot's scalar density
+makes the extinction grey, so Cycles' channel selection has nothing to act on.
+
+One defect the gate caught on the way: emission over the truncated segment
+must be added **unattenuated** (`E·L`) — the truncation already carries the
+survival probability. Weighting it by `(1 − e^{−σL})/σ` as well attenuated
+twice; V2 read 0.435 for 0.632, and the arithmetic of the double attenuation
+(`E·(1 − (1+e⁻²)/2)/σ = 0.432`) named it.
+
+### What the flag cost
+
+`RT_FLAG_VOLUME_ENABLED` needed a bit in a 32-bit word with none free
+(flags 0-3 / 9-10 / 15-19, min-bounce 4-8, transmission cap 11-14, sample
+count 20-27, max bounces 28-31). The sample-count field went from 8 to 7
+bits (max 127 per dispatch; the pipeline uses 1-3; the packer clamps rather
+than masks) and bit 27 is the flag. With it off the whole path folds away:
+fog off, the old binary and the new render bit-identical on every gate.
+
+### The gate
+
+Fixture: eight 1 cm black posts pin the scene AABB to a 2 m cube; every
+surface sits 1 mm inside a face (coplanar with the Cycles volume cube's face
+the surface is never hit — the surface-less face wins the intersection and
+the continuation skips the coincident plane); camera outside, tilted 8.5°
+down so the floor spans rows 45-80%. The analytic probes integrate **per
+pixel along the camera's own rays** — the camera's path through the fog is
+part of every reading, and it differs across a crop.
+
+| probe | fixture | reads | bar | result |
+|---|---|---|---|---|
+| V1 absorption | albedo 0, σt 0.5, emissive back wall | with / without fog | per-pixel `exp(-σt·L)` ± 1% | **−0.25%** |
+| V2 emission | albedo 0, σt 0.5, E 1 | crop mean | per-pixel `E_eff(1−e^{−σL})/σ` ± 1% | **+0.29%** |
+| V3 sun beam vs Cycles | albedo 1, σt 0.3, g 0.8, sun straight down | fog ÷ white floor (ratio-to-control) | ± 3% | **+2.49%** (0.02229 vs 0.02175) |
+| V4 sky haze vs Cycles | albedo 1, σt 0.3, g 0, world 1 | crop mean | ± 3% | **−0.28%** (0.8259 vs 0.8283) |
+| V5 surface shadowing | albedo 0, σt 0.5, sun, white floor | with / without | per-pixel `T_view · T_sun` ± 1% | **−0.50%** |
+
+Before F2: V1 1.0, V2 0, V3 0, V4 1.0, V5 1.0. Whole suite: old hand-over
+binary green except the four expected (bump and volume gates by design,
+energy `bumpy` and transmission probe 10 against their F1 references); new
+binary **21/21**. Doctest 1558/1558. Frame time with the fog compiled out:
+1.2347 (pre-F1) → 1.2821 ms/frame, of which F1 was 1.2738 — F2 adds ~0.7%,
+noise level. Job 226 at FHD with the fog on: 197 → 207 s (+5%).
+
+### On the asset
+
+Job 225/226 through the still route: the pipeline's `day` fog (density
+0.001, g 0.8) reaches the traced frame for the first time. At that density
+the effect is ±0.5% — +0.7% at the far end of the room, −0.2% near the
+camera — exactly the "0.6% over 6 m" the spec predicted, and what 0.001 per
+metre means. A demonstration at 20× (0.02, scratch copy only) shows the
+mechanism: the far end lifts +8.5%, the near dark side drops 4% — aerial
+perspective. No beams in this scene: the sun and the windows are behind the
+camera. Whether the pipeline's day haze should be denser is a look decision
+for the lighting rig (Gap #31), not an engine question.
+
+### Recorded follow-ups (spec, out of scope)
+
+- Equiangular sampling + MIS for point/spot lights in haze (Cycles'
+  `VOLUME_SAMPLE_MIS`) — variance only; needed if lamp-lit haze proves
+  noisy at the pipeline's sample count.
+- Multiple scattering (`volume_bounces > 0`) — needs a payload counter.
+- Emissive-mesh NEE at scatter points.
+- `FogVolume` nodes as object volumes with a volume stack (approach C).
+- Heterogeneous media.
