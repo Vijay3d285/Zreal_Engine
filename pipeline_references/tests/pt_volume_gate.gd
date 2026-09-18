@@ -20,21 +20,35 @@ extends "res://tests/pt_validation.gd"
 ## the raster converts with srgb_to_linear() (fog.cpp:1107,1113) and so does
 ## the tracer, so linear values are authored through linear_to_srgb() here.
 ##
+## The analytic probes (V1, V2, V5) are evaluated PER PIXEL on the CPU from
+## the camera's own rays and the same box (padded 1 cm as the engine pads it):
+## the camera's path through the fog is part of every reading, and it differs
+## across a crop (the floor rows sit ~0.9 m into the box, the back wall ~2 m).
+##
 ##   V1 absorption : albedo 0, sigma_t 0.5, white emissive back wall, black
-##                   world -> back crop with fog / without = exp(-1) (2 m of box)
+##                   world -> back crop with fog / without = mean exp(-sigma_t L_view)
 ##   V2 emission   : albedo 0, sigma_t 0.5, emission 1 energy 1, black world,
-##                   black floor -> fog crop = E (1 - e^-1) / sigma_t = 1.2642
+##                   black floor -> fog crop = mean E_eff (1 - e^(-sigma_t L)) / sigma_t,
+##                   E_eff = colour x energy x density -- Godot's raster
+##                   convention (volumetric_fog_process.glsl:393), which the
+##                   tracer follows
 ##   V3 sun beam   : albedo 1, sigma_t 0.3, g 0.8, sun straight down, black
 ##                   world, white floor -> fog crop / floor crop vs Cycles
 ##   V4 sky haze   : albedo 1, sigma_t 0.3, g 0, uniform world 1, black floor
 ##                   -> fog crop vs Cycles
 ##   V5 shadowing  : albedo 0, sigma_t 0.5, sun straight down, white floor ->
-##                   floor with fog / without = exp(-1) (every shadow ray climbs 2 m)
+##                   floor with fog / without = mean exp(-sigma_t L_view) x
+##                   exp(-sigma_t L_sun), L_sun the climb from the floor to the
+##                   box top
 ##   V6 (implicit) : fog off is compiled out -- pt_energy_gate and
 ##                   pt_light_energy_gate are unchanged to the digit.
 
 var FRAMES: int = 256 if OS.get_environment("ZR_GATE_FRAMES") == "" else int(OS.get_environment("ZR_GATE_FRAMES"))
 const TOL_ANALYTIC := 0.01
+const BOX_PAD := 0.01 # the engine pads the scene AABB by 1 cm
+const FLOOR_Y := 0.001
+const WALL_Z := -0.999
+var _cam: Camera3D
 const BAR_CYCLES := 0.03
 # Cycles 5.2.1, cycles_volume_box.py, 1024 spp, captured 2026-09-18 (Task 1 Step 2):
 #   V3 fog 0.013223 floor 0.607924 ratio 0.021751; V4 fog 0.828252.
@@ -63,12 +77,12 @@ func _ready() -> void:
 	var v1_off := await _render({"fog": false, "back_wall": true, "floor_albedo": 0.0, "world": 0.0, "sun": false})
 	var v1_on := await _render({"fog": true, "density": 0.5, "albedo": 0.0, "g": 0.0, "back_wall": true, "floor_albedo": 0.0, "world": 0.0, "sun": false})
 	var v1 := _crop(v1_on, 0.15, 0.45, 0.40, 0.60) / maxf(_crop(v1_off, 0.15, 0.45, 0.40, 0.60), 1e-9)
-	_check("V1 absorption", v1, exp(-1.0), TOL_ANALYTIC)
+	_check("V1 absorption", v1, _expected(0.15, 0.45, 0.40, 0.60, 0.5, "wall_transmittance"), TOL_ANALYTIC)
 
 	print("\n=== V2: emission ===")
 	var v2_img := await _render({"fog": true, "density": 0.5, "albedo": 0.0, "g": 0.0, "emission": 1.0, "floor_albedo": 0.0, "world": 0.0, "sun": false})
 	var v2 := _crop(v2_img, 0.10, 0.40, 0.30, 0.70)
-	_check("V2 emission", v2, (1.0 - exp(-1.0)) / 0.5, TOL_ANALYTIC)
+	_check("V2 emission", v2, _expected(0.10, 0.40, 0.30, 0.70, 0.5, "emission"), TOL_ANALYTIC)
 
 	print("\n=== V3: sun beam vs Cycles ===")
 	var v3_img := await _render({"fog": true, "density": 0.3, "albedo": 1.0, "g": 0.8, "floor_albedo": 1.0, "world": 0.0, "sun": true})
@@ -86,7 +100,7 @@ func _ready() -> void:
 	var v5_off := await _render({"fog": false, "floor_albedo": 1.0, "world": 0.0, "sun": true})
 	var v5_on := await _render({"fog": true, "density": 0.5, "albedo": 0.0, "g": 0.0, "floor_albedo": 1.0, "world": 0.0, "sun": true})
 	var v5 := _crop(v5_on, 0.62, 0.80, 0.30, 0.70) / maxf(_crop(v5_off, 0.62, 0.80, 0.30, 0.70), 1e-9)
-	_check("V5 surface shadowing", v5, exp(-1.0), TOL_ANALYTIC)
+	_check("V5 surface shadowing", v5, _expected(0.62, 0.80, 0.30, 0.70, 0.5, "floor_shadowed"), TOL_ANALYTIC)
 
 	print("")
 	if _failures.is_empty():
@@ -193,6 +207,7 @@ func _render(p: Dictionary) -> Image:
 	add_child(cam)
 	cam.look_at(Vector3(0.0, 0.4, 0.0), Vector3.UP)
 	cam.make_current()
+	_cam = cam
 
 	var env := _new_env_sky(float(p.get("world", 0.0)))
 	env.set_pathtracing_max_bounces(4)
@@ -207,6 +222,62 @@ func _render(p: Dictionary) -> Image:
 		env.volumetric_fog_emission_energy = 1.0
 	await get_tree().create_timer(1.0).timeout
 	return await _render_accum(env, get_viewport().get_viewport_rid(), FRAMES)
+
+
+## Ray / box slab test on the padded fixture box; returns [t_in, t_out] or
+## an empty array.
+func _box_clip(o: Vector3, d: Vector3) -> Array:
+	var bmin := Vector3(-1.0 - BOX_PAD, 0.0 - BOX_PAD, -1.0 - BOX_PAD)
+	var bmax := Vector3(1.0 + BOX_PAD, 2.0 + BOX_PAD, 1.0 + BOX_PAD)
+	var t_in := 0.0
+	var t_out := 1e9
+	for i in range(3):
+		var di: float = d[i]
+		if absf(di) < 1e-9:
+			if o[i] < bmin[i] or o[i] > bmax[i]:
+				return []
+			continue
+		var ta: float = (bmin[i] - o[i]) / di
+		var tb: float = (bmax[i] - o[i]) / di
+		t_in = maxf(t_in, minf(ta, tb))
+		t_out = minf(t_out, maxf(ta, tb))
+	if t_out <= t_in:
+		return []
+	return [t_in, t_out]
+
+
+## Per-pixel analytic expectation over a crop, from the camera's own rays.
+##   wall_transmittance : exp(-sigma_t L) to the back wall
+##   emission           : E_eff (1 - exp(-sigma_t L_box)) / sigma_t, E_eff = 1 * 1 * sigma_t
+##   floor_shadowed     : exp(-sigma_t L_view to the floor) * exp(-sigma_t (box top - floor))
+func _expected(fy0: float, fy1: float, fx0: float, fx1: float, sigma_t: float, mode: String) -> float:
+	var w := get_window().size.x
+	var h := get_window().size.y
+	var acc := 0.0
+	var n := 0
+	for y in range(int(h * fy0), int(h * fy1)):
+		for x in range(int(w * fx0), int(w * fx1)):
+			var sp := Vector2(float(x) + 0.5, float(y) + 0.5)
+			var o := _cam.project_ray_origin(sp)
+			var d := _cam.project_ray_normal(sp)
+			var clip := _box_clip(o, d)
+			var v := 0.0
+			if clip.is_empty():
+				v = 1.0 if mode != "emission" else 0.0
+			elif mode == "wall_transmittance":
+				var t_wall: float = (WALL_Z - o.z) / d.z
+				v = exp(-sigma_t * maxf(minf(t_wall, clip[1]) - clip[0], 0.0))
+			elif mode == "emission":
+				var e_eff := 1.0 * 1.0 * sigma_t
+				v = e_eff * (1.0 - exp(-sigma_t * (clip[1] - clip[0]))) / sigma_t
+			else:
+				var t_floor: float = (FLOOR_Y - o.y) / d.y
+				var l_view: float = maxf(minf(t_floor, clip[1]) - clip[0], 0.0)
+				var l_sun: float = (2.0 + BOX_PAD) - FLOOR_Y
+				v = exp(-sigma_t * l_view) * exp(-sigma_t * l_sun)
+			acc += v
+			n += 1
+	return acc / float(maxi(n, 1))
 
 
 func _crop(p_img: Image, fy0: float, fy1: float, fx0: float, fx1: float) -> float:

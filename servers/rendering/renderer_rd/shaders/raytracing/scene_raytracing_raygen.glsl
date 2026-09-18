@@ -50,6 +50,14 @@ layout(location = 0) rayPayloadEXT PathPayload payload;
 // frame counter and a sample index alone (see rng_init call sites in main()).
 // When `p_is_sample_zero` is true, the primary-ray G-buffer / depth /
 // velocity / DLSS-RR writes fire (matches the original SAMPLE_ZERO_FLAG).
+// F2: a scatter event. Task 3: weight by the single-scattering albedo and end
+// the path (Cycles' volume_bounces = 0 terminates after the first scatter);
+// Task 4 adds the direct light at the scatter point.
+void volume_scatter_shade(uvec2 p_pixel, vec3 p_pos, vec3 p_ray_dir, vec3 p_throughput, inout PathState ps) {
+	ps.throughput = p_throughput * volume_albedo();
+	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+}
+
 vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_zero,
 		uint p_max_bounces, vec3 p_origin, vec3 p_dir) {
 	PathState ps;
@@ -97,9 +105,33 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 				? (RT_RAY_FLAGS & ~gl_RayFlagsCullBackFacingTrianglesEXT)
 				: RT_RAY_FLAGS;
 
+		// F2: draw the free-flight distance through the fog box BEFORE the trace
+		// and bound the trace by it. A hit closer than that is a transmit event
+		// (P(t_free > t) = exp(-sigma_t t), so throughput is unchanged -- analog
+		// tracking on a grey extinction); a miss inside it is a scatter event the
+		// miss stage marks and raygen shades below. Cycles makes the same
+		// scatter-or-transmit decision after the intersection
+		// (volume_integrate_homogeneous); the estimator is the same.
+		float t_max_this = RT_RAY_TMAX;
+		float vol_t_in = 0.0;
+		float vol_t_out = 0.0;
+		bool vol_in_box = false;
+		if (volume_active()) {
+			vol_in_box = volume_box_clip(ray_origin, ray_dir, t_min, RT_RAY_TMAX, vol_t_in, vol_t_out);
+			if (vol_in_box) {
+				RNGState vrng = rng_unpack(ps.rng_packed, p_pixel);
+				float u = rng_1d(vrng, RT_PRNG_VOLUME);
+				float t_free = vol_t_in - log(max(1.0 - u, 1e-7)) / volume_sigma_t();
+				if (t_free < vol_t_out) {
+					t_max_this = t_free;
+				}
+			}
+		}
+		const vec3 throughput_before = ps.throughput;
+
 #ifdef USE_SER
 		hitObjectEXT hitObject;
-		hitObjectTraceRayEXT(hitObject, tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, RT_RAY_TMAX, 0);
+		hitObjectTraceRayEXT(hitObject, tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, t_max_this, 0);
 
 		// Reorder with a coherence hint that has 8 bits
 		uint hint = 0;
@@ -111,10 +143,34 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 		hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-		traceRayEXT(tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, RT_RAY_TMAX, 0);
+		traceRayEXT(tlas, ray_flags, 0xFF, 0, 0, 0, ray_origin, t_min, ray_dir, t_max_this, 0);
 #endif
 
 		ps = path_unpack(payload);
+
+		if (volume_active() && vol_in_box) {
+			// Where this segment ended inside the box: the surface, the scatter
+			// point, or the far wall of the box. (The miss stage writes ps.hit_t =
+			// RT_RAY_TMAX on a sky miss and t_max_this on a scatter, so min() is
+			// right in every case.)
+			const bool scattered = (ps.mis_ray_pdf == RT_MIS_PDF_VOLUME_SCATTER);
+			const float t_end = min(ps.hit_t, vol_t_out);
+			// Emission along the in-box length, UNATTENUATED: the segment is
+			// already truncated at the free-flight draw, so the survival
+			// probability IS the transmittance and E * L has expectation
+			// E (1 - exp(-sigma_t L_box)) / sigma_t -- Cycles'
+			// volume_emission_integrate. (Weighting by (1 - e^-od) / sigma_t here
+			// as well attenuated twice: pt_volume_gate V2 read 0.435 for 0.632.)
+			const vec3 E = volume_emission();
+			if (any(greaterThan(E, vec3(0.0)))) {
+				ps.radiance += throughput_before * E * max(t_end - vol_t_in, 0.0);
+			}
+			if (scattered) {
+				const vec3 scatter_pos = ray_origin + ray_dir * t_max_this;
+				volume_scatter_shade(p_pixel, scatter_pos, ray_dir, throughput_before, ps);
+				break;
+			}
+		}
 		if (is_path_terminated(ps.packed_bounces_flags)) {
 			break;
 		}
@@ -300,6 +356,30 @@ void main() {
 		return;
 	}
 #endif
+
+	// F2: a trace bounded below RT_RAY_TMAX by raygen's free-flight draw that
+	// reached its bound is a SCATTER event inside the fog box, not the sky. Mark
+	// it and hand it back; raygen shades it. Primary sample-zero rays still feed
+	// the denoiser guides, as a miss does, with the fog's albedo and the ray
+	// direction (depth stays 0 -- haze reads as "far").
+	if (volume_active() && gl_RayTmaxEXT < RT_RAY_TMAX) {
+		ps.mis_ray_pdf = RT_MIS_PDF_VOLUME_SCATTER;
+		ps.hit_t = gl_RayTmaxEXT;
+		if (get_total_bounces(ps.packed_bounces_flags) == 0u && is_sample_zero(ps.packed_bounces_flags)) {
+			ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+			imageStore(rt_depth_image, pixel, vec4(0.0));
+#ifdef DLSS_RR_ENABLED
+			imageStore(dlss_rr_diffuse_albedo, pixel, vec4(volume_albedo(), 1.0));
+			imageStore(dlss_rr_specular_albedo, pixel, vec4(0.0));
+			imageStore(dlss_rr_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 1.0));
+			imageStore(dlss_rr_specular_hit_dist, pixel, vec4(-1.0));
+			rt_accum_guide_sample(pixel, volume_albedo(), -gl_WorldRayDirectionEXT);
+#endif
+		}
+		path_pack(payload, ps);
+		return;
+	}
+	ps.hit_t = RT_RAY_TMAX; // F2: raygen reads the segment end from here on a sky miss.
 
 	// Miss always ends the path.
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
