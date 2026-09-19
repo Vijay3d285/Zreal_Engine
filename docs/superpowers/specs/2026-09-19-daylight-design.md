@@ -105,10 +105,16 @@ accumulation:
 1. `env.tonemap_exposure = 1.0`. Reset the accumulator by toggling
    `env.pathtracing_accumulate` off, waiting one frame, on (finding 5).
    Drive 16 frames; read `viewport_get_pathtracing_accum_image`.
-2. **Occupancy mask.** Luminance (mean RGB) at a 4 × 4 subsample
-   (FHD → 480 × 270 samples). Pixels above **8 × the raw median** are the
-   sky through windows (physical sky is 50–100 × the wall); everything else
-   is "occupied". No depth buffer, no engine change.
+2. **Occupancy mask.** Luminance (mean RGB) of **4 × 4 box averages**
+   (`Image.shrink_x2()` twice, in C++; FHD → 480 × 270 samples). Pixels
+   above **8 × the raw median** are the sky through windows (physical sky is
+   50–100 × the wall); everything else is "occupied". No depth buffer, no
+   engine change. Box averages, not point samples: measured 2026-09-19 on
+   the gate's windowed room, the point-sampled median of a 16-frame probe
+   sat 7.5% under the 256-frame still's (the mean only 2%) — path-tracing
+   noise is right-skewed and the sample median of noisy pixels is biased
+   low; a 4 × 4 average cuts the per-sample variance 16 × and the skew with
+   it. At 64 frames the point-sampled median was within 0.5%.
 3. `median`, `p25` of the occupied set. **Exposure**
    `e = 0.18 / median`, clamped to [0.05, 50]; outside that range the log
    says `[Daylight] probe: exposure clamped — scene is not a lit interior`

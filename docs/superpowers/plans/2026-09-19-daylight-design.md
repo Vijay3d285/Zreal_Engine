@@ -15,7 +15,7 @@
 - `albedo_color` on a `StandardMaterial3D` is sRGB-encoded by the RT upload (`srgb_to_linear()`): every linear albedo in a gate is authored as `Color(a, a, a).linear_to_srgb()`. `metallic_specular = 0.0` on Lambertian probes.
 - Gate viewports: msaa/FXAA/TAA/debanding off, `SCALING_3D_MODE_BILINEAR @ 1.0`, `TONE_MAPPER_LINEAR`, `AMBIENT_SOURCE_DISABLED` (memory: gates reading the viewport inherit project AA).
 - The accumulator resets only on the accumulate toggle off→on (three settle frames each side — `PTValidation._render_accum`), a camera move, a resize or a shader-flag change. Exposure changes and added lights do **not** reset it.
-- Constants, verbatim from the spec: `DAYLIGHT_SUN_TO_SKY = 5.0` (the sun's `light_energy` is `SUN_TO_SKY / π`: energy E is irradiance πE in the tracer), `DAYLIGHT_TARGET_MEDIAN = 0.18`, `DAYLIGHT_FLOOR = 0.02`, `DAYLIGHT_MASK_RATIO = 8.0`, `DAYLIGHT_PROBE_FRAMES = 16`, `DAYLIGHT_PROBE_STEP = 4`, exposure clamp `[0.05, 50.0]`, fill share cap `0.5`, fill scan `f = 0.01 × 1.1ⁿ`.
+- Constants, verbatim from the spec: `DAYLIGHT_SUN_TO_SKY = 5.0` (the sun's `light_energy` is `SUN_TO_SKY / π`: energy E is irradiance πE in the tracer), probe statistics on 4 × 4 BOX AVERAGES (`shrink_x2()` twice), not point samples, `DAYLIGHT_TARGET_MEDIAN = 0.18`, `DAYLIGHT_FLOOR = 0.02`, `DAYLIGHT_MASK_RATIO = 8.0`, `DAYLIGHT_PROBE_FRAMES = 16`, `DAYLIGHT_PROBE_STEP = 4`, exposure clamp `[0.05, 50.0]`, fill share cap `0.5`, fill scan `f = 0.01 × 1.1ⁿ`.
 - `day_render` is `lighting_profile != "night"` (`image_glb_creation.gd:455`), so **sunset is a day render** and gets the same treatment.
 - Night renders must be byte-identical before/after (Task 7 measures the repeat floor first — memory: renders may or may not be reproducible).
 - The live project (`C:\Zlendo2026\ZlenderRender_stage_copy\godot_project`) is **not** edited by this plan; `pipeline_references/` is the reference copy the user mirrors across. `day.exr` (200 MB) lives only in the live project.
@@ -59,7 +59,7 @@ const EXPOSURE_MIN := 0.05
 const EXPOSURE_MAX := 50.0
 const FILL_SHARE_CAP := 0.5
 static func sky_irradiance(p_img: Image) -> float                      # upward-facing irradiance of an equirect panorama
-static func subsample(p_img: Image, p_step: int) -> PackedFloat32Array # mean-RGB luminance at every p_step-th pixel, row-major
+static func subsample(p_img: Image, p_step: int) -> PackedFloat32Array # mean-RGB luminance of p_step x p_step BOX AVERAGES (p_step a power of two), row-major
 static func stats(p_samples: PackedFloat32Array) -> Dictionary         # {raw_median, median, p25, occupied_fraction, exposure, clamped}
 static func solve_fill(p_s0: PackedFloat32Array, p_s1: PackedFloat32Array) -> Dictionary
                                                                        # {needed: bool, energy, exposure, median, p25, capped}
@@ -155,17 +155,28 @@ func _init() -> void:
 		print("  U5 SKIP: %s not present on this machine" % LIVE_DAY_EXR)
 
 	print("\n=== daylight_unit: subsample / stats ===")
-	# 40 x 20 image: left 30 columns at 0.1, right 10 columns at 20.0 (a "window").
+	# 40 x 20 image: left 32 columns at 0.1, right 8 columns at 20.0 (a "window"),
+	# the edge on a 4-pixel boundary so 4x4 box averages are pure.
 	var frame := Image.create(40, 20, false, Image.FORMAT_RGBF)
 	for y in range(20):
 		for x in range(40):
-			var l := 0.1 if x < 30 else 20.0
+			var l := 0.1 if x < 32 else 20.0
 			frame.set_pixel(x, y, Color(l, l, l))
-	var s := Daylight.subsample(frame, 2)
-	_check_true("S1 subsample count 20x10", s.size() == 200)
+	var s := Daylight.subsample(frame, 4)
+	_check_true("S1 subsample count 10x5", s.size() == 50)
+	# Box average, not point sample: a 4x4 block that is half 0.1 / half 0.3
+	# must read 0.2 (a point sample at its corner would read 0.1).
+	var checker := Image.create(4, 4, false, Image.FORMAT_RGBF)
+	for y in range(4):
+		for x in range(4):
+			var v := 0.1 if x < 2 else 0.3
+			checker.set_pixel(x, y, Color(v, v, v))
+	var sc := Daylight.subsample(checker, 4)
+	_check_true("S1b one block", sc.size() == 1)
+	_check("S1c block is the 4x4 mean", sc[0], 0.2, 1e-5)
 	var st := Daylight.stats(s)
-	_check("S2 raw median (window in the top quartile only)", st["raw_median"], 0.1, 1e-6)
-	_check("S3 occupied fraction 0.75", st["occupied_fraction"], 0.75, 1e-6)
+	_check("S2 raw median (window in the top quintile only)", st["raw_median"], 0.1, 1e-6)
+	_check("S3 occupied fraction 0.8", st["occupied_fraction"], 0.8, 1e-6)
 	_check("S4 occupied median 0.1", st["median"], 0.1, 1e-6)
 	_check("S5 exposure 0.18 / 0.1", st["exposure"], 1.8, 1e-6)
 	_check_true("S6 not clamped", not st["clamped"])
@@ -319,13 +330,24 @@ static func sky_irradiance(p_img: Image) -> float:
 	return e
 
 
-## Mean-RGB luminance at every p_step-th pixel in x and y, row-major.
+## Mean-RGB luminance of p_step x p_step BOX AVERAGES, row-major. p_step
+## must be a power of two (1, 2, 4, 8): each shrink_x2() halves the image
+## with an exact 2x2 mean in C++. Box averages rather than point samples:
+## the sample median of noisy pixels is biased low (path-tracing noise is
+## right-skewed) -- a point-sampled 16-frame probe read 7.5% under the
+## 256-frame still on the gate's windowed room; averaging 16 pixels first
+## cuts the per-sample variance 16x and the skew with it (spec section 2).
 static func subsample(p_img: Image, p_step: int) -> PackedFloat32Array:
-	var out := PackedFloat32Array()
+	var img := p_img.duplicate()
 	var step := maxi(1, p_step)
-	for y in range(0, p_img.get_height(), step):
-		for x in range(0, p_img.get_width(), step):
-			var c := p_img.get_pixel(x, y)
+	assert(step & (step - 1) == 0, "subsample: p_step must be a power of two")
+	while step > 1 and img.get_width() >= 2 and img.get_height() >= 2:
+		img.shrink_x2()
+		step /= 2
+	var out := PackedFloat32Array()
+	for y in range(img.get_height()):
+		for x in range(img.get_width()):
+			var c := img.get_pixel(x, y)
 			out.append((c.r + c.g + c.b) / 3.0)
 	return out
 
