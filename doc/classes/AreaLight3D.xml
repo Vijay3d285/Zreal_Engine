@@ -21,6 +21,9 @@
 		<member name="area_normalize_energy" type="bool" setter="set_area_normalize_energy" getter="is_area_normalizing_energy" default="true">
 			Defines whether the energy is normalized (divided) by the surface area of the light. If set to [code]true[/code], changing the size does not affect the total energy output, and does not dramatically alter the brightness of the scene.
 		</member>
+		<member name="area_portal" type="bool" setter="set_area_portal" getter="is_area_portal" default="false">
+			If [code]true[/code], this area light is a [b]light portal[/b]: it emits nothing, but the path tracer aims part of its sky (environment) sampling through the rectangle from every point in front of it, which removes most of the noise of daylight entering a room through a window. Place one in each window opening, in the wall plane, facing into the room. Ignored by the rasterizer.
+		</member>
 		<member name="area_range" type="float" setter="set_param" getter="get_param" default="5.0">
 			The range of the area in meters. This determines the maximum distance from any point on the area at which the area can still emit light.
 		</member>

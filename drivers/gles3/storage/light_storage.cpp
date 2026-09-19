@@ -219,6 +219,13 @@ void LightStorage::light_set_negative(RID p_light, bool p_enable) {
 	light->negative = p_enable;
 }
 
+void LightStorage::light_set_portal(RID p_light, bool p_enable) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+
+	light->portal = p_enable;
+}
+
 void LightStorage::light_set_cull_mask(RID p_light, uint32_t p_mask) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);

@@ -865,6 +865,15 @@ bool AreaLight3D::is_area_normalizing_energy() const {
 	return area_normalize_energy;
 }
 
+void AreaLight3D::set_area_portal(bool p_enable) {
+	area_portal = p_enable;
+	RS::get_singleton()->light_set_portal(light, p_enable);
+}
+
+bool AreaLight3D::is_area_portal() const {
+	return area_portal;
+}
+
 AreaLight3D::AreaLight3D() :
 		Light3D(RSE::LIGHT_AREA) {
 	// Decrease the default shadow bias to better suit most scenes.
@@ -885,10 +894,14 @@ void AreaLight3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_area_normalize_energy", "enable"), &AreaLight3D::set_area_normalize_energy);
 	ClassDB::bind_method(D_METHOD("is_area_normalizing_energy"), &AreaLight3D::is_area_normalizing_energy);
 
+	ClassDB::bind_method(D_METHOD("set_area_portal", "enable"), &AreaLight3D::set_area_portal);
+	ClassDB::bind_method(D_METHOD("is_area_portal"), &AreaLight3D::is_area_portal);
+
 	ADD_GROUP("Area", "area_");
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "area_range", PROPERTY_HINT_RANGE, "0,4096,0.001,or_greater,exp,suffix:m"), "set_param", "get_param", PARAM_RANGE);
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "area_attenuation", PROPERTY_HINT_RANGE, "-10,10,0.001,or_greater,or_less"), "set_param", "get_param", PARAM_ATTENUATION);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "area_normalize_energy"), "set_area_normalize_energy", "is_area_normalizing_energy");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "area_portal"), "set_area_portal", "is_area_portal");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR2, "area_size", PROPERTY_HINT_LINK, "suffix:m"), "set_area_size", "get_area_size");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "area_texture", PROPERTY_HINT_RESOURCE_TYPE, "Texture2D,-AnimatedTexture,-AtlasTexture,-CameraTexture,-CanvasTexture,-MeshTexture,-Texture2DRD,-ViewportTexture"), "set_area_texture", "get_area_texture");
 }

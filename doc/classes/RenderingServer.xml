@@ -2240,6 +2240,14 @@
 				If [code]true[/code], the 3D light will subtract light instead of adding light. Equivalent to [member Light3D.light_negative].
 			</description>
 		</method>
+		<method name="light_set_portal">
+			<return type="void" />
+			<param index="0" name="light" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<description>
+				If [code]true[/code], the area light is a light portal for the path tracer: it emits nothing and guides sky sampling through its rectangle. Equivalent to [member AreaLight3D.area_portal].
+			</description>
+		</method>
 		<method name="light_set_param">
 			<return type="void" />
 			<param index="0" name="light" type="RID" />

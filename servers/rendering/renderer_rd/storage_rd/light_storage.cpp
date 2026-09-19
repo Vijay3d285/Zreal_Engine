@@ -333,6 +333,14 @@ void LightStorage::light_set_negative(RID p_light, bool p_enable) {
 	light->negative = p_enable;
 }
 
+void LightStorage::light_set_portal(RID p_light, bool p_enable) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+
+	light->portal = p_enable;
+	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
+}
+
 void LightStorage::light_set_cull_mask(RID p_light, uint32_t p_mask) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
@@ -956,6 +964,11 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				spot_light_count++;
 			} break;
 			case RSE::LIGHT_AREA: {
+				if (light->portal) {
+					// A portal emits nothing (Cycles' Light::has_contribution
+					// is false for it); the path tracer reads it separately.
+					continue;
+				}
 				if (area_light_count >= max_lights) {
 					continue;
 				}
