@@ -340,7 +340,7 @@ static func sky_irradiance(p_img: Image) -> float:
 static func subsample(p_img: Image, p_step: int) -> PackedFloat32Array:
 	var img := p_img.duplicate()
 	var step := maxi(1, p_step)
-	assert(step & (step - 1) == 0, "subsample: p_step must be a power of two")
+	assert((step & (step - 1)) == 0, "subsample: p_step must be a power of two") # == binds tighter than & in GDScript
 	while step > 1 and img.get_width() >= 2 and img.get_height() >= 2:
 		img.shrink_x2()
 		step /= 2
