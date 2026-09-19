@@ -184,6 +184,13 @@ func set_resolution(data):
 	# scale = 1.0 → no resolution change, pure denoising pass only.
 	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_DLSS
 	get_viewport().scaling_3d_scale = 1.0
+	# NO SHARPENER ON A STILL. Godot's Viewport default fsr_sharpness is 0.2, and
+	# the DLSS effect runs an NIS sharpen pass at fsr_sharpness / 2 on its output
+	# (servers/rendering/renderer_rd/effects/dlss.cpp, "NIS support"). On job 217
+	# it doubled the number of hard one-pixel steps along edges (270 vs 124 with
+	# it off). Phase A never enters the DLSS branch, but the default would bite
+	# the moment the realtime route is switched back on, so it is zeroed here.
+	get_viewport().fsr_sharpness = 0.0
 	print("[Render] DLSS viewport mode enabled for Ray Reconstruction denoising.")
 
 

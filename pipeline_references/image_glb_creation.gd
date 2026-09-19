@@ -501,6 +501,7 @@ func build_scene(data):
 	
 	if day_render:
 		_create_window_portal_lights()
+		_create_window_portals()
 		# _create_day_ambient_fill(geom_data) -- NOT used in PT: every OmniLight casts
 		# PT shadows regardless of shadow_enabled. Use ambient_light_energy instead.
 		if _dir_light and not _directional_light_authoring_locked:
@@ -2997,6 +2998,38 @@ func _create_window_portal_lights() -> void:
 	# 	ambient_omni.light_specular = 0.0
 	# 	add_child(ambient_omni)
 	# 	print("  [AmbientOmni] Window ", i, " fill omni at ", ambient_omni.position)
+
+
+# ---------------------------------------------------------------------------
+# _create_window_portals
+# ---------------------------------------------------------------------------
+# Light portals (engine spec 2026-09-18-light-portals-design.md). An AreaLight3D
+# with area_portal is NOT a light: it emits nothing and casts nothing, the
+# raster ignores it, and the path tracer aims half of its sky samples through
+# the rectangle from every point that faces it -- Cycles' portal. One per
+# window opening, in the wall plane, facing into the room. The window glass
+# itself keeps cast_shadow OFF (Gap #30) so the sky gets through.
+# The portal spots (_create_window_portal_lights) stay for now; the daylight
+# design (Gap #31) is what replaces them.
+func _create_window_portals() -> void:
+	if not day_render or _window_sunlight_data.is_empty():
+		return
+	for i in range(_window_sunlight_data.size()):
+		var win = _window_sunlight_data[i]
+		var center = win["center"] as Vector3
+		var inner_dir = (win["inner_dir"] as Vector3).normalized()
+		var portal := AreaLight3D.new()
+		portal.name = "WindowPortal_" + str(i)
+		portal.area_size = Vector2(float(win["width"]), float(win["height"]))
+		portal.area_normalize_energy = false
+		portal.light_energy = 0.0
+		portal.shadow_enabled = false
+		# set(): a binary without the property ignores it instead of failing to parse.
+		portal.set("area_portal", true)
+		add_child(portal)
+		portal.position = center
+		portal.look_at(center + inner_dir, Vector3.UP) # -Z points into the room
+		print("  [Portal] window ", i, " at ", center, " size=", portal.area_size, " facing ", inner_dir)
 
 # Polygon (world XZ, metres) of the area the camera is standing in.
 # Mirrors scene_optimizer.py's active-room detection — the same ray-cast
