@@ -9,14 +9,16 @@ extends RefCounted
 ## node handed to probe().
 ##
 ## Units: the tracer reads a white Lambertian surface under a uniform sky of
-## radiance L as L (irradiance pi*L), and under a DirectionalLight3D of
-## energy E at incidence theta as E*cos(theta)/pi. The panorama is normalised
-## so a horizontal surface receives irradiance exactly 1 from the sky; the sun
-## is then SUN_TO_SKY in the same units.
+## radiance L as L (irradiance pi*L), and a DirectionalLight3D of energy E at
+## incidence theta reads E*cos(theta), i.e. irradiance pi*E*cos(theta) --
+## measured by pt_daylight_gate D2, 2026-09-19. The panorama is normalised so
+## a horizontal surface receives irradiance exactly 1 from the sky; the sun
+## is then SUN_TO_SKY in the same units, via SUN_ENERGY.
 
 ## Direct-normal over diffuse-horizontal irradiance for a 10 AM clear sky:
 ## ~90 klux direct vs ~18 klux diffuse. The one look-defining constant.
 const SUN_TO_SKY := 5.0
+const SUN_ENERGY := SUN_TO_SKY / PI  # DirectionalLight3D.light_energy: energy E is irradiance pi*E in the tracer
 ## Photographic mid-grey: the occupied frame's median after exposure.
 const TARGET_MEDIAN := 0.18
 ## Darkest occupied quarter must reach this after exposure, or a fill is added.
