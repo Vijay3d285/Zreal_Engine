@@ -21,9 +21,17 @@ extends "res://tests/pt_validation.gd"
 ##   D3 exposure: windowed room probe, then a FRAMES_HI still: occupied
 ##                median x e -> 0.18
 ##   D4 no fill : windowed room -> p25 x e >= 0.02, solver says no fill
-##   D5 fill    : dark room (opening bricked, albedo 0.3, one corner omni):
-##                solver places DaylightFill; rendered with it, p25 x e = 0.02
-##                and median x e = 0.18
+##   D5 fill model: the solver's decision is unit-tested on synthetic samples
+##                (daylight_unit.gd F1-F3); what a render can test is the
+##                physics it relies on -- per-pixel linearity in the fill's
+##                energy -- so D5 reuses D4's probes (no fill / fill at 1.0),
+##                builds the per-pixel linear model at D5_FILL_ENERGY, and
+##                compares it to a rendered still at that energy. (The
+##                original "dark room, solver places a fill" fixture is
+##                dropped: a single lamp in this closed box gives
+##                p25/median 0.73-0.80 whether or not it is partitioned, well
+##                short of the trigger's < 0.11, so the trigger cannot be
+##                staged in this room.)
 ##   D6 mask    : camera facing the window: excluded fraction vs the window's
 ##                projected area
 ##
@@ -38,7 +46,7 @@ const TOL_EXPOSURE := 0.05
 const TOL_FLOOR := 0.10
 const TOL_MASK := 0.20
 const ALBEDO := 0.8
-const ALBEDO_DARK := 0.3
+const D5_FILL_ENERGY := 0.5
 const PANO_W := 512
 const PANO_H := 256
 const SKY_ZENITH := 1.2
@@ -89,7 +97,7 @@ func _ready() -> void:
 	_check("D2 card x pi", _crop(d2, CARD_ROWS) * PI, expected_d2, TOL_ENERGY)
 
 	print("\n=== D3: probe exposure on the windowed room, checked on a %d-frame still ===" % FRAMES_HI)
-	var env3 := await _room_scene(ALBEDO, "open", "back", false)
+	var env3 := await _room_scene(ALBEDO, "open", "back")
 	var pr := await Daylight.probe(self, env3, get_viewport().get_viewport_rid())
 	var st := Daylight.stats(pr["samples"])
 	print("  probe: raw median %.5f occupied %.1f%% median %.5f p25 %.5f exposure %.3f%s" % [
@@ -101,7 +109,7 @@ func _ready() -> void:
 	_check("D3 still occupied median x e", st_hi["median"] * st["exposure"], Daylight.TARGET_MEDIAN, TOL_EXPOSURE)
 
 	print("\n=== D6: mask, camera facing the window ===")
-	var env6 := await _room_scene(ALBEDO, "open", "window", false)
+	var env6 := await _room_scene(ALBEDO, "open", "window")
 	var still6 := await _render_accum(env6, get_viewport().get_viewport_rid(), FRAMES_HI)
 	var st6 := Daylight.stats(_samples(still6))
 	# The window is a 1.2 x 1.0 m rectangle 3.5 m from the camera, on axis,
@@ -110,6 +118,43 @@ func _ready() -> void:
 	var half_extent := 3.5 * tan(deg_to_rad(30.0))
 	var window_fraction := (1.0 / (2.0 * half_extent)) * (1.2 / (2.0 * half_extent))
 	_check("D6 excluded fraction vs window area", 1.0 - st6["occupied_fraction"], window_fraction, TOL_MASK)
+
+	print("\n=== D4: no fill when the daylight reaches ===")
+	var env4 := await _room_scene(ALBEDO, "open", "back")
+	var pr4 := await Daylight.probe(self, env4, get_viewport().get_viewport_rid())
+	var fill4 := _add_fill(1.0)
+	var pr4b := await Daylight.probe(self, env4, get_viewport().get_viewport_rid())
+	fill4.queue_free()
+	var sol4 := Daylight.solve_fill(pr4["samples"], pr4b["samples"])
+	print("  p25 x e = %.4f (floor %.3f); solver needed=%s" % [sol4["p25"] * sol4["exposure"], Daylight.FLOOR, str(sol4["needed"])])
+	_check_true("D4 windowed room needs no fill", not sol4["needed"], "(p25 x e = %.4f)" % (sol4["p25"] * sol4["exposure"]))
+
+	print("\n=== D5: fill model -- rendered fill at energy %.2f vs the per-pixel linear model ===" % D5_FILL_ENERGY)
+	# Same room and probes as D4 (pr4 = no fill, pr4b = fill at 1.0). The solver's
+	# decision is unit-tested on synthetic samples (daylight_unit.gd F1-F3); what
+	# only a render can test is the physics it relies on: per-pixel linearity in
+	# the fill's energy, the placement rule, area_normalize_energy. (A closed
+	# diffuse box lit by one lamp never reaches the trigger's p25/median < 0.11 --
+	# bounces homogenise it to ~0.7-0.8, partition or not -- so the trigger is not
+	# staged here.)
+	var model := PackedFloat32Array()
+	var s0: PackedFloat32Array = pr4["samples"]
+	var s1: PackedFloat32Array = pr4b["samples"]
+	model.resize(mini(s0.size(), s1.size()))
+	for k in range(model.size()):
+		model[k] = s0[k] + D5_FILL_ENERGY * (s1[k] - s0[k])
+	var st_model := Daylight.stats(model)
+	var st_none := Daylight.stats(s0)
+	print("  model at %.2f: median %.5f p25 %.5f (no fill: median %.5f)" % [D5_FILL_ENERGY, st_model["median"], st_model["p25"], st_none["median"]])
+	_check_true("D5 premise: the fill contributes >= 20%% of the median", st_model["median"] >= 1.2 * st_none["median"],
+			"(%.3fx)" % (st_model["median"] / maxf(st_none["median"], 1e-9)))
+	var fill5 := _add_fill(D5_FILL_ENERGY)
+	var still5 := await _render_accum(env4, get_viewport().get_viewport_rid(), FRAMES_HI)
+	var st5r := Daylight.stats(_samples(still5))
+	print("  rendered: median %.5f p25 %.5f" % [st5r["median"], st5r["p25"]])
+	_check("D5 rendered median vs model", st5r["median"], st_model["median"], TOL_EXPOSURE)
+	_check("D5 rendered p25 vs model", st5r["p25"], st_model["p25"], TOL_FLOOR)
+	fill5.queue_free()
 
 	print("")
 	if _failures.is_empty():
@@ -263,9 +308,8 @@ func _crop(p_img: Image, p_r: Array) -> float:
 ## p_opening: "open" (the 1.2 x 1.0 window), "bricked" (no window).
 ## p_camera: "back" = (0,1.5,1.2) looking at (0,1.2,-1.5) as the portal gate;
 ##           "window" = (1.5,1.4,0) looking at (-2,1.4,0), the window centred.
-## p_omni adds D5's corner lamp. Returns the Environment; render with
-## _render_accum or Daylight.probe.
-func _room_scene(p_albedo: float, p_opening: String, p_camera: String, p_omni: bool) -> Environment:
+## Returns the Environment; render with _render_accum or Daylight.probe.
+func _room_scene(p_albedo: float, p_opening: String, p_camera: String) -> Environment:
 	await _clear()
 	var mat := _lambert(p_albedo)
 	_quad(Vector3(0.0, 0.0, 0.0), Vector2(4.0, 3.0), Vector3(-90.0, 0.0, 0.0), mat) # floor, faces +Y
@@ -280,17 +324,6 @@ func _room_scene(p_albedo: float, p_opening: String, p_camera: String, p_omni: b
 		_quad(Vector3(-2.0, 2.45, 0.0), Vector2(3.0, 1.1), Vector3(0.0, 90.0, 0.0), mat) # above
 		_quad(Vector3(-2.0, 1.4, -1.05), Vector2(0.9, 1.0), Vector3(0.0, 90.0, 0.0), mat) # z < -0.6
 		_quad(Vector3(-2.0, 1.4, 1.05), Vector2(0.9, 1.0), Vector3(0.0, 90.0, 0.0), mat) # z > 0.6
-	if p_omni:
-		# D5's "fixture": one shadowed omni in the camera's corner so the far
-		# corners are dark relative to the median by construction.
-		var lamp := OmniLight3D.new()
-		lamp.light_energy = 2.0
-		lamp.omni_range = 6.0
-		lamp.omni_attenuation = 1.0
-		lamp.light_specular = 0.0
-		lamp.shadow_enabled = true
-		add_child(lamp)
-		lamp.position = Vector3(1.6, 2.5, 1.2)
 	var cam := Camera3D.new()
 	cam.fov = 60.0
 	cam.keep_aspect = Camera3D.KEEP_HEIGHT
@@ -313,3 +346,23 @@ func _room_scene(p_albedo: float, p_opening: String, p_camera: String, p_omni: b
 ## statistics the probe takes.
 func _samples(p_img: Image) -> PackedFloat32Array:
 	return Daylight.subsample(p_img, Daylight.PROBE_STEP)
+
+
+## The DaylightFill as the pipeline places it: room centroid, 0.3 m below the
+## ceiling, 0.6 x the room's extent, facing down, no shadows, normalised.
+## Room here is the gate's 4 x 3 x 3 m box.
+func _add_fill(p_energy: float) -> AreaLight3D:
+	var fill := AreaLight3D.new()
+	fill.name = "DaylightFill"
+	fill.area_size = Vector2(4.0 * 0.6, 3.0 * 0.6)
+	fill.area_normalize_energy = true
+	fill.light_energy = p_energy
+	fill.light_color = Color(1.0, 1.0, 1.0)
+	fill.light_specular = 0.0
+	fill.shadow_enabled = false
+	fill.set_param(Light3D.PARAM_RANGE, 2.0 * sqrt(4.0 * 4.0 + 3.0 * 3.0) + 4.0)
+	fill.set_param(Light3D.PARAM_ATTENUATION, 1.0)
+	add_child(fill)
+	fill.position = Vector3(0.0, 3.0 - 0.3, 0.0)
+	fill.rotation_degrees = Vector3(-90.0, 0.0, 0.0) # -Z points down
+	return fill
