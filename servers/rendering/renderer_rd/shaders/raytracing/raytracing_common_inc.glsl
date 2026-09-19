@@ -202,4 +202,6 @@ hitAttributeEXT HitAttribs hit_attribs;
 // line is textually after it. See raytracing_env_sampling_inc.glsl's header for why
 // it cannot live in raytracing_inc.glsl instead (that file precedes scene_data_block's
 // declaration in every stage).
+// Light portals: declared before the sky sampler, which mixes them in.
+#include "raytracing_portal_inc.glsl"
 #include "raytracing_env_sampling_inc.glsl"

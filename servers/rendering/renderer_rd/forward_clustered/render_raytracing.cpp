@@ -262,6 +262,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
 	}
+	if (p_state->portal_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->portal_buffer);
+	}
 	if (p_state->ies_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->ies_buffer);
 	}
@@ -3498,8 +3501,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 // Light gathering
 // ---------------------------------------------------------------------------
 
-uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights) {
+uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, RT_PortalData *r_portal_data, uint32_t &r_portal_count) {
 	uint32_t rt_light_count = 0;
+	r_portal_count = 0;
 
 	if (!p_render_data || !p_render_data->lights) {
 		return rt_light_count;
@@ -3555,6 +3559,9 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	// Helper: score a positional light and add to candidates.
 	auto score_positional_light = [&](RID light_instance) {
 		RID base = ls->light_instance_get_base_light(light_instance);
+		if (ls->light_get_type(base) == RSE::LIGHT_AREA && ls->light_is_portal(base)) {
+			return; // A portal is not a light: never a candidate for NEE.
+		}
 		Transform3D xform = ls->light_instance_get_base_transform(light_instance);
 		Vector3 light_pos = xform.origin;
 		float dist_sq = cam_pos.distance_squared_to(light_pos);
@@ -3647,14 +3654,23 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.position[1] = xform.origin.y;
 		ld.position[2] = xform.origin.z;
 		float spot_angle_deg = (type == RSE::LIGHT_SPOT) ? ls->light_get_param(base, RSE::LIGHT_PARAM_SPOT_ANGLE) : 0.0f;
-		if (type == RSE::LIGHT_SPOT && spot_angle_deg >= 179.9f) {
+		if (type == RSE::LIGHT_AREA || (type == RSE::LIGHT_SPOT && spot_angle_deg >= 179.9f)) {
+			// AreaLight3D is a rectangle; so is the 179.9 deg SpotLight3D
+			// convention (size = half-width, spot_angle_attenuation = half-height).
 			ld.type = RT_LIGHT_TYPE_RECT;
 		} else {
 			ld.type = (type == RSE::LIGHT_SPOT) ? RT_LIGHT_TYPE_SPOT : RT_LIGHT_TYPE_OMNI;
 		}
 
 		Color linear_col = ls->light_get_color(base).srgb_to_linear();
-		float energy = compute_light_energy(base, type);
+		// An AreaLight3D takes the spot conversion so the two rect paths agree;
+		// with area_normalize_energy the raster divides by the surface area
+		// (light_storage.cpp update_light_buffers), and so do we.
+		float energy = compute_light_energy(base, type == RSE::LIGHT_AREA ? RSE::LIGHT_SPOT : type);
+		if (type == RSE::LIGHT_AREA && ls->light_area_get_normalize_energy(base)) {
+			Vector2 area_size = ls->light_area_get_size(base);
+			energy /= MAX(area_size.x * area_size.y, 1e-6f);
+		}
 		ld.emission[0] = linear_col.r * energy;
 		ld.emission[1] = linear_col.g * energy;
 		ld.emission[2] = linear_col.b * energy;
@@ -3674,8 +3690,16 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		if (ld.type == RT_LIGHT_TYPE_RECT) {
 			Vector3 local_x = xform.basis.get_column(0).normalized();
 			Vector3 local_y = xform.basis.get_column(1).normalized();
-			float hw = ls->light_get_param(base, RSE::LIGHT_PARAM_SIZE); // half-width
-			float hh = ls->light_get_param(base, RSE::LIGHT_PARAM_SPOT_ATTENUATION); // half-height
+			float hw;
+			float hh;
+			if (type == RSE::LIGHT_AREA) {
+				Vector2 area_size = ls->light_area_get_size(base);
+				hw = area_size.x * 0.5f;
+				hh = area_size.y * 0.5f;
+			} else {
+				hw = ls->light_get_param(base, RSE::LIGHT_PARAM_SIZE); // half-width
+				hh = ls->light_get_param(base, RSE::LIGHT_PARAM_SPOT_ATTENUATION); // half-height
+			}
 			Vector3 axisU = local_x * hw;
 			Vector3 axisV = local_y * hh;
 			ld.spot_direction[0] = axisU.x;
@@ -3726,13 +3750,58 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		// -90 deg X correction that sends its default nadir to world -Y (down),
 		// while still letting node rotation re-aim the profile.
 		Transform3D ies_xform = xform;
-		if (type != RSE::LIGHT_SPOT) {
+		if (type != RSE::LIGHT_SPOT && type != RSE::LIGHT_AREA) {
 			ies_xform.basis = xform.basis * Basis(Vector3(1, 0, 0), Math::deg_to_rad(-90.0));
 		}
 		pack_light_basis(ld, ies_xform);
 		ld._ies_pad[0] = 0.0f;
 		ld._ies_pad[1] = 0.0f;
 		rt_light_count++;
+	}
+
+	// Light portals: AreaLight3D with area_portal, from the AABB-culled RT
+	// list. Not lights -- the sky sampler reads them (raytracing_portal_inc.glsl).
+	if (p_render_data->rt_lights && r_portal_data) {
+		const PagedArray<RID> &rt_lights = *p_render_data->rt_lights;
+		for (uint32_t li = 0; li < (uint32_t)rt_lights.size(); li++) {
+			RID light_instance = rt_lights[li];
+			RID base = ls->light_instance_get_base_light(light_instance);
+			if (ls->light_get_type(base) != RSE::LIGHT_AREA || !ls->light_is_portal(base)) {
+				continue;
+			}
+			if (r_portal_count >= RT_PORTALS_MAX) {
+				static bool warned = false;
+				if (!warned) {
+					WARN_PRINT(vformat("Path tracer: more than %d light portals in view; the rest are ignored.", (int)RT_PORTALS_MAX));
+					warned = true;
+				}
+				break;
+			}
+			Transform3D xform = ls->light_instance_get_base_transform(light_instance);
+			Basis b = xform.basis.orthonormalized();
+			Vector3 axis_u = b.get_column(0);
+			Vector3 axis_v = b.get_column(1);
+			Vector3 dir = -b.get_column(2); // Godot lights face their local -Z.
+			Vector2 area_size = ls->light_area_get_size(base);
+			RT_PortalData &pd = r_portal_data[r_portal_count];
+			pd.position[0] = xform.origin.x;
+			pd.position[1] = xform.origin.y;
+			pd.position[2] = xform.origin.z;
+			pd._pad0 = 0.0f;
+			pd.axis_u[0] = axis_u.x;
+			pd.axis_u[1] = axis_u.y;
+			pd.axis_u[2] = axis_u.z;
+			pd.len_u = MAX(area_size.x, 1e-4f);
+			pd.axis_v[0] = axis_v.x;
+			pd.axis_v[1] = axis_v.y;
+			pd.axis_v[2] = axis_v.z;
+			pd.len_v = MAX(area_size.y, 1e-4f);
+			pd.dir[0] = dir.x;
+			pd.dir[1] = dir.y;
+			pd.dir[2] = dir.z;
+			pd._pad1 = 0.0f;
+			r_portal_count++;
+		}
 	}
 
 	return rt_light_count;
@@ -4305,10 +4374,13 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// --- Light gathering ---
 		uint32_t rt_light_count = 0;
 		RT_LightData rt_light_data[RT_LIGHTS_MAX] = {};
+		RT_PortalData rt_portal_data[RT_PORTALS_MAX] = {};
+		uint32_t rt_portal_count = 0;
 
-		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX);
+		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX, rt_portal_data, rt_portal_count);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PORTAL_COUNT] = float(rt_portal_count);
 
 		// Upload light buffer.
 		{
@@ -4318,6 +4390,18 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				RD::get_singleton()->set_resource_name(p_state->light_buffer, "RT Light Buffer");
 			}
 			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, buf_size, rt_light_data);
+		}
+
+		// Upload the portal buffer (binding 41). Always uploaded: the shader
+		// reads RT_PARAM_PORTAL_COUNT entries and a stale buffer would be read
+		// the frame after the last portal leaves.
+		{
+			uint32_t buf_size = RT_PORTALS_MAX * sizeof(RT_PortalData);
+			if (!p_state->portal_buffer.is_valid()) {
+				p_state->portal_buffer = RD::get_singleton()->storage_buffer_create(buf_size);
+				RD::get_singleton()->set_resource_name(p_state->portal_buffer, "RT Portal Buffer");
+			}
+			RD::get_singleton()->buffer_update(p_state->portal_buffer, 0, buf_size, rt_portal_data);
 		}
 
 		// Upload IES photometric profile buffer. IESManager is a shared singleton, so its
@@ -4607,6 +4691,19 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 40;
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rb_data->rt_get_accum_normal_texture());
+		uniforms.push_back(u);
+	}
+
+	// Binding 41: light portals (SSBO, raytracing_portal_inc.glsl).
+	{
+		RD::Uniform u;
+		u.binding = 41;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (p_state->portal_buffer.is_valid()) {
+			u.append_id(p_state->portal_buffer);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
 		uniforms.push_back(u);
 	}
 

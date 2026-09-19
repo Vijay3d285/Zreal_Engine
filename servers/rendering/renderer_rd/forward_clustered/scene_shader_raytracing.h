@@ -209,6 +209,7 @@ public:
 	// F2 volumetrics: shader-side rt_params indices 16-34 (raytracing_inc.glsl).
 	static constexpr int RT_PARAM_VOLUME_SIGMA_T = 16;
 	static constexpr int RT_PARAM_VOLUME_G = 17;
+	static constexpr int RT_PARAM_PORTAL_COUNT = 18; // live light portals (raytracing_portal_inc.glsl)
 	static constexpr int RT_PARAM_VOLUME_ALBEDO_R = 20;
 	static constexpr int RT_PARAM_VOLUME_EMISSION_R = 24;
 	static constexpr int RT_PARAM_VOLUME_BOX_MIN_X = 28;

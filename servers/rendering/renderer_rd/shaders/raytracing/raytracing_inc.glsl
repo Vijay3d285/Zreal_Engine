@@ -35,6 +35,7 @@
 // live in the second block. All linear, energy applied on the CPU.
 #define RT_PARAM_VOLUME_SIGMA_T 16 // rt_params[4].x - extinction per metre (Environment.volumetric_fog_density)
 #define RT_PARAM_VOLUME_G 17 // rt_params[4].y - Henyey-Greenstein anisotropy
+#define RT_PARAM_PORTAL_COUNT 18 // rt_params[4].z - live light portals (raytracing_portal_inc.glsl)
 #define RT_PARAM_VOLUME_ALBEDO_R 20 // rt_params[5].xyz - single-scattering albedo
 #define RT_PARAM_VOLUME_EMISSION_R 24 // rt_params[6].xyz - emission per metre, already x energy x density
 #define RT_PARAM_VOLUME_BOX_MIN_X 28 // rt_params[7].xyz - world-space box (the scene's AABB, padded 1 cm)

@@ -211,9 +211,31 @@ static_assert(offsetof(RT_LightData, rect_half_height) == 76, "RT_LightData::rec
 static_assert(offsetof(RT_LightData, rect_axis_v) == 80, "RT_LightData::rect_axis_v must sit at offset 80 to match std430");
 static_assert(offsetof(RT_LightData, ies_slot) == 96, "RT_LightData::ies_slot must sit at offset 96 to match std430");
 
+// Light portals (spec 2026-09-18-light-portals-design.md). A portal is a
+// sampling hint for the sky, not a light: Cycles keeps them after the real
+// lights in one array (scene/light.cpp:1416); ours get a buffer of their own
+// because the miss stage -- which evaluates the portal pdf for MIS -- does not
+// include the light buffer. Centre, unit axes, full side lengths and the
+// facing direction (the light's -Z), i.e. Cycles' klight->area fields.
+// MIRRORED IN raytracing_portal_inc.glsl (RTPortalData).
+struct alignas(16) RT_PortalData {
+	float position[3];
+	float _pad0;
+	float axis_u[3];
+	float len_u;
+	float axis_v[3];
+	float len_v;
+	float dir[3];
+	float _pad1;
+};
+static_assert(sizeof(RT_PortalData) == 64, "RT_PortalData must be 64 bytes for std430");
+static_assert(offsetof(RT_PortalData, axis_u) == 16, "RT_PortalData::axis_u must sit at offset 16");
+static_assert(offsetof(RT_PortalData, dir) == 48, "RT_PortalData::dir must sit at offset 48");
+
 
 enum {
 	RT_LIGHTS_MAX = 64,
+	RT_PORTALS_MAX = 16, // Light portals (RT_PortalData), binding 41.
 	RT_LIGHTS_FRUSTUM_BUDGET = 48,
 	RT_LIGHTS_INDIRECT_BUDGET = RT_LIGHTS_MAX - RT_LIGHTS_FRUSTUM_BUDGET,
 };
@@ -414,6 +436,7 @@ struct RTViewportState {
 	uint32_t motion_transform_buffer_capacity = 0;
 
 	RID light_buffer;
+	RID portal_buffer; // RT_PORTALS_MAX x RT_PortalData, binding 41.
 	RID ies_buffer; // GPU SSBO for packed IES photometric profile data.
 	uint32_t ies_buffer_bytes = 0; // Tracks allocated size to detect resize need.
 	RID params_buffer;
@@ -711,7 +734,7 @@ public:
 	void cleanup_caches();
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
-	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);
+	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, RT_PortalData *r_portal_data, uint32_t &r_portal_count);
 	/// Walks this frame's per-instance arrays and collects the emissive ones.
 	/// Returns the number kept (<= EmissiveLights::INSTANCES_MAX). `r_slots` is
 	/// sized to the FULL instance count, -1 where the instance is not emissive.
