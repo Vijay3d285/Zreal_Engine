@@ -861,17 +861,6 @@ func setup_lighting(data, geom_data = {}):
 
 	env.tonemap_exposure = lighting["tonemap_exposure"]
 	if day_render:
-		# Global day exposure. This multiplies EVERYTHING — sun, sky ambient, portals,
-		# fixtures — so it is the right knob when the whole frame sits too high, and the
-		# wrong one when only part of it does (for shadow/corner lift use
-		# ambient_light_energy below; for hot sun pools use the sun energy).
-		# History: 1.5 -> 1.4 -> 1.0 (the value this block's comment and its log line
-		# had always claimed) -> 1.3, dialed back up because 1.0 read slightly dark
-		# once the portal/fixture cuts were already in place.
-		# MUST stay in step with video_glb_creation.gd — a still and the walkthrough of
-		# the same room get compared side by side. Change both together.
-		# If this needs adjusting again, move it here rather than re-inflating the
-		# per-light energies that were tuned underneath it.
 		# Daylight design (spec 2026-09-19): exposure is MEASURED per job by
 		# Daylight.probe() in render.gd (occupied median -> 0.18) and set there;
 		# 1.0 here is a placeholder the probe overwrites. ambient_light_energy is
