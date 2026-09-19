@@ -220,12 +220,23 @@ forgotten multiplier reads 2.4 ×, not 1 ×.
 | D2 sun ratio | D1 + sun at 45° elevation, energy 5/π | card crop mean × π | 1 + 5 cos 45° ± 3% |
 | D3 exposure | windowed room, probe, then 64-frame still | occupied median × e | 0.18 ± 5% |
 | D4 no fill when lit | windowed room | `DaylightFill` absent; p25 · e ≥ 0.02 | pass/fail |
-| D5 fill when dark | window bricked (a sixth quad), no fixtures | `DaylightFill` present; p25 · e | 0.02 ± 10%, median 0.18 ± 5% |
+| D5 fill model | the windowed room, probes without and with the fill at energy 1; then the fill rendered at energy 0.5 | rendered occupied median and p25 vs the per-pixel linear model `L₀ + 0.5·(L₁ − L₀)` | median ± 5%, p25 ± 10%; premise: the model's median at 0.5 ≥ 1.2 × without the fill (else the fixture cannot test linearity — red) |
 | D6 mask | windowed room, camera facing the window | excluded fraction vs the window's projected pixel area | ± 20% |
 
 D1 and D2 are red if the multiplier or the sun energy is ignored; D3–D5 are
 red if the probe reads the wrong buffer (exposure-baked values make D3 read
 0.18 for any `e`); D6 is red if the 8 × mask swallows a bright wall.
+
+D5 tests the physics the fill solver relies on (per-pixel linearity in the
+fill's energy, the placement rule, `area_normalize_energy`), not the
+decision: the decision — trigger at `p25 · e < 0.02`, exposure recomputed
+with the fill, the share cap — is exercised on synthetic samples by the
+unit checks F1–F3 (`tests/daylight_unit.gd`). Measured 2026-09-19: no
+closed diffuse box lit by one lamp reaches the trigger's `p25 / median <
+0.11` — bounces homogenise it to ≈ 0.7–0.8 with or without a partition
+(the first draft's "bricked room, no fixtures" is degenerate: 100% fill at
+any energy). The trigger is a high-contrast condition by design; on the
+four real jobs the log says whether it fired.
 
 ## The four jobs
 
