@@ -903,7 +903,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `pipeline_references/tests/pt_daylight_gate.gd`
 
 **Interfaces:**
-- Consumes: `Daylight.solve_fill`, `Daylight.FLOOR` (Task 1); `_room_scene` (Task 3).
+- Consumes: `Daylight.solve_fill`, `Daylight.FLOOR`, `Daylight.stats` (Task 1); `_room_scene` (Task 3).
+- Adds the constant `const D5_FILL_ENERGY := 0.5` next to the other tolerances. `ALBEDO_DARK` is no longer used by any probe: delete it, and do not add `p_omni`/`p_partition` fixtures (measured 2026-09-19: a single lamp in the closed box gives p25/median ≈ 0.73–0.80, with or without a partition — the trigger cannot be staged in this room; the decision is unit-tested F1–F3).
 - Produces: `_add_fill(p_energy: float) -> AreaLight3D` — the same placement rule `render.gd` will use in Task 6 (centroid, ceiling − 0.3, 0.6 × extent, down, shadows off, normalised).
 
 - [ ] **Step 1: Add the fill builder and D4/D5**
@@ -944,42 +945,43 @@ In `_ready()`, after D6:
 	print("  p25 x e = %.4f (floor %.3f); solver needed=%s" % [sol4["p25"] * sol4["exposure"], Daylight.FLOOR, str(sol4["needed"])])
 	_check_true("D4 windowed room needs no fill", not sol4["needed"], "(p25 x e = %.4f)" % (sol4["p25"] * sol4["exposure"]))
 
-	print("\n=== D5: fill when dark (bricked, albedo %.1f, corner lamp) ===" % ALBEDO_DARK)
-	var env5 := await _room_scene(ALBEDO_DARK, "bricked", "back", true)
-	var pr5 := await Daylight.probe(self, env5, get_viewport().get_viewport_rid())
-	var st5 := Daylight.stats(pr5["samples"])
-	print("  before: median %.5f p25 %.5f e %.3f p25 x e %.4f" % [st5["median"], st5["p25"], st5["exposure"], st5["p25"] * st5["exposure"]])
-	_check_true("D5 premise: dark corners below the floor before the fill", st5["p25"] * st5["exposure"] < Daylight.FLOOR,
-			"(p25 x e = %.4f)" % (st5["p25"] * st5["exposure"]))
-	var fill5 := _add_fill(1.0)
-	var pr5b := await Daylight.probe(self, env5, get_viewport().get_viewport_rid())
-	var sol5 := Daylight.solve_fill(pr5["samples"], pr5b["samples"])
-	print("  solver: needed=%s energy %.4f exposure %.3f capped=%s (model median %.5f p25 %.5f)" % [
-			str(sol5["needed"]), sol5["energy"], sol5["exposure"], str(sol5["capped"]), sol5["median"], sol5["p25"]])
-	_check_true("D5 solver places a fill", sol5["needed"])
-	fill5.light_energy = sol5["energy"]
-	var still5 := await _render_accum(env5, get_viewport().get_viewport_rid(), FRAMES_HI)
+	print("\n=== D5: fill model -- rendered fill at energy %.2f vs the per-pixel linear model ===" % D5_FILL_ENERGY)
+	# Same room and probes as D4 (pr4 = no fill, pr4b = fill at 1.0). The solver's
+	# decision is unit-tested on synthetic samples (daylight_unit.gd F1-F3); what
+	# only a render can test is the physics it relies on: per-pixel linearity in
+	# the fill's energy, the placement rule, area_normalize_energy. (A closed
+	# diffuse box lit by one lamp never reaches the trigger's p25/median < 0.11 --
+	# bounces homogenise it to ~0.7-0.8, partition or not -- so the trigger is not
+	# staged here.)
+	var model := PackedFloat32Array()
+	var s0: PackedFloat32Array = pr4["samples"]
+	var s1: PackedFloat32Array = pr4b["samples"]
+	model.resize(mini(s0.size(), s1.size()))
+	for k in range(model.size()):
+		model[k] = s0[k] + D5_FILL_ENERGY * (s1[k] - s0[k])
+	var st_model := Daylight.stats(model)
+	var st_none := Daylight.stats(s0)
+	print("  model at %.2f: median %.5f p25 %.5f (no fill: median %.5f)" % [D5_FILL_ENERGY, st_model["median"], st_model["p25"], st_none["median"]])
+	_check_true("D5 premise: the fill contributes >= 20%% of the median", st_model["median"] >= 1.2 * st_none["median"],
+			"(%.3fx)" % (st_model["median"] / maxf(st_none["median"], 1e-9)))
+	var fill5 := _add_fill(D5_FILL_ENERGY)
+	var still5 := await _render_accum(env4, get_viewport().get_viewport_rid(), FRAMES_HI)
 	var st5r := Daylight.stats(_samples(still5))
-	_check("D5 rendered median x e", st5r["median"] * sol5["exposure"], Daylight.TARGET_MEDIAN, TOL_EXPOSURE)
-	if sol5["capped"]:
-		print("  D5 fill was capped at share %.2f; the floor check below is informational" % Daylight.FILL_SHARE_CAP)
-		_checks += 1
-		if st5r["p25"] * sol5["exposure"] > Daylight.FLOOR * (1.0 + TOL_FLOOR):
-			_failures.append("D5 capped fill overshoots the floor: p25 x e = %.4f" % (st5r["p25"] * sol5["exposure"]))
-	else:
-		_check("D5 rendered p25 x e", st5r["p25"] * sol5["exposure"], Daylight.FLOOR, TOL_FLOOR)
+	print("  rendered: median %.5f p25 %.5f" % [st5r["median"], st5r["p25"]])
+	_check("D5 rendered median vs model", st5r["median"], st_model["median"], TOL_EXPOSURE)
+	_check("D5 rendered p25 vs model", st5r["p25"], st_model["p25"], TOL_FLOOR)
 	fill5.queue_free()
 ```
 
 - [ ] **Step 2: Run at 64 frames**
 
-Same command as Task 3 Step 2. Expected: D4 no fill; D5 premise holds, solver places a fill, rendered median × e = 0.18 ± 5%, p25 × e = 0.02 ± 10%. If the D5 premise fails (corners not dark enough), move the lamp closer to the camera corner (`(1.8, 2.7, 1.3)`) or drop `ALBEDO_DARK` to 0.2 — change the fixture, not the bar. If the rendered p25 × e misses by more than 10% while the model said 0.02, the per-pixel linearity assumption broke: print the model's `p25` against the render's at the solved energy; a rect light with `area_normalize_energy` is linear in energy, so look for the probe reading a stale buffer (the settle frames) first.
+Same command as Task 3 Step 2. Expected: D4 no fill; D5 premise holds (a 0.5-energy fill in the windowed room adds well over 20% to the median — if not, raise `D5_FILL_ENERGY`, it is a fixture constant, and say so), rendered median within 5% and p25 within 10% of the model. If the rendered values miss, the per-pixel linearity assumption broke: a rect light with `area_normalize_energy` is linear in energy, so look for the probe reading a stale buffer (the settle frames) first, then for `_add_fill` placing the light somewhere the 16-frame probe undersamples.
 
 - [ ] **Step 3: Default frames, commit**
 
 ```bash
 git add pipeline_references/tests/pt_daylight_gate.gd
-git commit -m "test(pt): daylight gate D4/D5 -- no fill on the lit room; a measured fill lands the dark room on 0.18 / 0.02
+git commit -m "test(pt): daylight gate D4/D5 -- no fill on the lit room; a rendered fill matches the per-pixel linear model the solver relies on
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ```
@@ -1507,6 +1509,6 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 ## Self-review (done while writing)
 
 - **Spec coverage.** §1 → Task 5 Steps 1–2 (+ gate D0–D2, Task 2). §2 → Task 1 (`stats`, `probe`), Task 6 Step 2–3, gate D3/D6 (Task 3). §3 → Task 1 (`solve_fill`), Task 6 Step 3 (`_place_daylight_fill`), gate D4/D5 (Task 4). §4 → Task 5 Steps 3–5, Task 6 Step 1. §5 → nothing to do. Gate table → Tasks 2–4. Four jobs → Task 8. Night identity + suite → Task 7. Measured section + roadmap → Task 9.
-- **Deviations from the spec, on record.** (1) The spec's D5 fixture ("window bricked up, fixtures off") is degenerate — a black room plus a fill is 100% fill at any energy and the share cap fires at the first step — so D5 uses a bricked room with albedo 0.3 and one shadowed corner omni, which gives dark corners relative to the median by construction; the gate asserts that premise before the fill. (2) D6 may need the panorama at 20× to put the window above 8× the wall (the gate's normalised sky is only ≈ 4.5× a 0.8 wall); Task 3 says when and records it. (3) The `[Sun] blur=1.2, angular=0.8` literals are printed from the live values if they differ.
+- **Deviations from the spec, on record.** (1) D5 is the fill *model* test (rendered fill at 0.5 vs the per-pixel linear prediction), not a staged dark room: the spec's first fixture was degenerate and no single-lamp box reaches the trigger (spec, gate table note); the decision logic is unit-tested F1–F3. (2) D6 may need the panorama at 20× to put the window above 8× the wall (the gate's normalised sky is only ≈ 4.5× a 0.8 wall); Task 3 says when and records it. (3) The `[Sun] blur=1.2, angular=0.8` literals are printed from the live values if they differ.
 - **Placeholders.** `2026-09-xx` in Task 9 is the date of the run, filled in at execution; `<v>` in the Measured template are the measured values — both are execution-time inputs, not design gaps. No "TBD"/"handle edge cases".
 - **Type consistency.** `Daylight.probe` returns `{samples: PackedFloat32Array, width, height}`; `stats` and `solve_fill` take `PackedFloat32Array`; `solve_fill` returns `{needed, energy, exposure, median, p25, capped}` — used with those keys in Tasks 4, 6. `_room_scene` returns `Environment`; `_add_fill`/`_place_daylight_fill` return `AreaLight3D`. `reset_accumulator(p_node, p_env)` used in Task 6 as defined in Task 1.
