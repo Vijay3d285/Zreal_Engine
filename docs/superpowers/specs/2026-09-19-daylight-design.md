@@ -77,9 +77,14 @@ run the same code, plus the call sites below. Nothing in `servers/` changes.
 
 Sun (day branch of `setup_lighting`):
 
-- `light_energy = DAYLIGHT_SUN_TO_SKY` = **5.0** — direct-normal over
-  diffuse-horizontal irradiance for a 10 AM clear sky (~90 klux direct vs
-  ~18 klux diffuse). One constant, with this measurement in its comment.
+- `DAYLIGHT_SUN_TO_SKY` = **5.0** — direct-normal over diffuse-horizontal
+  irradiance for a 10 AM clear sky (~90 klux direct vs ~18 klux diffuse).
+  One constant, with this measurement in its comment. The sun's
+  `light_energy` is **`SUN_TO_SKY / π ≈ 1.59`**: in the tracer (as in
+  Godot's raster) a `DirectionalLight3D` of energy E delivers irradiance
+  π·E — a white Lambertian reads `E·cosθ`, not `E·cosθ/π`. Measured by the
+  gate's D2 on 2026-09-19 (light_energy 5.0 read 1 + 5·cos45°·π to 0.02%);
+  the spec's first draft assumed the /π convention.
 - Colour white. Angular diameter, shadow blur, `sunAltitude` /
   `_orient_directional_light_from_windows` unchanged.
 - Window glass `cast_shadow OFF` stays (Gap #30). `WindowPortal_*` area
@@ -87,8 +92,9 @@ Sun (day branch of `setup_lighting`):
   line that printed it as "sky ambient energy" goes.
 
 In the tracer's units (a white Lambertian surface under a uniform sky of
-radiance L reads L; under a sun of energy E at incidence θ reads E cos θ / π),
-a horizontal white card outdoors reads (1 + 5 cos θ_sun) / π.
+radiance L reads L, irradiance πL; under a sun of energy E at incidence θ it
+reads E cos θ, irradiance πE cos θ), a horizontal white card outdoors under
+the normalised sky and a sun of energy 5/π reads (1 + 5 cos θ_sun) / π.
 
 ### 2. The probe and exposure (Layer 3a)
 
@@ -204,8 +210,8 @@ forgotten multiplier reads 2.4 ×, not 1 ×.
 
 | probe | fixture | reads | bar |
 |---|---|---|---|
-| D1 sky normalisation | card, sky only, `energy_multiplier = 1/E_sky` | card crop mean × π | 1.0 ± 2% |
-| D2 sun ratio | D1 + sun at 45° elevation, energy 5 | card crop mean × π | 1 + 5 cos 45° ± 2% |
+| D1 sky normalisation | card, sky only, `energy_multiplier = 1/E_sky` | card crop mean × π | 1.0 ± 3% |
+| D2 sun ratio | D1 + sun at 45° elevation, energy 5/π | card crop mean × π | 1 + 5 cos 45° ± 3% |
 | D3 exposure | windowed room, probe, then 64-frame still | occupied median × e | 0.18 ± 5% |
 | D4 no fill when lit | windowed room | `DaylightFill` absent; p25 · e ≥ 0.02 | pass/fail |
 | D5 fill when dark | window bricked (a sixth quad), no fixtures | `DaylightFill` present; p25 · e | 0.02 ± 10%, median 0.18 ± 5% |

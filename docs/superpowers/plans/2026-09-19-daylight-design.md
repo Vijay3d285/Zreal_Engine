@@ -15,7 +15,7 @@
 - `albedo_color` on a `StandardMaterial3D` is sRGB-encoded by the RT upload (`srgb_to_linear()`): every linear albedo in a gate is authored as `Color(a, a, a).linear_to_srgb()`. `metallic_specular = 0.0` on Lambertian probes.
 - Gate viewports: msaa/FXAA/TAA/debanding off, `SCALING_3D_MODE_BILINEAR @ 1.0`, `TONE_MAPPER_LINEAR`, `AMBIENT_SOURCE_DISABLED` (memory: gates reading the viewport inherit project AA).
 - The accumulator resets only on the accumulate toggle off→on (three settle frames each side — `PTValidation._render_accum`), a camera move, a resize or a shader-flag change. Exposure changes and added lights do **not** reset it.
-- Constants, verbatim from the spec: `DAYLIGHT_SUN_TO_SKY = 5.0`, `DAYLIGHT_TARGET_MEDIAN = 0.18`, `DAYLIGHT_FLOOR = 0.02`, `DAYLIGHT_MASK_RATIO = 8.0`, `DAYLIGHT_PROBE_FRAMES = 16`, `DAYLIGHT_PROBE_STEP = 4`, exposure clamp `[0.05, 50.0]`, fill share cap `0.5`, fill scan `f = 0.01 × 1.1ⁿ`.
+- Constants, verbatim from the spec: `DAYLIGHT_SUN_TO_SKY = 5.0` (the sun's `light_energy` is `SUN_TO_SKY / π`: energy E is irradiance πE in the tracer), `DAYLIGHT_TARGET_MEDIAN = 0.18`, `DAYLIGHT_FLOOR = 0.02`, `DAYLIGHT_MASK_RATIO = 8.0`, `DAYLIGHT_PROBE_FRAMES = 16`, `DAYLIGHT_PROBE_STEP = 4`, exposure clamp `[0.05, 50.0]`, fill share cap `0.5`, fill scan `f = 0.01 × 1.1ⁿ`.
 - `day_render` is `lighting_profile != "night"` (`image_glb_creation.gd:455`), so **sunset is a day render** and gets the same treatment.
 - Night renders must be byte-identical before/after (Task 7 measures the repeat floor first — memory: renders may or may not be reproducible).
 - The live project (`C:\Zlendo2026\ZlenderRender_stage_copy\godot_project`) is **not** edited by this plan; `pipeline_references/` is the reference copy the user mirrors across. `day.exr` (200 MB) lives only in the live project.
@@ -49,6 +49,7 @@
 ```gdscript
 class_name Daylight extends RefCounted
 const SUN_TO_SKY := 5.0
+const SUN_ENERGY := SUN_TO_SKY / PI  # DirectionalLight3D.light_energy: energy E is irradiance pi*E in the tracer
 const TARGET_MEDIAN := 0.18
 const FLOOR := 0.02
 const MASK_RATIO := 8.0
@@ -468,7 +469,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Create: `pipeline_references/tests/pt_daylight_gate_scene.tscn`
 
 **Interfaces:**
-- Consumes: `Daylight.sky_irradiance`, `Daylight.SUN_TO_SKY` (Task 1); `PTValidation._render_accum` (`tests/pt_validation.gd`).
+- Consumes: `Daylight.sky_irradiance`, `Daylight.SUN_TO_SKY`, `Daylight.SUN_ENERGY` (Task 1); `PTValidation._render_accum` (`tests/pt_validation.gd`).
 - Produces: the gate file that Tasks 3 and 4 extend with D3–D6; helpers `_gradient_panorama()`, `_new_env(pano, multiplier)`, `_card_scene()`, `_crop()`, `_check()`.
 
 - [ ] **Step 1: Write the scene file**
@@ -507,8 +508,10 @@ extends "res://tests/pt_validation.gd"
 ##   D0 control : card under the UNnormalised sky reads E_sky / pi (proves the
 ##                multiplier is what moves D1, not the integral)
 ##   D1 sky     : card, sky normalised (energy_multiplier = 1 / E_sky) -> 1/pi
-##   D2 sun     : D1 + sun at 45 deg elevation, energy SUN_TO_SKY
-##                -> (1 + 5 cos 45) / pi
+##   D2 sun     : D1 + sun at 45 deg elevation, light_energy SUN_ENERGY
+##                (= SUN_TO_SKY / pi: a DirectionalLight3D of energy E is
+##                irradiance pi*E in the tracer, as in Godot's raster --
+##                measured here 2026-09-19) -> (1 + 5 cos 45) / pi
 ##   D3 exposure: windowed room probe, then a FRAMES_HI still: occupied
 ##                median x e -> 0.18
 ##   D4 no fill : windowed room -> p25 x e >= 0.02, solver says no fill
@@ -574,7 +577,7 @@ func _ready() -> void:
 	var d1 := await _card_scene(1.0 / e_sky, false)
 	_check("D1 card x pi", _crop(d1, CARD_ROWS) * PI, 1.0, TOL_ENERGY)
 
-	print("\n=== D2: + sun at %.0f deg, energy %.1f ===" % [SUN_ELEVATION_DEG, Daylight.SUN_TO_SKY])
+	print("\n=== D2: + sun at %.0f deg, light_energy %.4f (sun:sky %.1f) ===" % [SUN_ELEVATION_DEG, Daylight.SUN_ENERGY, Daylight.SUN_TO_SKY])
 	var d2 := await _card_scene(1.0 / e_sky, true)
 	var expected_d2 := 1.0 + Daylight.SUN_TO_SKY * cos(deg_to_rad(90.0 - SUN_ELEVATION_DEG))
 	_check("D2 card x pi", _crop(d2, CARD_ROWS) * PI, expected_d2, TOL_ENERGY)
@@ -691,7 +694,7 @@ func _card_scene(p_multiplier: float, p_sun: bool) -> Image:
 	_quad(Vector3(0.0, 0.0, 0.0), Vector2(2.0, 2.0), Vector3(-90.0, 0.0, 0.0), _lambert(1.0)) # faces +Y
 	if p_sun:
 		var sun := DirectionalLight3D.new()
-		sun.light_energy = Daylight.SUN_TO_SKY
+		sun.light_energy = Daylight.SUN_ENERGY
 		sun.light_color = Color(1.0, 1.0, 1.0)
 		sun.light_angular_distance = 0.0
 		sun.shadow_enabled = true
@@ -734,7 +737,7 @@ cd "C:/Users/aiadmin/Desktop/Engine_Build_test/Zreal_Engine" && ZR_GATE_FRAMES=6
 
 Expected: D0, D1, D2 within 3%. Interpretation if not:
 - D0 off but D1 = D0 × E_sky → the multiplier is not reaching the tracer's radiance map (spec §5: engine fix in its own commit; stop and report).
-- D0 and D1 fine, D2 reads `(1 + 5 cos45 · π)/π` or `(1 + 5 cos45 / π)/π` → the sun convention is not `E cos θ / π`; report the measured ratio, do not adjust `SUN_TO_SKY`, stop and ask.
+- D0 and D1 fine, D2 reads `(1 + 5 cos45 · π)/π` or `(1 + 5 cos45 / π)/π` → the sun convention is not the one `SUN_ENERGY` assumes; report the measured ratio, do not adjust `SUN_TO_SKY`, stop and ask. (2026-09-19: the first run with `light_energy = 5.0` read exactly `1 + 5·cos45·π` — energy E is irradiance πE — which is why `SUN_ENERGY = SUN_TO_SKY / π` exists.)
 - D2 reads `1/π` → the sun's -Z is not pointing at the card (or the card shadows itself): print `sun.global_basis.z` and fix the rotation sign.
 - The card being lit from below by the ground half of the panorama is excluded by construction: the quad is single-sided and faces +Y.
 
@@ -967,8 +970,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Modify: `pipeline_references/image_glb_creation.gd` — the sky block (~line 782–795), the sun block (~718–722 and ~749–752), the day exposure/ambient block (~855–915), the AgX multipliers (~922–928), the exposure trim (~946–950), the `_create_window_portal_lights()` call (~503) and function (~2823), the "Scene Fill Lights" block (~1382–1430), the JSON reads (~611–628).
 
 **Interfaces:**
-- Consumes: `Daylight.sky_irradiance`, `Daylight.SUN_TO_SKY`.
-- Produces: on day renders the Environment has `tonemap_exposure = 1.0` (the probe sets it), the sky's `energy_multiplier = 1 / E_sky`, the sun at 5.0; no `FillLight`/`FrontFillLight`/`BackFillLight`, no `[PortalSpot]`.
+- Consumes: `Daylight.sky_irradiance`, `Daylight.SUN_ENERGY`, `Daylight.SUN_TO_SKY`.
+- Produces: on day renders the Environment has `tonemap_exposure = 1.0` (the probe sets it), the sky's `energy_multiplier = 1 / E_sky`, the sun at `SUN_ENERGY` (5/π); no `FillLight`/`FrontFillLight`/`BackFillLight`, no `[PortalSpot]`.
 
 Line numbers are from the 2026-09-19 file; find each block by its comment text, not the number.
 
@@ -1021,13 +1024,15 @@ with:
 ```gdscript
 	if day_render:
 		# Daylight design (spec 2026-09-19): the sky is normalised to unit
-		# horizontal irradiance above, so this is the sun-to-sky ratio -- 5 for
-		# a 10 AM clear sky (~90 klux direct-normal vs ~18 klux diffuse). The
-		# exposure is measured per job by the probe in render.gd, so the
-		# absolute level here is not a brightness knob; the ratio is the look.
-		dir_energy = Daylight.SUN_TO_SKY
+		# horizontal irradiance above; the sun is SUN_TO_SKY (5, a 10 AM clear
+		# sky: ~90 klux direct-normal vs ~18 klux diffuse) times that, and a
+		# DirectionalLight3D of energy E is irradiance pi*E in the tracer, so
+		# light_energy = 5 / pi. The exposure is measured per job by the probe
+		# in render.gd, so the absolute level here is not a brightness knob;
+		# the ratio is the look.
+		dir_energy = Daylight.SUN_ENERGY # = SUN_TO_SKY / pi: energy E is irradiance pi*E in the tracer
 		dir_color = Color(1.0, 1.0, 1.0) # Color(1.0, 0.835, 0.50) 10AM sunlight — warm golden white
-		print("[Sun] Day render: energy=%.1f (sun : sky), blur=1.2, angular=0.8 (soft shadows)." % dir_energy)
+		print("[Sun] Day render: light_energy=%.4f (sun : sky irradiance %.1f), blur=1.2, angular=0.8 (soft shadows)." % [dir_energy, Daylight.SUN_TO_SKY])
 ```
 
 And in the application block replace `dir_light.light_energy = dir_energy * _auto_sun_multiplier # automation scales for dark/light surfaces` with `dir_light.light_energy = dir_energy`. Check the `blur=1.2, angular=0.8` claims against the lines that set `shadow_blur` / `light_angular_distance` on `dir_light` (grep `dir_light.shadow_blur`); print the live values instead of literals if they differ.
@@ -1095,7 +1100,7 @@ The scratch copy of the live project used for job 226 is `C:\Users\aiadmin\AppDa
 S="/c/Users/aiadmin/AppData/Local/Temp/claude/C--Users-aiadmin-Desktop-Engine-Build-test-Zreal-Engine/b37a70cf-2a76-48f2-b7de-63b1ab2399c1/scratchpad"; cp pipeline_references/image_glb_creation.gd pipeline_references/daylight.gd pipeline_references/render.gd "$S/proj_225/" && ZR_PT_ACCUM_TARGET=16 ZR_PT_FINAL=none bin/godot.windows.editor.x86_64.console.exe --rendering-driver vulkan --path "$S/proj_225" main.tscn "$S/proj_225/input_json/f2_226_input.json" "$S/t5_226.png" > "$S/t5_226_godot.log" 2>&1; echo exit=$?; grep -n "\[Daylight\]\|\[Sun\]\|PortalSpot\|FillLight\|Fill grid\|AUTO-LIGHTING\|sky ambient\|Placed .* light" "$S/t5_226_godot.log" | cut -c1-160
 ```
 
-Expected: `[Daylight] sky irradiance 1.62xx -> energy_multiplier 0.61xx`, `[Sun] Day render: energy=5.0 ...`, the JSON-fields line, `Placed 23 room light(s)`; **no** `[PortalSpot]`, no `AUTO-LIGHTING`, no `sky ambient`. `Fill grid at 1.25x` still prints (render.gd is Task 6). exit 0.
+Expected: `[Daylight] sky irradiance 1.62xx -> energy_multiplier 0.61xx`, `[Sun] Day render: light_energy=1.5915 (sun : sky irradiance 5.0) ...`, the JSON-fields line, `Placed 23 room light(s)`; **no** `[PortalSpot]`, no `AUTO-LIGHTING`, no `sky ambient`. `Fill grid at 1.25x` still prints (render.gd is Task 6). exit 0.
 
 - [ ] **Step 7: Commit**
 
