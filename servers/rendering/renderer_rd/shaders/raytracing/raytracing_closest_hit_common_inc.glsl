@@ -1865,7 +1865,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		// would trace into a direction whose pdf is the one reported for a
 		// different direction, which is exactly the silent MIS bias the env
 		// sampling header warns about.
-		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && (dot(env_dir, N) > 0.0 || dot(env_dir, diffuseLobeNormal(N, brdf_mat)) > 0.0)) { // F1 approach C
+		if (env_sample(h.hit_pos, rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && (dot(env_dir, N) > 0.0 || dot(env_dir, diffuseLobeNormal(N, brdf_mat)) > 0.0)) { // F1 approach C
 			vec3 env_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
 			vec3 env_shadow_atten = lights_trace_shadow_ray(env_origin, env_dir, RT_RAY_TMAX);
 			if (rt_max_component(env_shadow_atten) > 0.0) {

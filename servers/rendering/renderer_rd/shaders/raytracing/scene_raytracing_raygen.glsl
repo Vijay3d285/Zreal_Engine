@@ -127,7 +127,7 @@ void volume_scatter_shade(uvec2 p_pixel, vec3 p_pos, vec3 p_ray_dir, vec3 p_thro
 	{
 		vec3 env_dir;
 		float env_pdf_val;
-		if (env_sample(rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && env_pdf_val > 0.0) {
+		if (env_sample(p_pos, rng_2d(rng, RT_PRNG_ENV), env_dir, env_pdf_val) && env_pdf_val > 0.0) {
 			vec3 atten = lights_trace_shadow_ray(p_pos, env_dir, RT_RAY_TMAX);
 			if (rt_max_component(atten) > 0.0) {
 				vec2 border = vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0);
@@ -554,7 +554,9 @@ void main() {
 	float mis_w = 1.0;
 #if RT_ENV_NEE_ENABLED
 	if (ps.mis_ray_pdf >= 0.0) {
-		float e_pdf = env_pdf(gl_WorldRayDirectionEXT);
+		// Light portals: the mixture depends on which portals face the ray's
+		// origin (Cycles passes ray_P, light/sample.h:591).
+		float e_pdf = env_pdf(gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT);
 		// The e_pdf > 0.0 guard covers a scene with no sky at all: marginal_total
 		// == 0 makes env_pdf() return 0 for every direction, env NEE therefore
 		// contributes w_env = 0 everywhere, and this strategy must take the whole

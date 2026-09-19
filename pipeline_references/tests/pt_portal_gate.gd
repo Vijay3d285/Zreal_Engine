@@ -35,9 +35,11 @@ var FRAMES_HI: int = 1024 if OS.get_environment("ZR_GATE_FRAMES") == "" else int
 const FRAMES_LO := 16
 const TOL := 0.01
 const BAR_CYCLES := 0.03
-# Task 4 captures the on/off RMS ratio on the first green build and writes
-# it here with margin; 0.0 makes P2 fail loudly until then.
-const P2_BAR := 0.0
+# On/off RMS ratio of the back-wall crop at 16 frames, captured 2026-09-18 on
+# the first portal build: 0.2320 (RMS 0.009771 with the portal, 0.042124
+# without -- 4.3x less noise, ~18x less variance). Bar = 1.5x that. A build
+# whose portal quietly does nothing reads 1.0 here.
+const P2_BAR := 0.35
 # Cycles 5.2.1, cycles_portal_room.py, 1024 spp, 16 bounces, captured 2026-09-18
 # (Task 1 Step 2): portal on: wall 0.076156 floor 0.070482; no-portal control
 # 0.076143 / 0.070287. (At 8 bounces both sides: Cycles 0.069613 / 0.063858,

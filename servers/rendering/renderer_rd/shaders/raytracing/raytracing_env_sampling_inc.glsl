@@ -4,10 +4,12 @@
 //
 // A CPU mirror of the sky-space math lives in tests/servers/rendering/test_pt_env_cdf.cpp.
 //
-// CRITICAL INVARIANT: env_sample() and env_pdf_from_uv() must agree exactly.
+// CRITICAL INVARIANT: env_sample() and env_pdf() must agree exactly, and (since
+// the light portals) both must be given the SAME position the ray starts from.
 // A BSDF ray that hits the sky is weighted against the pdf this file reports for
 // its direction; if sampling and evaluation use different formulas, MIS is biased
-// and no convergence test will catch it.
+// and no convergence test will catch it. env_map_sample()/env_map_pdf() are the
+// map strategy alone; env_sample()/env_pdf() are Cycles' portal/map mixture.
 //
 // COORDINATE SPACE (see env_cdf.h:50-93, "CONTRACT FOR CONSUMERS"): the CDF grid
 // lives in SKY/OCTMAP space, not world space -- env_cdf_build.glsl walks cell
@@ -118,24 +120,24 @@ mat3 env_world_to_sky() {
 	return scene_data_block.data.radiance_inverse_xform * camera_basis;
 }
 
-/// pdf for an arbitrary WORLD-space direction. Converts world -> sky, then routes
-/// through the same env_pdf_from_uv() that env_sample() uses.
+/// MAP strategy: pdf for an arbitrary WORLD-space direction. Converts world ->
+/// sky, then routes through the same env_pdf_from_uv() that env_map_sample() uses.
 ///
 /// NaN firewall: unlike env_sample() (which fails closed on a non-positive
 /// marginal_total), this function has no such gate on its input -- p_dir can come
 /// from a degenerate BSDF sample. A NaN pdf would poison a MIS weight downstream
 /// (power_heuristic(NaN, x) is NaN, not a clamped value), so scrub it here the same
 /// way sanitize_payload_value() (raytracing_inc.glsl) scrubs the payload.
-float env_pdf(vec3 p_dir) {
+float env_map_pdf(vec3 p_dir) {
 	vec3 sky_dir = env_world_to_sky() * p_dir;
 	float pdf = env_pdf_from_uv(env_uv_from_direction(sky_dir));
 	pdf = isnan(pdf) ? 0.0 : pdf;
 	return max(pdf, 0.0);
 }
 
-/// Sample a direction proportional to sky radiance. Returns false when no usable
-/// distribution exists (no environment, or an all-black sky). r_dir is WORLD-space,
-/// ready to trace.
+/// MAP strategy: sample a direction proportional to sky radiance. Returns false
+/// when no usable distribution exists (no environment, or an all-black sky).
+/// r_dir is WORLD-space, ready to trace.
 ///
 /// Cell selection (binary search) picks a CELL, but the pdf env_pdf_from_uv()
 /// reports is a CONTINUOUS density over (u, v) -- the density of "pick a cell
@@ -150,7 +152,7 @@ float env_pdf(vec3 p_dir) {
 /// (du, dv) is where `target` fell between the cell's lower and upper prefix-sum
 /// bounds, linearly, so cell interiors are covered with positive probability
 /// instead of only their centres.
-bool env_sample(vec2 p_rand, out vec3 r_dir, out float r_pdf) {
+bool env_map_sample(vec2 p_rand, out vec3 r_dir, out float r_pdf) {
 	r_dir = vec3(0.0, 1.0, 0.0);
 	r_pdf = 0.0;
 	if (env_dist.marginal_total <= 0.0) {
@@ -212,4 +214,104 @@ bool env_sample(vec2 p_rand, out vec3 r_dir, out float r_pdf) {
 	r_dir = transpose(env_world_to_sky()) * sky_dir; // sky -> world.
 	r_pdf = env_pdf_from_uv(uv);
 	return r_pdf > 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// Light portals (spec 2026-09-18-light-portals-design.md). Cycles'
+// background_light_sample / background_light_pdf (kernel/light/background.h:
+// 333-470) minus the Nishita sun strategy: the map strategy above and the
+// portal strategy (raytracing_portal_inc.glsl) mixed 1:1 whenever at least one
+// portal faces P (background_num_possible_portals > 0), map only otherwise.
+// Both entry points take the shading position because the mixture depends on
+// which portals face it; the miss stage passes the ray origin, as Cycles'
+// light/sample.h:591 passes ray_P. With no portal in the buffer both collapse
+// to the map strategy exactly as before -- bit-identical renders.
+//
+// The "no sky" contract is kept from the map sampler: marginal_total <= 0
+// means no usable sky, env_sample() returns false and env_pdf() 0, so NEE
+// and MIS agree that the sky strategy does not exist (Cycles falls back to
+// uniform sphere sampling there; a black sky makes that moot).
+// ---------------------------------------------------------------------------
+
+/// Sample a sky direction from P. r_dir is WORLD-space; r_pdf is the mixture's
+/// pdf for it (background.h:333-433).
+bool env_sample(vec3 P, vec2 p_rand, out vec3 r_dir, out float r_pdf) {
+	r_dir = vec3(0.0, 1.0, 0.0);
+	r_pdf = 0.0;
+	if (env_dist.marginal_total <= 0.0) {
+		return false;
+	}
+
+	float portal_method_pdf = 0.0;
+	int num_portals = 0;
+	if (portal_count() > 0) {
+		// Check if there are portals in the scene which we can sample.
+		num_portals = portal_num_possible(P);
+		portal_method_pdf = (num_portals > 0) ? 1.0 : 0.0;
+	}
+	float map_method_pdf = 1.0;
+
+	// We have 100% in total and split it between the two categories (Cycles
+	// splits three, background.h:351-367): portals if rand.x is below
+	// portal_method_pdf, map otherwise.
+	float pdf_fac = 1.0 / (portal_method_pdf + map_method_pdf);
+	portal_method_pdf *= pdf_fac;
+	map_method_pdf *= pdf_fac;
+
+	if (p_rand.x < portal_method_pdf) {
+		// Rescale rand.x.
+		p_rand.x /= portal_method_pdf;
+		// Sample a portal.
+		int portal;
+		float pdf;
+		r_dir = portal_sample(P, p_rand, num_portals, portal, pdf);
+		if (portal < 0) {
+			return false;
+		}
+		if (num_portals > 1) {
+			// Ignore the chosen portal, its pdf is already included.
+			bool unused;
+			pdf += portal_pdf(P, r_dir, portal, unused);
+		}
+		// MIS weighting against the map strategy.
+		r_pdf = pdf * portal_method_pdf + env_map_pdf(r_dir) * map_method_pdf;
+	} else {
+		// Rescale rand.x.
+		if (map_method_pdf != 1.0) {
+			p_rand.x = (p_rand.x - portal_method_pdf) / map_method_pdf;
+		}
+		float pdf;
+		if (!env_map_sample(p_rand, r_dir, pdf)) {
+			return false;
+		}
+		// Skip MIS if this is the only method.
+		if (map_method_pdf == 1.0) {
+			r_pdf = pdf;
+			return r_pdf > 0.0;
+		}
+		bool unused;
+		r_pdf = pdf * map_method_pdf + portal_pdf(P, r_dir, -1, unused) * portal_method_pdf;
+	}
+	r_pdf = isnan(r_pdf) ? 0.0 : r_pdf;
+	return r_pdf > 0.0;
+}
+
+/// pdf of the mixture for an arbitrary WORLD-space direction from P
+/// (background.h:436-470). Same NaN firewall as env_map_pdf.
+float env_pdf(vec3 P, vec3 p_dir) {
+	if (env_dist.marginal_total <= 0.0) {
+		return 0.0;
+	}
+	float pdf = env_map_pdf(p_dir);
+	if (portal_count() > 0) {
+		// Portals are a special case here since we need to compute their pdf in
+		// order to find out if we can sample them.
+		bool is_possible = false;
+		float portal_pdf_val = portal_pdf(P, p_dir, -1, is_possible);
+		if (is_possible) {
+			pdf = 0.5 * pdf + 0.5 * portal_pdf_val;
+		}
+	}
+	pdf = isnan(pdf) ? 0.0 : pdf;
+	return max(pdf, 0.0);
 }
