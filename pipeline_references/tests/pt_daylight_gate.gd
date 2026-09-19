@@ -88,6 +88,29 @@ func _ready() -> void:
 	var expected_d2 := 1.0 + Daylight.SUN_TO_SKY * cos(deg_to_rad(90.0 - SUN_ELEVATION_DEG))
 	_check("D2 card x pi", _crop(d2, CARD_ROWS) * PI, expected_d2, TOL_ENERGY)
 
+	print("\n=== D3: probe exposure on the windowed room, checked on a %d-frame still ===" % FRAMES_HI)
+	var env3 := await _room_scene(ALBEDO, "open", "back", false)
+	var pr := await Daylight.probe(self, env3, get_viewport().get_viewport_rid())
+	var st := Daylight.stats(pr["samples"])
+	print("  probe: raw median %.5f occupied %.1f%% median %.5f p25 %.5f exposure %.3f%s" % [
+			st["raw_median"], 100.0 * st["occupied_fraction"], st["median"], st["p25"], st["exposure"],
+			" (CLAMPED)" if st["clamped"] else ""])
+	_check_true("D3 probe not clamped", not st["clamped"])
+	var still3 := await _render_accum(env3, get_viewport().get_viewport_rid(), FRAMES_HI)
+	var st_hi := Daylight.stats(_samples(still3))
+	_check("D3 still occupied median x e", st_hi["median"] * st["exposure"], Daylight.TARGET_MEDIAN, TOL_EXPOSURE)
+
+	print("\n=== D6: mask, camera facing the window ===")
+	var env6 := await _room_scene(ALBEDO, "open", "window", false)
+	var still6 := await _render_accum(env6, get_viewport().get_viewport_rid(), FRAMES_HI)
+	var st6 := Daylight.stats(_samples(still6))
+	# The window is a 1.2 x 1.0 m rectangle 3.5 m from the camera, on axis,
+	# facing it: projected height 1.0 / (2 * 3.5 * tan 30) of the frame, width
+	# 1.2 / (2 * 3.5 * tan 30) of a square frame.
+	var half_extent := 3.5 * tan(deg_to_rad(30.0))
+	var window_fraction := (1.0 / (2.0 * half_extent)) * (1.2 / (2.0 * half_extent))
+	_check("D6 excluded fraction vs window area", 1.0 - st6["occupied_fraction"], window_fraction, TOL_MASK)
+
 	print("")
 	if _failures.is_empty():
 		print("PASS: all %d daylight checks passed." % _checks)
@@ -233,3 +256,60 @@ func _crop(p_img: Image, p_r: Array) -> float:
 			acc += (c.r + c.g + c.b) / 3.0
 			n += 1
 	return acc / float(maxi(n, 1))
+
+
+## The portal gate's room: x [-2,2], y [0,3], z [-1.5,1.5], six inward
+## quads, opening in the x = -2 wall z [-0.6,0.6], y [0.9,1.9] (1.2 x 1.0 m).
+## p_opening: "open" (the 1.2 x 1.0 window), "bricked" (no window).
+## p_camera: "back" = (0,1.5,1.2) looking at (0,1.2,-1.5) as the portal gate;
+##           "window" = (1.5,1.4,0) looking at (-2,1.4,0), the window centred.
+## p_omni adds D5's corner lamp. Returns the Environment; render with
+## _render_accum or Daylight.probe.
+func _room_scene(p_albedo: float, p_opening: String, p_camera: String, p_omni: bool) -> Environment:
+	await _clear()
+	var mat := _lambert(p_albedo)
+	_quad(Vector3(0.0, 0.0, 0.0), Vector2(4.0, 3.0), Vector3(-90.0, 0.0, 0.0), mat) # floor, faces +Y
+	_quad(Vector3(0.0, 3.0, 0.0), Vector2(4.0, 3.0), Vector3(90.0, 0.0, 0.0), mat) # ceiling, faces -Y
+	_quad(Vector3(0.0, 1.5, -1.5), Vector2(4.0, 3.0), Vector3(0.0, 0.0, 0.0), mat) # back, faces +Z
+	_quad(Vector3(0.0, 1.5, 1.5), Vector2(4.0, 3.0), Vector3(0.0, 180.0, 0.0), mat) # front, faces -Z
+	_quad(Vector3(2.0, 1.5, 0.0), Vector2(3.0, 3.0), Vector3(0.0, -90.0, 0.0), mat) # right, faces -X
+	if p_opening == "bricked":
+		_quad(Vector3(-2.0, 1.5, 0.0), Vector2(3.0, 3.0), Vector3(0.0, 90.0, 0.0), mat) # left, whole
+	else:
+		_quad(Vector3(-2.0, 0.45, 0.0), Vector2(3.0, 0.9), Vector3(0.0, 90.0, 0.0), mat) # below
+		_quad(Vector3(-2.0, 2.45, 0.0), Vector2(3.0, 1.1), Vector3(0.0, 90.0, 0.0), mat) # above
+		_quad(Vector3(-2.0, 1.4, -1.05), Vector2(0.9, 1.0), Vector3(0.0, 90.0, 0.0), mat) # z < -0.6
+		_quad(Vector3(-2.0, 1.4, 1.05), Vector2(0.9, 1.0), Vector3(0.0, 90.0, 0.0), mat) # z > 0.6
+	if p_omni:
+		# D5's "fixture": one shadowed omni in the camera's corner so the far
+		# corners are dark relative to the median by construction.
+		var lamp := OmniLight3D.new()
+		lamp.light_energy = 2.0
+		lamp.omni_range = 6.0
+		lamp.omni_attenuation = 1.0
+		lamp.light_specular = 0.0
+		lamp.shadow_enabled = true
+		add_child(lamp)
+		lamp.position = Vector3(1.6, 2.5, 1.2)
+	var cam := Camera3D.new()
+	cam.fov = 60.0
+	cam.keep_aspect = Camera3D.KEEP_HEIGHT
+	cam.near = 0.05
+	cam.far = 100.0
+	add_child(cam)
+	if p_camera == "window":
+		cam.position = Vector3(1.5, 1.4, 0.0)
+		cam.look_at(Vector3(-2.0, 1.4, 0.0), Vector3.UP)
+	else:
+		cam.position = Vector3(0.0, 1.5, 1.2)
+		cam.look_at(Vector3(0.0, 1.2, -1.5), Vector3.UP)
+	cam.make_current()
+	var env := _new_env(_pano, 1.0 / Daylight.sky_irradiance(_pano))
+	await get_tree().create_timer(1.0).timeout
+	return env
+
+
+## Mean-RGB luminance samples of a full image at PROBE_STEP, for the same
+## statistics the probe takes.
+func _samples(p_img: Image) -> PackedFloat32Array:
+	return Daylight.subsample(p_img, Daylight.PROBE_STEP)
