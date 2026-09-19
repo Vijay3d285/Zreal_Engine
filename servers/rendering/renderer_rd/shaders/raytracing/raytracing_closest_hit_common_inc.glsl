@@ -2401,6 +2401,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 		ps.sss_exit = true;
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+		ps.mis_origin = h.hit_pos;
 		ps.rng_packed = rng_pack(rng_next_bounce(rng));
 		path_pack(payload, ps);
 		return;
@@ -2587,6 +2588,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		float bsdf_pdf = combinedPdf(N, next_dir, V, brdf_mat);
 		ps.mis_ray_pdf = (bsdf_pdf > 0.0) ? bsdf_pdf : RT_MIS_PDF_NONE;
 	}
+	// Light portals: the sky pdf the miss stage weighs this ray against is
+	// evaluated from the same point the env NEE above used (h.hit_pos).
+	ps.mis_origin = h.hit_pos;
 
 	path_pack(payload, ps);
 }

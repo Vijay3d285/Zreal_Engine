@@ -25,6 +25,14 @@ extends "res://tests/pt_validation.gd"
 ##                  build's own repeat floor (off rendered twice)
 ##   P5 area light: a 1 x 1 m AreaLight3D (normalize off) over a floor vs the
 ##                  179.9 deg spot-rect of the same size and energy -> 1 +- 1 %
+##   P6 pane       : an alpha 0.5 BLEND pane 1 cm inside the opening, shadows
+##                  ON (so NEE and BSDF rays see the same pane), portal on /
+##                  off at FRAMES_HI -> 1 +- 1.5 %. A BSDF ray that passes
+##                  through the pane restarts AT the pane; the miss stage must
+##                  weigh it with the sky pdf from the wall that produced it
+##                  (the payload's mis_origin), not from the pane -- otherwise
+##                  the NEE and BSDF weights no longer sum to 1 and the window
+##                  light is counted twice.
 ##
 ## albedo_color is sRGB-encoded: linear values are authored through
 ## linear_to_srgb(). The portal flag is set with set("area_portal", true) so a
@@ -119,6 +127,17 @@ func _ready() -> void:
 	print("  area %.6f spot-rect %.6f" % [area_v, spot_v])
 	_check("P5 area / spot-rect", area_v / maxf(spot_v, 1e-9), 1.0, TOL)
 
+	print("\n=== P6: pane in the opening (shadows on), portal on / off at %d frames ===" % FRAMES_HI)
+	var pane_on := await _render_room("on", FRAMES_HI, true)
+	var pane_off := await _render_room("off", FRAMES_HI, true)
+	var pw_on := _crop(pane_on, WALL_ROWS)
+	var pw_off := _crop(pane_off, WALL_ROWS)
+	var pf_on := _crop(pane_on, FLOOR_ROWS)
+	var pf_off := _crop(pane_off, FLOOR_ROWS)
+	print("  wall on %.6f off %.6f | floor on %.6f off %.6f" % [pw_on, pw_off, pf_on, pf_off])
+	_check("P6 pane wall on/off", pw_on / maxf(pw_off, 1e-9), 1.0, 0.015)
+	_check("P6 pane floor on/off", pf_on / maxf(pf_off, 1e-9), 1.0, 0.015)
+
 	print("")
 	if _failures.is_empty():
 		print("PASS: all %d portal checks passed." % _checks)
@@ -195,10 +214,19 @@ func _build_room(p_mat: Material) -> void:
 
 
 ## Builds the room with the portal "on", "off" or "flipped" and returns the
-## accumulated frame.
-func _render_room(p_portal: String, p_frames: int) -> Image:
+## accumulated frame. p_pane adds the P6 alpha pane 1 cm inside the opening.
+func _render_room(p_portal: String, p_frames: int, p_pane: bool = false) -> Image:
 	await _clear()
 	_build_room(_lambert(ALBEDO))
+
+	if p_pane:
+		var pm := StandardMaterial3D.new()
+		pm.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		pm.albedo_color = Color(1.0, 1.0, 1.0, 0.5)
+		pm.roughness = 1.0
+		pm.metallic_specular = 0.0
+		# Faces +X like the wall around it; cast_shadow stays ON (default).
+		_quad(Vector3(-1.99, 1.4, 0.0), Vector2(1.2, 1.0), Vector3(0.0, 90.0, 0.0), pm)
 
 	if p_portal != "off":
 		var portal := AreaLight3D.new()

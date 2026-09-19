@@ -85,6 +85,16 @@ struct PathPayload {
 	// medium. A first cut put it at bit 27 and every path with an odd number
 	// of glass crossings restarted from (0,0,0). 16 bytes; the struct is 80.
 	vec4 sss_restart;
+	// Light portals. The vertex whose BSDF sample produced this ray -- the
+	// point its NEE used. The sky pdf now depends on the position (which
+	// portals face it, and their solid angle from it), so the miss stage must
+	// evaluate it HERE, not at gl_WorldRayOriginEXT: after an alpha
+	// pass-through the ray restarts at the pane (Gap #26) with mis_ray_pdf
+	// untouched, and a pdf taken from the pane would not be the one the NEE
+	// weight was built from -- the two MIS weights would no longer sum to 1.
+	// Cycles keeps ray.P at the scattering vertex across a transparent bounce
+	// (shade_surface.h:573-576) for the same reason. 12 bytes; struct is 92.
+	vec3 mis_origin;
 };
 
 /// Sentinel: this ray has no meaningful BSDF pdf, so anything it hits takes the
@@ -167,6 +177,7 @@ struct PathState {
 	uint skip_prim;
 	vec3 sss_restart;
 	bool sss_exit;
+	vec3 mis_origin;
 };
 
 PathState path_unpack(PathPayload p) {
@@ -183,6 +194,7 @@ PathState path_unpack(PathPayload p) {
 	s.skip_prim = p.skip_prim;
 	s.sss_restart = p.sss_restart.xyz;
 	s.sss_exit = p.sss_restart.w > 0.5;
+	s.mis_origin = p.mis_origin;
 	return s;
 }
 
@@ -198,6 +210,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.skip_geom = s.skip_geom;
 	p.skip_prim = s.skip_prim;
 	p.sss_restart = vec4(s.sss_restart, s.sss_exit ? 1.0 : 0.0);
+	p.mis_origin = s.mis_origin;
 }
 
 // Bounce count helpers.

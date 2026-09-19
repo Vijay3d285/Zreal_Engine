@@ -194,10 +194,18 @@ with the Cycles line cited above each function:
   portal term only when `possible`, same normalisation, same NaN scrub as
   today.
 - Call sites: `shade_and_bounce` passes `h.hit_pos`; the raygen scatter site
-  passes the scatter position `p_pos`; the miss stage passes
-  `gl_WorldRayOriginEXT` (Cycles' `ray_P`, `sample.h:591`). The direction
-  tests, shadow ray, sky lookup, `RT_ENV_NEE_ENABLED` guard and MIS weights
-  around them do not change.
+  passes the scatter position `p_pos`; the miss stage passes the payload's
+  **`mis_origin`** — the vertex whose BSDF sample produced the ray, written
+  by `shade_and_bounce` next to `mis_ray_pdf` and set to the camera position
+  for the primary ray. NOT `gl_WorldRayOriginEXT`: after an alpha
+  pass-through (Gap #26) the ray restarts at the pane with `mis_ray_pdf`
+  untouched, and a sky pdf taken from the pane is not the one the NEE weight
+  was built from, so the two MIS weights no longer sum to 1 and the window
+  light is counted twice (measured +68% on P6 before the fix). Cycles' `ray_P`
+  (`sample.h:591`) is the same thing: `shade_surface.h:573-576` keeps it at
+  the scattering vertex across a transparent bounce. The direction tests,
+  shadow ray, sky lookup, `RT_ENV_NEE_ENABLED` guard and MIS weights around
+  them do not change. `PathPayload` grows 80 → 92 bytes.
 - With `portal_count() == 0` the mixture collapses to `w_map` only; the
   chosen-strategy shortcut returns the map sample and pdf exactly as today —
   the no-portal render must be bit-identical (checked in the gate's P4 and by
@@ -241,13 +249,30 @@ fractions of the frame; the back-wall crop avoids the window's direct patch.
 | P3 Cycles | portal on, 1024 spp | back-wall and floor crop means | ± 3% vs `tools/cycles_comparison/cycles_portal_room.py` (same room, one area light `is_portal`, world strength 1, 1024 spp, no denoise) |
 | P4 side test | the same portal flipped (`−Z` pointing outdoors), so no surface in the room faces it | flipped vs portal off, 16 spp | max abs diff over the frame ≤ the build's own repeat floor (portal off rendered twice — memory: renders may or may not be reproducible; expected 0) — the facing test must zero the strategy everywhere, and the RNG stream must not shift |
 | P5 area light | a 1 × 1 m `AreaLight3D`, normalize off, energy 1, 1 m over a floor, vs the 179.9° spot-rect of the same size/energy | floor crop, area ÷ spot-rect | 1 ± 1% |
+| P6 pane | an alpha-0.5 BLEND pane 1 cm inside the opening, cast_shadow ON (so NEE and BSDF rays see the same pane), portal on vs off, 1024 spp | back-wall and floor crops, on ÷ off | 1 ± 1.5% — red (+68%) when the miss stage takes the sky pdf at the pane instead of at the scattering vertex |
 
 Whole suite on the new binary green (22/22); old hand-over binary green
-except the new gate (P2, P3 and P5 red by design; P1 and P4 pass trivially there); doctest
+except the new gate (P2, P3, P5 and P6 red by design; P1 and P4 pass trivially there); doctest
 count unchanged; frame time on a no-portal gate scene within noise; job 226
 rendered through the still route with the pipeline's portals, once with
 `ZR_LIGHTS_SKIP=pos` (sun + sky + portals only) for a look at what the window
 does on its own, and a timing.
+
+## Measured (2026-09-19)
+
+Job 226, sun + sky only (`ZR_LIGHTS_SKIP=pos`), 2048 frames, linear EXR,
+portal binary vs the no-portal F2 binary: **+2.2% frame mean, +12.8% in the
+window regions** — not noise (the F2 binary's own 256→2048 drift is +0.03%),
+not clamp (clamp-0 legs read the same). With `ZR_GLASS_SHADOW=1` the same
+comparison is **+0.05% frame mean**, every region within noise, grain ratio
+0.95 whole-frame and 0.75–0.85 beside the windows. The production panes are
+authored alpha with `cast_shadow OFF` (Gap #30): the shadow ray ignores them
+(T = 1) while the bounce ray carries T = 1−α, so the expectation is
+`w_nee·L + w_bsdf·T·L` and a sampler that raises `w_nee` through the window
+brightens it. Cycles' Ray Visibility › Shadow off has the same semantics; this
+is a property of Gap #30, recorded here and not changed by this phase. The
+P6 double counting, by contrast, was −7.3% at the windows between the pre- and
+post-`mis_origin` binaries on the glass-shadow-on leg.
 
 ## Out of scope (recorded)
 

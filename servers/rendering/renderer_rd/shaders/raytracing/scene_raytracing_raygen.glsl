@@ -153,6 +153,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	// The camera ray has no preceding BSDF sample, so sky seen directly through a
 	// window takes its full contribution.
 	ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+	ps.mis_origin = p_origin;
 	ps.skip_geom = RT_SKIP_NONE;
 	ps.skip_prim = RT_SKIP_NONE;
 	ps.sss_restart = vec3(0.0);
@@ -554,9 +555,13 @@ void main() {
 	float mis_w = 1.0;
 #if RT_ENV_NEE_ENABLED
 	if (ps.mis_ray_pdf >= 0.0) {
-		// Light portals: the mixture depends on which portals face the ray's
-		// origin (Cycles passes ray_P, light/sample.h:591).
-		float e_pdf = env_pdf(gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT);
+		// Light portals: the mixture depends on the position -- which portals
+		// face it and their solid angle from it -- so it is evaluated at the
+		// vertex whose BSDF sample produced this ray (the point its NEE used),
+		// NOT at gl_WorldRayOriginEXT, which after an alpha pass-through is the
+		// pane. Cycles passes ray_P (light/sample.h:591), which it keeps at the
+		// scattering vertex across transparent bounces.
+		float e_pdf = env_pdf(ps.mis_origin, gl_WorldRayDirectionEXT);
 		// The e_pdf > 0.0 guard covers a scene with no sky at all: marginal_total
 		// == 0 makes env_pdf() return 0 for every direction, env NEE therefore
 		// contributes w_env = 0 everywhere, and this strategy must take the whole
