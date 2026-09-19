@@ -458,15 +458,19 @@ func render_image(data, output_path):
 		print("[PhaseA] Viewport scaling set to BILINEAR @1.0 (no temporal upscaler) — removes the projection jitter so it cannot double up with the path tracer's pixel filter.")
 
 	if cam:
-		setup_fixed_fill_lights()
+		if day_render:
+			# Daylight design (spec 2026-09-19): no omni fill grid on day renders.
+			# The room is sun + normalised sky + fixtures + portals; if the probe
+			# below finds the darkest occupied quarter under the floor, ONE
+			# measured DaylightFill is added. Night keeps its grid.
+			print("[Daylight] fill grid skipped on day render (probe-exposed daylight).")
+		else:
+			setup_fixed_fill_lights()
 		_apply_no_authored_light_boost()
 		_apply_color_mood_to_scene()
 		if day_render:
-			if _dir_light:
-				# Sun energy is calibrated at 2.8 — no boost needed.
-				# Previous 1.30x and 1.10x boosts were causing floor blowout.
-				print("[Render] Day render: sun energy is calibrated (no boost applied).")
 			if accumulate_enabled:
+				await _daylight_probe_and_expose(env.environment)
 				# Phase A: drive the path-tracer accumulator. Each process_frame
 				# blends one 1-SPP sample into the running average, so waiting N
 				# frames yields ~N effective samples (noise ~1/sqrt(N)). Give the
@@ -614,6 +618,87 @@ func _get_world_environment():
 		if child is WorldEnvironment:
 			return child
 	return null
+
+## Daylight design (spec 2026-09-19, sections 2-3). Measures the job's own
+## frame and sets the exposure; adds one DaylightFill if the darkest occupied
+## quarter is still under the floor. Leaves the accumulator reset so the
+## still that follows starts from a cleared buffer.
+func _daylight_probe_and_expose(p_env: Environment) -> void:
+	var vp := get_viewport().get_viewport_rid()
+	p_env.tonemap_exposure = 1.0
+	var t0 := Time.get_ticks_msec()
+	var pr := await Daylight.probe(self, p_env, vp)
+	if pr["samples"].is_empty():
+		printerr("[Daylight] probe: accumulator readback returned nothing; exposure left at 1.0")
+		await Daylight.reset_accumulator(self, p_env)
+		return
+	var st := Daylight.stats(pr["samples"])
+	print("[Daylight] probe: median %.5f (occupied %.1f%%), exposure %.3f%s, p25 %.5f -> %.4f after exposure  [%d ms, %dx%d]" % [
+			st["median"], 100.0 * st["occupied_fraction"], st["exposure"],
+			" CLAMPED -- scene is not a lit interior" if st["clamped"] else "",
+			st["p25"], st["p25"] * st["exposure"], Time.get_ticks_msec() - t0, pr["width"], pr["height"]])
+	var exposure: float = st["exposure"]
+	if st["p25"] * exposure < Daylight.FLOOR and not st["clamped"]:
+		var fill := _place_daylight_fill(1.0)
+		var pr1 := await Daylight.probe(self, p_env, vp)
+		var sol := Daylight.solve_fill(pr["samples"], pr1["samples"])
+		if sol["needed"]:
+			fill.light_energy = sol["energy"]
+			exposure = sol["exposure"]
+			print("[Daylight] fill: p25 %.4f < %.3f after exposure -> DaylightFill at %s size %s energy %.4f%s; exposure %.3f -> %.3f" % [
+					st["p25"] * st["exposure"], Daylight.FLOOR, str(fill.global_position), str(fill.area_size),
+					sol["energy"], " (CAPPED at share %.2f)" % Daylight.FILL_SHARE_CAP if sol["capped"] else "",
+					st["exposure"], exposure])
+		else:
+			fill.queue_free()
+	p_env.tonemap_exposure = exposure
+	await Daylight.reset_accumulator(self, p_env)
+
+
+## The fallback fill: centroid of the camera's room (or the lighting bounds'
+## centre), 0.3 m below its ceiling, 0.6 x the room's extent, facing down,
+## no shadows, normalised energy. Same rule as pt_daylight_gate.gd _add_fill().
+func _place_daylight_fill(p_energy: float) -> AreaLight3D:
+	# _extract_room_lighting_bounds() expects the parsed floor-plan geometry
+	# dict (areas/vertices), not the raw job JSON. build_scene() resolves
+	# that exact dict as `geom_data` and hands it to setup_lighting(data,
+	# geom_data) -- see image_glb_creation.gd:458-488; it also stashes it
+	# in the member `_floor_plan_root_data` at line 476, so that member IS
+	# what setup_lighting receives. `_render_data.get("floor_plan_data", {})`
+	# (the brief's suggestion) would instead be the RAW value, which per the
+	# task brief can be a JSON string in some jobs -- a string fails the
+	# Dictionary type check and silently falls back to the (0,0,0)/6x6/2.8
+	# defaults. Reusing _floor_plan_root_data avoids that.
+	var bounds := _extract_room_lighting_bounds(_floor_plan_root_data)
+	var center: Vector3 = bounds["center"]
+	var extent: Vector2 = bounds["extent"]
+	var ceiling_y: float = bounds["ceiling_y"]
+	var poly := _resolve_active_area_polygon()
+	if poly.size() >= 3:
+		var sum := Vector2.ZERO
+		var mn := Vector2(1e9, 1e9)
+		var mx := Vector2(-1e9, -1e9)
+		for p in poly:
+			sum += p
+			mn = Vector2(minf(mn.x, p.x), minf(mn.y, p.y))
+			mx = Vector2(maxf(mx.x, p.x), maxf(mx.y, p.y))
+		var c := sum / float(poly.size())
+		center = Vector3(c.x, center.y, c.y)
+		extent = mx - mn
+	var fill := AreaLight3D.new()
+	fill.name = "DaylightFill"
+	fill.area_size = extent * 0.6
+	fill.area_normalize_energy = true
+	fill.light_energy = p_energy
+	fill.light_color = Color(1.0, 1.0, 1.0)
+	fill.light_specular = 0.0
+	fill.shadow_enabled = false
+	fill.set_param(Light3D.PARAM_RANGE, 2.0 * extent.length() + 4.0)
+	fill.set_param(Light3D.PARAM_ATTENUATION, 1.0)
+	add_child(fill)
+	fill.position = Vector3(center.x, ceiling_y - 0.3, center.z)
+	fill.rotation_degrees = Vector3(-90.0, 0.0, 0.0) # -Z points down
+	return fill
 
 func _apply_color_mood_to_scene() -> void:
 	var directional_tint = _get_color_mood_light_color("directional")
