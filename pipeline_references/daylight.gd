@@ -1,0 +1,201 @@
+class_name Daylight
+extends RefCounted
+
+## Daylight design for day renders (docs/superpowers/specs/2026-09-19-daylight-design.md).
+##
+## Pure functions plus one coroutine, shared by the pipeline (render.gd /
+## image_glb_creation.gd) and pt_daylight_gate.gd so the gate proves the code
+## the pipeline runs. Nothing here touches the scene tree except through the
+## node handed to probe().
+##
+## Units: the tracer reads a white Lambertian surface under a uniform sky of
+## radiance L as L (irradiance pi*L), and under a DirectionalLight3D of
+## energy E at incidence theta as E*cos(theta)/pi. The panorama is normalised
+## so a horizontal surface receives irradiance exactly 1 from the sky; the sun
+## is then SUN_TO_SKY in the same units.
+
+## Direct-normal over diffuse-horizontal irradiance for a 10 AM clear sky:
+## ~90 klux direct vs ~18 klux diffuse. The one look-defining constant.
+const SUN_TO_SKY := 5.0
+## Photographic mid-grey: the occupied frame's median after exposure.
+const TARGET_MEDIAN := 0.18
+## Darkest occupied quarter must reach this after exposure, or a fill is added.
+const FLOOR := 0.02
+## Pixels above MASK_RATIO x the raw median are sky seen through windows
+## (a physical sky is 50-100x the wall) and are excluded from the statistics.
+const MASK_RATIO := 8.0
+const PROBE_FRAMES := 16
+## Statistics are taken at every PROBE_STEP-th pixel in x and y.
+const PROBE_STEP := 4
+const EXPOSURE_MIN := 0.05
+const EXPOSURE_MAX := 50.0
+## The fill may supply at most this share of the occupied median.
+const FILL_SHARE_CAP := 0.5
+const FILL_SCAN_START := 0.01
+const FILL_SCAN_STEP := 1.1
+const FILL_SCAN_MAX_ITER := 400
+## Downsample the panorama to this before integrating (256 x 128 of an
+## 8192 x 4096 EXR estimates its full-resolution irradiance within 1%).
+const IRRADIANCE_W := 256
+const IRRADIANCE_H := 128
+## Frames to hold each side of the accumulate off/on edge so the rendering
+## server observes the transition (pt_validation.gd RESET_SETTLE_FRAMES).
+const RESET_SETTLE_FRAMES := 3
+
+
+## Upward-facing irradiance of an equirect panorama (v = 0 is the zenith, as
+## Godot's PanoramaSkyMaterial maps it: v = acos(dir.y) / PI):
+##   E = sum over rows with theta < pi/2, all columns, of
+##       L * cos(theta) * sin(theta) * (2 pi / W) * (pi / H)
+## A uniform sky of radiance 1 gives pi. Same integral as
+## pt_sky_energy_gate.gd _analytic_outgoing_radiance() without the azimuthal
+## shortcut.
+static func sky_irradiance(p_img: Image) -> float:
+	var img := p_img
+	if p_img.get_width() > IRRADIANCE_W or p_img.get_height() > IRRADIANCE_H:
+		img = p_img.duplicate()
+		img.resize(IRRADIANCE_W, IRRADIANCE_H, Image.INTERPOLATE_CUBIC)
+	var w := img.get_width()
+	var h := img.get_height()
+	var d_theta := PI / float(h)
+	var d_phi := TAU / float(w)
+	var e := 0.0
+	for y in range(h):
+		var theta := (float(y) + 0.5) * d_theta
+		if theta >= PI * 0.5:
+			break
+		var weight := cos(theta) * sin(theta) * d_theta * d_phi
+		var row := 0.0
+		for x in range(w):
+			var c := img.get_pixel(x, y)
+			row += (c.r + c.g + c.b) / 3.0
+		e += row * weight
+	return e
+
+
+## Mean-RGB luminance at every p_step-th pixel in x and y, row-major.
+static func subsample(p_img: Image, p_step: int) -> PackedFloat32Array:
+	var out := PackedFloat32Array()
+	var step := maxi(1, p_step)
+	for y in range(0, p_img.get_height(), step):
+		for x in range(0, p_img.get_width(), step):
+			var c := p_img.get_pixel(x, y)
+			out.append((c.r + c.g + c.b) / 3.0)
+	return out
+
+
+static func _percentile(p_sorted: PackedFloat32Array, p_q: float) -> float:
+	if p_sorted.is_empty():
+		return 0.0
+	var idx := int(floor(p_q * float(p_sorted.size() - 1)))
+	return p_sorted[clampi(idx, 0, p_sorted.size() - 1)]
+
+
+## Occupancy mask + exposure from a probe's luminance samples.
+## Returns {raw_median, median, p25, occupied_fraction, exposure, clamped}.
+## `median` and `p25` are over the OCCUPIED samples (<= MASK_RATIO x raw median).
+static func stats(p_samples: PackedFloat32Array) -> Dictionary:
+	var sorted := p_samples.duplicate()
+	sorted.sort()
+	var raw_median := _percentile(sorted, 0.5)
+	var occupied := PackedFloat32Array()
+	var cut := raw_median * MASK_RATIO
+	for v in sorted:
+		if v <= cut:
+			occupied.append(v)
+		else:
+			break # sorted ascending: everything after is excluded too
+	var median := _percentile(occupied, 0.5)
+	var p25 := _percentile(occupied, 0.25)
+	var clamped := false
+	var exposure := EXPOSURE_MAX
+	if median > 0.0:
+		exposure = TARGET_MEDIAN / median
+	else:
+		clamped = true # a black frame: nothing to expose for
+	if exposure < EXPOSURE_MIN or exposure > EXPOSURE_MAX:
+		clamped = true
+		exposure = clampf(exposure, EXPOSURE_MIN, EXPOSURE_MAX)
+	return {
+		"raw_median": raw_median,
+		"median": median,
+		"p25": p25,
+		"occupied_fraction": float(occupied.size()) / float(maxi(p_samples.size(), 1)),
+		"exposure": exposure,
+		"clamped": clamped,
+	}
+
+
+## Fill energy from two probes: p_s0 without the fill, p_s1 with it at energy
+## 1.0 (same pixels, same order). Per pixel L(f) = L0 + f (L1 - L0). Scans f
+## geometrically from FILL_SCAN_START and returns the first f whose
+## p25(f) * e(f) reaches FLOOR, with e(f) = TARGET_MEDIAN / median(f)
+## recomputed at every step (the fill lifts the median too). Capped where
+## the fill's share of the occupied median, (median(f) - median(0)) /
+## median(f), reaches FILL_SHARE_CAP.
+## Returns {needed, energy, exposure, median, p25, capped}.
+static func solve_fill(p_s0: PackedFloat32Array, p_s1: PackedFloat32Array) -> Dictionary:
+	var base := stats(p_s0)
+	if base["p25"] * base["exposure"] >= FLOOR:
+		return {"needed": false, "energy": 0.0, "exposure": base["exposure"],
+				"median": base["median"], "p25": base["p25"], "capped": false}
+	var n := mini(p_s0.size(), p_s1.size())
+	var f := FILL_SCAN_START
+	var mixed := PackedFloat32Array()
+	mixed.resize(n)
+	var last := base
+	for _i in range(FILL_SCAN_MAX_ITER):
+		for k in range(n):
+			mixed[k] = p_s0[k] + f * (p_s1[k] - p_s0[k])
+		var st := stats(mixed)
+		last = st
+		var share := 0.0
+		if st["median"] > 0.0:
+			share = (st["median"] - base["median"]) / st["median"]
+		if st["p25"] * st["exposure"] >= FLOOR:
+			return {"needed": true, "energy": f, "exposure": st["exposure"],
+					"median": st["median"], "p25": st["p25"], "capped": false}
+		if share >= FILL_SHARE_CAP:
+			return {"needed": true, "energy": f, "exposure": st["exposure"],
+					"median": st["median"], "p25": st["p25"], "capped": true}
+		f *= FILL_SCAN_STEP
+	return {"needed": true, "energy": f, "exposure": last["exposure"],
+			"median": last["median"], "p25": last["p25"], "capped": true}
+
+
+## Drives a fresh accumulation of p_frames frames and reads the linear
+## accumulator back, subsampled. p_node is any node in the tree (for
+## process_frame); p_env the Environment; p_vp the viewport RID.
+## Transcribed from pt_validation.gd _render_accum(): the accumulate flag
+## must be seen off for several server frames before it is set on again, or
+## the driver keeps the old average.
+static func probe(p_node: Node, p_env: Environment, p_vp: RID, p_frames: int = PROBE_FRAMES, p_step: int = PROBE_STEP) -> Dictionary:
+	var prev_target := p_env.pathtracing_accumulation_target
+	p_env.pathtracing_accumulate = false
+	for _i in range(RESET_SETTLE_FRAMES):
+		await p_node.get_tree().process_frame
+	await RenderingServer.frame_post_draw
+	p_env.pathtracing_accumulate = true
+	p_env.pathtracing_accumulation_target = p_frames
+	for _i in range(RESET_SETTLE_FRAMES):
+		await p_node.get_tree().process_frame
+	for _i in range(p_frames):
+		await p_node.get_tree().process_frame
+	await RenderingServer.frame_post_draw
+	var img: Image = RenderingServer.viewport_get_pathtracing_accum_image(p_vp)
+	p_env.pathtracing_accumulation_target = prev_target
+	if img == null or img.is_empty():
+		return {"samples": PackedFloat32Array(), "width": 0, "height": 0}
+	return {"samples": subsample(img, p_step), "width": img.get_width(), "height": img.get_height()}
+
+
+## Resets the accumulator the same way probe() does, without rendering
+## anything: call before the final still so it starts from a cleared buffer.
+static func reset_accumulator(p_node: Node, p_env: Environment) -> void:
+	p_env.pathtracing_accumulate = false
+	for _i in range(RESET_SETTLE_FRAMES):
+		await p_node.get_tree().process_frame
+	await RenderingServer.frame_post_draw
+	p_env.pathtracing_accumulate = true
+	for _i in range(RESET_SETTLE_FRAMES):
+		await p_node.get_tree().process_frame
