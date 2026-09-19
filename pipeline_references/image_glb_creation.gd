@@ -80,6 +80,26 @@ const GLB_KEEP_ALPHA_KEYWORDS = [
 	"cloud", "dust", "spray", "bubble", "foam", "caustic", "glow",
 	"screen", "display", "hologram", "flame", "fire", "particle",
 ]
+# E3 subsurface presets (2026-09-15), keyed on the MATERIAL name plus the
+# surface name -- never on the asset. Runs on every OPAQUE surface of every
+# loaded GLB after the glass pass; a name the keep-alpha, water or glass lists
+# claim is left to those rules. First matching row wins.
+#
+# depth (transmittance_depth, metres) 0.0 means THIN-WALL: a sheet, rendered as
+# the OpenPBR diffuse/translucent split (light passes straight through the
+# surface, no volume). > 0 means a SOLID: Cycles' random walk inside the body,
+# with radius * depth the per-channel mean free path. radius is the Cycles
+# "Subsurface Radius" colour in linear light (marble scatters all channels
+# alike, skin/wax scatter red furthest).
+#
+# These are starting points, tuned by eye against Blender's material preview.
+# See docs/superpowers/specs/2026-09-15-e3-subsurface-scattering-design.md.
+const GLB_SUBSURFACE_PRESETS = [
+	{"keywords": ["marble"], "strength": 1.0, "radius": Color(1.0, 0.95, 0.9), "depth": 0.03},
+	{"keywords": ["candle", "wax"], "strength": 1.0, "radius": Color(1.0, 0.8, 0.6), "depth": 0.05},
+	{"keywords": ["lampshade", "shade", "paper"], "strength": 0.7, "radius": Color(1, 1, 1), "depth": 0.0},
+	{"keywords": ["leaf"], "strength": 0.3, "radius": Color(1, 1, 1), "depth": 0.0},
+]
 # Refractive index for converted glass. 1.5 (soda-lime) since 2026-09-15.
 #
 # HISTORY. This was 1.2, "deliberately unphysical", to push the critical angle
@@ -1232,25 +1252,39 @@ func setup_lighting(data, geom_data = {}):
 	# ── ROUTE SELECT: realtime DLSS-RR (default) vs Phase A offline accumulation ──
 	#
 	#   >>> FLIP THIS ONE LINE TO true TO USE THE PHASE A OFFLINE ROUTE <<<
-	const PHASE_A_OFFLINE_STILL := false
+	const PHASE_A_OFFLINE_STILL := true
 
 	# Tuning, all editable here (env vars of the same name below still override).
 	#   ACCUM_TARGET     frames to accumulate. Noise falls as 1/sqrt(N), so 4x the
-	#                    frames halves the grain. 256 is a preview, 1024 a hero shot.
+	#                    frames halves the grain. 256 matches the Blender reference; 512 halves the
+	#                    grain again at double the time.
 	#   FINAL            "none" | "oidn" | "dlssrr". OIDN removes residual grain at a
 	#                    cost in fine detail; prefer more samples first, but on a dark
 	#                    interior OIDN at 256-512 beats raw at 256.
-	#   CLAMP_INDIRECT   firefly suppression, 0 = off. Blender's default is 10.0.
+	#   CLAMP_INDIRECT   firefly suppression, 0 = off. 10.0 is Cycles'
+	#                    sample_clamp_indirect default. Measured on job 225 at FHD
+	#                    (2026-09-16): pixels above 4x the local median 0.12% -> 0.00%,
+	#                    brightest/median 36x -> 2x, medians unchanged to 4 digits.
+	#                    Those fireflies are what OIDN smeared into blotches.
 	#   NOISE_THRESHOLD  adaptive sampling, 0 = off. Spends the budget on noisy pixels.
-	const PHASE_A_ACCUM_TARGET := 1024
-	const PHASE_A_FINAL := "none"
-	const PHASE_A_CLAMP_INDIRECT := 0.0
+	const PHASE_A_ACCUM_TARGET := 256
+	const PHASE_A_FINAL := "oidn"
+	const PHASE_A_CLAMP_INDIRECT := 10.0
 	const PHASE_A_NOISE_THRESHOLD := 0.0
 
-	# ZR_PHASE_A=1 also forces it on, but be aware the variable must be set for the
-	# process that SPAWNS Godot — i.e. the uvicorn server — not a separate shell.
-	# Setting it in another terminal does nothing, which is why the constant above
-	# exists as the reliable switch.
+	# PRODUCTION SINCE 2026-09-16 (spec 2026-09-16-still-route-pixel-filter-design.md).
+	# The realtime DLSS-RR route below is a game denoiser: its reconstruction never
+	# converges to the pixel-filtered image, and on a 4K still it left a one-pixel
+	# staircase on every edge and a checkerboard on flat walls, whatever it was fed
+	# (sharpener off, jitter sign, 64 jitter phases -- all measured, none fixed it).
+	# Phase A is Cycles' own pipeline -- N samples through the Blackman-Harris pixel
+	# filter, then OIDN -- and measured clean on the same frame, in half the time.
+	# 256 is the sample count of the Blender reference still; OIDN matches Blender's
+	# default final denoise. Video keeps DLSS-RR (video_glb_creation.gd).
+	#
+	# ZR_PHASE_A=1 ALSO turns the route on (either is enough; it used to need
+	# both). The variable must be set for the process that SPAWNS Godot -- i.e.
+	# the uvicorn server -- not a separate shell.
 	#
 	# Whichever way it is enabled, the run logs a "[PhaseA] Offline accumulation ON"
 	# line. If that line is absent from the Godot log, the offline route did NOT run
@@ -1273,7 +1307,7 @@ func setup_lighting(data, geom_data = {}):
 	# estimate different integrands, so the sky darkens where the env-NEE weight is high
 	# while BSDF-sampled sun fireflies pass through unclamped. This is inert at the
 	# default (clamp is 0 = off); it is not intended behaviour, just not yet fixed.
-	var phase_a_offline := PHASE_A_OFFLINE_STILL and OS.get_environment("ZR_PHASE_A") == "1"
+	var phase_a_offline := PHASE_A_OFFLINE_STILL or OS.get_environment("ZR_PHASE_A") == "1"
 
 	if phase_a_offline:
 		# PHASE A OFFLINE STILL: trace one sample per driver frame into a persistent
@@ -1665,6 +1699,80 @@ func _apply_glb_transmissive_glass(mat: BaseMaterial3D, kind: String) -> void:
 
 	# An emissive pane would double-count once it starts bouncing.
 	mat.emission_enabled = false
+
+# Returns the first keyword of the preset that applied, or "" when none did.
+# `context_text` is the same material-plus-surface name the glass classifier
+# reads, so the two rules can never disagree about who owns a surface.
+func _apply_glb_subsurface_preset(mat: BaseMaterial3D, context_text: String) -> String:
+	var t = context_text.to_lower()
+	if t.strip_edges() == "":
+		return ""
+	for kw in GLB_KEEP_ALPHA_KEYWORDS:
+		if kw in t:
+			return ""
+	if _classify_glb_alpha_material(context_text) != "":
+		return "" # glass and water are handled by their own rules
+	for preset in GLB_SUBSURFACE_PRESETS:
+		for kw in preset["keywords"]:
+			if kw in t:
+				mat.subsurf_scatter_enabled = true
+				mat.subsurf_scatter_strength = float(preset["strength"])
+				mat.subsurf_scatter_transmittance_enabled = true
+				# The engine reads this colour through srgb_to_linear, the same
+				# way it reads albedo, so store the linear preset as sRGB.
+				mat.subsurf_scatter_transmittance_color = (preset["radius"] as Color).linear_to_srgb()
+				mat.subsurf_scatter_transmittance_depth = float(preset["depth"])
+				return str(kw)
+	return ""
+
+# Walks every surface of every mesh under `root` (opaque ones included -- the
+# glass pass above only looks at alpha-blended surfaces) and applies the first
+# GLB_SUBSURFACE_PRESETS row whose keyword the material/surface name carries.
+# A material_override wins over every surface on its instance, so it is
+# checked on its own and the surfaces under it are skipped, exactly as in
+# _convert_glb_alpha_glass. Always duplicates before mutating: GLB instances
+# share material resources.
+func _apply_glb_subsurface(root: Node, asset_label: String = "") -> void:
+	if GLB_SUBSURFACE_PRESETS.is_empty():
+		return
+	var applied = []
+	for m in _get_all_meshes(root):
+		if not m.mesh:
+			continue
+		var node_name = str(m.name)
+		if m.material_override != null and m.material_override is BaseMaterial3D:
+			var ov = m.material_override
+			var ov_ctx = str(ov.resource_name)
+			if ov_ctx.strip_edges() == "":
+				ov_ctx = node_name
+			var ov_dup = ov.duplicate()
+			var ov_hit = _apply_glb_subsurface_preset(ov_dup, ov_ctx)
+			if ov_hit != "":
+				m.material_override = ov_dup
+				applied.append("%s [override, %s]" % [ov_ctx.strip_edges(), ov_hit])
+			continue
+		for i in range(m.mesh.get_surface_count()):
+			var mat = m.get_surface_override_material(i)
+			if mat == null:
+				mat = m.mesh.surface_get_material(i)
+			if mat == null or not (mat is BaseMaterial3D):
+				continue
+			var ctx = str(mat.resource_name) + " " + str(m.mesh.surface_get_name(i))
+			if ctx.strip_edges() == "":
+				ctx = node_name
+			var dup = mat.duplicate()
+			var hit = _apply_glb_subsurface_preset(dup, ctx)
+			if hit == "":
+				continue
+			m.set_surface_override_material(i, dup)
+			applied.append("%s [%s]" % [ctx.strip_edges(), hit])
+	if applied.is_empty():
+		return
+	var label = asset_label if asset_label != "" else str(root.name)
+	# Read this line when a marble/wax/paper surface renders as plain diffuse:
+	# no entry here means no keyword matched -- add the material's name to
+	# GLB_SUBSURFACE_PRESETS and re-render.
+	print("  [SSS] %s -> subsurface: %s" % [label, ", ".join(applied)])
 
 func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 	if not CONVERT_GLB_ALPHA_GLASS or not USE_TRANSMISSIVE_GLASS:
@@ -3835,6 +3943,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 									add_child(asset_node)
 									_sanitize_glb_lights(asset_node)
 									_convert_glb_alpha_glass(asset_node, model_path.get_file())
+									_apply_glb_subsurface(asset_node, model_path.get_file())
 
 									var aabb = _get_hierarchy_aabb(asset_node)
 									var dims = aabb.size
@@ -3870,8 +3979,20 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 									asset_node.scale = Vector3(scale_x * flip_x, scale_y, scale_z * flip_z)
 
 									_apply_item_materials(asset_node, hole)
-									#_fix_glass_materials_for_shadows(asset_node)
-									print("Loaded hole asset: ", model_path, " final scale: ", asset_node.scale, " (shadows: handled by material)")
+									# WINDOW GLASS DOES NOT CAST SHADOWS (Gap #30, 2026-09-16). Cycles'
+									# rule -- refractive glass blocks a shadow ray -- is right for a vase
+									# and wrong for a window pane: with it, sun and sky reach the glass
+									# and stop there (job 225 with only sun + sky rendered black; the
+									# room was lit by the artificial fill lights alone). Blender archviz
+									# answers this on every window with Ray Visibility > Shadow off; the
+									# tracer now honours Godot's equivalent, cast_shadow = OFF, per
+									# instance (RT_INSTANCE_MASK_NO_SHADOW): camera and bounce rays
+									# still see and refract through the pane, no shadow ray does. Frames
+									# and mullions keep their shadows (_is_glass_mesh decides per mesh).
+									# Doors are left alone: an opaque door should shadow.
+									if is_window_for_sun:
+										_disable_shadow_casting_recursive(asset_node)
+									print("Loaded hole asset: ", model_path, " final scale: ", asset_node.scale, " (window glass: cast_shadow OFF)" if is_window_for_sun else " (shadows: handled by material)")
 									# Detect glass: enables shadow on glass-door fill SpotLights
 									if not is_window_for_sun:
 										hole_has_glass = _node_has_any_glass(asset_node)
@@ -6296,6 +6417,7 @@ func _load_layer_items(items, layer_altitude, layer_id := "", render_mode: Strin
 				_apply_item_materials(node, item)
 				_add_light_fixture_effect(node, item, aabb, final_scale)
 				_convert_glb_alpha_glass(node, resolved_model_path.get_file())
+				_apply_glb_subsurface(node, resolved_model_path.get_file())
 				print("Loaded asset: ", resolved_model_path, " final scale: ", final_scale)
 				load_status = "loaded"
 				load_reason = ""
