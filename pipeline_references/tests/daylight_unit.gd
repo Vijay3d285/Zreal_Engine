@@ -166,6 +166,19 @@ func _init() -> void:
 	var r2 := Daylight.solve_fill(c0, c1)
 	_check_true("F3 fill that cannot reach the corners is capped", r2["capped"])
 	_check("F3 capped at share 0.5 (f = 0.02)", r2["energy"], 0.02, 0.10)
+	# Degenerate second probe (empty samples -- e.g. accumulator readback
+	# failed): must not run the geometric scan against an empty mix, which
+	# would otherwise return needed=true with energy on the order of
+	# FILL_SCAN_START * FILL_SCAN_STEP^FILL_SCAN_MAX_ITER.
+	var r3 := Daylight.solve_fill(dark, PackedFloat32Array())
+	_check_true("F4 empty second probe -> no fill", not r3["needed"])
+	_check("F4 empty second probe -> energy 0", r3["energy"], 0.0, 1e-9)
+	# Size mismatch between the two probes (also a failed/partial readback).
+	var dark1_short := dark1.duplicate()
+	dark1_short.remove_at(dark1_short.size() - 1)
+	var r4 := Daylight.solve_fill(dark, dark1_short)
+	_check_true("F5 size-mismatched probes -> no fill", not r4["needed"])
+	_check("F5 size-mismatched probes -> energy 0", r4["energy"], 0.0, 1e-9)
 
 	print("")
 	if _failures.is_empty():

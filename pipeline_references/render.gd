@@ -641,16 +641,20 @@ func _daylight_probe_and_expose(p_env: Environment) -> void:
 	if st["p25"] * exposure < Daylight.FLOOR and not st["clamped"]:
 		var fill := _place_daylight_fill(1.0)
 		var pr1 := await Daylight.probe(self, p_env, vp)
-		var sol := Daylight.solve_fill(pr["samples"], pr1["samples"])
-		if sol["needed"]:
-			fill.light_energy = sol["energy"]
-			exposure = sol["exposure"]
-			print("[Daylight] fill: p25 %.4f < %.3f after exposure -> DaylightFill at %s size %s energy %.4f%s; exposure %.3f -> %.3f" % [
-					st["p25"] * st["exposure"], Daylight.FLOOR, str(fill.global_position), str(fill.area_size),
-					sol["energy"], " (CAPPED at share %.2f)" % Daylight.FILL_SHARE_CAP if sol["capped"] else "",
-					st["exposure"], exposure])
-		else:
+		if pr1["samples"].is_empty() or pr1["samples"].size() != pr["samples"].size():
+			printerr("[Daylight] fill probe: accumulator readback returned nothing; no fill")
 			fill.queue_free()
+		else:
+			var sol := Daylight.solve_fill(pr["samples"], pr1["samples"])
+			if sol["needed"]:
+				fill.light_energy = sol["energy"]
+				exposure = sol["exposure"]
+				print("[Daylight] fill: p25 %.4f < %.3f after exposure -> DaylightFill at %s size %s energy %.4f%s; exposure %.3f -> %.3f" % [
+						st["p25"] * st["exposure"], Daylight.FLOOR, str(fill.global_position), str(fill.area_size),
+						sol["energy"], " (CAPPED at share %.2f)" % Daylight.FILL_SHARE_CAP if sol["capped"] else "",
+						st["exposure"], exposure])
+			else:
+				fill.queue_free()
 	p_env.tonemap_exposure = exposure
 	await Daylight.reset_accumulator(self, p_env)
 

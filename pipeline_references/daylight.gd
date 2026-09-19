@@ -146,10 +146,20 @@ static func stats(p_samples: PackedFloat32Array) -> Dictionary:
 ## recomputed at every step (the fill lifts the median too). Capped where
 ## the fill's share of the occupied median, (median(f) - median(0)) /
 ## median(f), reaches FILL_SHARE_CAP.
+## Degenerate input (p_s1 empty, or its size does not match p_s0 -- e.g. the
+## second probe's accumulator readback failed) -> no fill: without a real
+## second sample there is nothing to mix, and the geometric scan below would
+## otherwise run every one of its FILL_SCAN_MAX_ITER iterations against an
+## empty/zero mix (stats(empty) is clamped with p25 0, so neither exit
+## condition ever fires) and return an energy on the order of
+## FILL_SCAN_START * FILL_SCAN_STEP^FILL_SCAN_MAX_ITER -- effectively infinite.
 ## Returns {needed, energy, exposure, median, p25, capped}.
 static func solve_fill(p_s0: PackedFloat32Array, p_s1: PackedFloat32Array) -> Dictionary:
 	var base := stats(p_s0)
 	if base["p25"] * base["exposure"] >= FLOOR:
+		return {"needed": false, "energy": 0.0, "exposure": base["exposure"],
+				"median": base["median"], "p25": base["p25"], "capped": false}
+	if p_s0.is_empty() or p_s1.is_empty() or p_s0.size() != p_s1.size():
 		return {"needed": false, "energy": 0.0, "exposure": base["exposure"],
 				"median": base["median"], "p25": base["p25"], "capped": false}
 	var n := mini(p_s0.size(), p_s1.size())
