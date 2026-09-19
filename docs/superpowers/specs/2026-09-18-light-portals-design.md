@@ -96,15 +96,16 @@
 - 3. Portal-only when a portal faces `P` — loses the sky a point also sees
   around a corner (terrace, a room open on one side); Cycles keeps both.
 
-Authoring: **`AreaLight3D.portal`** (Blender's own model, visible in the
+Authoring: **`AreaLight3D.area_portal`** (Blender's own model, visible in the
 inspector) over an `Environment` list or a name convention.
 
 ## Design
 
 ### 1. Authoring and the raster (engine, C++)
 
-- `AreaLight3D`: `set_portal(bool)` / `is_portal()`, property `portal`
-  (default false) in the area group. Plumbed exactly like `light_negative`:
+- `AreaLight3D`: `set_area_portal(bool)` / `is_area_portal()`, property
+  `area_portal` (default false; the `area_` prefix keeps it inside the
+  inspector's Area group). Plumbed exactly like `light_negative`:
   `RenderingServer::light_set_portal(RID, bool)` (`rendering_server.h`),
   `FUNC2` in `rendering_server_default.h`, `RendererLightStorage` virtual
   (`servers/rendering/storage/light_storage.h`), RD `LightStorage::Light::portal`
@@ -115,30 +116,32 @@ inspector) over an `Environment` list or a name convention.
   `shadow_enabled = false` and `light_energy = 0` on portals so no shadow map
   is rendered for them.
 
-### 2. The light buffer, Cycles' layout (engine, C++)
+### 2. The portal buffer (engine, C++)
 
-`gather_lights(p_render_data, r_light_data, p_max_lights)`:
+Cycles appends portals to its light array. We cannot: the light SSBO
+(`raytracing_lights_inc.glsl`, binding 13) is declared only in the raygen and
+closest-hit stages, and the **miss stage** — which must evaluate the portal
+pdf for MIS — includes neither it nor the ray-query machinery it drags in.
+The sky sampler, by contrast, is included from `raytracing_common_inc.glsl`
+in every stage. So portals get their own small SSBO, declared next to the
+sky sampler:
 
-- New enum values: `RT_LIGHT_TYPE_PORTAL = 4` (C++ and GLSL, mirrored),
-  `RT_PORTALS_MAX = 16`.
-- First pass over `rt_lights`: collect `LIGHT_AREA` instances with
-  `light_is_portal()` into a portal list (up to `RT_PORTALS_MAX`, extra ones
-  dropped with a once-per-session warning). `portal_count` = its size.
-- Analytic gather runs unchanged with capacity `p_max_lights − portal_count`;
-  portals are **skipped** by the positional scorer (they must never enter the
-  reservoir selection).
-- Portals are written at `[light_count, light_count + portal_count)`:
-  `position` = light origin; `spot_direction` = `basis.x.normalized() ×
-  area_size.x / 2`; `rect_axis_v` = `basis.y.normalized() × area_size.y / 2`;
-  `rect_half_height = area_size.y / 2`; `type = RT_LIGHT_TYPE_PORTAL`;
-  `emission = 0`, `shadow_enabled = 0`, `ies_slot = −1`, everything else zero.
-  The facing direction is `cross(axisV, axisU)` = the light's `−Z`, the same
-  identity `lights_eval_rect_light` uses (`raytracing_lights_inc.glsl:520`).
-- `gather_lights` returns the analytic count as before; a new out-parameter
-  (or member) carries `portal_count`. Upload: `RT_PARAM_PORTAL_OFFSET = 18`
-  (`[4].z`) = `light_count`, `RT_PARAM_PORTAL_COUNT = 19` (`[4].w`).
-  `RT_PARAM_LIGHT_COUNT` stays the analytic count, so light selection, the
-  emissive gather and every existing loop see nothing new.
+- `RT_PortalData` (C++ `render_raytracing.h`, `alignas(16)`, 64 bytes,
+  `static_assert`) ↔ `RTPortalData` (GLSL): `vec3 position; float _pad0;
+  vec3 axis_u; float len_u; vec3 axis_v; float len_v; vec3 dir; float _pad1;`
+  — centre, unit axes, full side lengths (Cycles' `klight->area` fields),
+  facing direction = the light's `−Z`.
+- Binding **41** (the next free slot after `rt_accum_normal` at 40),
+  `RTViewportState::portal_buffer`, `RT_PORTALS_MAX = 16` entries, uploaded
+  every frame next to the light buffer; the default storage buffer is bound
+  when no portal exists. `RT_PARAM_PORTAL_COUNT = 18` (`rt_params[4].z`).
+- `gather_lights(p_render_data, r_light_data, p_max_lights, r_portal_data,
+  r_portal_count)`: the positional scorer **skips** a `LIGHT_AREA` whose
+  `light_is_portal()` is set (portals never enter the reservoir selection);
+  a separate pass over `rt_lights` writes up to `RT_PORTALS_MAX` portals
+  (extra ones dropped with a once-per-session warning). `RT_PARAM_LIGHT_COUNT`
+  stays the analytic count, so light selection, the emissive gather and
+  every existing loop see nothing new.
 - **Incidental fix in the same function:** a `LIGHT_AREA` that is *not* a
   portal becomes `RT_LIGHT_TYPE_RECT`: half-width `area_size.x / 2`,
   half-height `area_size.y / 2`, axes from the basis' `+X`/`+Y`, energy through
@@ -150,15 +153,14 @@ inspector) over an `Environment` list or a name convention.
 
 ### 3. Portal sampling (engine, GLSL) — new `raytracing_portal_inc.glsl`
 
-Included from every stage block of `scene_raytracing_raygen.glsl` after
-`raytracing_lights_inc.glsl` (it reads `rt_lights`) and before
-`raytracing_env_sampling_inc.glsl` (which calls it). Transcriptions, with the
-Cycles line cited above each function:
+Included from `raytracing_common_inc.glsl` immediately before
+`raytracing_env_sampling_inc.glsl` (which calls it), so every stage that has
+the sky sampler has the portals. Declares the binding-41 SSBO. Transcriptions,
+with the Cycles line cited above each function:
 
-- `int portal_offset()`, `int portal_count()` — `get_rt_param` reads.
+- `int portal_count()` — `get_rt_param(RT_PARAM_PORTAL_COUNT)`.
 - `bool portal_fetch_and_check_side(int i, vec3 P, out vec3 pos, out vec3 dir)`
-  — `background.h:153`; `dir = normalize(cross(axisV, axisU))`;
-  `dot(dir, P − pos) > 1e-4`.
+  — `background.h:153`; `dot(dir, P − pos) > 1e-4`.
 - `float portal_rect_sample(vec3 P, inout vec3 light_p, vec3 axis_u, float len_u,
   vec3 axis_v, float len_v, vec2 rand, bool sample_coord)` — `area.h:19-102`,
   Ureña; `len_u = 2·|axisU|`, `len_v = 2·|axisV|`, `axis_u/v` the unit axes;
@@ -199,7 +201,8 @@ Cycles line cited above each function:
 - With `portal_count() == 0` the mixture collapses to `w_map` only; the
   chosen-strategy shortcut returns the map sample and pdf exactly as today —
   the no-portal render must be bit-identical (checked in the gate's P4 and by
-  the whole suite).
+  the whole suite). Cost with no portal: one uniform read and a branch per
+  call.
 
 ### 5. Pipeline hookup (`pipeline_references/image_glb_creation.gd`, uncommitted)
 
@@ -207,7 +210,7 @@ Cycles line cited above each function:
 for day renders: per `_window_sunlight_data` record one `AreaLight3D` named
 `WindowPortal_<i>`, `position = center`, `area_size = Vector2(width, height)`,
 `look_at(center + inner_dir, Vector3.UP)` (so `−Z` points into the room),
-`portal = true`, `light_energy = 0.0`, `shadow_enabled = false`,
+`area_portal = true`, `light_energy = 0.0`, `shadow_enabled = false`,
 `area_normalize_energy = false`. Prints one line per portal. Nothing else in
 the rig changes — the portal spots, fills and exposure are sub-project B's.
 
@@ -236,7 +239,7 @@ fractions of the frame; the back-wall crop avoids the window's direct patch.
 | P1 unbiased | portal on vs portal off, 1024 spp each | back-wall crop and floor crop, on ÷ off | 1 ± 1% both |
 | P2 variance | 16 spp, on and off | per-pixel RMS over the back-wall crop against the 1024-spp render of the same crop, on ÷ off | captured from the first measurement on this build and written into the gate with margin; must be < 1 (bar is the *point* of the feature — it goes red if the portal quietly does nothing); expected ≤ 0.5 |
 | P3 Cycles | portal on, 1024 spp | back-wall and floor crop means | ± 3% vs `tools/cycles_comparison/cycles_portal_room.py` (same room, one area light `is_portal`, world strength 1, 1024 spp, no denoise) |
-| P4 side test | the same portal flipped (`−Z` pointing outdoors), so no surface in the room faces it | flipped vs portal off, 16 spp | pixel-identical (max abs diff 0 over the frame) — the facing test must zero the strategy everywhere, and the RNG stream must not shift |
+| P4 side test | the same portal flipped (`−Z` pointing outdoors), so no surface in the room faces it | flipped vs portal off, 16 spp | max abs diff over the frame ≤ the build's own repeat floor (portal off rendered twice — memory: renders may or may not be reproducible; expected 0) — the facing test must zero the strategy everywhere, and the RNG stream must not shift |
 | P5 area light | a 1 × 1 m `AreaLight3D`, normalize off, energy 1, 1 m over a floor, vs the 179.9° spot-rect of the same size/energy | floor crop, area ÷ spot-rect | 1 ± 1% |
 
 Whole suite on the new binary green (22/22); old hand-over binary green
