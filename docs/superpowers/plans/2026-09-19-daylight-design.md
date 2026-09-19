@@ -855,7 +855,7 @@ In `_ready()`, before the final `print("")`, add:
 
 ```gdscript
 	print("\n=== D3: probe exposure on the windowed room, checked on a %d-frame still ===" % FRAMES_HI)
-	var env3 := await _room_scene(ALBEDO, "open", "back", false)
+	var env3 := await _room_scene(ALBEDO, "open", "back")
 	var pr := await Daylight.probe(self, env3, get_viewport().get_viewport_rid())
 	var st := Daylight.stats(pr["samples"])
 	print("  probe: raw median %.5f occupied %.1f%% median %.5f p25 %.5f exposure %.3f%s" % [
@@ -867,7 +867,7 @@ In `_ready()`, before the final `print("")`, add:
 	_check("D3 still occupied median x e", st_hi["median"] * st["exposure"], Daylight.TARGET_MEDIAN, TOL_EXPOSURE)
 
 	print("\n=== D6: mask, camera facing the window ===")
-	var env6 := await _room_scene(ALBEDO, "open", "window", false)
+	var env6 := await _room_scene(ALBEDO, "open", "window")
 	var still6 := await _render_accum(env6, get_viewport().get_viewport_rid(), FRAMES_HI)
 	var st6 := Daylight.stats(_samples(still6))
 	# The window is a 1.2 x 1.0 m rectangle 3.5 m from the camera, on axis,
@@ -936,7 +936,7 @@ In `_ready()`, after D6:
 
 ```gdscript
 	print("\n=== D4: no fill when the daylight reaches ===")
-	var env4 := await _room_scene(ALBEDO, "open", "back", false)
+	var env4 := await _room_scene(ALBEDO, "open", "back")
 	var pr4 := await Daylight.probe(self, env4, get_viewport().get_viewport_rid())
 	var fill4 := _add_fill(1.0)
 	var pr4b := await Daylight.probe(self, env4, get_viewport().get_viewport_rid())
