@@ -7,6 +7,14 @@ extends SceneTree
 ##
 ## Pure functions only: no viewport, no path tracer. The rendered checks are
 ## pt_daylight_gate.gd.
+##
+## A failed `assert()` anywhere under daylight.gd stalls this run silently in
+## this editor build (this -s invocation pauses waiting for a debugger: no
+## output, no exit, no error) rather than raising a catchable error -- if the
+## script prints nothing for about a minute, it is stalled, not slow; kill
+## the process and check daylight.gd's asserts (2026-09-19: `step & (step -
+## 1) == 0` parsed as `step & ((step - 1) == 0)` -- `==` binds tighter than
+## `&` in GDScript -- and failed on every step > 1).
 
 const LIVE_DAY_EXR := "C:/Zlendo2026/ZlenderRender_stage_copy/godot_project/day.exr"
 # Full-resolution (8192 x 4096) upward-facing irradiance of day.exr, measured
@@ -83,17 +91,28 @@ func _init() -> void:
 		print("  U5 SKIP: %s not present on this machine" % LIVE_DAY_EXR)
 
 	print("\n=== daylight_unit: subsample / stats ===")
-	# 40 x 20 image: left 30 columns at 0.1, right 10 columns at 20.0 (a "window").
+	# 40 x 20 image: left 32 columns at 0.1, right 8 columns at 20.0 (a "window"),
+	# the edge on a 4-pixel boundary so 4x4 box averages are pure.
 	var frame := Image.create(40, 20, false, Image.FORMAT_RGBF)
 	for y in range(20):
 		for x in range(40):
-			var l := 0.1 if x < 30 else 20.0
+			var l := 0.1 if x < 32 else 20.0
 			frame.set_pixel(x, y, Color(l, l, l))
-	var s := Daylight.subsample(frame, 2)
-	_check_true("S1 subsample count 20x10", s.size() == 200)
+	var s := Daylight.subsample(frame, 4)
+	_check_true("S1 subsample count 10x5", s.size() == 50)
+	# Box average, not point sample: a 4x4 block that is half 0.1 / half 0.3
+	# must read 0.2 (a point sample at its corner would read 0.1).
+	var checker := Image.create(4, 4, false, Image.FORMAT_RGBF)
+	for y in range(4):
+		for x in range(4):
+			var v := 0.1 if x < 2 else 0.3
+			checker.set_pixel(x, y, Color(v, v, v))
+	var sc := Daylight.subsample(checker, 4)
+	_check_true("S1b one block", sc.size() == 1)
+	_check("S1c block is the 4x4 mean", sc[0], 0.2, 1e-5)
 	var st := Daylight.stats(s)
-	_check("S2 raw median (window in the top quartile only)", st["raw_median"], 0.1, 1e-6)
-	_check("S3 occupied fraction 0.75", st["occupied_fraction"], 0.75, 1e-6)
+	_check("S2 raw median (window in the top quintile only)", st["raw_median"], 0.1, 1e-6)
+	_check("S3 occupied fraction 0.8", st["occupied_fraction"], 0.8, 1e-6)
 	_check("S4 occupied median 0.1", st["median"], 0.1, 1e-6)
 	_check("S5 exposure 0.18 / 0.1", st["exposure"], 1.8, 1e-6)
 	_check_true("S6 not clamped", not st["clamped"])

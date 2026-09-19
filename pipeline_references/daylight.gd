@@ -75,13 +75,24 @@ static func sky_irradiance(p_img: Image) -> float:
 	return e
 
 
-## Mean-RGB luminance at every p_step-th pixel in x and y, row-major.
+## Mean-RGB luminance of p_step x p_step BOX AVERAGES, row-major. p_step
+## must be a power of two (1, 2, 4, 8): each shrink_x2() halves the image
+## with an exact 2x2 mean in C++. Box averages rather than point samples:
+## the sample median of noisy pixels is biased low (path-tracing noise is
+## right-skewed) -- a point-sampled 16-frame probe read 7.5% under the
+## 256-frame still on the gate's windowed room; averaging 16 pixels first
+## cuts the per-sample variance 16x and the skew with it (spec section 2).
 static func subsample(p_img: Image, p_step: int) -> PackedFloat32Array:
-	var out := PackedFloat32Array()
+	var img: Image = p_img.duplicate()
 	var step := maxi(1, p_step)
-	for y in range(0, p_img.get_height(), step):
-		for x in range(0, p_img.get_width(), step):
-			var c := p_img.get_pixel(x, y)
+	assert((step & (step - 1)) == 0, "subsample: p_step must be a power of two") # == binds tighter than & in GDScript
+	while step > 1 and img.get_width() >= 2 and img.get_height() >= 2:
+		img.shrink_x2()
+		step /= 2
+	var out := PackedFloat32Array()
+	for y in range(img.get_height()):
+		for x in range(img.get_width()):
+			var c := img.get_pixel(x, y)
 			out.append((c.r + c.g + c.b) / 3.0)
 	return out
 
