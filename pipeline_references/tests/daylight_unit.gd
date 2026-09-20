@@ -179,6 +179,31 @@ func _init() -> void:
 	var r4 := Daylight.solve_fill(dark, dark1_short)
 	_check_true("F5 size-mismatched probes -> no fill", not r4["needed"])
 	_check("F5 size-mismatched probes -> energy 0", r4["energy"], 0.0, 1e-9)
+	# F6: loop exhaustion is "no fill", not an energy of
+	# FILL_SCAN_START * FILL_SCAN_STEP^FILL_SCAN_MAX_ITER pretending to be
+	# one. NOTE: perturbing dark's own LAST 10 elements (its own dark-quarter
+	# tail, i<75 ? 0.2 : 0.001, so indices 90-99) does NOT exhaust the scan
+	# -- verified by running it: those 10 elements ARE what p25 is measured
+	# from, so f growing geometrically and unboundedly over 400 steps still
+	# clears the floor at f ~= 21532 (iteration 153 of 400), because nothing
+	# in solve_fill bounds how large a "fill" the scan is willing to try.
+	# A genuinely-exhausting probe pair must leave BOTH p25 (the darkest
+	# quarter) and the median untouched: nudge 10 samples INSIDE the
+	# already-lit 75-sample block instead. p25 is unaffected (it is entirely
+	# the 0.001 tail) and the median is unaffected too (comfortably more
+	# than 50 of the 100 samples stay at exactly 0.2 regardless of f, so
+	# percentile(0.5) keeps landing on an untouched one) -- so neither exit
+	# condition can ever fire and the scan runs its full budget.
+	var s1_f6 := dark.duplicate()
+	for i in range(40, 50):
+		s1_f6[i] = dark[i] + 1e-6
+	var r5 := Daylight.solve_fill(dark, s1_f6)
+	_check_true("F6 exhausted scan -> no fill", not r5["needed"])
+	_check("F6 exhausted scan -> energy 0", r5["energy"], 0.0, 1e-9)
+	_check_true("F6 exhausted flag set", r5["exhausted"])
+	_check_true("F1 lit room not exhausted", not r0["exhausted"])
+	_check_true("F2 dark corners not exhausted", not r1["exhausted"])
+	_check_true("F3 capped fill not exhausted", not r2["exhausted"])
 
 	print("")
 	if _failures.is_empty():

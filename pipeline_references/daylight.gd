@@ -56,7 +56,19 @@ static func sky_irradiance(p_img: Image) -> float:
 	var img := p_img
 	if p_img.get_width() > IRRADIANCE_W or p_img.get_height() > IRRADIANCE_H:
 		img = p_img.duplicate()
-		img.resize(IRRADIANCE_W, IRRADIANCE_H, Image.INTERPOLATE_CUBIC)
+		# Bicubic at a 32x reduction (8192 -> 256) POINT-SAMPLES: it reads a
+		# small neighbourhood around each output texel from the FULL-RES
+		# image and ignores the rest, so any feature narrower than the
+		# sampling stride -- a sun disc, a bright window -- is normalised by
+		# luck, depending only on whether it happens to land under a sample.
+		# generate_mipmaps() box-filters the whole image down through every
+		# power-of-two level first; INTERPOLATE_TRILINEAR then blends the two
+		# mip levels bracketing the target size, so every output texel is an
+		# area average of the corresponding source region instead of a
+		# point sample of it.
+		if img.get_mipmap_count() == 0:
+			img.generate_mipmaps()
+		img.resize(IRRADIANCE_W, IRRADIANCE_H, Image.INTERPOLATE_TRILINEAR)
 	var w := img.get_width()
 	var h := img.get_height()
 	var d_theta := PI / float(h)
@@ -153,37 +165,43 @@ static func stats(p_samples: PackedFloat32Array) -> Dictionary:
 ## empty/zero mix (stats(empty) is clamped with p25 0, so neither exit
 ## condition ever fires) and return an energy on the order of
 ## FILL_SCAN_START * FILL_SCAN_STEP^FILL_SCAN_MAX_ITER -- effectively infinite.
-## Returns {needed, energy, exposure, median, p25, capped}.
-static func solve_fill(p_s0: PackedFloat32Array, p_s1: PackedFloat32Array) -> Dictionary:
+## Loop exhaustion (FILL_SCAN_MAX_ITER steps without either exit condition
+## firing) is ALSO no fill, for the same reason: a fill that cannot move the
+## median or the darkest quarter -- placed outside the room, above a low
+## ceiling, leaking through a doorway rather than into the occupied
+## space -- is no fill, not an energy of 0.01 * 1.1^400 pretending to be one.
+## p_floor overrides FLOOR (spec F2: ZR_DAYLIGHT_FLOOR forces the trigger for
+## a forced test render; stats()'s own exposure target, TARGET_MEDIAN, is
+## unaffected).
+## Returns {needed, energy, exposure, median, p25, capped, exhausted}.
+static func solve_fill(p_s0: PackedFloat32Array, p_s1: PackedFloat32Array, p_floor: float = FLOOR) -> Dictionary:
 	var base := stats(p_s0)
-	if base["p25"] * base["exposure"] >= FLOOR:
+	if base["p25"] * base["exposure"] >= p_floor:
 		return {"needed": false, "energy": 0.0, "exposure": base["exposure"],
-				"median": base["median"], "p25": base["p25"], "capped": false}
+				"median": base["median"], "p25": base["p25"], "capped": false, "exhausted": false}
 	if p_s0.is_empty() or p_s1.is_empty() or p_s0.size() != p_s1.size():
 		return {"needed": false, "energy": 0.0, "exposure": base["exposure"],
-				"median": base["median"], "p25": base["p25"], "capped": false}
+				"median": base["median"], "p25": base["p25"], "capped": false, "exhausted": false}
 	var n := mini(p_s0.size(), p_s1.size())
 	var f := FILL_SCAN_START
 	var mixed := PackedFloat32Array()
 	mixed.resize(n)
-	var last := base
 	for _i in range(FILL_SCAN_MAX_ITER):
 		for k in range(n):
 			mixed[k] = p_s0[k] + f * (p_s1[k] - p_s0[k])
 		var st := stats(mixed)
-		last = st
 		var share := 0.0
 		if st["median"] > 0.0:
 			share = (st["median"] - base["median"]) / st["median"]
-		if st["p25"] * st["exposure"] >= FLOOR:
+		if st["p25"] * st["exposure"] >= p_floor:
 			return {"needed": true, "energy": f, "exposure": st["exposure"],
-					"median": st["median"], "p25": st["p25"], "capped": false}
+					"median": st["median"], "p25": st["p25"], "capped": false, "exhausted": false}
 		if share >= FILL_SHARE_CAP:
 			return {"needed": true, "energy": f, "exposure": st["exposure"],
-					"median": st["median"], "p25": st["p25"], "capped": true}
+					"median": st["median"], "p25": st["p25"], "capped": true, "exhausted": false}
 		f *= FILL_SCAN_STEP
-	return {"needed": true, "energy": f, "exposure": last["exposure"],
-			"median": last["median"], "p25": last["p25"], "capped": true}
+	return {"needed": false, "energy": 0.0, "exposure": base["exposure"],
+			"median": base["median"], "p25": base["p25"], "capped": false, "exhausted": true}
 
 
 ## Drives a fresh accumulation of p_frames frames and reads the linear
