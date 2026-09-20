@@ -166,8 +166,10 @@ Two probes at most, ≈ 10 s at FHD. Log:
 
 Removed on **day** renders:
 
-- `render.gd` fill builder: the `day_render` branch (`energy_multiplier =
-  1.25`, "Fill grid at 1.25x") and the day grid loop. Night grid untouched.
+- `render.gd`: `setup_fixed_fill_lights()` is no longer called on day
+  stills (the call in `render_image()` is gated on night). The function
+  itself, including its day branch, stays intact: `render_video()` calls it
+  ungated and the video route is unchanged by this design.
 - `_create_window_portal_lights()` and its call: its only caller is the day
   branch of `image_glb_creation.gd` (`video_glb_creation.gd` has its own
   copy, untouched), so the function is deleted with the call.
