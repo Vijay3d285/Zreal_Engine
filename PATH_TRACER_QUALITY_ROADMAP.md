@@ -124,7 +124,7 @@ Ranked by impact on offline still quality.
 | 28 | **Still route: DLSS-RR reconstruction, NIS sharpen, 1.0 px filter** — 4K stills had a one-pixel staircase on every edge and a checkerboard on flat walls. **Closed 2026-09-16 (§11.24)**: stills go through Phase A (accumulate 256 × BH filter, OIDN), the filter widened to Cycles' 1.5 px, `fsr_sharpness` 0. `pt_pixel_filter_gate` F1 0.72 → 1.08 px. | `raytracing_inc.glsl camera_filter_jitter`, `render.gd`, `image_glb_creation.gd` | `film.cpp filter_table`, `properties.py filter_width` | High |
 | 29 | **OIDN guides were one 8-bit point sample per pixel** — the Phase A still blurred more with distance. **Closed 2026-09-16 (§11.25)**: albedo/normal accumulated with the colour (Cycles' denoising passes), ACCURATE prefilter, `cleanAux` on. `pt_oidn_guide_gate` fine-checker retention 0.62 → 0.999 (Cycles 0.998). | `raytracing_common_inc.glsl rt_accum_guide_sample`, `render_forward_clustered.cpp _oidn_final_denoise_accumulator`, `oidn_denoiser.cpp` | `kernel/film/denoising_passes.h`, `integrator/denoiser_oidn_gpu.cpp` | High |
 | 30 | **Daylight could not enter: the tracer ignored `cast_shadow = OFF`; indirect clamp off** — a "day" interior was lit by 17 artificial lights, sun + sky alone rendered black, fireflies at 36× fed OIDN's blotches. **Closed 2026-09-16 (§11.26)**: `RT_INSTANCE_MASK_NO_SHADOW` (Cycles' shadow visibility) honours `cast_shadow = OFF`; window glass gets it in the pipeline; `PHASE_A_CLAMP_INDIRECT` 10 (Cycles' default). `pt_shadow_visibility_gate` V2 0 → 1.0. Lighting rig: user's decision, three renders delivered. | `render_raytracing.cpp rt_instance_mask`, `renderer_geometry_instance.h`, `image_glb_creation.gd` | `kernel/light/light.h` visibility, `scene.cycles.sample_clamp_indirect` | High |
-| 31 | **PIPELINE — day renders are lit by a lamp rig, not by daylight.** A "day" interior gets ~3% of its light from sun + sky (the sky reads ~0.5 linear, exposure is tuned for 17 artificial fills and portal spots that paint hard stripes and half the wall grain). Blender's reference is a *daylight design*: physical sun and sky, exposure set for the interior, a film tone curve, the room's own fixtures, and an artist-placed fill only where daylight cannot reach. **OPEN — spec in §11.27, parked 2026-09-16.** | `image_glb_creation.gd` lighting rig (`_create_window_portal_lights`, fill grid, `_auto_ambient_boost`), `render.gd` exposure/tonemap | Cycles sun/world strength, Filmic/AgX, archviz practice | High (look) |
+| 31 | **PIPELINE — day renders are lit by a lamp rig, not by daylight.** A "day" interior gets ~3% of its light from sun + sky (the sky reads ~0.5 linear, exposure is tuned for 17 artificial fills and portal spots that paint hard stripes and half the wall grain). Blender's reference is a *daylight design*: physical sun and sky, exposure set for the interior, a film tone curve, the room's own fixtures, and an artist-placed fill only where daylight cannot reach. **DONE 2026-09-19 — spec 2026-09-19-daylight-design.md.** | `image_glb_creation.gd` lighting rig (`_create_window_portal_lights`, fill grid, `_auto_ambient_boost`), `render.gd` exposure/tonemap | Cycles sun/world strength, Filmic/AgX, archviz practice | High (look) |
 | 32 | **ENGINE — variance of bounce-lit surfaces under hard lamp rigs.** A ceiling lit only by bounce from 17 hard lights sits at ~12% grain after 256 samples; a faint shadow line (17% contrast) in that grain is smoothed away by OIDN, since shadows exist only in the colour, never in the guides. Cycles' sampler is no better here (box test: 3.4% vs our 1.6%), and its OIDN is the same library — the only lever that works on *any* rig is lower variance per sample: path guiding for indirect light (Cycles: Open PGL, off by default, CPU-only) and/or resampled (ReSTIR-style) light selection. **OPEN — spec in §11.28, parked 2026-09-17.** | `raytracing_closest_hit_common_inc.glsl` bounce sampling, `raytracing_light_select_inc.glsl` | `kernel/integrator/guiding.h`, Open PGL | High (noise) |
 | 24 | **CLOSED 2026-09-12.** A thin-walled surface flipped `eta` to `1/ior` on its back face like a thick one. A thin wall does not bend the ray, so the second face of a double-sided slab — every glTF glass pane is `doubleSided` — is hit from behind at the *same* angle the outer face saw, and past `asin(1/ior)` that is **total internal reflection: a 100% mirror** (41.8° at 1.5, 56.4° at the pipeline's 1.2). Front panels clear, side panels mirrors — the fish-tank symptom. Cycles' thin wall evaluates the back side at the refracted angle, which is the front reflectance again; a sheet cannot TIR. Probe 3b (double-sided thin slab at 70°): **T = 0.000 → 0.708**, Cycles' closed form 0.708. See §11.17. | `raytracing_closest_hit_common_inc.glsl` (`brdf_mat.eta`), `pt_transmission_gate.gd` probe 3b | `intern/cycles/kernel/closure/bsdf_microfacet.h:1236-1280` (`bsdf_thin_glass_fresnel`) | **High** |
 | 23 | **CLOSED 2026-09-11.** The three analytic-light NEE sites (`raytracing_lights_inc.glsl` rect / omni-spot / directional) applied **no multiple-scattering factor** to the base specular lobe — the on-record rule said "no second MIS strategy to agree with", which is true of MIS and irrelevant to energy, because for a delta light NEE is the only estimator. A white metal at roughness 0.9 under one directional light read **43% of Cycles** (−57.0%), roughness 0.6 −18.1%; the deficit was predicted to 0.1% by `1/E(rough, μ)` alone. Now `evalMultiScatterFactorForMaterial` at all three sites: −0.041% / −0.024% / **−0.001%**, dielectric −0.013%. First analytic-light comparison against Cycles. See §11.15. | `raytracing_lights_inc.glsl` (three sites), `brdf_inc.glsl` (`evalMultiScatterFactorForMaterial`), `pipeline_references/tests/pt_light_energy_gate.gd` | `intern/cycles/kernel/closure/bsdf_microfacet.h:1091` (energy_scale on every eval, light sampling included) | **High** |
@@ -6718,7 +6718,7 @@ of the variance, which is why Blender references are clean at 256.
   not honoured; its only pipeline user is disabled.
 - A light tree for the artificial lights' remaining grain, if the rig stays.
 
-## 11.27 Gap #31 (pipeline, OPEN) — a daylight design for day renders
+## 11.27 Gap #31 (pipeline, DONE 2026-09-19) — a daylight design for day renders
 
 **Parked 2026-09-16 at the user's request; to be picked up later.** This is a
 pipeline gap, not an engine gap: after Gaps #28–#30 the tracer renders
@@ -6800,6 +6800,24 @@ geometry.
   4.7 ships AgX.
 - Many-light sampling (a light tree) becomes unnecessary once the rig is
   one fill plus the room's fixtures.
+
+### Closed 2026-09-19
+
+Spec `docs/superpowers/specs/2026-09-19-daylight-design.md`, plan
+`docs/superpowers/plans/2026-09-19-daylight-design.md`. `day.exr` turned out
+to be an LDR panorama (max 1.0, E_sky 1.62); it is normalised to unit
+horizontal irradiance at load and the sun is 5× that. Exposure is a
+16-frame probe of the job's own frame (occupied median → 0.18); one measured
+`DaylightFill` when the darkest occupied quarter is under 0.02. Fill grid,
+portal spots, scene fills and the LLM lighting multipliers are gone from day
+renders. Numbers: spec "Measured". Video route unchanged (follow-up).
+
+Two open follow-ups from the four-job measurement: wall grain (pre-denoise)
+is RED on 3 of 4 jobs at 12.8–16.4% against the ≤10% bar — this is Gap #32
+(variance reduction), not a daylight-design defect; and job 157's fixture
+emission levels were tuned for the pipeline's old exposure regime
+(~1.3–1.9×) and blow out at the new probe-driven exposure (12.6×) — a
+fixture-tuning follow-up against the new exposure model, not addressed here.
 
 ## 11.28 Gap #32 (engine, OPEN) — variance reduction for bounce-lit surfaces
 

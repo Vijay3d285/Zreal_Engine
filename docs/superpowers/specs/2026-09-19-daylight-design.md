@@ -265,6 +265,75 @@ Plus: suite 22/22 unchanged; one night job rendered before and after,
 byte-identical (memory: measure the repeat floor on the build first).
 Numbers, red or green, go into a "Measured" section of this file.
 
+## Measured (2026-09-19)
+
+Gate `pt_daylight_gate` (256 frames): D0 2.820399 vs E_sky 2.827753 (-0.26%);
+D1 0.997366 vs 1.000000 (-0.26%); D2 4.532951 vs 4.535534 (-0.06%, sun:sky
+5.0, `light_energy` 1.5915 = 5/π); D3 still occupied median·e 0.175495 vs
+0.180000 (-2.50%); D4 p25·e 0.1513 vs floor 0.020 (solver needed=false, ok);
+D5 fill model at energy 0.50: model median 0.02458 / rendered 0.02477
+(+0.76%), model p25 0.02189 / rendered 0.02203 (+0.60%), premise the fill
+contributes ≥20% of the median: 1.839× (ok); D6 excluded fraction 0.070557
+vs window area 0.073469 (-3.96%). All 11/11 gate checks PASS.
+Unit checks: 27/27. Suite 23/23. Night job `urbantest164_render_input.json`:
+repeat floor identical (md5 `92d4c1c92013bc521967bc21c9f662bc` on both
+pre-plan renders), before/after identical (same md5 on the post-plan render).
+
+| job | class | exposure | fill | occupied median·e | darkest tile | window clipped | wall grain (pre-denoise) |
+|---|---|---|---|---|---|---|---|
+| 226 | window in view | 5.812 | none | 0.1880 (ok) | 0.0732 (ok) | 0.00% (ok) | 12.82% (RED) |
+| 227 (substituted for duplicate 225) | window in view | 3.764 | none | 0.1802 (ok) | 0.1097 (ok) | 0.00% (ok) | 16.39% (RED) |
+| 176 | deep room | 0.747 | none | 0.1803 (ok) | 0.0976 (ok) | not measured (22-px mask, <0.5% of frame) | 5.48% (ok) |
+| 157 | windowless | 12.588 | none | 0.1784 (ok) | 0.0527 (ok) | 11.44% (RED) | 14.29% (RED) |
+
+Window clipping is measured on the tonemapped PNG (≥254/255), not the linear
+buffer (see Findings (4)). Wall grain is the pre-denoise EXR/PFM number
+against the spec's ≤10% bar; the post-denoise PNG grain on the same crops is
+0.10–3.76% and is informational only (Findings (6)).
+
+Blender reference (job 226): not available — no reference file was supplied;
+job 226 was not compared side by side against a Blender still.
+Probe cost: 16.7–19.6 s at FHD (one probe; none of the four jobs triggered
+the fill probe).
+
+### Findings during execution
+
+1. The tracer's `DirectionalLight3D` energy E is irradiance π·E (a white
+   Lambertian reads `E·cosθ`, not `E·cosθ/π`), so the sun's `light_energy`
+   must be `SUN_TO_SKY/π` (5/π = 1.5915) to hold the intended 5:1 sun:sky
+   ratio — found via gate D2 reading +166.89% high before the fix.
+2. Probe statistics moved from point-sampling to 4×4 box averages, because
+   the point-sampled median of a 16-frame probe read 7.5–8.1% low against a
+   256-frame converged still (gate D3): right-skewed path-tracing noise
+   makes the point-sampled median a slow-converging, low-biased statistic.
+3. The fill trigger (p25/median < 0.11) is unreachable in any single-lamp
+   closed box — p25/median measured 0.70–0.80 across four fixture variants,
+   partitioned or not — because GI homogenizes a convex diffuse cavity; gate
+   D5 therefore tests the fill's per-pixel linear model against a rendered
+   still (premise 1.839× ≥ 1.2×, both green) rather than staging the
+   trigger, and the trigger logic itself is covered only by unit tests F1–F3.
+4. Window clipping is judged on the tonemapped PNG rather than the linear
+   EXR, since every physical window pixel exceeds 1.0 linear by construction
+   once the room is exposed to the 0.18 occupied-median target — the linear
+   buffer reads 100% "clipped" in all four jobs, which is expected and
+   informational, not a defect.
+5. In a sun-lit room the visible sky can be only about 2× the wall's raw
+   brightness rather than the assumed 8× (job 176), so the probe's
+   >8×-median window mask can miss the window almost entirely (22 of
+   2,073,600 pixels) without affecting exposure, since the occupied-median
+   target does not depend on which pixels the window mask selects.
+6. Wall grain (pre-denoise EXR) is RED on 3 of 4 jobs — 226 at 12.82%, 227
+   at 16.39%, 157 at 14.29%, all against a ≤10% bar and on hand-verified
+   flat-wall crops — while the post-denoise PNG grain on the same crops is
+   only 0.10–3.76%, informational.
+7. Job 157's window-clipping RED (11.44% on the PNG) traces to a backlit
+   fixture panel blown out at the job's exposure of 12.588×; the fixture's
+   emission levels were tuned for the pipeline's old exposure regime
+   (~1.3–1.9×) and were not revisited for the new probe-driven exposure —
+   a follow-up, not fixed here.
+8. None of the four measured jobs (226, 227, 176, 157) triggered a
+   `DaylightFill` placement.
+
 ## Out of scope (recorded)
 
 - Video route daylight (`video_glb_creation.gd`).
