@@ -279,22 +279,78 @@ Unit checks: 27/27. Suite 23/23. Night job `urbantest164_render_input.json`:
 repeat floor identical (md5 `92d4c1c92013bc521967bc21c9f662bc` on both
 pre-plan renders), before/after identical (same md5 on the post-plan render).
 
-| job | class | exposure | fill | occupied median·e | darkest tile | window clipped | wall grain (pre-denoise) |
-|---|---|---|---|---|---|---|---|
-| 226 | window in view | 5.812 | none | 0.1880 (ok) | 0.0732 (ok) | 0.00% (ok) | 12.82% (RED) |
-| 227 (substituted for duplicate 225) | window in view | 3.764 | none | 0.1802 (ok) | 0.1097 (ok) | 0.00% (ok) | 16.39% (RED) |
-| 176 | deep room | 0.747 | none | 0.1803 (ok) | 0.0976 (ok) | not measured (22-px mask, <0.5% of frame) | 5.48% (ok) |
-| 157 | windowless | 12.588 | none | 0.1784 (ok) | 0.0527 (ok) | 11.44% (RED) | 14.29% (RED) |
+| job | class | exposure | fill | occupied median·e | darkest tile | window clipped | wall grain (pre-denoise) | wall crop (y0 y1 x0 x1) |
+|---|---|---|---|---|---|---|---|---|
+| 226 | window in view | 5.812 | none | 0.1880 (ok) | 0.0732 (ok) | 0.00% (ok) | 12.82% (RED) | 0.03 0.25 0.72 0.95 |
+| 227 (substituted for duplicate 225) | window in view | 3.764 | none | 0.1802 (ok) | 0.1097 (ok) | 0.00% (ok) | 16.39% (RED) | 0.12 0.44 0.59 0.64 |
+| 176 | deep room | 0.747 | none | 0.1803 (ok) | 0.0976 (ok) | not measured (22-px mask, <0.5% of frame) | 5.48% (ok) | 0.40 0.60 0.40 0.60 (default) |
+| 157 | windowless | 12.588 | none | 0.1784 (ok) | 0.0527 (ok) | 11.44% (RED) | 14.29% (RED) | 0.30 0.50 0.67 0.71 |
 
 Window clipping is measured on the tonemapped PNG (≥254/255), not the linear
 buffer (see Findings (4)). Wall grain is the pre-denoise EXR/PFM number
 against the spec's ≤10% bar; the post-denoise PNG grain on the same crops is
-0.10–3.76% and is informational only (Findings (6)).
+0.10–3.76% and is informational only (Findings (6)). The crops above are not
+the script's `0.40 0.60 0.40 0.60` default except for 176: on 226 the default
+crop lands on the pendant chandelier and reads 22.89% (a different, higher
+number than the recorded 12.82%, for the same job, depending only on which
+20%×20% square is sampled) and on 157 it lands on a blown-out backlit fixture
+panel and reads 1012.58% — neither is a wall reading at all, which is why the
+crop used for each job is recorded here rather than left implicit
+(`task-8-report.md`, "Wall crop" notes per job).
 
 Blender reference (job 226): not available — no reference file was supplied;
 job 226 was not compared side by side against a Blender still.
 Probe cost: 16.7–19.6 s at FHD (one probe; none of the four jobs triggered
 the fill probe).
+
+### Forced fill run (2026-09-20, F2 fix-wave)
+
+None of the four measured jobs above triggered `DaylightFill` (finding 8), so
+the fill path had never actually executed end to end. `render.gd`'s
+`_daylight_probe_and_expose` gained a `ZR_DAYLIGHT_FLOOR` environment
+override (read once, threaded through `solve_fill`'s new `p_floor` param, so
+`Daylight.FLOOR` itself is unchanged for every other caller) purely to force
+the trigger on a real job without editing the constant. Run: job 226's own
+input (`f2_226_input.json`) with `ZR_DAYLIGHT_FLOOR=1.0 ZR_PT_EXR=1
+ZR_PT_ACCUM_TARGET=64`, in a scratch copy of `pipeline_references/`. Log:
+
+```
+[Daylight] floor override ZR_DAYLIGHT_FLOOR=1.0
+[Daylight] probe: median 0.03097 (occupied 97.7%), exposure 5.812, p25 0.01431 -> 0.0832 after exposure  [17311 ms, 1920x1080]
+[Daylight] fill: p25 0.0832 < 1.000 after exposure -> DaylightFill at (12.58286, 2.5, 7.351805) size (8.076, 6.280209) energy 1121.7797 (CAPPED at share 0.50); exposure 5.812 -> 2.866
+```
+
+Exit code 0, `Image saved to: .../fill_226.png`, `[Render] Linear HDR EXR
+saved to: .../fill_226.exr`. The scan hit the `FILL_SHARE_CAP` exit (0.50)
+rather than clearing the forced floor of 1.0 outright — an artificial floor
+that high was never going to be reachable by any physically-sized fill, so
+the cap firing first is the expected outcome, not a defect; it is exactly
+what F3 in `daylight_unit.gd` predicts for a fill whose share saturates
+before the floor does. `tools/daylight_validation.py` on the resulting
+PFM/PNG (`--wall 0.03 0.25 0.72 0.95`, job 226's own crop):
+
+```
+fill_226.pfm  exposure 2.866 (with DaylightFill)  window 1.2% of frame
+  RED occupied median x e   0.1324   [0.15, 0.35]
+  ok  darkest occupied tile 0.0607   >= 0.02
+  ok  window clipped (PNG >= 254/255)  0.00%  <= 2%
+  RED wall grain, pre-denoise 44.62%  <= 10%  (crop rows 0.03-0.25 cols 0.72-0.95)
+  .   wall grain, post-denoise (PNG) 0.25%  (informational, same crop)
+```
+
+Both REDs are the expected consequence of the artificial floor, not a new
+defect: an energy-1121.7797 fill capped at 50% share badly overpowers the
+room relative to the sun/sky it was tuned against, dragging the occupied
+median off target and adding its own noise on top of Gap #32's. The PNG
+(post-OIDN) itself: the same dining room as the unforced job 226 (marble
+table, dark chairs, gold pendant, aquarium credenza) but with visible
+posterization/banding across the ceiling and the back-left wall — the
+denoiser's guides could not fully absorb a synthetic fill three orders of
+magnitude past any value the solver would choose under the real 0.02 floor.
+This run exercises the fill-branch code path (`solve_fill`'s "needed" exit,
+`_place_daylight_fill`, the fill log line, and `daylight_validation.py`'s
+`fill:` regex with "(with DaylightFill)") for the first time against a real
+render; it is not evidence about ordinary-floor behaviour.
 
 ### Findings during execution
 
@@ -325,7 +381,10 @@ the fill probe).
 6. Wall grain (pre-denoise EXR) is RED on 3 of 4 jobs — 226 at 12.82%, 227
    at 16.39%, 157 at 14.29%, all against a ≤10% bar and on hand-verified
    flat-wall crops — while the post-denoise PNG grain on the same crops is
-   only 0.10–3.76%, informational.
+   only 0.10–3.76%, informational; against §11.26's 7.8% for the prior rig
+   (fill grid + portals, no daylight design) on the same plan as job 227,
+   this design's grain is roughly double, not merely over the ≤10% bar (see
+   PATH_TRACER_QUALITY_ROADMAP.md §11.27 closeout and §11.28/Gap #32).
 7. Job 157's window-clipping RED (11.44% on the PNG) traces to a backlit
    fixture panel blown out at the job's exposure of 12.588×; the fixture's
    emission levels were tuned for the pipeline's old exposure regime

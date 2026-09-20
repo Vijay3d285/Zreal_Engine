@@ -6819,11 +6819,21 @@ emission levels were tuned for the pipeline's old exposure regime
 (~1.3–1.9×) and blow out at the new probe-driven exposure (12.6×) — a
 fixture-tuning follow-up against the new exposure model, not addressed here.
 
+Pre-denoise wall grain on the four jobs is 12.8–16.4% (job 176: 5.5%) against
+§11.26's 7.8% for the rig without portal spots on the same plan as job
+227 — roughly double: with windows small or behind the camera the walls are
+lit by multi-bounce daylight, and removing the shadowless fills removed a
+zero-variance contribution. The shipped PNG after OIDN reads 0.1–3.8%. This
+is the price of physical light and is Gap #32's problem to solve; it is a
+regression against the prior best rig, not just a bar miss.
+
 ## 11.28 Gap #32 (engine, OPEN) — variance reduction for bounce-lit surfaces
 
 **Parked 2026-09-17 at the user's request; the engine-side counterpart of
-Gap #31.** Gap #31 lowers the grain by changing the light; this gap lowers
-it for any light.
+Gap #31.** Gap #31 was expected to lower the grain by changing the light;
+measured 2026-09-19 it raised the pre-denoise grain (7.8% → 12.8–16.4%)
+because the fills it removed were zero-variance — this gap now carries the
+whole burden.
 
 ### What was established (2026-09-17, jobs 225/226)
 
