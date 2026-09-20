@@ -65,10 +65,15 @@ def read_png_luma(path):
 
 def exposure_from_log(path):
     text = open(path, encoding="utf-8", errors="replace").read()
-    fill = re.findall(r"\[Daylight\] fill:.*exposure ([0-9.]+) -> ([0-9.]+)", text)
+    # Anchored on the literal punctuation next to the number, not a bare
+    # "exposure" word -- both log lines use "exposure" more than once (the
+    # fill line's "after exposure -> DaylightFill ..." has no digits after
+    # it, so an unanchored match still fell through to the right group by
+    # luck; anchoring removes the luck).
+    fill = re.findall(r"\[Daylight\] fill:.*; exposure ([0-9.]+) -> ([0-9.]+)", text)
     if fill:
         return float(fill[-1][1]), True
-    probe = re.findall(r"\[Daylight\] probe: .*exposure ([0-9.]+)", text)
+    probe = re.findall(r"\[Daylight\] probe: .*, exposure ([0-9.]+)", text)
     if not probe:
         raise SystemExit("no [Daylight] probe line in %s" % path)
     return float(probe[-1]), False
