@@ -490,6 +490,7 @@ func render_image(data, output_path):
 				# No Phase-A accumulator. If the realtime DLSS-RR denoiser is on it IS the
 				# temporal accumulator — drive ~256 frames so its across-frame noise integration
 				# converges to a clean reconstructed still, then capture. Otherwise just SDFGI warmup.
+				printerr("[Daylight] the realtime route ships the normalised daylight at exposure 1.0 -- the probe only runs on the accumulate route")
 				if dlss_rr_realtime:
 					print("[Render] Driving %d frames of realtime DLSS Ray Reconstruction (1-SPP/frame temporal denoising) for still convergence..." % DLSS_RR_REALTIME_STILL_FRAMES)
 					await _wait_frames(DLSS_RR_REALTIME_STILL_FRAMES)
@@ -627,6 +628,16 @@ func _daylight_probe_and_expose(p_env: Environment) -> void:
 	var vp := get_viewport().get_viewport_rid()
 	p_env.tonemap_exposure = 1.0
 	var t0 := Time.get_ticks_msec()
+	# ZR_DAYLIGHT_FLOOR: test-only override of Daylight.FLOOR so the fill
+	# path (never exercised by any of the four measured jobs -- Measured
+	# 2026-09-19, finding 8) can be forced on a real job without editing the
+	# constant. solve_fill() compares against Daylight.FLOOR internally too,
+	# so floor_v is threaded through to it below rather than only used here.
+	var floor_v := Daylight.FLOOR
+	var floor_override := OS.get_environment("ZR_DAYLIGHT_FLOOR")
+	if floor_override != "":
+		floor_v = float(floor_override)
+		print("[Daylight] floor override ZR_DAYLIGHT_FLOOR=%s" % floor_override)
 	var pr := await Daylight.probe(self, p_env, vp)
 	if pr["samples"].is_empty():
 		printerr("[Daylight] probe: accumulator readback returned nothing; exposure left at 1.0")
@@ -638,21 +649,24 @@ func _daylight_probe_and_expose(p_env: Environment) -> void:
 			" CLAMPED -- scene is not a lit interior" if st["clamped"] else "",
 			st["p25"], st["p25"] * st["exposure"], Time.get_ticks_msec() - t0, pr["width"], pr["height"]])
 	var exposure: float = st["exposure"]
-	if st["p25"] * exposure < Daylight.FLOOR and not st["clamped"]:
+	if st["p25"] * exposure < floor_v and not st["clamped"]:
 		var fill := _place_daylight_fill(1.0)
 		var pr1 := await Daylight.probe(self, p_env, vp)
 		if pr1["samples"].is_empty() or pr1["samples"].size() != pr["samples"].size():
 			printerr("[Daylight] fill probe: accumulator readback returned nothing; no fill")
 			fill.queue_free()
 		else:
-			var sol := Daylight.solve_fill(pr["samples"], pr1["samples"])
+			var sol := Daylight.solve_fill(pr["samples"], pr1["samples"], floor_v)
 			if sol["needed"]:
 				fill.light_energy = sol["energy"]
 				exposure = sol["exposure"]
 				print("[Daylight] fill: p25 %.4f < %.3f after exposure -> DaylightFill at %s size %s energy %.4f%s; exposure %.3f -> %.3f" % [
-						st["p25"] * st["exposure"], Daylight.FLOOR, str(fill.global_position), str(fill.area_size),
+						st["p25"] * st["exposure"], floor_v, str(fill.global_position), str(fill.area_size),
 						sol["energy"], " (CAPPED at share %.2f)" % Daylight.FILL_SHARE_CAP if sol["capped"] else "",
 						st["exposure"], exposure])
+			elif sol["exhausted"]:
+				printerr("[Daylight] fill: solver exhausted (the fill moved neither the median nor the darkest quarter); no fill")
+				fill.queue_free()
 			else:
 				fill.queue_free()
 	p_env.tonemap_exposure = exposure
@@ -833,14 +847,14 @@ func setup_fixed_fill_lights():
 	if illumination_scale <= 0.0:
 		illumination_scale = _resolve_illumination_scale(_render_data)
 
-	# Dim automated room fills if manual light fixtures are already present
+	# Dim automated room fills if manual light fixtures are already present.
+	# (day_render never reaches this function any more -- spec 2026-09-19:
+	# no fill grid on day renders, see the call site's `if day_render: ...
+	# else: setup_fixed_fill_lights()` gate -- so the branches below are
+	# night-only.)
 	var energy_multiplier = 1.0
 	var fixture_count = get_tree().get_nodes_in_group("fixture_lights").size()
-	if day_render:
-		# Keep the room bright, but leave enough contrast for window-frame shadows to read.
-		energy_multiplier = 1.25
-		print("[Render] Day Render: Fill grid at 1.25x — preserving sunlight contrast and window shadows.")
-	elif fixture_count > 0 or _has_fixture_lights_cache:
+	if fixture_count > 0 or _has_fixture_lights_cache:
 		energy_multiplier = 0.5
 		if fixture_count > 0:
 			print("[Render] %d fixture lights detected. Dimming automated room fill lights (0.5x)." % fixture_count)
@@ -864,14 +878,6 @@ func setup_fixed_fill_lights():
 	var floor_fill_color = Color(1.0, 0.82, 0.55) if is_warm_fill else Color(1.0, 0.88, 0.70)
 
 	if areas.size() > 0 and verts.size() > 0:
-		# For sunbeam detection
-		var sun_dir_flat = Vector3.ZERO
-		if day_render and _dir_light:
-			sun_dir_flat = - _dir_light.global_transform.basis.z
-			sun_dir_flat.y = 0
-			if sun_dir_flat.length() > 0.001:
-				sun_dir_flat = sun_dir_flat.normalized()
-				
 		# ── Active-room gating for area fill lights ───────────────────────────────
 		# Every light placed in this loop has shadow_enabled = false, and in this
 		# fork's path tracer a shadowless light traces NO occlusion ray at all
@@ -950,158 +956,86 @@ func setup_fixed_fill_lights():
 			var room_d = max(max_z - min_z, 0.5)
 			var diag = sqrt(room_w * room_w + room_d * room_d)
 
-			if day_render:
-				# ── Day Render: Dynamic Grid Fill Lighting ──
-				var spacing = clamp(min(room_w, room_d) / 4.0, 1.2, 2.5)
-				# Fill grid is the room's ambient fill — sun handles the primary drama.
-				# Slightly softer fill keeps the daylight believable without flattening the sun patch.
-				var grid_energy = clamp(0.28 + diag * 0.016, 0.28, 0.58) * energy_multiplier * illumination_scale
-				
-				var steps_x = int(ceil(room_w / spacing))
-				var steps_z = int(ceil(room_d / spacing))
-				
-				for ix in range(steps_x + 1):
-					for iz in range(steps_z + 1):
-						var px = min_x + (ix * room_w / float(max(1, steps_x)))
-						var pz = min_z + (iz * room_d / float(max(1, steps_z)))
-						var p2d = Vector2(px, pz)
-						
-						if not Geometry2D.is_point_in_polygon(p2d, poly2d):
-							continue
-							
-						# Check if in directional light passing area (sunbeam)
-						var in_sunlight = false
-						if sun_dir_flat.length() > 0.5:
-							for win in _window_sunlight_data:
-								var w_center = win["center"] as Vector3
-								var vec_to_p = Vector3(px - w_center.x, 0, pz - w_center.z)
-								var proj_len = vec_to_p.dot(sun_dir_flat)
-								if proj_len > 0.0: # In front of window
-									var proj_point = Vector3(w_center.x, 0, w_center.z) + sun_dir_flat * proj_len
-									var lat_dist = Vector3(px, 0, pz).distance_to(proj_point)
-									var win_width = 2.0
-									if win.has("width"): win_width = win["width"]
-									# Stricter culling: only cull if squarely inside the sunbeam
-									if lat_dist < (win_width * 0.4) + (proj_len * 0.05):
-										in_sunlight = true
-										break
-						
-						if not in_sunlight:
-							# SpotLight pointed DOWN — angle MUST be ≤60° or light bleeds back onto ceiling
-							# 85° was nearly a hemisphere, creating bright hotspots on the ceiling surface
-							# from each grid light directly above it.
-							var light = SpotLight3D.new()
-							light.name = "GridFill_%s_%d_%d" % [area_id, ix, iz]
-							light.position = Vector3(px, ceil_h - 0.2, pz)
-							light.rotation_degrees = Vector3(-90, 0, 0)
-							light.spot_angle = 55.0 # Tight cone — only illuminates downward, no ceiling bleed
-							light.spot_range = clamp(spacing * 3.5, 6.0, 12.0)
-							light.light_energy = grid_energy
-							light.shadow_enabled = false
-							light.light_color = fill_color
-							light.light_specular = 0.0
-							light.add_to_group("fill_lights")
-							add_child(light)
-							placed += 1
+			# ── Night / Legacy: Center SpotLight and OmniLight ──
+			var omni_range = clamp(diag + 1.5, 6.0, 16.0)
+			var energy = clamp(0.7 + diag * 0.10, 0.7, 1.6)
 
-				# GridFloorFill OmniLight: SKIP for day renders.
-				# OmniLight at y=0.35 radiates in ALL directions including UP.
-				# With omni_range up to 20m it creates a visible circular hotspot on the ceiling
-				# which combined with adjacent grid SpotLights creates the wave/diamond pattern.
-				# Day renders don't need this — the sun + grid SpotLights handle floor fill.
-				if not day_render:
-					var floor_fill = OmniLight3D.new()
-					floor_fill.name = "GridFloorFill_" + str(area_id)
-					floor_fill.position = Vector3(cx, 0.35, cz)
-					floor_fill.light_energy = 0.35 * energy_multiplier * illumination_scale
-					floor_fill.omni_range = clamp(diag + 3.0, 8.0, 20.0)
-					floor_fill.shadow_enabled = false
-					floor_fill.light_color = floor_fill_color
-					floor_fill.light_specular = 0.1
-					floor_fill.add_to_group("fill_lights")
-					add_child(floor_fill)
+			var light = SpotLight3D.new()
+			light.name = "RoomLight_" + str(area_id)
+			light.position = Vector3(cx, light_y, cz) # ← fixed world position
+			light.rotation_degrees = Vector3(-90, 0, 0)
+			light.spot_angle = 85.0
+			light.spot_range = omni_range
+			light.light_energy = energy * energy_multiplier * illumination_scale
+			light.shadow_enabled = false
+			light.light_color = fill_color
+			light.light_specular = 0.10 # small specular — points DOWN so hits floor, not ceiling
+			light.add_to_group("fill_lights")
+			add_child(light)
+			placed += 1
 
-			else:
-				# ── Night / Legacy: Center SpotLight and OmniLight ──
-				var omni_range = clamp(diag + 1.5, 6.0, 16.0)
-				var energy = clamp(0.7 + diag * 0.10, 0.7, 1.6)
+			# ── Ceiling Ambient Fill (OmniLight at mid-room height) ──
+			# Placed at mid-room height rather than near the ceiling so that
+			# inverse-square falloff produces a smooth, even wash across the whole
+			# ceiling surface instead of circular hotspot patches.
+			# NOTE: deliberately ignores energy_multiplier so fixture-detection's
+			# 0.5x halving does NOT starve the ceiling of light.
+			var ceil_fill = OmniLight3D.new()
+			ceil_fill.name = "CeilingCenterFill_" + str(area_id)
+			# Mid-room height: far enough from the ceiling that the light fans out
+			# evenly without creating a visible round hotspot.
+			var ceil_fill_y = clamp(ceil_h * 0.55, 1.2, ceil_h - 0.6)
+			ceil_fill.position = Vector3(cx, ceil_fill_y, cz)
+			# Moderate energy — SDFGI + SSIL now carry most of the ceiling bounce,
+			# this fill just ensures a clean base luminance floor on the ceiling.
+			var ceil_energy_base = clamp(energy * 0.5 * illumination_scale, 0.72, 2.16)
+			ceil_fill.light_energy = ceil_energy_base
+			# Wide range to reach ceiling and corners uniformly
+			ceil_fill.omni_range = clamp(diag * 1.6 + 3.0, 10.0, 25.0)
+			ceil_fill.omni_attenuation = 1.5 # Gentler falloff for softer spread
+			ceil_fill.shadow_enabled = false
+			ceil_fill.light_color = fill_color
+			ceil_fill.light_specular = 0.12 # soft floor gloss — mid-room height avoids ceiling hotspot
+			ceil_fill.add_to_group("fill_lights")
+			add_child(ceil_fill)
+			
+			# ── Corner fills at mid-room height — keep edges from going dark ──
+			var corner_energy = ceil_energy_base * 0.45
+			var corner_range = clamp(diag * 1.0 + 2.0, 6.0, 16.0)
+			var corner_offsets = [
+				Vector2(room_w * 0.35, room_d * 0.35),
+				Vector2(-room_w * 0.35, room_d * 0.35),
+				Vector2(room_w * 0.35, -room_d * 0.35),
+				Vector2(-room_w * 0.35, -room_d * 0.35),
+			]
+			var ci = 0
+			for co in corner_offsets:
+				var cp2d = Vector2(cx + co.x, cz + co.y)
+				if Geometry2D.is_point_in_polygon(cp2d, poly2d):
+					var corner_fill = OmniLight3D.new()
+					corner_fill.name = "CeilingCornerFill_%s_%d" % [area_id, ci]
+					# Also at mid-room height — no hotspots on ceiling edges
+					corner_fill.position = Vector3(cx + co.x, ceil_fill_y, cz + co.y)
+					corner_fill.light_energy = corner_energy
+					corner_fill.omni_range = corner_range
+					corner_fill.omni_attenuation = 1.5
+					corner_fill.shadow_enabled = false
+					corner_fill.light_color = fill_color
+					corner_fill.light_specular = 0.0
+					corner_fill.add_to_group("fill_lights")
+					add_child(corner_fill)
+				ci += 1
 
-				var light = SpotLight3D.new()
-				light.name = "RoomLight_" + str(area_id)
-				light.position = Vector3(cx, light_y, cz) # ← fixed world position
-				light.rotation_degrees = Vector3(-90, 0, 0)
-				light.spot_angle = 85.0
-				light.spot_range = omni_range
-				light.light_energy = energy * energy_multiplier * illumination_scale
-				light.shadow_enabled = false
-				light.light_color = fill_color
-				light.light_specular = 0.10 # small specular — points DOWN so hits floor, not ceiling
-				light.add_to_group("fill_lights")
-				add_child(light)
-				placed += 1
-
-				# ── Ceiling Ambient Fill (OmniLight at mid-room height) ──
-				# Placed at mid-room height rather than near the ceiling so that
-				# inverse-square falloff produces a smooth, even wash across the whole
-				# ceiling surface instead of circular hotspot patches.
-				# NOTE: deliberately ignores energy_multiplier so fixture-detection's
-				# 0.5x halving does NOT starve the ceiling of light.
-				var ceil_fill = OmniLight3D.new()
-				ceil_fill.name = "CeilingCenterFill_" + str(area_id)
-				# Mid-room height: far enough from the ceiling that the light fans out
-				# evenly without creating a visible round hotspot.
-				var ceil_fill_y = clamp(ceil_h * 0.55, 1.2, ceil_h - 0.6)
-				ceil_fill.position = Vector3(cx, ceil_fill_y, cz)
-				# Moderate energy — SDFGI + SSIL now carry most of the ceiling bounce,
-				# this fill just ensures a clean base luminance floor on the ceiling.
-				var ceil_energy_base = clamp(energy * 0.5 * illumination_scale, 0.72, 2.16)
-				ceil_fill.light_energy = ceil_energy_base
-				# Wide range to reach ceiling and corners uniformly
-				ceil_fill.omni_range = clamp(diag * 1.6 + 3.0, 10.0, 25.0)
-				ceil_fill.omni_attenuation = 1.5 # Gentler falloff for softer spread
-				ceil_fill.shadow_enabled = false
-				ceil_fill.light_color = fill_color
-				ceil_fill.light_specular = 0.12 # soft floor gloss — mid-room height avoids ceiling hotspot
-				ceil_fill.add_to_group("fill_lights")
-				add_child(ceil_fill)
-				
-				# ── Corner fills at mid-room height — keep edges from going dark ──
-				var corner_energy = ceil_energy_base * 0.45
-				var corner_range = clamp(diag * 1.0 + 2.0, 6.0, 16.0)
-				var corner_offsets = [
-					Vector2(room_w * 0.35, room_d * 0.35),
-					Vector2(-room_w * 0.35, room_d * 0.35),
-					Vector2(room_w * 0.35, -room_d * 0.35),
-					Vector2(-room_w * 0.35, -room_d * 0.35),
-				]
-				var ci = 0
-				for co in corner_offsets:
-					var cp2d = Vector2(cx + co.x, cz + co.y)
-					if Geometry2D.is_point_in_polygon(cp2d, poly2d):
-						var corner_fill = OmniLight3D.new()
-						corner_fill.name = "CeilingCornerFill_%s_%d" % [area_id, ci]
-						# Also at mid-room height — no hotspots on ceiling edges
-						corner_fill.position = Vector3(cx + co.x, ceil_fill_y, cz + co.y)
-						corner_fill.light_energy = corner_energy
-						corner_fill.omni_range = corner_range
-						corner_fill.omni_attenuation = 1.5
-						corner_fill.shadow_enabled = false
-						corner_fill.light_color = fill_color
-						corner_fill.light_specular = 0.0
-						corner_fill.add_to_group("fill_lights")
-						add_child(corner_fill)
-					ci += 1
-
-				var floor_fill = OmniLight3D.new()
-				floor_fill.name = "FloorFill_" + str(area_id)
-				floor_fill.position = Vector3(cx, 0.35, cz) # near-floor height
-				floor_fill.light_energy = energy * 0.25 * energy_multiplier * illumination_scale
-				floor_fill.omni_range = clamp(omni_range * 0.7, 3.0, 10.0)
-				floor_fill.shadow_enabled = false
-				floor_fill.light_color = floor_fill_color
-				floor_fill.light_specular = 0.35 # grazing-angle shimmer on polished marble/tile
-				floor_fill.add_to_group("fill_lights")
-				add_child(floor_fill)
+			var floor_fill = OmniLight3D.new()
+			floor_fill.name = "FloorFill_" + str(area_id)
+			floor_fill.position = Vector3(cx, 0.35, cz) # near-floor height
+			floor_fill.light_energy = energy * 0.25 * energy_multiplier * illumination_scale
+			floor_fill.omni_range = clamp(omni_range * 0.7, 3.0, 10.0)
+			floor_fill.shadow_enabled = false
+			floor_fill.light_color = floor_fill_color
+			floor_fill.light_specular = 0.35 # grazing-angle shimmer on polished marble/tile
+			floor_fill.add_to_group("fill_lights")
+			add_child(floor_fill)
 
 	if placed == 0:
 		print("[Render] No area data found — placing ceiling grid fallback lights.")
@@ -1118,7 +1052,10 @@ func setup_fixed_fill_lights():
 
 func _apply_no_authored_light_boost() -> void:
 	if day_render:
-		# Day render now uses setup_fixed_fill_lights() dynamic grid fill, skip this boost
+		# Day render is probe-exposed daylight with no fill grid (spec
+		# 2026-09-19: setup_fixed_fill_lights() is not called on day renders
+		# at all -- see the call site's day_render gate), so this legacy
+		# no-authored-light boost, tuned for the fill grid, does not apply.
 		print("[Render] Skipping legacy no-authored-light boost for Day Render.")
 		return
 

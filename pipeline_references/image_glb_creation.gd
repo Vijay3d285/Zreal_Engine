@@ -819,6 +819,8 @@ func setup_lighting(data, geom_data = {}):
 		sky_mat.sun_curve = lighting["sun_curve"]
 		env.sky.sky_material = sky_mat
 		print("Using fallback procedural sky")
+		if day_render:
+			print("[Daylight] procedural sky is not normalised; sun:sky ratio undefined for this job")
 
 	# --- Ambient Light ---
 	# DAY RENDERS: Use SKY as ambient source.
