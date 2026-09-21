@@ -1,5 +1,8 @@
 extends "res://tests/pt_validation.gd"
 
+# Preloaded, not a global class name: the live pipeline has no class cache.
+const Daylight = preload("res://daylight.gd")
+
 ## Daylight design gate (spec 2026-09-19-daylight-design.md).
 ##
 ##   bin\godot.windows.editor.x86_64.console.exe --rendering-driver vulkan \

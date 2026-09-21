@@ -1,4 +1,8 @@
 ﻿extends Node3D
+# Daylight design (spec 2026-09-19). Preloaded, not a global class name: the
+# live pipeline runs without an editor import, so no class cache exists there.
+# render.gd extends this script and inherits the constant.
+const Daylight = preload("res://daylight.gd")
 const MOImage = preload("res://mo_image.gd")
 # image_glb_creation.gd
 # Handles the construction of the scene: Architecture (Walls, Floors, Ceilings) and Asset Loading.

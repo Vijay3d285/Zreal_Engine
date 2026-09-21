@@ -1,5 +1,11 @@
-class_name Daylight
 extends RefCounted
+
+## NO class_name. A global class name is resolved through
+## .godot/global_script_class_cache.cfg, which only the editor's import step
+## writes; the live pipeline launches Godot headless straight into main.tscn
+## with no .godot/ directory, so `Daylight` was "not declared in the current
+## scope" there (2026-09-20) while every editor-imported copy worked. Consumers
+## preload this file instead: `const Daylight = preload("res://daylight.gd")`.
 
 ## Daylight design for day renders (docs/superpowers/specs/2026-09-19-daylight-design.md).
 ##
