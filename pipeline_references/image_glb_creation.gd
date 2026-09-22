@@ -23,6 +23,9 @@ var _directional_light_authoring_locked: bool = false
 var _interior_shadow_clusters := {}
 var _glb_cache := {}
 var _texture_cache := {}
+# Source-mesh instance id -> auto-smoothed rebuild. GLB duplicates share the
+# Mesh resource, so one rebuild serves every instance. See GLB_GLASS_AUTOSMOOTH_DEG.
+var _autosmooth_mesh_cache := {}
 var day_render = true
 var lighting_profile = "day"
 const ENABLE_PROCEDURAL_WINDOW_GRID_CASTER = false
@@ -120,6 +123,22 @@ const GLB_SUBSURFACE_PRESETS = [
 # unreachable.
 const GLB_CONVERTED_GLASS_IOR = 1.5
 const GLB_CONVERTED_WATER_IOR = 1.33
+# Auto-smooth angle (Blender's default) for every surface the pass above turns
+# into a traced dielectric. Vertex normals are recomputed from the geometry:
+# faces meeting at a dihedral angle above this stay hard, below it smooth.
+#
+# WHY. These libraries export glass BOXES smooth-shaded. Measured on the
+# MarineDecorativeGlassAquarium (2026-09-21): the vertex normals tilt 13.8 deg
+# on the big front pane and 24-39 deg on the side, inner and base faces. A
+# dielectric reflects and refracts on the SHADING normal (Cycles does the
+# same), so a flat pane whose normal sweeps 14 deg across it is a lens -- the
+# reflection swings 28 deg, the interior warps, and the water line vanishes
+# into the warp (urbantestdark232). Cycles never shows this because the
+# authored material is alpha-blend, not glass; a Glass BSDF there would warp
+# identically. A Blender artist fixes it with auto-smooth; this is that step,
+# applied only to the surfaces we convert, so a curved vase (dihedral angles
+# of a few degrees) keeps its smooth normals and a box gets hard edges.
+const GLB_GLASS_AUTOSMOOTH_DEG = 30.0
 # Water keeps its alphaMode BLEND material instead of being converted to an
 # opaque transmissive one. Set false to restore the old conversion.
 #
@@ -1698,6 +1717,188 @@ func _apply_glb_subsurface(root: Node, asset_label: String = "") -> void:
 	# GLB_SUBSURFACE_PRESETS and re-render.
 	print("  [SSS] %s -> subsurface: %s" % [label, ", ".join(applied)])
 
+# Gathers one vertex attribute for the rebuilt vertex list. Scalar packed
+# arrays (tangents, bones, weights, custom) carry N values per vertex; the
+# stride is recovered from the array length.
+static func _gather_vertex_array(p_src, p_src_ids: PackedInt32Array, p_vertex_count: int):
+	if p_src == null:
+		return null
+	if p_src is PackedVector3Array or p_src is PackedVector2Array or p_src is PackedColorArray:
+		var out = p_src.duplicate()
+		out.resize(p_src_ids.size())
+		for i in range(p_src_ids.size()):
+			out[i] = p_src[p_src_ids[i]]
+		return out
+	if p_src is PackedFloat32Array or p_src is PackedByteArray or p_src is PackedInt32Array:
+		var stride: int = p_src.size() / maxi(p_vertex_count, 1)
+		var out = p_src.duplicate()
+		out.resize(p_src_ids.size() * stride)
+		for i in range(p_src_ids.size()):
+			var s: int = p_src_ids[i] * stride
+			for k in range(stride):
+				out[i * stride + k] = p_src[s + k]
+		return out
+	return p_src
+
+# Recomputes the normals of a triangle surface with a dihedral-angle threshold
+# (Blender's auto-smooth): a corner's normal is the area-weighted mean of the
+# adjacent faces whose normal lies within p_angle_deg of its own face's, so
+# hard edges split and gentle curvature stays smooth. Adjacency is by welded
+# POSITION, since exporters duplicate vertices along UV seams. Vertices are
+# split per distinct normal, every other attribute follows.
+#
+# Returns {"arrays": Array, "max_correction_deg": float}; arrays is p_arrays
+# itself when nothing needed to change.
+static func _autosmooth_surface_arrays(p_arrays: Array, p_angle_deg: float) -> Dictionary:
+	var verts = p_arrays[Mesh.ARRAY_VERTEX]
+	if verts == null or verts.is_empty():
+		return {"arrays": p_arrays, "max_correction_deg": 0.0}
+	var idx = p_arrays[Mesh.ARRAY_INDEX]
+	if idx == null or idx.is_empty():
+		idx = PackedInt32Array(range(verts.size()))
+	var tri_count: int = idx.size() / 3
+	if tri_count == 0:
+		return {"arrays": p_arrays, "max_correction_deg": 0.0}
+
+	var lo: Vector3 = verts[0]
+	var hi: Vector3 = verts[0]
+	for p in verts:
+		lo = lo.min(p)
+		hi = hi.max(p)
+	var q: float = 1.0e5 / maxf((hi - lo)[(hi - lo).max_axis_index()], 1.0e-9)
+	var pos_key := PackedInt32Array()
+	pos_key.resize(verts.size())
+	var key_ids := {}
+	for v in range(verts.size()):
+		var p: Vector3 = verts[v]
+		var k := Vector3i(roundi(p.x * q), roundi(p.y * q), roundi(p.z * q))
+		if not key_ids.has(k):
+			key_ids[k] = key_ids.size()
+		pos_key[v] = key_ids[k]
+
+	# Unit face normals (Godot front faces wind clockwise) and, per welded
+	# position, the adjacent faces with the weight each carries there:
+	# AREA x CORNER ANGLE. Neither alone works on these meshes. Corner angle
+	# only (Blender's vertex normals): the aquarium's panes end in 0.1-unit
+	# chamfer strips whose slivers subtend ~180 deg at the pane's corner, so
+	# a strip 28 deg off (inside the merge angle) outweighs the pane and tilts
+	# it 16 deg. Area only: a triangulated quad strip meets each vertex with
+	# one triangle from one quad and two from the next, tilting every normal
+	# of a smooth cylinder by a sixth of a segment. The product cancels the
+	# strip asymmetry (2 x 45 deg vs 1 x 90 deg at equal area) and keeps the
+	# slivers negligible (measured: panes within 0.2 deg, cylinder within
+	# 0.05 deg).
+	var face_n := PackedVector3Array()
+	face_n.resize(tri_count)
+	var adjacent := []
+	var adjacent_w := []
+	adjacent.resize(key_ids.size())
+	adjacent_w.resize(key_ids.size())
+	for i in range(adjacent.size()):
+		adjacent[i] = PackedInt32Array()
+		adjacent_w[i] = PackedFloat32Array()
+	for f in range(tri_count):
+		var tri := [verts[idx[f * 3]], verts[idx[f * 3 + 1]], verts[idx[f * 3 + 2]]]
+		var n: Vector3 = (tri[2] - tri[0]).cross(tri[1] - tri[0])
+		var area2: float = n.length()
+		if area2 <= 0.0:
+			continue # degenerate: contributes nothing; its corners keep their authored normal below
+		face_n[f] = n / area2
+		for k in range(3):
+			var e1: Vector3 = tri[(k + 1) % 3] - tri[k]
+			var e2: Vector3 = tri[(k + 2) % 3] - tri[k]
+			var pk: int = pos_key[idx[f * 3 + k]]
+			adjacent[pk].append(f)
+			adjacent_w[pk].append(area2 * e1.angle_to(e2))
+
+	var cos_t: float = cos(deg_to_rad(p_angle_deg))
+	var old_normals = p_arrays[Mesh.ARRAY_NORMAL]
+	var max_corr: float = 0.0
+	var new_index := PackedInt32Array()
+	new_index.resize(idx.size())
+	var remap := {}
+	var src_ids := PackedInt32Array()
+	var new_normals := PackedVector3Array()
+	for f in range(tri_count):
+		var fn: Vector3 = face_n[f]
+		for k in range(3):
+			var v: int = idx[f * 3 + k]
+			var acc := Vector3.ZERO
+			var pk: int = pos_key[v]
+			var faces: PackedInt32Array = adjacent[pk]
+			var weights: PackedFloat32Array = adjacent_w[pk]
+			for j in range(faces.size()):
+				var g: int = faces[j]
+				if g == f or face_n[g].dot(fn) >= cos_t:
+					acc += face_n[g] * weights[j]
+			var has_old: bool = old_normals != null and old_normals.size() == verts.size()
+			var n: Vector3
+			if acc.length_squared() > 0.0:
+				n = acc.normalized()
+			elif has_old:
+				n = old_normals[v] # degenerate face: keep what was authored
+			else:
+				n = Vector3.UP
+			if has_old:
+				var on: Vector3 = old_normals[v]
+				if on.length_squared() > 0.0 and acc.length_squared() > 0.0:
+					max_corr = maxf(max_corr, rad_to_deg(acos(clampf(on.normalized().dot(n), -1.0, 1.0))))
+			var key := Vector4i(v, roundi(n.x * 4096.0), roundi(n.y * 4096.0), roundi(n.z * 4096.0))
+			var nid: int
+			if remap.has(key):
+				nid = remap[key]
+			else:
+				nid = src_ids.size()
+				remap[key] = nid
+				src_ids.append(v)
+				new_normals.append(n)
+			new_index[f * 3 + k] = nid
+
+	var out := []
+	out.resize(Mesh.ARRAY_MAX)
+	for slot in range(Mesh.ARRAY_MAX):
+		out[slot] = _gather_vertex_array(p_arrays[slot], src_ids, verts.size())
+	out[Mesh.ARRAY_NORMAL] = new_normals
+	out[Mesh.ARRAY_INDEX] = new_index
+	return {"arrays": out, "max_correction_deg": max_corr}
+
+# Replaces m.mesh with a copy whose listed surfaces carry auto-smoothed
+# normals (GLB_GLASS_AUTOSMOOTH_DEG). Surface order, names and materials are
+# kept, so the instance's per-surface override materials still line up.
+# Returns report strings, one per rebuilt surface; empty when nothing changed.
+func _autosmooth_converted_surfaces(m: MeshInstance3D, surface_ids: Array) -> Array:
+	var mesh = m.mesh
+	if surface_ids.is_empty() or not (mesh is ArrayMesh) or mesh.get_blend_shape_count() > 0:
+		return []
+	var mid: int = mesh.get_instance_id()
+	if _autosmooth_mesh_cache.has(mid):
+		var hit: Dictionary = _autosmooth_mesh_cache[mid]
+		if hit["mesh"] != null:
+			m.mesh = hit["mesh"]
+		return hit["report"]
+	var report := []
+	var rebuilt := ArrayMesh.new()
+	rebuilt.resource_name = mesh.resource_name
+	var changed := false
+	for i in range(mesh.get_surface_count()):
+		var prim: int = mesh.surface_get_primitive_type(i)
+		var arrays: Array = mesh.surface_get_arrays(i)
+		if i in surface_ids and prim == Mesh.PRIMITIVE_TRIANGLES:
+			var res := _autosmooth_surface_arrays(arrays, GLB_GLASS_AUTOSMOOTH_DEG)
+			if res["max_correction_deg"] >= 0.5:
+				arrays = res["arrays"]
+				changed = true
+				report.append("%s (normals corrected up to %.1f deg)" % [mesh.surface_get_name(i), res["max_correction_deg"]])
+		rebuilt.add_surface_from_arrays(prim, arrays)
+		rebuilt.surface_set_name(i, mesh.surface_get_name(i))
+		var src_mat = mesh.surface_get_material(i)
+		if src_mat != null:
+			rebuilt.surface_set_material(i, src_mat)
+	if changed:
+		m.mesh = rebuilt
+	_autosmooth_mesh_cache[mid] = {"mesh": rebuilt if changed else null, "report": report}
+	return report
+
 func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 	if not CONVERT_GLB_ALPHA_GLASS or not USE_TRANSMISSIVE_GLASS:
 		return
@@ -1705,11 +1906,13 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 	var converted = []
 	var left_alone = []
 	var kept_alpha_water = []
+	var autosmoothed = []
 
 	for m in _get_all_meshes(root):
 		if not m.mesh:
 			continue
 		var node_name = str(m.name)
+		var dielectric_surfaces := []
 
 		# A material_override wins over every surface on this instance, so it has
 		# to be handled on its own -- converting the surface materials underneath
@@ -1732,6 +1935,7 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 				else:
 					_apply_glb_transmissive_glass(ov, ov_kind)
 					converted.append("%s [override->%s]" % [ov_ctx.strip_edges(), ov_kind])
+					autosmoothed.append_array(_autosmooth_converted_surfaces(m, range(m.mesh.get_surface_count())))
 			else:
 				left_alone.append("%s [override]" % ov_ctx.strip_edges())
 			continue
@@ -1767,12 +1971,18 @@ func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 			_apply_glb_transmissive_glass(dup, kind)
 			m.set_surface_override_material(i, dup)
 			converted.append("%s [%s]" % [ctx.strip_edges(), kind])
+			dielectric_surfaces.append(i)
+		autosmoothed.append_array(_autosmooth_converted_surfaces(m, dielectric_surfaces))
 
 	if converted.is_empty() and left_alone.is_empty() and kept_alpha_water.is_empty():
 		return
 	var label = asset_label if asset_label != "" else str(root.name)
 	if not converted.is_empty():
 		print("  [GlassFix] %s -> traced dielectric: %s" % [label, ", ".join(converted)])
+	if not autosmoothed.is_empty():
+		# Read this line when a converted pane still lenses: no entry means its
+		# authored normals were already within 0.5 deg of the auto-smooth result.
+		print("  [GlassFix] %s -> auto-smooth %.0f deg: %s" % [label, GLB_GLASS_AUTOSMOOTH_DEG, ", ".join(autosmoothed)])
 	if not kept_alpha_water.is_empty():
 		# Read this line when the water looks colourless: an entry here means the
 		# surface reached the tracer's Transparent BSDF closure with its authored
