@@ -93,15 +93,20 @@ collision makes two surfaces share one distribution — a loss of guiding
 efficiency, never of correctness: whatever the cell says is the density
 that is both sampled and reported, and any positive density is unbiased.
 
-**Bins.** An 8×8 octahedral map over the full sphere (`oct_encode` /
-`oct_decode`, the mapping the sky octmap uses). Equal-area: every bin
-subtends `4π/64` sr, so `p_guide(ω) = w[bin(ω)] / (W_hemi · 4π/64)`, where
-`W_hemi` is the cell's total over the bins whose centre lies in the
-hemisphere of the current normal.
+**Bins.** An 8×8 grid over the full sphere in `(cos θ, φ)` with world +Y
+as the polar axis: row = `floor((d.y + 1)/2 · 8)`, column = `floor((atan(d.z,
+d.x) + π)/2π · 8)`. This is exactly equal-area (`4π/64` sr per bin) and a
+uniform point in a bin's `(cos θ, φ)` rectangle is uniform in solid angle,
+so `p_guide(ω) = w[bin(ω)] / (W_hemi · 4π/64)` is exact, where `W_hemi` is
+the cell's total over the bins whose CENTRE lies in the hemisphere of the
+current normal. (Not the octahedral map: `oct_inc.glsl`'s L1 projection is
+not equal-area, and a pdf that assumes it is would be biased — plan
+deviation, 2026-09-22.)
 
 **Fixed point.** Bins are `uint`, added with `atomicAdd`, value ×
-`GUIDE_FIXED = 4096`, saturating at `0xFFFFFFFF` (an add that would
-overflow is skipped; the cell has learnt what it needs by then). Integer
+`GUIDE_FIXED = 1024`, saturating (an add that would overflow is skipped;
+the cell has learnt what it needs by then). Well-trained bins receive
+`L/p ≈ constant` adds, which is what keeps the sums bounded; see Risks. Integer
 adds are associative, so the trained table — and the render — is
 repeat-identical run to run, which the suite's md5 floors depend on.
 
@@ -109,7 +114,12 @@ repeat-identical run to run, which the suite's md5 floors depend on.
 copied to `rt_guide_read` (`RD::buffer_copy`, no shader). The frame samples
 and evaluates pdfs from `rt_guide_read` only; the sampling density and the
 MIS density are therefore the same frozen data. Both buffers are zeroed
-(`RD::buffer_clear`) on the accumulation reset path.
+(`RD::buffer_clear`) when accumulation is switched ON — the new-cycle edge
+at `render_raytracing.cpp:4293` — and NOT on the camera-move / resize /
+rt-flags resets: the table is world-space and scene-bound, a camera move
+does not invalidate it, and a gate that switches to the vis mode to inspect
+the table (an rt-flags change) must find it intact. Guiding is inert on
+non-accumulating frames (`RT_PARAM_GUIDE_PROB` is written as 0 there).
 
 ### 2. Training
 
@@ -118,9 +128,12 @@ of the path: `pos`, `nkey`, `dir` (the direction taken), `pdf` (the density
 it was drawn with, i.e. the mixture at that vertex), `throughput_after`
 (after the BSDF weight and roulette), `radiance_before` (the pixel's
 radiance accumulated through that vertex's NEE). A vertex is recorded when
-the closest-hit reports a diffuse or sheen lobe draw (`brdfType` DIFFUSE /
-SHEEN, the same predicate that increments the diffuse counter). Glossy,
-transmissive and SSS vertices are neither recorded nor guided.
+the closest-hit reports a diffuse or sheen lobe draw (`brdfType == DIFFUSE_TYPE` only). Sheen, glossy, transmissive and SSS
+vertices are neither recorded nor guided: the diffuse counter also counts
+sheen and SSS exits, so the closest-hit marks a diffuse-lobe draw with a
+second bit in the payload's `sss_restart.w` (0/1 today for `sss_exit`;
+bit 1 = guide record) — no payload growth, and raygen reads exactly the
+predicate it needs.
 
 When the path ends (terminated, missed, rouletted, capped), for each recorded
 vertex `k`, in any order:
@@ -152,7 +165,7 @@ records nothing for `k`: its continuation carried no estimate.
 
 ### 3. Sampling and MIS
 
-At a diffuse/sheen lobe draw, the vertex's cell in `rt_guide_read` is
+At a diffuse-lobe draw (`brdfType == DIFFUSE_TYPE`), the vertex's cell in `rt_guide_read` is
 looked up once. Guiding is **active** at the vertex iff `guide_prob > 0`,
 `count ≥ GUIDE_MIN_COUNT = 32` and `W_hemi > 0`; otherwise the draw is
 exactly today's (`α = 0`, the pdf hook returns the cosine density, no code
@@ -174,13 +187,21 @@ With `α = guide_prob` (0.5 in production, Cycles' `surface_guiding_probability`
   per-vertex guiding state passed in (`GuideState {active, α, cell,
   W_hemi_cos}`), so its three call sites are unchanged text and the miss /
   emissive-hit consumers of `mis_ray_pdf` see a consistent number.
-- The sample weight of a guided draw is `f(ω)·cos / p_total(ω)` from the
-  FULL BSDF evaluation (`evalCombinedBRDFSeparate`) and `combinedPdf` — not
-  the single-lobe `f_diff·cos/p_diff` shortcut — because a guided direction
-  must be weighted against the specular lobe's share of the mixture too.
-  The cosine draw keeps its existing weight path; when guiding is active its
-  weight is also recomputed as `f·cos/p_total` so both branches of the coin
-  use one density. When guiding is inactive nothing is recomputed.
+- The sample weight. The integrator's estimator is one-sample-per-lobe:
+  `shade_and_bounce` divides the throughput by the lobe's selection
+  probability and `evalIndirectCombinedBRDF`'s diffuse branch returns
+  `f_diff·cos / p_cos` (`diffuseReflectance · diffuseTerm`, the cosine
+  density cancelled analytically). That estimator stays; only the diffuse
+  density changes. So for BOTH coin outcomes, when guiding is active, the
+  returned weight is multiplied by `p_cos(ω) / p_diff(ω)` — the cosine
+  density the branch assumed over the mixture density the direction was
+  actually drawn with. For a guided draw the direction is injected into the
+  same diffuse branch (a `evalIndirectCombinedBRDF` overload taking a
+  world-space direction instead of drawing one), so the weight, the
+  `bumpShadowingTerm` and the geometry-horizon rejection are the existing
+  code's. When guiding is inactive nothing is multiplied. (Plan deviation
+  from the first draft's "full BSDF evaluation": that would have changed the
+  estimator, not just its density.)
 
 `W_hemi_cos` (the cosine-weighted hemisphere total for the vertex's N) is
 computed once per vertex from 64 reads and passed to both the CDF build and
@@ -278,6 +299,11 @@ instrument (`tools/daylight_validation.py`) on its hand-verified wall crops:
   bounded by how much of the bin the patch fills. If G1 passes but
   production misses 10%, the next lever is 16×16 bins (4× memory, same
   code), before any parametric fit.
+- **Table saturation**: a bin whose fixed-point sum would exceed 2^32 stops
+  learning (the add is skipped). With `L/p` adds that is ~4 M adds at
+  `L/p = 1`; a cell in front of a window at 4K sees ~1e5 samples per bin.
+  Watch `RT_VIS_GUIDE_CELL`'s count channel on the four jobs; if it
+  saturates, the fallback is a halving pass in a compute snapshot shader.
 - **Hash collisions** at 2^18 cells: a 10 m room at 16 cm cells × 6 normal
   keys is ~1.5 M possible keys but only surfaces occupy cells; measured
   occupancy goes in the closeout. If collisions matter, the fix is a
