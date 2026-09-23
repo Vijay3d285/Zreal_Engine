@@ -40,6 +40,9 @@
 #define RT_PARAM_VOLUME_EMISSION_R 24 // rt_params[6].xyz - emission per metre, already x energy x density
 #define RT_PARAM_VOLUME_BOX_MIN_X 28 // rt_params[7].xyz - world-space box (the scene's AABB, padded 1 cm)
 #define RT_PARAM_VOLUME_BOX_MAX_X 32 // rt_params[8].xyz
+#define RT_PARAM_GUIDE_PROB 35 // rt_params[8].w - path-guiding mixture probability (0 = off)
+#define RT_PARAM_GUIDE_ORIGIN_X 36 // rt_params[9].xyz - guide grid origin (the TLAS AABB min)
+#define RT_PARAM_GUIDE_CELL 39 // rt_params[9].w - guide voxel edge in metres (0 = off)
 
 // ============================================================================
 // PATHTRACING PAYLOAD (48 bytes nominal, fp32 radiance/throughput)
@@ -177,6 +180,7 @@ struct PathState {
 	uint skip_prim;
 	vec3 sss_restart;
 	bool sss_exit;
+	bool guide_record; // this vertex drew the diffuse lobe at density mis_ray_pdf (Gap #32)
 	vec3 mis_origin;
 };
 
@@ -193,7 +197,10 @@ PathState path_unpack(PathPayload p) {
 	s.skip_geom = p.skip_geom;
 	s.skip_prim = p.skip_prim;
 	s.sss_restart = p.sss_restart.xyz;
-	s.sss_exit = p.sss_restart.w > 0.5;
+	// sss_restart.w carries two bits as a small integer: 1 = sss_exit, 2 = guide_record.
+	uint sss_bits = uint(p.sss_restart.w + 0.5);
+	s.sss_exit = (sss_bits & 1u) != 0u;
+	s.guide_record = (sss_bits & 2u) != 0u;
 	s.mis_origin = p.mis_origin;
 	return s;
 }
@@ -209,7 +216,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.mis_ray_pdf = s.mis_ray_pdf;
 	p.skip_geom = s.skip_geom;
 	p.skip_prim = s.skip_prim;
-	p.sss_restart = vec4(s.sss_restart, s.sss_exit ? 1.0 : 0.0);
+	p.sss_restart = vec4(s.sss_restart, float((s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u)));
 	p.mis_origin = s.mis_origin;
 }
 
@@ -411,6 +418,7 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 #define RT_PRNG_TRANSPARENT 10u // 1D: transparent-vs-shade choice (alpha closure).
 #define RT_PRNG_TRANSMIT 11u // 1D: reflect-vs-transmit choice inside the dielectric closure (E1).
 #define RT_PRNG_VOLUME 12u // 1D: free-flight distance through the fog box (F2).
+#define RT_PRNG_GUIDE 13u // 1D: guided-vs-cosine coin at a diffuse draw (Gap #32).
 // Slots 12-15 are free. Earlier dimensions are better stratified, so the
 // highest-variance decision (the BSDF direction) keeps 0.
 

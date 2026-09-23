@@ -27,8 +27,11 @@
 
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
-#include "brdf_inc.glsl" // F2: the NEE code below evaluates MaterialProperties
+// F2: the NEE code below evaluates MaterialProperties
+#include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+// get_rt_param (raytracing_common_inc.glsl, just above) must precede this include: guide_prob()/guide_cell_of() call it.
+#include "raytracing_guiding_inc.glsl"
 #include "raytracing_volume_inc.glsl"
 
 layout(set = 0, binding = 0, rgba32f) uniform image2D image;
@@ -158,6 +161,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	ps.skip_prim = RT_SKIP_NONE;
 	ps.sss_restart = vec3(0.0);
 	ps.sss_exit = false;
+	ps.guide_record = false;
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
@@ -423,6 +427,7 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_guiding_inc.glsl"
 #include "raytracing_volume_inc.glsl"
 // clang-format on
 
@@ -620,6 +625,7 @@ void main() {
 #include "../scene_data_inc.glsl"
 #include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_guiding_inc.glsl"
 #include "raytracing_volume_inc.glsl"
 // clang-format on
 
