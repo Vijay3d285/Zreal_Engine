@@ -3847,6 +3847,15 @@ void RenderingServer::init() {
 	// scene that already places an analytic light inside an emissive fixture mesh
 	// would then be lit twice.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/emissive_mesh_lights"), false);
+	// Path guiding for diffuse bounces (roadmap Gap #32, spec
+	// docs/superpowers/specs/2026-09-22-path-guiding-design.md). The mixture
+	// probability between the learnt directional histogram and cosine sampling
+	// at a diffuse-lobe draw; 0 disables the guide entirely (no buffers, no
+	// training). Only meaningful on the accumulating still route -- one sample
+	// per frame has no training window -- so the pipeline sets it there and
+	// leaves it 0 for video and DLSS-RR. A project setting rather than an
+	// Environment property because Environment.pathtracing_params[16] is full.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/guiding_probability", PROPERTY_HINT_RANGE, "0.0,0.9,0.05"), 0.0);
 	// Transmission / rough glass (roadmap E1). Defaults to true, unlike C1's
 	// emissive_mesh_lights: the feature is already data-gated (transmission
 	// defaults to 0.0 and no pre-Phase-D content can set it), so an untouched

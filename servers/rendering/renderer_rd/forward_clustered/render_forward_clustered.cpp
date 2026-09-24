@@ -2937,6 +2937,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			rt_state->accum_reset_pending = false;
 		}
 
+		raytracing->guide_prepare_frame(rt_state); // Gap #32: clear on the accumulate edge, snapshot every frame.
+
 		// Phase F: once the one-shot OIDN final-denoise has already run this convergence
 		// cycle (oidn_denoise_done), SKIP the per-frame trace + copy_output_texture. The
 		// denoised color that the OIDN pass wrote into internal_texture on the denoise
@@ -2972,6 +2974,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		// Make sure BDA referenced buffers are registered as dependencies, otherwise GPU hangs may occur, or render graph will not be able to order the dependencies correctly.
 		raytracing->register_raytracing_buffer_dependencies(raytracing_list);
+
+		if (rt_state && rt_state->guide_train_buffer.is_valid()) {
+			RD::get_singleton()->raytracing_list_add_buffer_dependency(raytracing_list, rt_state->guide_train_buffer, /*p_writable=*/true);
+			RD::get_singleton()->raytracing_list_add_buffer_dependency(raytracing_list, rt_state->guide_read_buffer, /*p_writable=*/false);
+		}
 
 		// Raytracing dispatches at internal (pre-upscale) size because the RT
 		// output texture is allocated at that resolution; FSR/upscaler runs

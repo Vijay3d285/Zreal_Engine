@@ -265,6 +265,12 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->portal_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->portal_buffer);
 	}
+	if (p_state->guide_train_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->guide_train_buffer);
+	}
+	if (p_state->guide_read_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->guide_read_buffer);
+	}
 	if (p_state->ies_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->ies_buffer);
 	}
@@ -4296,6 +4302,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			p_state->oidn_denoise_done = false; // a new convergence cycle must re-denoise.
 			p_state->dlss_rr_warmup_left = 0; // Phase F2: re-warm DLSS-RR final next cycle.
 			p_state->dlss_rr_final_done = false;
+			p_state->guide_clear_pending = true; // Gap #32: a new convergence cycle starts a new guide.
 		}
 		if (accum_enabled) {
 			bool need_reset = false;
@@ -4355,6 +4362,36 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// fixed per-pixel pattern (bias, real detail) from sample noise; used for
 		// the Gap #30 follow-up (roadmap 11.26). Production never sets it.
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame + zr_seed_offset());
+		// Gap #32 path guiding. Inert unless accumulating: the parameters are
+		// written as 0, guide_enabled() in the shader is then false, and no
+		// buffer is created or copied. The grid is the TLAS AABB at 1/64 of its
+		// longest edge, floored at 15 cm.
+		{
+			float guide_prob = 0.0f;
+			float guide_cell = 0.0f;
+			Vector3 guide_origin;
+			if (accum_enabled && p_state->volume_box_valid) {
+				guide_prob = CLAMP((float)GLOBAL_GET("rendering/pathtracer/guiding_probability"), 0.0f, 0.9f);
+				if (guide_prob > 0.0f) {
+					const AABB box = p_state->volume_box;
+					guide_cell = MAX(box.get_longest_axis_size() / 64.0f, 0.15f);
+					guide_origin = box.position;
+				}
+			}
+			p_state->guide_active_this_frame = guide_prob > 0.0f;
+			if (p_state->guide_active_this_frame && !p_state->guide_train_buffer.is_valid()) {
+				p_state->guide_train_buffer = RD::get_singleton()->storage_buffer_create(GUIDE_BUFFER_BYTES);
+				RD::get_singleton()->set_resource_name(p_state->guide_train_buffer, "RT Guide Train");
+				p_state->guide_read_buffer = RD::get_singleton()->storage_buffer_create(GUIDE_BUFFER_BYTES);
+				RD::get_singleton()->set_resource_name(p_state->guide_read_buffer, "RT Guide Read");
+				p_state->guide_clear_pending = true; // fresh buffers hold undefined bytes.
+			}
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_GUIDE_PROB] = guide_prob;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_GUIDE_ORIGIN_X + 0] = guide_origin.x;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_GUIDE_ORIGIN_X + 1] = guide_origin.y;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_GUIDE_ORIGIN_X + 2] = guide_origin.z;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_GUIDE_CELL] = guide_cell;
+		}
 		p_state->accum_enabled = accum_enabled;
 		// accum_frame is incremented post-trace in the dispatch site
 		// (render_forward_clustered.cpp) so it only advances after a real launch.
@@ -4707,6 +4744,23 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// Bindings 42/43: Gap #32 guiding tables (raytracing_guiding_inc.glsl).
+	// Always bound; the shader never touches them while RT_PARAM_GUIDE_PROB is 0.
+	{
+		RD::Uniform u;
+		u.binding = 42;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(p_state->guide_train_buffer.is_valid() ? p_state->guide_train_buffer : RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 43;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(p_state->guide_read_buffer.is_valid() ? p_state->guide_read_buffer : RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		uniforms.push_back(u);
+	}
+
 	// Binding 34: environment sampling distribution (env NEE).
 	{
 		RD::Uniform u;
@@ -4860,6 +4914,23 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 		if (e->replicated_idx_buffer.is_valid()) {
 			rd->raytracing_list_add_buffer_dependency(p_list, e->replicated_idx_buffer, /*p_writable=*/false);
 		}
+	}
+}
+
+void RenderRaytracing::guide_prepare_frame(RTViewportState *p_state) {
+	if (!p_state || !p_state->guide_train_buffer.is_valid()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	if (p_state->guide_clear_pending) {
+		rd->buffer_clear(p_state->guide_train_buffer, 0, GUIDE_BUFFER_BYTES);
+		rd->buffer_clear(p_state->guide_read_buffer, 0, GUIDE_BUFFER_BYTES);
+		p_state->guide_clear_pending = false;
+	}
+	if (p_state->guide_active_this_frame) {
+		// The frame samples and evaluates pdfs from the snapshot only, so the
+		// density is frozen for the whole dispatch while training continues.
+		rd->buffer_copy(p_state->guide_train_buffer, p_state->guide_read_buffer, 0, 0, GUIDE_BUFFER_BYTES);
 	}
 }
 

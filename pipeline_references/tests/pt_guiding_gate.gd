@@ -52,7 +52,7 @@ func _ready() -> void:
 
 	var baseline_out := OS.get_environment("ZR_GUIDE_BASELINE")
 	if baseline_out != "":
-		var img := await _render_scene(0.0, FRAMES_LO)
+		var img := await _render_scene(float(OS.get_environment("ZR_GUIDE_BASELINE_PROB")) if OS.get_environment("ZR_GUIDE_BASELINE_PROB") != "" else 0.0, FRAMES_LO)
 		_save_pfm(img, baseline_out)
 		print("baseline written: %s (wall mean %.6f)" % [baseline_out, _crop(img, WALL_ROWS)])
 		get_tree().quit(0)

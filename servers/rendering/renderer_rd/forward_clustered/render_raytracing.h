@@ -437,6 +437,16 @@ struct RTViewportState {
 
 	RID light_buffer;
 	RID portal_buffer; // RT_PORTALS_MAX x RT_PortalData, binding 41.
+
+	// Gap #32 path guiding. Two flat uint SSBOs of GUIDE_BUFFER_BYTES: the
+	// raygen trains into guide_train_buffer (binding 42), the closest-hit
+	// samples from guide_read_buffer (binding 43), a copy taken at the start
+	// of every accumulating frame. Cleared when accumulation switches on
+	// (world-space table: a camera move does not invalidate it).
+	RID guide_train_buffer;
+	RID guide_read_buffer;
+	bool guide_clear_pending = false;
+	bool guide_active_this_frame = false;
 	RID ies_buffer; // GPU SSBO for packed IES photometric profile data.
 	uint32_t ies_buffer_bytes = 0; // Tracks allocated size to detect resize need.
 	RID params_buffer;
@@ -747,6 +757,11 @@ public:
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);
 
 	void register_raytracing_buffer_dependencies(RD::RaytracingListID p_list);
+
+	// Gap #32: clear (on the accumulate edge) and snapshot (every accumulating
+	// frame) the guiding buffers. Call before the raytracing list begins.
+	void guide_prepare_frame(RTViewportState *p_state);
+	static constexpr uint32_t GUIDE_BUFFER_BYTES = 262144u * 65u * 4u;
 
 	SceneShaderRaytracing *get_shader() const { return shader; }
 

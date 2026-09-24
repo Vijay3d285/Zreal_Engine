@@ -214,6 +214,9 @@ public:
 	static constexpr int RT_PARAM_VOLUME_EMISSION_R = 24;
 	static constexpr int RT_PARAM_VOLUME_BOX_MIN_X = 28;
 	static constexpr int RT_PARAM_VOLUME_BOX_MAX_X = 32;
+	static constexpr int RT_PARAM_GUIDE_PROB = 35; // Gap #32: guiding mixture probability, 0 = off
+	static constexpr int RT_PARAM_GUIDE_ORIGIN_X = 36; // ..38: guide grid origin (TLAS AABB min)
+	static constexpr int RT_PARAM_GUIDE_CELL = 39; // guide voxel edge, metres; 0 = off
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces, uint32_t p_min_bounce, uint32_t p_max_transmission_bounce) {
 		uint32_t result = p_flags;
