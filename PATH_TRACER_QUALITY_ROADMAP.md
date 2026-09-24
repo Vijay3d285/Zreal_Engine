@@ -6827,7 +6827,7 @@ zero-variance contribution. The shipped PNG after OIDN reads 0.1–3.8%. This
 is the price of physical light and is Gap #32's problem to solve; it is a
 regression against the prior best rig, not just a bar miss.
 
-## 11.28 Gap #32 (engine, OPEN) — variance reduction for bounce-lit surfaces
+## 11.28 Gap #32 (engine, PARTLY MEASURED / OPEN) — variance reduction for bounce-lit surfaces
 
 **Parked 2026-09-17 at the user's request; the engine-side counterpart of
 Gap #31.** Gap #31 was expected to lower the grain by changing the light;
@@ -6891,6 +6891,48 @@ whole burden.
 Acceptance: the fixture's bounce-lit ceiling ≤ 5% grain at 256 samples (from
 ~12%), the shadow-line retention through OIDN ≥ 0.85, and job 225's ceiling
 measured before/after at equal wall time.
+
+### Measured 2026-09-24 — a guide was built; the variance is not where this section assumed
+
+Spec `docs/superpowers/specs/2026-09-22-path-guiding-design.md`, plan
+`docs/superpowers/plans/2026-09-22-path-guiding.md`, working notes under
+`.superpowers/sdd/2026-09-22-path-guiding/`.
+
+An unbiased GPU path guide was implemented (a hashed world-space grid of
+8×8 equal-area directional histograms, mixed with cosine sampling at
+α = 0.5, one density hook in `combinedPdf`'s diffuse term so every MIS
+consumer inherits it, fixed-point atomics so the table and the render stay
+repeat-identical). It is correct — the 1024-frame unbiasedness check reads
++0.13% — and **shipped default-off** via
+`rendering/pathtracer/guiding_probability`.
+
+It does not deliver, for a reason that invalidates this section's premise.
+Decomposed on job 227 (FHD, 256 frames): **direct lighting is 86.4% of the
+wall's variance**; all indirect is 13.6%, of which the first bounce is 7.9,
+leaving **5.75% in the bounces 2+ that a guide can touch**. A perfect guide
+would take 16.47% to 15.99%. Measured on the real job it bought ~1% for
++18% render time. Narrowing further: sun off → 9.33% (passes the bar), sky
+off → 16.52% (unchanged), portals firing correctly but worth 0.00 on the
+crop. The noise is the sun's shadow sampling at the partially-occluded
+window; the sun's angular size is not the lever either (0.8° vs the physical
+0.53° differ by 1.0007 in variance, i.e. not at all).
+
+**And the measurements this gap was opened on were partly instrument error.**
+Of the three daylight jobs recorded RED, job 227's reading was a
+contaminated crop — a recessed ceiling downlight inside a "hand-verified
+flat-wall" rectangle — and on clean wall it reads 8.20% and passes, with
+textbook 2.0×-per-4×-samples convergence and a 0.00% floor. Jobs 226
+(11.47%) and 157 (14.93%) hold up on clean crops. Corrections are in
+`docs/superpowers/specs/2026-09-19-daylight-design.md` Findings (6).
+
+**Before any further work on this gap:** run the direct/indirect split and
+the multi-frame convergence check on 226 and 157. Everything above was
+measured on 227 — the one job that turned out not to be failing. The
+proposed order of work below (adaptive sampling → ReSTIR → guiding) was
+written before any of this was measured; guiding has now been tried and is
+the wrong lever for 227, and item 2 (ReSTIR, direct light) is the one the
+227 data points at, contrary to the "Relation to Gap #31" reasoning that
+dismissed it.
 
 ### Relation to Gap #31
 

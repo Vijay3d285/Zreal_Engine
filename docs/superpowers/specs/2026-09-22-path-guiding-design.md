@@ -320,3 +320,90 @@ Glossy guiding (Cycles guides roughness above a threshold), NEE/light
 guiding, guiding on the video and real-time routes, Open PGL parity, the
 night many-light fixture and ReSTIR (§11.28 steps 1 and 3 — a second spec
 if the night rig's ceiling grain is still a complaint after this).
+
+
+## Measured (2026-09-24) — built, correct, and aimed at the wrong term
+
+The guide was implemented through Task 4 of
+`docs/superpowers/plans/2026-09-22-path-guiding.md` and is **shipped
+default-off** (`rendering/pathtracer/guiding_probability` defaults to 0.0).
+Working notes for every number below are in
+`.superpowers/sdd/2026-09-22-path-guiding/`.
+
+### The gate
+
+| check | result |
+|---|---|
+| G0 unbiased, 1024 frames, guiding 0 vs 0.5 | **PASS, +0.13%** — the sampled density and the reported density are one function |
+| G2 repeatable | PASS |
+| G3 instrument (vis 45) | PASS, cell count 2101.9 against a bar of 32 |
+| G1 variance, guided ≤ 0.5× unguided | **FAIL, 1.098×** |
+| G5 cost ≤ 1.25× | **FAIL, 1.305×** (1.59× excluding a fixed settle) |
+| G4 inert at probability 0 | FAIL at 3.7e-9 — making `g_guide` runtime-variable stops constant folding and changes FMA contraction, 2 ULP on 1.3% of pixels; frame mean unchanged to 8 dp |
+
+An α sweep at 0.2 / 0.5 / 0.8 gave 0.1346 / 0.1288 / 0.1244 against 0.1173
+unguided: worse at every setting, so no knob rescues G1. The bar was not
+touched.
+
+### Why G1 failed: the premise was reasoned, not measured
+
+"The complaint" above asserts the noise source is the indirect diffuse term
+and that ReSTIR "does not apply here". Both claims were derived from the
+roadmap rather than measured. Decomposed on job 227 (FHD, 256 frames,
+guiding off, wall crop):
+
+| variant | grain | wall mean |
+|---|---|---|
+| full, 12 bounces | 16.47% | 0.1592 |
+| direct only | 19.92% | 0.1224 |
+| direct + 1 bounce | 17.75% | 0.1435 |
+
+**Direct lighting carries 86.4% of the variance.** All indirect is 13.6%, of
+which the first bounce alone is 7.9 — so bounces 2+, the only region a path
+guide touches, are worth **5.75% of total variance**. A *perfect* guide
+therefore multiplies noise by √(1 − 0.0575) = 0.971: 16.47% → 15.99%. The
+≤10% target was never reachable through guiding, and guiding's measured ~1%
+improvement on the real job is a correct implementation skimming a nearly
+empty pool, not a weak one.
+
+Narrowing further, on the same job: **sky only (sun off) reads 9.33%**
+(variance ratio 0.304, passing the bar); **sun only (sky off) reads 16.52%**
+(ratio 0.999). Light portals fire correctly — two reach the shader with
+correct pose, verified with a temporary print at the line setting
+`RT_PARAM_PORTAL_COUNT` — and are worth nothing on this crop (16.4733% vs
+16.4779% on/off). So the direct variance is the sun's shadow sampling at the
+partially-occluded window. Setting the sun's `light_angular_distance` to the
+physical 0.53° instead of the rig's 0.8° changes nothing measurable: 8.2049%
+vs 8.2070% on the corrected crop, ratio 1.0007, within run-to-run noise.
+
+### What the crops were actually measuring
+
+Job 227's noise converges cleanly (16.47% → 9.55% → 6.96% at 256 → 1024 →
+4096 frames), so it is genuine Monte Carlo noise, not a converged gradient.
+But the falloff decelerates (1.726×, then 1.371×, against 2.0× for pure
+noise), and the reason is that **12% of its "hand-verified flat wall" crop is
+ceiling containing a recessed IES downlight**, whose edge barely converges
+(49.0% → 45.3% across a 16× sample increase) and pins the whole crop's floor
+near 5.7%. On a clean crop of the same wall the same renders read 8.20% /
+3.98% / 2.00%, falling 2.062× then 1.993× with a fitted floor of **0.00%**.
+
+Job 227 passes the bar at production settings and always did. Audited the
+other two RED jobs: 226 is mildly contaminated (a ceiling-corner shadow
+gradient) and still fails at 11.47%; 157 is contaminated (a picture frame's
+dark wood edge) and still fails at 14.93% — slightly worse once cleaned,
+because that wall is dim and genuinely noisy. Corrections are recorded in
+`2026-09-19-daylight-design.md` Findings (6).
+
+**Tally: of the three RED readings that justified this gap, one was a
+measurement artifact and two hold up.** The gap is partly justified, not void.
+
+### Not measured, and load-bearing for whatever comes next
+
+The direct/indirect split, the sun/sky split and the convergence check were
+all run on job 227 — the one job that turned out not to be failing. Whether
+226's and 157's noise is also direct-dominated, and so also out of a path
+guide's reach, is untested; neither has a second frame-count render, so the
+convergence check that settled 227 has not been run on them. **Do that
+first.** Repeating this gap's mistake — choosing a lever before measuring
+which term the variance is in — is the one outcome these notes exist to
+prevent.

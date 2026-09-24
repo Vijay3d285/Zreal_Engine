@@ -283,10 +283,10 @@ pre-plan renders), before/after identical (same md5 on the post-plan render).
 
 | job | class | exposure | fill | occupied median·e | darkest tile | window clipped | wall grain (pre-denoise) | wall crop (y0 y1 x0 x1) |
 |---|---|---|---|---|---|---|---|---|
-| 226 | window in view | 5.812 | none | 0.1880 (ok) | 0.0732 (ok) | 0.00% (ok) | 12.82% (RED) | 0.03 0.25 0.72 0.95 |
-| 227 (substituted for duplicate 225) | window in view | 3.764 | none | 0.1802 (ok) | 0.1097 (ok) | 0.00% (ok) | 16.39% (RED) | 0.12 0.44 0.59 0.64 |
+| 226 | window in view | 5.812 | none | 0.1880 (ok) | 0.0732 (ok) | 0.00% (ok) | 12.82% → **11.47% (RED)** on a clean crop | ~~0.03 0.25 0.72 0.95~~ → 0.1389 0.3797 0.7292 0.95 |
+| 227 (substituted for duplicate 225) | window in view | 3.764 | none | 0.1802 (ok) | 0.1097 (ok) | 0.00% (ok) | ~~16.39% (RED)~~ → **8.20% (ok)** on a clean crop, see Findings (6) | ~~0.12 0.44 0.59 0.64~~ → 0.2875 0.5329 0.5867 0.6430 |
 | 176 | deep room | 0.747 | none | 0.1803 (ok) | 0.0976 (ok) | not measured (22-px mask, <0.5% of frame) | 5.48% (ok) | 0.40 0.60 0.40 0.60 (default) |
-| 157 | windowless | 12.588 | none | 0.1784 (ok) | 0.0527 (ok) | 11.44% (RED) | 14.29% (RED) | 0.30 0.50 0.67 0.71 |
+| 157 | windowless | 12.588 | none | 0.1784 (ok) | 0.0527 (ok) | 11.44% (RED) | 14.29% → **14.93% (RED)** on a clean crop | ~~0.30 0.50 0.67 0.71~~ → 0.2778 0.5370 0.6771 0.7042 |
 
 Window clipping is measured on the tonemapped PNG (≥254/255), not the linear
 buffer (see Findings (4)). Wall grain is the pre-denoise EXR/PFM number
@@ -387,6 +387,34 @@ render; it is not evidence about ordinary-floor behaviour.
    (fill grid + portals, no daylight design) on the same plan as job 227,
    this design's grain is roughly double, not merely over the ≤10% bar (see
    PATH_TRACER_QUALITY_ROADMAP.md §11.27 closeout and §11.28/Gap #32).
+
+   **Corrected 2026-09-24 — one of those three readings was the crop, not
+   the render.** Audited while investigating Gap #32; see
+   `2026-09-22-path-guiding-design.md` "What the crops were actually
+   measuring".
+
+   - **227 was an artifact.** Its crop contained a recessed ceiling IES
+     downlight whose sharp, barely-converging edge dominated the statistic.
+     On a clean crop of the same wall (`0.2875 0.5329 0.5867 0.6430`, 86% of
+     the old area) the SAME render reads **8.20%** — passing — and the noise
+     falls at 2.062× then 1.993× per 4× samples with a fitted floor of
+     0.00%, against the old crop's 1.726×/1.371× and a spurious 5.72% floor.
+   - **226 mildly contaminated, still RED.** A soft ceiling/wall corner
+     shadow gradient in the top rows; clean crop `0.1389 0.3797 0.7292 0.95`
+     reads **11.47%**. Other clean regions of the same wall read 11–15%.
+   - **157 contaminated, still RED, and slightly worse.** The crop contained
+     a picture frame's dark wood edge plus a corner-highlight tail; clean
+     crop `0.2778 0.5370 0.6771 0.7042` reads **14.93%**. That wall is dim
+     (the highest exposure of the four jobs) and genuinely noisy at 256
+     frames.
+
+   So the bar is missed on 2 of 4 jobs, not 3, and "hand-verified flat-wall
+   crop" above means hand-verified for GEOMETRY, not for uniform
+   illumination — a flat wall carrying a fixture edge or a shadow boundary
+   defeats this statistic, which is a 5×5 spatial residual and cannot tell
+   noise from structure. 226 and 157 have not been re-rendered at a second
+   frame count, so the convergence check that settled 227 has not been run
+   on them.
 7. Job 157's window-clipping RED (11.44% on the PNG) traces to a backlit
    fixture panel blown out at the job's exposure of 12.588×; the fixture's
    emission levels were tuned for the pipeline's old exposure regime
