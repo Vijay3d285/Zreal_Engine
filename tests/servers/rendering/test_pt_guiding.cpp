@@ -19,15 +19,33 @@ TEST_FORCE_LINK(test_pt_guiding)
 
 namespace TestPTGuiding {
 
+// Matches raytracing_inc.glsl's `#define PI 3.141592653589f` exactly (a float
+// literal, not Math::PI truncated from double at each use site): the functions
+// below are a literal twin of GLSL float32 arithmetic, and Math::PI is a
+// double that silently upgrades a "float" expression's precision at every use,
+// which can round differently than doing the whole expression in float32 the
+// way the shader does. Statistical/Monte-Carlo helpers below (sphere_dir's
+// callers doing Riemann sums, etc.) still use Math::PI on purpose -- they are
+// not part of the bit-level twin, just numerical estimators.
+static const float PI_F = 3.141592653589f;
+
 static const int BINS = 64;
-static const float BIN_SOLID_ANGLE = 4.0f * Math::PI / 64.0f;
+static const float BIN_SOLID_ANGLE = 4.0f * PI_F / 64.0f;
 
 // guide_bin_of_dir: 8 rows in cos(theta) over world +Y, 8 columns in phi = atan2(z, x).
 static int bin_of_dir(const Vector3 &d) {
 	float ct = CLAMP(d.y, -1.0f, 1.0f);
 	int row = MIN(int((ct + 1.0f) * 0.5f * 8.0f), 7);
 	float phi = Math::atan2(d.z, d.x);
-	int col = MIN(int((phi + Math::PI) / (2.0f * Math::PI) * 8.0f), 7);
+	// atan2's range is (-PI, PI], so phi + PI_F is mathematically >= 0, but
+	// phi can come back a float32 ULP more negative than -PI_F when the
+	// hardware's internal pi differs from PI_F in its last bit -- clamp
+	// before the cast: GLSL's uint(negative) is undefined behaviour (col
+	// wraps to a huge value that then clamps to 7), while a bare C++ int
+	// cast of a small negative float truncates to 0. Clamping the quotient
+	// to >= 0 on BOTH sides makes them agree (col 0) instead of silently
+	// diverging (7 vs 0) on this edge case.
+	int col = MIN(int(MAX((phi + PI_F) / (2.0f * PI_F) * 8.0f, 0.0f)), 7);
 	return row * 8 + col;
 }
 
@@ -36,7 +54,7 @@ static Vector3 dir_of_bin(int bin, const Vector2 &u) {
 	int row = bin / 8;
 	int col = bin % 8;
 	float ct = -1.0f + (float(row) + u.x) * 0.25f;
-	float phi = -Math::PI + (float(col) + u.y) * (2.0f * Math::PI / 8.0f);
+	float phi = -PI_F + (float(col) + u.y) * (2.0f * PI_F / 8.0f);
 	float st = Math::sqrt(MAX(1.0f - ct * ct, 0.0f));
 	return Vector3(st * Math::cos(phi), ct, st * Math::sin(phi));
 }
@@ -110,9 +128,15 @@ static bool guide_sample(const std::vector<uint32_t> &bins, const Vector3 &Nd, f
 	return false;
 }
 
-// The diffuse lobe's density under guiding: (1 - a) cos/pi + a * guide.
+// The diffuse lobe's density under guiding: (1 - a) cos/pi + a * guide. The
+// MAX(NdotLd, 0.0f) clamp is load-bearing: guide_diffuse_pdf() is evaluated by
+// MIS for an arbitrary sampled direction, which can be below the shading
+// horizon (NdotLd < 0). Fix round 1, finding 1: the GLSL twin omitted this
+// clamp (`p_cos = NdotLd / PI`), so a below-horizon L produced a NEGATIVE
+// combinedPdf term reaching MIS -- fixed in raytracing_guiding_inc.glsl's
+// guide_diffuse_pdf() to match this clamp exactly.
 static float mix_pdf(float alpha, float NdotLd, float guide) {
-	return (1.0f - alpha) * MAX(NdotLd, 0.0f) / Math::PI + alpha * guide;
+	return (1.0f - alpha) * MAX(NdotLd, 0.0f) / PI_F + alpha * guide;
 }
 
 static Vector3 sphere_dir(float u, float v) {
@@ -123,7 +147,16 @@ static Vector3 sphere_dir(float u, float v) {
 }
 
 TEST_CASE("[PathTracer][Guiding] bins tile the sphere with equal solid angle") {
-	// 64 x 64 stratified directions: each bin must receive 1/64 of them +- 10%.
+	// 256 x 256 stratified directions over an (equal-area-in-cos(theta),
+	// equal-area-in-phi) grid, against an (equal-area-in-cos(theta),
+	// equal-area-in-phi) binning, with N an exact multiple of 8 in both axes:
+	// every bin should get EXACTLY N*N/64 hits (a double-precision Python
+	// mirror of this exact loop measures zero variance -- min == max ==
+	// 1024). Fix round 1, minor finding: +-10% (over 100x looser than the
+	// true float64 floor) would silently pass a bug that misassigns several
+	// percent of samples. +-2% leaves headroom only for float32 boundary
+	// jitter (a handful of samples landing exactly on a bin edge), not for a
+	// real defect.
 	std::vector<int> hits(BINS, 0);
 	const int N = 256;
 	for (int i = 0; i < N; i++) {
@@ -132,8 +165,8 @@ TEST_CASE("[PathTracer][Guiding] bins tile the sphere with equal solid angle") {
 		}
 	}
 	for (int b = 0; b < BINS; b++) {
-		CHECK(hits[b] > int(N * N / 64.0 * 0.9));
-		CHECK(hits[b] < int(N * N / 64.0 * 1.1));
+		CHECK(hits[b] > int(N * N / 64.0 * 0.98));
+		CHECK(hits[b] < int(N * N / 64.0 * 1.02));
 	}
 }
 
@@ -186,8 +219,21 @@ TEST_CASE("[PathTracer][Guiding] the sampler's frequencies match the pdf it repo
 		}
 	}
 	CHECK(drawn == N * N);
+	// Fix round 1, finding 3: `expected` used to be recomputed inline from
+	// bin_weight()/total, bypassing guide_pdf() entirely -- a defect confined
+	// to guide_pdf() (the function combinedPdf() actually calls through
+	// guide_diffuse_pdf()) could not fail this test, even though this test
+	// exists specifically to catch the sampler and the reported pdf drifting
+	// apart. Routing through guide_pdf(bin_center(b)) instead calls the same
+	// function under test that guide_sample() is being checked against: a
+	// bug in guide_pdf() (e.g. wrong bin lookup, a missing /BIN_SOLID_ANGLE,
+	// or a wrong `total`) now shows up as `expected` disagreeing with the
+	// empirical sampling frequency, exactly as this test's name promises.
+	// bin_center(b) is a legitimate representative direction for bin b's
+	// (constant-across-the-bin) weight: "dir_of_bin lands in its own bin"
+	// guarantees bin_of_dir(bin_center(b)) == b.
 	for (int b = 0; b < BINS; b++) {
-		float expected = bin_weight(bins, b, Nd) / total; // = pdf * solid angle
+		float expected = guide_pdf(bins, Nd, total, bin_center(b)) * BIN_SOLID_ANGLE; // = pdf * solid angle
 		float observed = float(hits[b]) / float(drawn);
 		if (expected > 0.005f) {
 			CHECK(observed == doctest::Approx(expected).epsilon(0.05));
@@ -198,10 +244,20 @@ TEST_CASE("[PathTracer][Guiding] the sampler's frequencies match the pdf it repo
 }
 
 TEST_CASE("[PathTracer][Guiding] the mixture density is positive wherever the cosine lobe is") {
+	// Fix round 1, finding 2: bin 3 is row 0 (bin/8 == 0), whose CENTRE sits
+	// well below the horizon for Nd=(0,1,0) (ct = -0.875) -- bin_weight()
+	// clamps to 0 there, so total == 0, guide_pdf() always returns 0, and the
+	// original assertion collapsed to `0.5f * MAX(NdotL,0)/PI > 0`, true by
+	// construction and incapable of ever exercising the guide term. Train a
+	// bin whose centre is ABOVE the horizon instead (row 4, ct = +0.125) so
+	// total > 0 and guide_pdf() actually contributes.
 	std::vector<uint32_t> bins(BINS, 0u);
-	bins[3] = 100u; // a single trained bin
+	const int trained_bin = 4 * 8 + 3; // row 4 (above the horizon for Nd), col 3
+	bins[trained_bin] = 100u;
 	Vector3 Nd = Vector3(0, 1, 0);
 	float total = total_weight(bins, Nd);
+	REQUIRE(total > 0.0f); // guards against this test silently going vacuous again
+
 	for (int i = 0; i < 64; i++) {
 		Vector3 d = sphere_dir((i + 0.5f) / 64.0f, 0.37f);
 		float NdotL = d.dot(Nd);
@@ -209,6 +265,30 @@ TEST_CASE("[PathTracer][Guiding] the mixture density is positive wherever the co
 		if (NdotL > 0.0f) {
 			CHECK(p > 0.0f);
 		}
+	}
+
+	// Isolate the guide term (alpha = 1, so the cosine fallback contributes
+	// nothing): density must be positive INSIDE the trained bin and exactly
+	// zero everywhere else. This is what the loop above cannot catch on its
+	// own -- with alpha = 0.5 the cosine term alone keeps p > 0 almost
+	// everywhere regardless of whether guide_pdf() or the alpha-mixing is
+	// broken. At alpha = 1 this fails if: guide_pdf() silently returns 0
+	// for the trained bin (e.g. a wrong bin lookup or an inverted weight),
+	// or if the mixture formula drops/ignores alpha and always adds the
+	// cosine term (density would then be nonzero outside the trained bin
+	// too, where it must be exactly 0).
+	Vector3 inside = bin_center(trained_bin);
+	CHECK(mix_pdf(1.0f, inside.dot(Nd), guide_pdf(bins, Nd, total, inside)) > 0.0f);
+	for (int b = 0; b < BINS; b++) {
+		if (b == trained_bin) {
+			continue;
+		}
+		Vector3 outside = bin_center(b);
+		float NdotL = outside.dot(Nd);
+		if (NdotL <= 0.0f) {
+			continue; // the loop above already only claims positivity above the horizon
+		}
+		CHECK(mix_pdf(1.0f, NdotL, guide_pdf(bins, Nd, total, outside)) == doctest::Approx(0.0f));
 	}
 }
 
@@ -220,7 +300,16 @@ TEST_CASE("[PathTracer][Guiding] the two faces of a wall get different cells") {
 	uint32_t b = cell_of(p, Vector3(0, 0, 1), origin, cell);
 	CHECK(a != b);
 	CHECK(a < 262144u);
-	CHECK(cell_of(p, Vector3(0, 0, -1), origin, cell) == a); // deterministic
+	// Fix round 1, minor finding: re-calling cell_of() with the exact same
+	// arguments and checking it against `a` (itself computed by that same
+	// call) is true for ANY pure function purely by construction -- it
+	// cannot fail no matter how the hash is implemented, so it caught
+	// nothing. Pin it to a value computed independently (float32 lowbias32
+	// simulation, voxel (13, 10, 20), nkey 5) instead: a future edit that
+	// changes any of the magic constants, the shift amounts, or vx/vy/vz's
+	// rounding now actually has something to disagree with.
+	CHECK(a == 165561u);
+	CHECK(b == 225800u);
 	// Two points 1 mm apart in the same voxel share a cell; across a voxel edge they may not.
 	CHECK(cell_of(p + Vector3(0.001f, 0, 0), Vector3(0, 0, -1), origin, cell) == a);
 }

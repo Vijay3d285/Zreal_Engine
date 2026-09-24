@@ -22,6 +22,13 @@
 #define GUIDE_MIN_COUNT 32u
 #define GUIDE_FIXED 1024.0
 #define GUIDE_MAX_INV_PDF 64.0
+// Task 4: the number of diffuse vertices recorded per path for deferred
+// training (raygen arrays like `vec3 guide_pos[GUIDE_RECORD]`, bounded by
+// `guide_n < GUIDE_RECORD`). This is an ARRAY SIZE, not a bitmask -- it is
+// unrelated to the guide_record PathState flag, whose bit value in
+// sss_restart.w is 2 (see raytracing_inc.glsl's path_pack/path_unpack).
+// Dead in this commit (Task 2: pure functions only, nothing records yet);
+// the raygen training loop that consumes it lands in Task 4.
 #define GUIDE_RECORD 4
 const float GUIDE_BIN_SOLID_ANGLE = 4.0 * PI / 64.0;
 
@@ -75,7 +82,14 @@ uint guide_bin_of_dir(vec3 d) {
 	float ct = clamp(d.y, -1.0, 1.0);
 	uint row = min(uint((ct + 1.0) * 0.5 * 8.0), 7u);
 	float phi = atan(d.z, d.x);
-	uint col = min(uint((phi + PI) / (2.0 * PI) * 8.0), 7u);
+	// atan's range is (-PI, PI], so (phi + PI) is mathematically >= 0, but a
+	// float32 ULP mismatch between this PI and the hardware atan's internal
+	// pi can make phi land a hair below -PI. uint() of a negative value is
+	// undefined in GLSL (col could wrap to a huge number that min() then
+	// clamps to 7, silently misbinning a direction into the wrong column) --
+	// clamp to >= 0 before the cast instead of relying on that UB. Mirrors
+	// the same clamp added to bin_of_dir() in the CPU twin.
+	uint col = min(uint(max((phi + PI) / (2.0 * PI) * 8.0, 0.0)), 7u);
 	return row * 8u + col;
 }
 
@@ -126,9 +140,14 @@ float guide_pdf(GuideState g, vec3 L) {
 }
 
 // combinedPdf's diffuse density. Identical to diffusePdf(NdotLd) when the
-// vertex is not guided; the mixture when it is.
+// vertex is not guided; the mixture when it is. max(NdotLd, 0.0) is
+// load-bearing: this is evaluated by MIS for an arbitrary sampled direction
+// (e.g. a light sample), which can be below the shading horizon. Fix round 1,
+// finding 1: this used to be a bare `NdotLd / PI` with no clamp, so a
+// below-horizon L produced a NEGATIVE density reaching combinedPdf/MIS --
+// unlike the CPU twin's mix_pdf(), which already clamped. Both now match.
 float guide_diffuse_pdf(float NdotLd, vec3 L) {
-	float p_cos = NdotLd / PI;
+	float p_cos = max(NdotLd, 0.0) / PI;
 	if (!g_guide.is_active) {
 		return p_cos;
 	}
@@ -157,6 +176,32 @@ bool guide_sample(GuideState g, vec2 u, out vec3 L) {
 	return false;
 }
 
+// Fix round 1, finding 4: a saturating atomic add. The original guard read
+// `cur = guide_train[idx]` then conditionally called atomicAdd() -- two
+// separate, non-atomic steps. Under contention (many raygen invocations
+// hitting the same cell/bin in the same frame, which is the expected case
+// near convergence), another invocation's add can land between the read and
+// the atomicAdd, so the add proceeds anyway and wraps -- silently corrupting
+// that bin's trained weight and contradicting this function's own "order-
+// independent" invariant. atomicCompSwap retries against the CURRENT value
+// on every failed attempt, so the overflow check and the add are one atomic
+// unit: either it applies cleanly or it correctly declines because some
+// OTHER thread's now-visible add already pushed the total close enough to
+// overflow.
+void guide_atomic_saturating_add(uint idx, uint add) {
+	uint old_val = guide_train[idx];
+	for (;;) {
+		if (old_val > 0xFFFFFFFFu - add) {
+			return; // Would overflow; the cell has learnt what it needs.
+		}
+		uint prev = atomicCompSwap(guide_train[idx], old_val, old_val + add);
+		if (prev == old_val) {
+			return; // Swap succeeded.
+		}
+		old_val = prev; // Another invocation won the race; retry against its value.
+	}
+}
+
 // Training: value is luminance(L_in) / pdf, already clamped by the caller.
 // Saturating: an add that would wrap is skipped (the cell has learnt what it
 // needs); integer atomics keep the table order-independent.
@@ -167,10 +212,7 @@ void guide_train_vertex(vec3 p, vec3 n, vec3 dir, float value) {
 	uint cell = guide_cell_of(p, n);
 	uint idx = cell * GUIDE_STRIDE + guide_bin_of_dir(dir);
 	uint add = uint(min(value * GUIDE_FIXED, 4.0e9));
-	uint cur = guide_train[idx];
-	if (cur < 0xFFFFFFFFu - add) {
-		atomicAdd(guide_train[idx], add);
-	}
+	guide_atomic_saturating_add(idx, add);
 	atomicAdd(guide_train[cell * GUIDE_STRIDE + GUIDE_BINS], 1u);
 }
 
