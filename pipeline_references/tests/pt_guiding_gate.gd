@@ -58,9 +58,65 @@ func _ready() -> void:
 		get_tree().quit(0)
 		return
 
-	# G0-G5 are added by Tasks 4 and 5.
-	print("PASS: scaffold only.")
-	get_tree().quit(0)
+	print("\n=== G0: unbiased -- wall mean at %d frames, guiding 0 vs %.2f ===" % [FRAMES_HI, GUIDE_PROB])
+	var off_hi := await _render_scene(0.0, FRAMES_HI)
+	var on_hi := await _render_scene(GUIDE_PROB, FRAMES_HI)
+	var wall_off := _crop(off_hi, WALL_ROWS)
+	var wall_on := _crop(on_hi, WALL_ROWS)
+	_check("G0 wall on/off", wall_on / maxf(wall_off, 1e-9), 1.0, TOL_G0)
+
+	print("\n=== G1: variance -- wall grain at %d frames ===" % FRAMES_LO)
+	var t0 := Time.get_ticks_msec()
+	var off_lo := await _render_scene(0.0, FRAMES_LO)
+	var t_off := Time.get_ticks_msec() - t0
+	t0 = Time.get_ticks_msec()
+	var on_lo := await _render_scene(GUIDE_PROB, FRAMES_LO)
+	var t_on := Time.get_ticks_msec() - t0
+	var grain_off := _grain(off_lo, WALL_ROWS)
+	var grain_on := _grain(on_lo, WALL_ROWS)
+	var rms_off := _rms(off_lo, off_hi, WALL_ROWS)
+	var rms_on := _rms(on_lo, on_hi, WALL_ROWS)
+	print("  grain off %.4f on %.4f (ratio %.3f, bar %.2f) | RMS vs %d: off %.6f on %.6f" % [grain_off, grain_on, grain_on / maxf(grain_off, 1e-9), G1_RATIO, FRAMES_HI, rms_off, rms_on])
+	_check_true("G1 guided grain <= %.2f x unguided" % G1_RATIO, grain_on <= G1_RATIO * grain_off, "(%.3f)" % (grain_on / maxf(grain_off, 1e-9)))
+
+	print("\n=== G2: repeatable -- two guided %d-frame renders ===" % FRAMES_LO)
+	var on_lo_b := await _render_scene(GUIDE_PROB, FRAMES_LO)
+	var floor_diff := _max_abs_diff(off_lo, await _render_scene(0.0, FRAMES_LO))
+	var rep_diff := _max_abs_diff(on_lo, on_lo_b)
+	print("  unguided repeat floor %.12f | guided repeat %.12f" % [floor_diff, rep_diff])
+	_check_true("G2 guided repeat within the unguided floor", rep_diff <= floor_diff, "(%.12f vs %.12f)" % [rep_diff, floor_diff])
+
+	print("\n=== G3: instrument -- vis mode %d after a guided render ===" % VIS_GUIDE_CELL)
+	var vis := await _render_scene(GUIDE_PROB, 64, VIS_GUIDE_CELL)
+	var cnt := _crop_channel(vis, WALL_ROWS, 0) * 256.0
+	var tot := _crop_channel(vis, WALL_ROWS, 1)
+	print("  wall cell count %.1f (>= 32) | total/(total+1) %.4f (> 0)" % [cnt, tot])
+	_check_true("G3 wall cells trained", cnt >= 32.0 and tot > 0.0, "(count %.1f, total %.4f)" % [cnt, tot])
+
+	print("\n=== G5: cost -- ms per %d frames ===" % FRAMES_LO)
+	print("  off %d ms | on %d ms | ratio %.3f (bar %.2f)" % [t_off, t_on, float(t_on) / maxf(float(t_off), 1.0), G5_RATIO])
+	_check_true("G5 guided time <= %.2f x unguided" % G5_RATIO, float(t_on) <= G5_RATIO * float(t_off), "(%.3f)" % (float(t_on) / maxf(float(t_off), 1.0)))
+
+	var ref_path := OS.get_environment("ZR_GUIDE_BASELINE_REF")
+	if ref_path != "":
+		print("\n=== G4: inert -- guiding 0 vs the pre-change baseline ===")
+		var ref := _load_pfm(ref_path)
+		if ref == null:
+			_check_true("G4 baseline readable", false, ref_path)
+		else:
+			var d := _max_abs_diff(off_lo, ref)
+			print("  max abs diff vs baseline %.12f (floor %.12f)" % [d, floor_diff])
+			_check_true("G4 guiding 0 == baseline", d <= floor_diff, "(%.12f vs %.12f)" % [d, floor_diff])
+
+	print("")
+	if _failures.is_empty():
+		print("PASS: all %d guiding checks passed." % _checks)
+		get_tree().quit(0)
+	else:
+		for f in _failures:
+			print("FAIL - %s" % f)
+		print("FAIL: %d of %d checks failed." % [_failures.size(), _checks])
+		get_tree().quit(1)
 
 
 func _check(p_name: String, p_value: float, p_expected: float, p_tol: float) -> void:

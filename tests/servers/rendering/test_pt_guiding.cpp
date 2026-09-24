@@ -135,8 +135,14 @@ static bool guide_sample(const std::vector<uint32_t> &bins, const Vector3 &Nd, f
 // clamp (`p_cos = NdotLd / PI`), so a below-horizon L produced a NEGATIVE
 // combinedPdf term reaching MIS -- fixed in raytracing_guiding_inc.glsl's
 // guide_diffuse_pdf() to match this clamp exactly.
+//
+// Task 4: the cosine term is a MULTIPLY by the folded (1 / PI), mirroring the
+// GLSL twin, which had to match brdf_inc.glsl's diffusePdf() bit-for-bit once
+// combinedPdf started routing its diffuse term through guide_diffuse_pdf() at
+// every vertex (see that function's comment -- a 1-ULP divide/multiply
+// difference there breaks the guiding-off inertness guarantee).
 static float mix_pdf(float alpha, float NdotLd, float guide) {
-	return (1.0f - alpha) * MAX(NdotLd, 0.0f) / PI_F + alpha * guide;
+	return (1.0f - alpha) * (MAX(NdotLd, 0.0f) * (1.0f / PI_F)) + alpha * guide;
 }
 
 static Vector3 sphere_dir(float u, float v) {

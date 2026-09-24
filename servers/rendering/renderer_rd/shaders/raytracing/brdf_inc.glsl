@@ -3503,6 +3503,20 @@ float combineLobePdf(float weights[LOBE_COUNT], float pdfs[LOBE_COUNT]) {
 	return acc;
 }
 
+// Gap #32: the guide's diffuse density. DEFINED in raytracing_guiding_inc.glsl,
+// forward-declared here because that include must come AFTER this file in every
+// stage -- it calls get_rt_param(), which raytracing_common_inc.glsl declares,
+// and common_inc is itself included after brdf_inc.glsl in all three stages of
+// scene_raytracing_raygen.glsl. (The design brief wrote this hook as an
+// `#ifdef RT_GUIDING_INC`; with that ordering the macro is never defined yet
+// here, so the guard would silently compile the guide out of MIS while the
+// sampler still drew from it -- exactly the sampled-vs-reported density drift
+// the whole design exists to prevent. A prototype puts the density in this ONE
+// place unconditionally instead.) Every stage that includes brdf_inc.glsl also
+// includes raytracing_guiding_inc.glsl; a stage that did not would fail to
+// link, loudly, rather than diverge.
+float guide_diffuse_pdf(float NdotLd, float3 L);
+
 // PDF that the combined diffuse+specular sampler in evalIndirectCombinedBRDF
 // would assign to an arbitrary direction L.
 //
@@ -3546,7 +3560,14 @@ float combinedPdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float pSpec = lobeWeight(material);
 
 	// Diffuse lobe: cosine-weighted hemisphere around the diffuse lobe's normal.
-	float pdfDiffuse = (NdotLd > 0.0f) ? diffusePdf(NdotLd) : 0.0f;
+	//
+	// Gap #32: when the vertex is guided the diffuse lobe's density is the
+	// cosine/histogram mixture; at every other vertex guide_diffuse_pdf is
+	// EXACTLY diffusePdf(NdotLd) (it returns max(NdotLd,0)/PI when g_guide is
+	// inactive, and NdotLd > 0 is already established here). This ONE line is
+	// what every MIS consumer inherits -- mis_ray_pdf, env NEE, emissive NEE --
+	// so the sampled and reported densities cannot drift apart.
+	float pdfDiffuse = (NdotLd > 0.0f) ? guide_diffuse_pdf(NdotLd, L) : 0.0f;
 
 	// Specular lobe: VNDF reflection pdf. Built in the local frame where N = +Z,
 	// matching how sampleSpecular generates directions.
@@ -3962,7 +3983,12 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 }
 
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for indirect light)
-bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, const int brdfType, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight, float4 debug) {
+//
+// Gap #32: the Impl form takes `useGivenDir`/`givenDirLocal` so a guided draw can
+// inject its direction into the DIFFUSE branch and inherit, unchanged, everything
+// that follows -- the weight, the Fresnel attenuation, the bump shadowing, the
+// geometry-plane horizon test. The two public wrappers are below.
+bool evalIndirectCombinedBRDFImpl(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, const int brdfType, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight, float4 debug, bool useGivenDir, float3 givenDirLocal) {
 	// Ignore incident ray coming from "below" the hemisphere
 	//if (dot(shadingNormal, V) <= 0.0f) return false;
 
@@ -3994,7 +4020,12 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 
 	if (brdfType == DIFFUSE_TYPE) {
 		// Sample diffuse ray using cosine-weighted hemisphere sampling
-		rayDirectionLocal = sampleHemisphere(u);
+		//
+		// Gap #32: a guided draw injects its direction (already in the diffuse
+		// lobe's local frame); the weight, bump shadowing and horizon test below
+		// are then exactly the cosine draw's, and the caller rescales the weight
+		// by p_cos / p_mixture.
+		rayDirectionLocal = useGivenDir ? givenDirLocal : sampleHemisphere(u);
 		// F1 approach C: the cosine lobe sits around the diffuse lobe's normal
 		// (the raw bump normal, Cycles' diffuse closure); when that differs from
 		// the corrected shading normal, sample in ITS frame and evaluate the
@@ -4179,6 +4210,26 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	}
 
 	return true;
+}
+
+bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, const int brdfType, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight, float4 debug) {
+	return evalIndirectCombinedBRDFImpl(u, shadingNormal, geometryNormal, V, material, brdfType, rayDirection, sampleWeight, debug, false, float3(0.0f, 0.0f, 1.0f));
+}
+
+// Gap #32: the diffuse lobe evaluated at a WORLD-space direction chosen by the
+// guide. The direction is rotated into the diffuse lobe's frame (about
+// diffuseLobeNormal, which is what the DIFFUSE branch rotates back from: that
+// branch sets qBack = getRotationToZAxis(Nd) when Nd != shadingNormal and
+// otherwise leaves qBack == qRotationToZ == getRotationToZAxis(shadingNormal)
+// == getRotationToZAxis(Nd), so the two frames are the same one in both arms
+// and rayDirection comes back as Lworld up to float rounding).
+bool evalIndirectDiffuseGivenDir(float3 Lworld, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight) {
+	const float3 Nd = diffuseLobeNormal(shadingNormal, material);
+	const float3 Llocal = rotatePoint(getRotationToZAxis(Nd), Lworld);
+	if (Llocal.z <= 0.0f) {
+		return false;
+	}
+	return evalIndirectCombinedBRDFImpl(float2(0.0f, 0.0f), shadingNormal, geometryNormal, V, material, DIFFUSE_TYPE, rayDirection, sampleWeight, float4(0.0f, 0.0f, 0.0f, 0.0f), true, Llocal);
 }
 
 // -------------------------------------------------------------------------

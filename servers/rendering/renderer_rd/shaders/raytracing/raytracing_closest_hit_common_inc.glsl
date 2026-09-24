@@ -580,6 +580,23 @@ void debug_visualize(
 		// E3 arrival gate: r = sss_weight, g = sss_scale, b = thin-wall flag.
 		ps.radiance = vec3(dbg_material.sss_weight, dbg_material.sss_scale,
 				((dbg_material.flags & RT_MAT_FLAG_SSS_THIN) != 0u) ? 1.0 : 0.0);
+	} else if (vis_mode == 45) {
+		// Gap #32 instrument: this primary hit's guide cell in the snapshot.
+		// r = count / 256, g = hemisphere total / (total + 1), b = nkey / 5.
+		// A flat black image means the key/hash/lookup path is broken.
+		//
+		// Reads guide_read (the frozen per-frame snapshot) through the SAME
+		// guide_cell_of() and the SAME h.geometry_normal production looks up
+		// with, so a cell this reports as trained is the cell production would
+		// have sampled.
+		vec3 hp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+		uint cell = guide_cell_of(hp, geometry_normal);
+		float cnt = float(guide_read[cell * GUIDE_STRIDE + GUIDE_BINS]);
+		float total = 0.0;
+		for (uint b = 0u; b < GUIDE_BINS; b++) {
+			total += float(guide_read[cell * GUIDE_STRIDE + b]) / GUIDE_FIXED;
+		}
+		ps.radiance = vec3(cnt / 256.0, total / (total + 1.0), float(guide_nkey(geometry_normal)) / 5.0);
 	} else if (vis_mode == 30 || vis_mode == 31) {
 		// Resolved dielectric F0 (30) and resolved eta (31) after the E1
 		// arbitration, RAW and unscaled.
@@ -1355,6 +1372,11 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// through-events below set it again.
 	ps.skip_geom = RT_SKIP_NONE;
 	ps.skip_prim = RT_SKIP_NONE;
+	// Gap #32: the record bit describes THIS vertex's draw. Cleared here so a
+	// vertex that returns early (alpha pass-through, SSS entry/exit,
+	// transmissive) never carries the previous vertex's bit into raygen's
+	// training record.
+	ps.guide_record = false;
 #ifdef RT_SSS_ENABLED
 	// E3: this hit is the EXIT of a random walk (ps.sss_exit). Cycles'
 	// subsurface_shader_data_setup replaces the whole shader with a diffuse
@@ -1784,6 +1806,16 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// one input and cannot desync. Factor is exactly 1.0 when transmissivness
 	// is 0 -- bit-identical to pre-E1 on every non-glass material.
 	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.transmissivness);
+
+	// Gap #32: ONE cell lookup per vertex, before any MIS consumer runs -- env
+	// NEE (below), emissive NEE (below) and the mis_ray_pdf write at the end of
+	// this function all reach combinedPdf, whose diffuse term reads g_guide.
+	// Inert (is_active == false) when the guide is off, the cell is untrained,
+	// or its cosine-weighted hemisphere total is zero; combinedPdf then reports
+	// exactly diffusePdf. The Nd handed in is the SAME diffuseLobeNormal(N,
+	// brdf_mat) combinedPdf derives for itself, so the histogram is projected
+	// onto the same hemisphere both sides describe.
+	g_guide = guide_lookup(h.hit_pos, h.geometry_normal, diffuseLobeNormal(N, brdf_mat));
 
 	// =================================================================
 	// DLSS Ray Reconstruction output (primary ray, sample 0 only)
@@ -2409,7 +2441,35 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 #else
 	const bool sss_thin_through = false;
 #endif
-	if (!transmissive_sample_ok && !evalIndirectCombinedBRDF(u, N, h.face_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
+	// Gap #32: at a guided diffuse vertex, the diffuse lobe's draw is a mixture
+	// -- coin < alpha draws from the histogram, else cosine -- and the weight
+	// returned for a cosine draw (f cos / p_cos) is rescaled below to the
+	// mixture density: weight *= p_cos / p_mix. Both branches end with the same
+	// density combinedPdf reports for this direction.
+	//
+	// rng_1d does not mutate RNGState (raytracing_inc.glsl), and the coin is
+	// only drawn when guide_vertex is true, so with guiding off not one value in
+	// the sequence moves: the whole branch is bit-inert.
+	bool guided_ok = false;
+	bool guide_vertex = (brdfType == DIFFUSE_TYPE) && g_guide.is_active && !transmissive_sample_ok;
+	if (guide_vertex && rng_1d(rng, RT_PRNG_GUIDE) < g_guide.alpha) {
+		vec3 guided_dir;
+		if (guide_sample(g_guide, u, guided_dir)) {
+			guided_ok = evalIndirectDiffuseGivenDir(guided_dir, N, h.face_normal, V, brdf_mat, next_dir, brdf_weight);
+		}
+		if (!guided_ok) {
+			// A guided direction under the horizon or with zero weight is a
+			// zero-valued sample of a positive-density strategy: unbiased, ends here.
+			// mis_ray_pdf is cleared because this return is ABOVE the write at the
+			// end of the function, so it would otherwise keep the PREVIOUS vertex's
+			// density (see the raygen training record, which reads it).
+			ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+	}
+	if (!guided_ok && !transmissive_sample_ok && !evalIndirectCombinedBRDF(u, N, h.face_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Zero weight, or a direction below the TRUE face. Cycles returns
 		// LABEL_NONE for both (bsdf_microfacet.h:863, bsdf_diffuse.h:65) and the
 		// path ends. F1 removed the mirror-and-keep-the-weight recovery that stood
@@ -2422,6 +2482,34 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	}
 
 	ps.throughput *= brdf_weight;
+
+	// Gap #32: the estimator is untouched -- evalIndirectCombinedBRDFImpl's
+	// diffuse branch still returns f_diff*cos / p_cos with the cosine density
+	// cancelled analytically. All that changes is the density the direction was
+	// actually drawn from, so the ONE correction needed is the ratio
+	// p_cos / p_mix, and p_mix comes from guide_diffuse_pdf -- the same function
+	// combinedPdf reports through. Sampled density and reported density are one
+	// expression.
+	if (guide_vertex) {
+		float NdotLd = max(dot(g_guide.Nd, next_dir), 0.0);
+		float p_cos = NdotLd * ONE_OVER_PI;
+		float p_mix = guide_diffuse_pdf(NdotLd, next_dir);
+		if (p_mix > 0.0) {
+			ps.throughput *= p_cos / p_mix;
+		} else {
+			// No strategy has density here; the sample is worth nothing.
+			ps.mis_ray_pdf = RT_MIS_PDF_NONE;
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			return;
+		}
+		ps.guide_record = true;
+	} else {
+		// Every diffuse-lobe draw is recorded, guided or not, so an untrained
+		// cell learns from cosine draws -- that is what fills the table in the
+		// first frames.
+		ps.guide_record = (brdfType == DIFFUSE_TYPE) && !transmissive_sample_ok;
+	}
 
 	if (took_transmissive_lobe) {
 		ps.packed_bounces_flags = inc_transmission_bounce(ps.packed_bounces_flags);

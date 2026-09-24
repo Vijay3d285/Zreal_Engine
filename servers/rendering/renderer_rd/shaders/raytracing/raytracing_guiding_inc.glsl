@@ -147,7 +147,18 @@ float guide_pdf(GuideState g, vec3 L) {
 // below-horizon L produced a NEGATIVE density reaching combinedPdf/MIS --
 // unlike the CPU twin's mix_pdf(), which already clamped. Both now match.
 float guide_diffuse_pdf(float NdotLd, vec3 L) {
-	float p_cos = max(NdotLd, 0.0) / PI;
+	// Task 4: the MULTIPLY by the folded constant, not a divide, is load-bearing.
+	// combinedPdf's diffuse term now routes through this function at EVERY
+	// vertex, and brdf_inc.glsl's diffusePdf() -- the expression it replaces --
+	// is `NdotL * ONE_OVER_PI` with ONE_OVER_PI == (1.0f / PI) folded at compile
+	// time. `NdotLd / PI` is a different operation that differs from it by up to
+	// 1 ULP, which would shift mis_ray_pdf, env NEE and emissive NEE on EVERY
+	// existing render and break the guiding-off inertness guarantee (gate G4,
+	// and with it all 23 of the repo's other rendered gates). Written as
+	// `(1.0 / PI)` rather than ONE_OVER_PI so this file stays independent of
+	// brdf_inc.glsl's macros; the two constant expressions fold identically.
+	// The CPU twin's mix_pdf() carries the same multiply.
+	float p_cos = max(NdotLd, 0.0) * (1.0 / PI);
 	if (!g_guide.is_active) {
 		return p_cos;
 	}

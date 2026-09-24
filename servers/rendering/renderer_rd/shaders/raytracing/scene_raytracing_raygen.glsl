@@ -185,6 +185,19 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	// exists to prevent. min(.., 15u) mirrors the 4-bit counter clamp there.
 	const uint iteration_limit = p_max_bounces +
 			min(resolve_bounce_cap(float(RT_GET_MAX_TRANSMISSION_BOUNCE()), p_max_bounces), 15u);
+
+	// Gap #32: the first GUIDE_RECORD diffuse-lobe vertices of this path.
+	// Trained after the path ends, from the path's OWN radiance estimate --
+	// which is not known until the path is done, hence the deferred record.
+	const bool guide_on = guide_enabled();
+	int guide_n = 0;
+	vec3 guide_pos[GUIDE_RECORD];
+	vec3 guide_nrm[GUIDE_RECORD];
+	vec3 guide_dir[GUIDE_RECORD];
+	float guide_pdf_k[GUIDE_RECORD];
+	vec3 guide_thr[GUIDE_RECORD];
+	vec3 guide_rad[GUIDE_RECORD];
+
 	[[dont_unroll]] for (uint bounce = 0u; bounce <= iteration_limit; bounce++) {
 		path_pack(payload, ps);
 
@@ -266,6 +279,28 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 		}
 		// Reconstruct the next ray origin from the current ray + hit distance.
 		vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
+
+		// Gap #32: record this vertex for deferred training.
+		//
+		// TERMINATION IS ALREADY HANDLED, and this placement is what handles it.
+		// shade_and_bounce writes ps.mis_ray_pdf only at the very END of the
+		// function, so a vertex killed earlier (Russian roulette, a rejected
+		// sample, the guided early-outs added by Gap #32) would still be
+		// carrying the PREVIOUS vertex's density here. It never reaches this
+		// line: every one of those paths sets PATH_TERMINATED, and the
+		// `if (is_path_terminated(...)) break;` a dozen lines above sits ABOVE
+		// this record. The guided early-outs additionally clear mis_ray_pdf to
+		// RT_MIS_PDF_NONE, so the invariant does not rest on that ordering alone.
+		if (guide_on && ps.guide_record && guide_n < GUIDE_RECORD && ps.mis_ray_pdf > 0.0) {
+			guide_pos[guide_n] = hit_pos;
+			guide_nrm[guide_n] = ps.offset_normal;
+			guide_dir[guide_n] = ps.next_ray_dir;
+			guide_pdf_k[guide_n] = ps.mis_ray_pdf;
+			guide_thr[guide_n] = ps.throughput; // after the BSDF weight and roulette
+			guide_rad[guide_n] = ps.radiance; // through this vertex's own NEE
+			guide_n++;
+		}
+
 		// Gap #26. After a THROUGH-event the hit shader left the crossed
 		// triangle's id in skip_geom/skip_prim and the any-hit stage refuses
 		// exactly that triangle, so the restart needs no distance margin at
@@ -291,6 +326,30 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 			t_min = skip_active ? 0.0 : 0.001;
 		}
 		ray_dir = ps.next_ray_dir;
+	}
+
+	// Gap #32: train from the finished path. `ps.radiance - guide_rad[k]` is
+	// exact for the contributions added AFTER vertex k, because both are reads
+	// of the same running sum; the max(.., 0) only guards float rounding. The
+	// volume_scatter_shade `break` path reaches this code too, and its radiance
+	// is likewise "after" any recorded vertex, which is correct.
+	if (guide_on) {
+		const float clamp_ind = get_rt_param(RT_PARAM_CLAMP_INDIRECT);
+		for (int k = 0; k < guide_n; k++) {
+			vec3 thr = guide_thr[k];
+			float thr_max = max(max(thr.r, thr.g), thr.b);
+			if (thr_max <= 0.0) {
+				continue; // the continuation carried no estimate
+			}
+			vec3 after = max(ps.radiance - guide_rad[k], vec3(0.0));
+			vec3 L_in = after / max(thr, vec3(1e-6));
+			float v = dot(L_in, vec3(0.2126, 0.7152, 0.0722));
+			if (clamp_ind > 0.0) {
+				v = min(v, clamp_ind);
+			}
+			float inv_pdf = min(1.0 / guide_pdf_k[k], GUIDE_MAX_INV_PDF);
+			guide_train_vertex(guide_pos[k], guide_nrm[k], guide_dir[k], v * inv_pdf);
+		}
 	}
 
 	return ps.radiance;
