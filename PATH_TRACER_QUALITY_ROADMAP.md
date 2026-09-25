@@ -6925,14 +6925,40 @@ textbook 2.0×-per-4×-samples convergence and a 0.00% floor. Jobs 226
 (11.47%) and 157 (14.93%) hold up on clean crops. Corrections are in
 `docs/superpowers/specs/2026-09-19-daylight-design.md` Findings (6).
 
-**Before any further work on this gap:** run the direct/indirect split and
-the multi-frame convergence check on 226 and 157. Everything above was
-measured on 227 — the one job that turned out not to be failing. The
-proposed order of work below (adaptive sampling → ReSTIR → guiding) was
-written before any of this was measured; guiding has now been tried and is
-the wrong lever for 227, and item 2 (ReSTIR, direct light) is the one the
-227 data points at, contrary to the "Relation to Gap #31" reasoning that
-dismissed it.
+**227 turned out to be the outlier.** Decomposing the two jobs whose RED
+readings survived the crop audit reversed the picture: 226 is 62.6% indirect
+(35.9% in bounces 2+) and 157 is majority-indirect (≥51.9% in bounces 2+),
+against 227's 86.4% DIRECT. The one job where indirect light was irrelevant
+is the one that was not actually failing.
+
+Re-tested there, the guide does work — and still does not close the gate:
+
+| job | grain off → on | variance | time | vs the same time in samples |
+|---|---|---|---|---|
+| 226 | 11.61% → 10.77% | −13.9% | +4.0% | 1.12× more efficient |
+| 157 | 16.02% → 14.00% | −23.6% | +25.1% | 1.05× (break-even) |
+| 227 | 16.47% → 16.33% | −1.7% | +18.4% | 0.86× (a net loss) |
+
+Determinism verified (a repeat render came back byte-identical), crop means
+unchanged, capture efficiency 38–43% of the addressable pool. Both failing
+jobs stay RED: 226 lands 0.77 points over, 157 4.00 points over, and even a
+perfect guide would only just clear 226 and would not clear 157.
+
+**The default stays 0.0.** The guide's value flips sign with a scene's
+direct/indirect balance, so a blanket enable would cost direct-dominated
+jobs real time for negative benefit. Enabling it per-scene is defensible;
+a classifier to decide that automatically does not exist and should not be
+invented from three data points.
+
+**Where the remaining gap is, and what is still unmeasured:** closing 157
+needs roughly a further 2× variance reduction beyond guiding and nothing
+measured here says where it comes from; the multi-frame convergence check
+has been run only on 227, so neither 226 nor 157 has been shown to be
+noise-limited rather than structure-limited on its corrected crop. Run that
+before picking the next lever. The proposed order of work below was written
+before any of this was measured: guiding (item 4) has now been tried and
+scoped, and item 2 (ReSTIR, direct light) is what the 227-type jobs point
+at, contrary to the "Relation to Gap #31" reasoning that dismissed it.
 
 ### Relation to Gap #31
 

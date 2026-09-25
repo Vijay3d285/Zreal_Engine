@@ -397,13 +397,65 @@ because that wall is dim and genuinely noisy. Corrections are recorded in
 **Tally: of the three RED readings that justified this gap, one was a
 measurement artifact and two hold up.** The gap is partly justified, not void.
 
-### Not measured, and load-bearing for whatever comes next
+### Then measured on the jobs that actually fail — and 227 was the outlier
 
-The direct/indirect split, the sun/sky split and the convergence check were
-all run on job 227 — the one job that turned out not to be failing. Whether
-226's and 157's noise is also direct-dominated, and so also out of a path
-guide's reach, is untested; neither has a second frame-count render, so the
-convergence check that settled 227 has not been run on them. **Do that
-first.** Repeating this gap's mistake — choosing a lever before measuring
-which term the variance is in — is the one outcome these notes exist to
-prevent.
+Everything above was measured on job 227. Decomposing the two jobs whose RED
+readings survived the crop audit reversed the picture:
+
+| job | Var_direct | Var_indirect | bounce-2+ (guiding's reach) |
+|---|---|---|---|
+| 227 | **86.4%** | 13.6% | 5.75% |
+| 226 | 37.4% | **62.6%** | **35.9%** |
+| 157 | (see note) | majority | **≥51.9%** |
+
+Job 157's direct-only variant failed its own sanity check — the log reads
+`exposure 50.000 CLAMPED — scene is not a lit interior` and the
+occupied-median gate went RED, so a windowless room cannot be exposed under a
+1-bounce cap; its figure comes from the full-vs-(direct+1) comparison, which
+does not use that variant.
+
+So **227 is the outlier, and it is the one job that was not actually
+failing.** On the two that do fail, indirect carries the majority of the
+variance and guiding's addressable pool is 6–9× larger than what the earlier
+sections measured it against.
+
+### What the guide actually buys (A/B, same resolution, frame count and bounce settings)
+
+| job | grain off → on | variance | time | vs spending the same time on samples |
+|---|---|---|---|---|
+| 226 | 11.61% → **10.77%** | −13.9% | +4.0% | **1.12× more efficient** |
+| 157 | 16.02% → **14.00%** | −23.6% | +25.1% | 1.05× — break-even |
+| 227 | 16.47% → 16.33% | −1.7% | +18.4% | **0.86× — a net loss** |
+
+Crop means move by under 0.1% in every case, consistent with G0. Determinism
+was verified rather than assumed: a repeat of 226-off came back
+byte-for-byte identical, so these deltas are switch effects, not run-to-run
+noise (single seed per configuration, not an ensemble). Capture efficiency
+was 38% and 43% of the addressable bounce-2+ pool, against ~30% on 227.
+
+**Neither failing job reaches the bar**: 226 goes from 1.61 points over to
+0.77 over, 157 from 6.02 over to 4.00 over. Even a perfect guide would only
+just clear 226 (9.3%) and would not clear 157 (11.1%).
+
+### Conclusion, and why the default stays 0.0
+
+The guide is correct and does what it was designed to do. It is not a fix for
+this gate on its own, and its value **flips sign with the scene's
+direct/indirect balance** — a blanket enable would make direct-dominated
+jobs like 227 measurably worse for an 18% time cost. So
+`rendering/pathtracer/guiding_probability` stays at 0.0 and the plan's Task 5
+(turn it on for every still) is deliberately not executed.
+
+Turning it on is defensible per-scene, or behind a cheap classifier of the
+direct/indirect balance — but that classifier does not exist, and inventing
+one from three data points would repeat this gap's original mistake.
+
+### Still not measured
+
+- The convergence check (does grain fall 2× per 4× samples, or hit a floor)
+  has been run only on 227. Neither 226 nor 157 has a second frame-count
+  render, so neither has been shown to be noise-limited rather than
+  structure-limited on its corrected crop.
+- Whether the remaining gap on 226/157 is reachable at all: closing 157 needs
+  a further ~2× variance reduction beyond guiding, and nothing measured here
+  says where that would come from.
