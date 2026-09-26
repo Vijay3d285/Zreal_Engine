@@ -31,6 +31,11 @@ FUNC_PATH_KWARGS: list[tuple[Callable[..., None], str, dict[str, Any]]] = [
         {"shader": "tests/python_build/fixtures/glsl/vertex_fragment.glsl"},
     ),
     (
+        build_raw_header,
+        "tests/python_build/fixtures/glsl/include_comment.out",
+        {"shader": "tests/python_build/fixtures/glsl/include_comment.glsl"},
+    ),
+    (
         build_rd_header,
         "tests/python_build/fixtures/rd_glsl/compute.out",
         {"shader": "tests/python_build/fixtures/rd_glsl/compute.glsl"},
@@ -39,6 +44,11 @@ FUNC_PATH_KWARGS: list[tuple[Callable[..., None], str, dict[str, Any]]] = [
         build_rd_header,
         "tests/python_build/fixtures/rd_glsl/vertex_fragment.out",
         {"shader": "tests/python_build/fixtures/rd_glsl/vertex_fragment.glsl"},
+    ),
+    (
+        build_rd_header,
+        "tests/python_build/fixtures/rd_glsl/include_comment.out",
+        {"shader": "tests/python_build/fixtures/rd_glsl/include_comment.glsl"},
     ),
 ]
 

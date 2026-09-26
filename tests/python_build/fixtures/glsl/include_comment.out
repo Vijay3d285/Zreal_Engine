@@ -1,0 +1,17 @@
+static const char include_comment_shader_glsl[] = {
+R"<!>(#[compute]
+
+#version 450
+
+#VERSION_DEFINES
+
+#define M_PI 3.14159265359
+#define M_TAU 6.28318530718
+// a comment that merely mentions #include "nothing.glsl" must not be chased
+// the raw builder emits source verbatim, so every comment here must survive
+
+void main() {
+	vec3 static_light = vec3(0, 1, 0); // including this one
+}
+)<!>"
+};

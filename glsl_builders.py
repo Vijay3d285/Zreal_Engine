@@ -151,6 +151,17 @@ def include_file_in_rd_header(filename: str, header_data: RDHeaderStruct, depth:
 
                 line = fs.readline()
 
+                # Strip line comments here as well, exactly as the outer loop does above:
+                # lines consumed by this inner loop bypass that strip entirely. Without it an
+                # include carrying a trailing "//" comment -- e.g. the second of two adjacent
+                # #include lines -- is still matched here, and the .strip()[1:-1] slice above
+                # then cuts the comment instead of the quoted path, so the include resolves to
+                # a bogus filename and the build dies (2026-09-22). A comment that merely
+                # contains the substring "#include " fails the same way.
+                index = line.find("//")
+                if index != -1:
+                    line = line[:index]
+
             line = line.replace("\r", "").replace("\n", "")
 
             if header_data.reading == "vertex":
@@ -260,13 +271,25 @@ def include_file_in_raw_header(filename: str, header_data: RAWHeaderStruct, dept
         line = fs.readline()
 
         while line:
-            while line.find("#include ") != -1:
-                includeline = line.replace("#include ", "").strip()[1:-1]
+            # Match #include on a comment-stripped copy while leaving `line` itself intact.
+            # Unlike the RD builder above, this one reproduces the shader source verbatim
+            # (`header_data.code += line`), so comments must survive into the generated
+            # header -- stripping in place would silently delete them from every raw-built
+            # shader. Matching the raw line is what breaks: an include carrying a trailing
+            # "//" comment -- e.g. the second of two adjacent #include lines -- is still
+            # matched, and the .strip()[1:-1] slice below then cuts the comment instead of
+            # the quoted path, so the include resolves to a bogus filename and the build
+            # dies. A comment merely containing "#include " fails the same way.
+            stripped = line.split("//", 1)[0]
+
+            while stripped.find("#include ") != -1:
+                includeline = stripped.replace("#include ", "").strip()[1:-1]
 
                 included_file = os.path.relpath(os.path.dirname(filename) + "/" + includeline)
                 include_file_in_raw_header(included_file, header_data, depth + 1)
 
                 line = fs.readline()
+                stripped = line.split("//", 1)[0]
 
             header_data.code += line
             line = fs.readline()

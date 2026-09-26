@@ -1,0 +1,25 @@
+#include "servers/rendering/renderer_rd/shader_rd.h"
+
+class IncludeCommentShaderRD : public ShaderRD {
+public:
+	IncludeCommentShaderRD() {
+		static const char *_vertex_code = nullptr;
+		static const char *_fragment_code = nullptr;
+		static const char _compute_code[] = {
+R"<!>(
+#version 450
+
+#VERSION_DEFINES
+
+#define M_PI 3.14159265359
+#define M_TAU 6.28318530718
+
+
+void main() {
+	float t = M_PI + M_TAU;
+}
+)<!>"
+		};
+		setup(_vertex_code, _fragment_code, _compute_code, "IncludeCommentShaderRD");
+	}
+};
