@@ -36,11 +36,11 @@ func _check(p_name: String, p_value: float, p_expected: float, p_tol: float) -> 
 		_failures.append("%s: %.6f vs %.6f, %.2f%% off" % [p_name, p_value, p_expected, 100.0 * err])
 
 
-func _check_true(p_name: String, p_cond: bool) -> void:
+func _check_true(p_name: String, p_cond: bool, p_detail: String = "") -> void:
 	_checks += 1
-	print("  %s: %s" % [p_name, "ok" if p_cond else "FAILED"])
+	print("  %s: %s %s" % [p_name, "ok" if p_cond else "FAILED", p_detail])
 	if not p_cond:
-		_failures.append(p_name)
+		_failures.append("%s %s" % [p_name, p_detail])
 
 
 ## Equirect panorama whose radiance depends on elevation only:
@@ -207,6 +207,66 @@ func _init() -> void:
 	_check_true("F1 lit room not exhausted", not r0["exhausted"])
 	_check_true("F2 dark corners not exhausted", not r1["exhausted"])
 	_check_true("F3 capped fill not exhausted", not r2["exhausted"])
+
+	print("\n=== daylight_unit: highlight_relief ===")
+	# R1: nothing above the knee -> no relief, and strength EXACTLY 0.0.
+	var flat := PackedFloat32Array()
+	for i in range(1000):
+		flat.append(0.01)
+	var r_flat := Daylight.highlight_relief(flat, 18.0) # 0.01 * 18 = 0.18, middle grey
+	_check_true("R1 flat frame needs no relief", not r_flat["needed"])
+	_check("R1 flat strength is exactly zero", r_flat["strength"], 0.0, 1e-9)
+	_check("R1 flat clipped fraction", r_flat["clipped_fraction"], 0.0, 1e-9)
+
+	# R2: a 10% blown patch far above the knee -> relief, strength > 0.
+	var patch := PackedFloat32Array()
+	for i in range(900):
+		patch.append(0.01)
+	for i in range(100):
+		patch.append(1.0) # 1.0 * 18 = 18, well past the knee
+	var r_patch := Daylight.highlight_relief(patch, 18.0)
+	_check_true("R2 blown frame needs relief", r_patch["needed"])
+	_check_true("R2 strength positive", r_patch["strength"] > 0.0, "(%.4f)" % r_patch["strength"])
+	_check("R2 clipped fraction 0.10", r_patch["clipped_fraction"], 0.10, 1e-6)
+
+	# R3: strength grows with how far past the knee the highlights sit.
+	var hotter := PackedFloat32Array()
+	for i in range(900):
+		hotter.append(0.01)
+	for i in range(100):
+		hotter.append(4.0)
+	var r_hot := Daylight.highlight_relief(hotter, 18.0)
+	_check_true("R3 strength grows with excess", r_hot["strength"] > r_patch["strength"],
+			"(%.4f vs %.4f)" % [r_hot["strength"], r_patch["strength"]])
+
+	# R4: strength is capped.
+	var extreme := PackedFloat32Array()
+	for i in range(500):
+		extreme.append(0.01)
+	for i in range(500):
+		extreme.append(1000.0)
+	var r_ext := Daylight.highlight_relief(extreme, 18.0)
+	_check_true("R4 strength capped at RELIEF_MAX_STRENGTH",
+			r_ext["strength"] <= Daylight.RELIEF_MAX_STRENGTH + 1e-6,
+			"(%.4f, cap %.4f)" % [r_ext["strength"], Daylight.RELIEF_MAX_STRENGTH])
+
+	# R5: the gate boundary does not step -- just under the threshold is off,
+	# just over is on with a SMALL strength, not a jump to full.
+	var n_just_under: int = int(floor(Daylight.RELIEF_MIN_FRACTION * 1000.0)) - 1
+	var under := PackedFloat32Array()
+	for i in range(1000 - n_just_under):
+		under.append(0.01)
+	for i in range(n_just_under):
+		under.append(1.0)
+	var r_under := Daylight.highlight_relief(under, 18.0)
+	_check_true("R5 just under the gate is off", not r_under["needed"])
+	_check("R5 just under has zero strength", r_under["strength"], 0.0, 1e-9)
+
+	# R6: degenerate inputs never crash and never ask for relief.
+	var r_empty := Daylight.highlight_relief(PackedFloat32Array(), 18.0)
+	_check_true("R6 empty samples -> no relief", not r_empty["needed"] and r_empty["strength"] == 0.0)
+	var r_zero_exp := Daylight.highlight_relief(patch, 0.0)
+	_check_true("R6 zero exposure -> no relief", not r_zero_exp["needed"] and r_zero_exp["strength"] == 0.0)
 
 	print("")
 	if _failures.is_empty():

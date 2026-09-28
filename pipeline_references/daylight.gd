@@ -50,6 +50,25 @@ const IRRADIANCE_H := 128
 ## server observes the transition (pt_validation.gd RESET_SETTLE_FRAMES).
 const RESET_SETTLE_FRAMES := 3
 
+## Local highlight relief (spec 2026-09-28-local-highlight-relief-design.md).
+##
+## RELIEF_KNEE is in POST-EXPOSURE linear units, the same units the tone curve
+## sees. AgX's crossover is 0.18 (middle grey) and its white is 16.29, so a
+## sample at 4.0 is already deep in the shoulder and heading for the ceiling
+## while one at 1.0 still has room. 4.0 leaves normal bright surfaces --
+## a white wall at 0.18, a lamp shade at 1-2 -- completely untouched.
+const RELIEF_KNEE := 4.0
+## Below this fraction of samples past the knee, do nothing at all: the pass is
+## not dispatched and the render is byte-identical to a build without this
+## feature. Job 201 measured 4.17% of the FRAME clipped, and its sun patch is
+## the case this exists for; 0.01 is well under that and well over the stray
+## specular highlight that should not trigger a whole-frame operation.
+const RELIEF_MIN_FRACTION := 0.01
+## Cap on the gain exponent. At strength s the gain at luminance L is
+## 1/(1 + s*(L/knee - 1)), so s = 1.0 halves the gain one knee past the knee.
+## Capped so a pathological frame cannot drive the image to black.
+const RELIEF_MAX_STRENGTH := 1.0
+
 
 ## Upward-facing irradiance of an equirect panorama (v = 0 is the zenith, as
 ## Godot's PanoramaSkyMaterial maps it: v = acos(dir.y) / PI):
@@ -154,6 +173,39 @@ static func stats(p_samples: PackedFloat32Array) -> Dictionary:
 		"occupied_fraction": float(occupied.size()) / float(maxi(p_samples.size(), 1)),
 		"exposure": exposure,
 		"clamped": clamped,
+	}
+
+
+## How much local highlight relief this frame needs, from the SAME samples the
+## exposure probe already collected -- no extra render.
+##
+## Returns {needed: bool, strength: float, clipped_fraction: float}.
+## `needed` false always pairs with `strength` EXACTLY 0.0, which is the
+## contract the engine's gate relies on: at 0.0 the pass is never dispatched.
+##
+## strength is driven by the MEDIAN excess of the over-knee samples, not their
+## maximum: one runaway firefly must not set the strength for the whole frame.
+static func highlight_relief(p_samples: PackedFloat32Array, p_exposure: float) -> Dictionary:
+	var off := {"needed": false, "strength": 0.0, "clipped_fraction": 0.0}
+	if p_samples.is_empty() or not (p_exposure > 0.0):
+		return off
+	var over := PackedFloat32Array()
+	for v in p_samples:
+		var e := v * p_exposure
+		if e > RELIEF_KNEE:
+			over.append(e)
+	var fraction := float(over.size()) / float(p_samples.size())
+	if fraction < RELIEF_MIN_FRACTION:
+		return {"needed": false, "strength": 0.0, "clipped_fraction": fraction}
+	over.sort()
+	var median_excess: float = _percentile(over, 0.5) / RELIEF_KNEE - 1.0
+	# A median excess of one knee (i.e. 2x the knee) asks for half strength;
+	# it saturates smoothly rather than stepping at any particular value.
+	var strength: float = RELIEF_MAX_STRENGTH * (median_excess / (median_excess + 1.0))
+	return {
+		"needed": true,
+		"strength": clampf(strength, 0.0, RELIEF_MAX_STRENGTH),
+		"clipped_fraction": fraction,
 	}
 
 
