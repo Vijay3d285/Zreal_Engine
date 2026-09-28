@@ -1,4 +1,4 @@
-﻿extends Node3D
+extends Node3D
 # Daylight design (spec 2026-09-19). Preloaded, not a global class name: the
 # live pipeline runs without an editor import, so no class cache exists there.
 # render.gd extends this script and inherits the constant.
@@ -902,7 +902,11 @@ func setup_lighting(data, geom_data = {}):
 			env.ambient_light_energy = lighting["ambient_energy"] * _lighting_illumination_scale * _auto_ambient_boost
 
 	if env.tonemap_mode == Environment.TONE_MAPPER_AGX:
-		env.tonemap_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
+		# AgX reads tonemap_agx_white, not tonemap_white -- Environment::_update_tonemap()
+		# (scene/resources/environment.cpp) forwards tonemap_agx_white to the renderer
+		# when tone_mapper == TONE_MAPPER_AGX; tonemap_white is inert in that branch and
+		# was silently discarding every profile's intended value (fixed 2026-09-28).
+		env.tonemap_agx_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
 		# Day: the probe owns the exposure (spec 2026-09-19); a multiplier after
 		# it would move the median off 0.18. Night keeps the profile's contrast
 		# and warm-mood terms.
@@ -3258,7 +3262,7 @@ func _build_external_area_floor(area_id: String, area: Dictionary, vertices: Dic
 	var floor_material_data = _resolve_area_floor_material_data(area, floor_props)
 	if not floor_material_data.is_empty():
 		var f_mat = create_material(floor_material_data, "floor")
-		f_mat = _apply_architecture_texture_scale(f_mat, floor_material_data, floor_span)
+		f_mat = _apply_architecture_texture_scale(f_mat, floor_material_data, floor_span, false)
 		floor_poly.material = f_mat
 		print("External Area Material Optimized: ", floor_material_data.get("mapUrl", "default"))
 	else:
@@ -4384,9 +4388,11 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 						f_mat = _apply_architecture_texture_scale(
 							f_mat,
 							floor_props["material"],
-							floor_span
+							floor_span,
+							false  # editor parity: no density boost on floors
 						)
 						floor_poly.material = f_mat
+						print("[FloorUV] Base floor ", area_id, " uv1_scale=", f_mat.uv1_scale, " span=", floor_span)
 						print("Floor Material Optimized: ", floor_props["material"].get("mapUrl", "default"))
 					else:
 						var floor_mat = StandardMaterial3D.new()
@@ -4495,12 +4501,33 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 							shape_depth = get_dimension_value(shape["thickness"], 10.0) * scale_factor
 						s_poly.depth = shape_depth
 						s_poly.rotation.x = PI / 2
-						# Sit 5 mm above floor base (avoids z-fighting with paving)
-						s_poly.position.y = layer_altitude + 0.005 + 0.001 * shape_idx
+						# CSGPolygon3D with rotation.x = PI/2 extrudes UPWARD from position.y,
+						# so the floor slab spans [layer_altitude, layer_altitude + floor_depth]
+						# (and paving tiles reach layer_altitude + 0.002 + 0.02). The old
+						# "+0.005" put a 10 mm rug at 5-15 mm, i.e. buried inside a 20 mm slab.
+						# Seat the shape on the actual walkable top instead.
+						var cs_floor_top = layer_altitude + floor_depth
+						if has_paving:
+							cs_floor_top = max(cs_floor_top, layer_altitude + 0.002 + 0.02)
+						s_poly.position.y = cs_floor_top + 0.001 + 0.001 * shape_idx
 						if shape.has("material"):
 							var smat = create_material(shape["material"], "floor")
 							var span = Vector2(max_x - min_x, max_y - min_y)
 							smat = _apply_custom_shape_texture_scale(smat, shape["material"], span)
+							# CSGPolygon3D cap UVs are normalised 0..1 across the polygon's
+							# bounding box (not world metres), so repeats = span / tile size.
+							# _apply_custom_shape_texture_scale uses 1 / tile, which stretched
+							# one texture tile over (tile / span) of the shape -> over-scaled.
+							var cs_tile_u = float(shape["material"].get("repeatX", 0.0))
+							var cs_tile_v = float(shape["material"].get("repeatY", 0.0))
+							if cs_tile_u > 0.0 and cs_tile_v > 0.0:
+								# CSGPolygon3D cap UVs are packed into [0, 0.5] in UV space.
+								# To get `span / tile` repeats, we must multiply by 2.0.
+								smat.uv1_scale = Vector3(
+									(span.x * 2.0) / max(cs_tile_u * _scene_unit_scale, 0.000001),
+									(span.y * 2.0) / max(cs_tile_v * _scene_unit_scale, 0.000001),
+									1.0)
+								print("[CustomShape] Floor shape ", shape_idx, " uv1_scale=", smat.uv1_scale, " span=", span)
 							smat.cull_mode = BaseMaterial3D.CULL_BACK
 							s_poly.material = smat
 						shape_root.add_child(s_poly)
@@ -6465,7 +6492,9 @@ func _get_polygon_world_span(polygon: PackedVector2Array) -> Vector2:
 
 	return Vector2(max(0.001, max_x - min_x), max(0.001, max_y - min_y))
 
-func _apply_architecture_texture_scale(mat: StandardMaterial3D, mat_data: Dictionary, surface_size: Vector2) -> StandardMaterial3D:
+# apply_density_boost=false -> exact editor parity (Three.js: repeat = 1000 / repeatX
+# per metre, i.e. span / tile across a CSG polygon). Floors pass false.
+func _apply_architecture_texture_scale(mat: StandardMaterial3D, mat_data: Dictionary, surface_size: Vector2, apply_density_boost: bool = true) -> StandardMaterial3D:
 	if mat == null or typeof(mat_data) != TYPE_DICTIONARY:
 		return mat
 
@@ -6493,9 +6522,10 @@ func _apply_architecture_texture_scale(mat: StandardMaterial3D, mat_data: Dictio
 		scale_v = height / max(tile_v * _scene_unit_scale, 0.000001)
 		has_physical_repeat = true
 	if has_physical_repeat:
-		# Apply density boost â€” multiplying UV scale makes tiles appear smaller.
-		mat.uv1_scale = Vector3(scale_u * FLOOR_CEIL_TEXTURE_DENSITY_BOOST,
-								scale_v * FLOOR_CEIL_TEXTURE_DENSITY_BOOST, 1.0)
+		# Apply density boost - multiplying UV scale makes tiles appear smaller.
+		# Multiply by 2.0 to account for CSGPolygon3D packing caps into 0..0.5 UV space.
+		var boost = FLOOR_CEIL_TEXTURE_DENSITY_BOOST if apply_density_boost else 1.0
+		mat.uv1_scale = Vector3(scale_u * boost * 2.0, scale_v * boost * 2.0, 1.0)
 		return mat
 
 	# Legacy repeat arrays keep the existing 2.4 m density rule.

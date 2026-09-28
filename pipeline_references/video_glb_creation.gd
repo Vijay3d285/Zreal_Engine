@@ -1210,7 +1210,11 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 			env.ambient_light_energy = lighting["ambient_energy"] * _lighting_illumination_scale * _auto_ambient_boost
 
 	if env.tonemap_mode == Environment.TONE_MAPPER_AGX:
-		env.tonemap_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
+		# AgX reads tonemap_agx_white, not tonemap_white -- Environment::_update_tonemap()
+		# (scene/resources/environment.cpp) forwards tonemap_agx_white to the renderer
+		# when tone_mapper == TONE_MAPPER_AGX; tonemap_white is inert in that branch and
+		# was silently discarding every profile's intended value (fixed 2026-09-28).
+		env.tonemap_agx_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
 		# AGX contrast is applied via exposure adjustment (baked into exposure).
 		env.tonemap_exposure *= lighting.get("tonemap_agx_contrast", 1.0)
 		# Warm mood: slightly boost AGX exposure for richer shadows
@@ -3500,8 +3504,15 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 						shape_depth = get_dimension_value(shape["thickness"], 10.0) * scale_factor
 					s_poly.depth = shape_depth
 					s_poly.rotation.x = PI / 2
-					# Sit 5 mm above floor base (avoids z-fighting with paving)
-					s_poly.position.y = layer_altitude + 0.005 + 0.001 * shape_idx
+					# Floor slab extrudes UPWARD to layer_altitude + floor_depth (paving tiles
+					# to +0.022); the old "+0.005" buried the shape inside the slab.
+					var cs_floor_top = layer_altitude + floor_depth
+					var cs_pav = area["floor_properties"].get("paving", {})
+					if typeof(cs_pav) == TYPE_DICTIONARY:
+						var cs_pat = str(cs_pav.get("pattern", "none")).strip_edges().to_lower()
+						if cs_pat != "none" and cs_pat != "":
+							cs_floor_top = max(cs_floor_top, layer_altitude + 0.002 + 0.02)
+					s_poly.position.y = cs_floor_top + 0.001 + 0.001 * shape_idx
 					if shape.has("material"):
 						var smat = create_material(shape["material"], "floor")
 						var span = Vector2(max_x - min_x, max_y - min_y)
@@ -3733,9 +3744,10 @@ func _apply_architecture_texture_scale(mat: StandardMaterial3D, mat_data: Dictio
 		scale_v = height / max(tile_v * _scene_unit_scale, 0.000001)
 		has_physical_repeat = true
 	if has_physical_repeat:
-		# Apply density boost — multiplying UV scale makes tiles appear smaller.
-		mat.uv1_scale = Vector3(scale_u * FLOOR_CEIL_TEXTURE_DENSITY_BOOST,
-								scale_v * FLOOR_CEIL_TEXTURE_DENSITY_BOOST, 1.0)
+		# Apply density boost - multiplying UV scale makes tiles appear smaller.
+		# Multiply by 2.0 to account for CSGPolygon3D packing caps into 0..0.5 UV space.
+		mat.uv1_scale = Vector3(scale_u * FLOOR_CEIL_TEXTURE_DENSITY_BOOST * 2.0,
+								scale_v * FLOOR_CEIL_TEXTURE_DENSITY_BOOST * 2.0, 1.0)
 		return mat
 
 	if mat_data.has("repeat"):

@@ -462,7 +462,11 @@ func setup_lighting(data, geom_data = {}):
 			env.ambient_light_energy = lighting["ambient_energy"] * _lighting_illumination_scale
 
 	if env.tonemap_mode == Environment.TONE_MAPPER_AGX:
-		env.tonemap_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
+		# AgX reads tonemap_agx_white, not tonemap_white -- Environment::_update_tonemap()
+		# (scene/resources/environment.cpp) forwards tonemap_agx_white to the renderer
+		# when tone_mapper == TONE_MAPPER_AGX; tonemap_white is inert in that branch and
+		# was silently discarding every profile's intended value (fixed 2026-09-28).
+		env.tonemap_agx_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
 		# AGX contrast is applied via exposure adjustment (baked into exposure).
 		env.tonemap_exposure *= lighting.get("tonemap_agx_contrast", 1.0)
 		# Warm mood: slightly boost AGX exposure for richer shadows
