@@ -670,6 +670,17 @@ func _daylight_probe_and_expose(p_env: Environment) -> void:
 			else:
 				fill.queue_free()
 	p_env.tonemap_exposure = exposure
+	# Local highlight relief (spec 2026-09-28): decided from the SAME probe
+	# samples, so this costs no extra render. At strength 0 the engine does not
+	# dispatch the pass at all and the frame is byte-identical to a build
+	# without the feature -- which is what keeps renders that do not need it
+	# exactly as they are today.
+	var relief: Dictionary = Daylight.highlight_relief(pr["samples"], exposure)
+	ProjectSettings.set_setting("rendering/pathtracer/highlight_relief_knee", Daylight.RELIEF_KNEE)
+	ProjectSettings.set_setting("rendering/pathtracer/highlight_relief_strength", relief["strength"])
+	print("[Relief] clipped %.2f%% of probe samples past knee %.1f -> strength %.3f (%s)" % [
+			100.0 * relief["clipped_fraction"], Daylight.RELIEF_KNEE, relief["strength"],
+			"ON" if relief["needed"] else "off"])
 	await Daylight.reset_accumulator(self, p_env)
 
 

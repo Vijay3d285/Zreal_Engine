@@ -3258,6 +3258,25 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		}
 	}
 
+	// Local highlight relief (spec 2026-09-28). Runs on the DENOISED linear
+	// image and before the tone curve, which is the only window where both
+	// are true -- a compositor effect at POST_TRANSPARENT runs before the
+	// denoise and is overwritten by the copy above.
+	//
+	// Gated to a real dispatch: at strength 0 nothing is bound and no shader
+	// runs, so a frame the daylight probe did not flag is byte-identical.
+	{
+		const float relief_strength = CLAMP((float)GLOBAL_GET("rendering/pathtracer/highlight_relief_strength"), 0.0f, 1.0f);
+		if (relief_strength > 0.0f && p_render_data->environment.is_valid()) {
+			const float relief_exposure = environment_get_exposure(p_render_data->environment);
+			if (relief_exposure > 0.0f) {
+				local_highlight->process(rb, relief_strength, relief_exposure,
+						(float)GLOBAL_GET("rendering/pathtracer/highlight_relief_knee"),
+						(bool)GLOBAL_GET("rendering/pathtracer/highlight_relief_debug"));
+			}
+		}
+	}
+
 	// Phase F2: DLSS Ray Reconstruction (DLSS-RR) "reconstruct final" over the converged
 	// accumulator — the neural *reconstructive* final pass. DLSS-RR rebuilds plausible
 	// fabric weave / specular / refraction / clean edges from the albedo+normal AOVs, the
@@ -6692,6 +6711,7 @@ RenderForwardClustered::RenderForwardClustered() {
 	dlss_effect = memnew(RendererRD::DLSSEffect);
 	ss_effects = memnew(RendererRD::SSEffects);
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
+	local_highlight = memnew(RendererRD::LocalHighlight);
 #ifdef METAL_MFXTEMPORAL_ENABLED
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
 #endif
@@ -6723,6 +6743,11 @@ RenderForwardClustered::~RenderForwardClustered() {
 	if (motion_vectors_store) {
 		memdelete(motion_vectors_store);
 		motion_vectors_store = nullptr;
+	}
+
+	if (local_highlight) {
+		memdelete(local_highlight);
+		local_highlight = nullptr;
 	}
 
 #ifdef METAL_MFXTEMPORAL_ENABLED

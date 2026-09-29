@@ -3847,6 +3847,20 @@ void RenderingServer::init() {
 	// scene that already places an analytic light inside an emissive fixture mesh
 	// would then be lit twice.
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/emissive_mesh_lights"), false);
+	// Local highlight relief (spec 2026-09-28-local-highlight-relief-design.md).
+	// Strength of the local highlight compression applied between the OIDN
+	// denoise and the tone curve. 0.0 disables it completely -- the pass is not
+	// dispatched at all, so a gated-off frame runs no shader and is
+	// byte-identical to a build without the feature. The daylight probe in
+	// render.gd measures this per job from its own samples; nothing else writes it.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/highlight_relief_strength", PROPERTY_HINT_RANGE, "0.0,1.0,0.01"), 0.0);
+	// Write the relief pass's gain map out as greyscale instead of applying it,
+	// so a wrong-looking render is diagnosed by looking at the gain.
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/highlight_relief_debug"), false);
+	// The knee, in POST-EXPOSURE linear units, must match Daylight.RELIEF_KNEE
+	// in daylight.gd -- the decision and the operator have to agree about where
+	// the shoulder starts or the strength means something different on each side.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/highlight_relief_knee", PROPERTY_HINT_RANGE, "0.5,32.0,0.1"), 4.0);
 	// Path guiding for diffuse bounces (roadmap Gap #32, spec
 	// docs/superpowers/specs/2026-09-22-path-guiding-design.md). The mixture
 	// probability between the learnt directional histogram and cosine sampling
