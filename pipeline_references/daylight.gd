@@ -54,10 +54,24 @@ const RESET_SETTLE_FRAMES := 3
 ##
 ## RELIEF_KNEE is in POST-EXPOSURE linear units, the same units the tone curve
 ## sees. AgX's crossover is 0.18 (middle grey) and its white is 16.29, so a
-## sample at 4.0 is already deep in the shoulder and heading for the ceiling
-## while one at 1.0 still has room. 4.0 leaves normal bright surfaces --
+## sample at 3.0 is already deep in the shoulder and heading for the ceiling
+## while one at 1.0 still has room. 3.0 leaves normal bright surfaces --
 ## a white wall at 0.18, a lamp shade at 1-2 -- completely untouched.
-const RELIEF_KNEE := 4.0
+##
+## 3.0 is a MEASUREMENT, not a derivation (2026-09-29, knee sweep on job 201 at
+## 1080p, knees 4.0 / 3.0 / 2.0; the owner chose 3.0). At knee 3.0 the probe
+## measured strength 0.753 and the sun patch's clipping fell to 0.68% at 254+
+## and 6.51% at 250+ (23.25% / 24.30% with relief off); the patch median
+## reached 248.21 (255 off); the flat wall did not move (168.224, same as
+## relief off); the inner annulus (8-48 px outside the patch) darkened 2.83%.
+## Knee 4.0 (strength 0.677) left the patch a white slab -- median 252.07, 21.41%
+## still at 250+. Knee 2.0 (strength 0.829) was rejected: it reached the patch
+## (median 240.28) but visibly dimmed other highlights in the frame -- dark
+## smudges under each downlight, dimmed air-conditioner LED strips, the window
+## jamb and the side-table lamp. The C++ default of
+## rendering/pathtracer/highlight_relief_knee (rendering_server.cpp) must equal
+## this, so the decision and the operator agree even if render.gd never runs.
+const RELIEF_KNEE := 3.0
 ## Below this fraction of samples past the knee, do nothing at all: the pass is
 ## not dispatched and the render is byte-identical to a build without this
 ## feature. Job 201 measured 4.17% of the FRAME clipped, and its sun patch is

@@ -3860,7 +3860,9 @@ void RenderingServer::init() {
 	// The knee, in POST-EXPOSURE linear units, must match Daylight.RELIEF_KNEE
 	// in daylight.gd -- the decision and the operator have to agree about where
 	// the shoulder starts or the strength means something different on each side.
-	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/highlight_relief_knee", PROPERTY_HINT_RANGE, "0.5,32.0,0.1"), 4.0);
+	// 3.0 is the value measured on job 201 (2026-09-29 knee sweep; see the comment
+	// on RELIEF_KNEE in daylight.gd for the numbers).
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/highlight_relief_knee", PROPERTY_HINT_RANGE, "0.5,32.0,0.1"), 3.0);
 	// Path guiding for diffuse bounces (roadmap Gap #32, spec
 	// docs/superpowers/specs/2026-09-22-path-guiding-design.md). The mixture
 	// probability between the learnt directional histogram and cosine sampling
