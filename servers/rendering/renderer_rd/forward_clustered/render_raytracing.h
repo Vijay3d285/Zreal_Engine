@@ -490,15 +490,23 @@ struct RTViewportState {
 	// on the same events that clear the accumulator so each convergence cycle re-warms.
 	int dlss_rr_warmup_left = 0;
 	bool dlss_rr_final_done = false;
-	// Local highlight relief (spec 2026-09-28-local-highlight-relief-design.md), fix round 1:
-	// one-shot bookkeeping shaped exactly like oidn_denoise_done above. The relief operator
-	// divides the colour buffer IN PLACE, so N dispatches this convergence cycle compound to
-	// gain^N -- Daylight.highlight_relief()'s strength is calibrated for exactly one
-	// application. Without this flag the dispatch site re-fired on every driver frame once
-	// the project setting went nonzero (every accumulation frame, the OIDN +1 frame, the
-	// capture force_draw). Set true the one frame relief actually dispatches; reset to false
-	// on the same events that clear oidn_denoise_done so the next convergence cycle re-applies.
-	bool relief_applied_done = false;
+	// Local highlight relief (spec 2026-09-28-local-highlight-relief-design.md): true while the
+	// CURRENT contents of internal_texture have already had relief applied. The operator divides
+	// the colour buffer IN PLACE, so a second application to the same pixels compounds to gain^2 --
+	// Daylight.highlight_relief()'s strength is calibrated for exactly one application per image.
+	//
+	// This is a per-content-generation latch, not a per-convergence-cycle one. With OIDN active,
+	// internal_texture is regenerated once (the denoise re-blit) and then frozen, so the two shapes
+	// coincide and relief dispatches exactly once. With no denoiser nothing ever freezes it: the
+	// trace + copy_output_texture runs every frame (render.gd then adds force_draw frames past the
+	// accumulation target before it reads the image), so each frame hands relief a fresh,
+	// unrelieved image and relief is owed one application per frame -- a once-per-cycle latch
+	// would relieve one frame and then have that result overwritten by the next copy.
+	//
+	// Set true when relief dispatches. Cleared wherever internal_texture is regenerated
+	// (copy_output_texture, the OIDN re-blit -- render_forward_clustered.cpp) and on the same
+	// events that clear oidn_denoise_done (accumulator reset), so a new view is never skipped.
+	bool relief_applied_to_current = false;
 
 	// E3: the packed rt_flags this frame's TLAS was actually built against --
 	// `p_rt_flags | scene_mask`, where scene_mask is the OR of every material's

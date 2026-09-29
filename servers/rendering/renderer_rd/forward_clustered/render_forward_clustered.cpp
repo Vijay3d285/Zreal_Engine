@@ -2316,13 +2316,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			if (env_params[RSE::PT_PARAM_DLSS_RR_FINAL_FLAG] >= 0.5f) {
 				rt_dlss_rr_final_active = true;
 			}
-			if (rt_oidn_active || rt_dlss_rr_final_active) {
-				// Accumulation target is environment-authored into the params buffer
-				// (PT_PARAM_ACCUM_TARGET, pack at scene/resources/environment.cpp).
-				rt_accum_target = (uint32_t)env_params[RSE::PT_PARAM_ACCUM_TARGET];
-				if (rt_accum_target == 0) {
-					rt_accum_target = 64; // safe default if the Environment left it unset.
-				}
+			// Accumulation target is environment-authored into the params buffer
+			// (PT_PARAM_ACCUM_TARGET, pack at scene/resources/environment.cpp). Read
+			// whenever accumulation is on, NOT only when a denoiser is: it is the sample
+			// count the pipeline drives to (render.gd drives exactly this many frames), so
+			// it is the meaningful "enough samples" mark with or without a final pass.
+			// Local highlight relief keys off it below; while this stayed 0 with both
+			// denoisers off, relief silently never dispatched. The two denoiser consumers
+			// are unchanged -- each still gates on its own *_active flag.
+			rt_accum_target = (uint32_t)env_params[RSE::PT_PARAM_ACCUM_TARGET];
+			if (rt_accum_target == 0) {
+				rt_accum_target = 64; // safe default if the Environment left it unset.
 			}
 		}
 	}
@@ -3008,6 +3012,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// (written to rt_velocity_image). No raster motion pass needed.
 
 		raytracing->copy_output_texture(p_render_data);
+		if (rt_state) {
+			// internal_texture now holds a fresh, unrelieved image: relief is owed again.
+			rt_state->relief_applied_to_current = false;
+		}
 		}
 	}
 
@@ -3255,6 +3263,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			RD::get_singleton()->draw_command_begin_label("RT OIDN Re-blit Denoised -> Internal");
 			raytracing->copy_output_texture(p_render_data);
 			RD::get_singleton()->draw_command_end_label();
+			// The denoised image replaced whatever internal_texture held: relief is owed again.
+			rt_state->relief_applied_to_current = false;
 		}
 	}
 
@@ -3266,36 +3276,40 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// Gated to a real dispatch: at strength 0 nothing is bound and no shader
 	// runs, so a frame the daylight probe did not flag is byte-identical.
 	//
-	// Fix round 1 (Critical, see task-3-report.md): strength > 0 alone is not
-	// a one-shot gate. render.gd sets highlight_relief_strength once, before
-	// the accumulation loop starts, and never clears it -- so a strength-only
-	// gate fired on every driver frame that followed: every accumulation
-	// frame, the OIDN "+1" convergence frame, and the capture force_draw,
-	// each dispatch dividing the already-relief-adjusted colour by another
-	// gain (gain^N compounding, not the gain^1 Daylight.highlight_relief()
-	// calibrated strength for). relief_applied_done on the RT viewport state
-	// is the same one-shot shape as oidn_denoise_done immediately above:
-	// latched true the one frame accum_frame first reaches the convergence
-	// target -- the same frame the OIDN block above finishes denoising, so
-	// this reads the just-re-blitted denoised image, not the raw running
-	// average -- and reset to false wherever oidn_denoise_done is (render_raytracing.cpp).
+	// Exactly one application per image. The operator divides internal_texture
+	// IN PLACE, so applying it to pixels it already relieved compounds (gain^N)
+	// and the strength is calibrated for one application. render.gd sets the
+	// strength once, before accumulation, and never clears it, so strength alone
+	// cannot be the gate: every driver frame reaches this block. The gate is
+	// relief_applied_to_current on the RT viewport state -- true once relief has
+	// run on what internal_texture holds now, cleared wherever that is
+	// regenerated (copy_output_texture above, the OIDN re-blit) and on every
+	// accumulation reset. Consequences:
+	//   - OIDN on: internal_texture is regenerated once (the denoise re-blit on
+	//     the convergence frame), then frozen -- one dispatch, on the denoised image.
+	//   - no denoiser: nothing freezes it. The trace + copy runs every frame, so
+	//     every frame is a fresh image and gets its own single application; the
+	//     delivered image (the last frame drawn) has been relieved exactly once.
+	//     A once-per-cycle latch would relieve one frame and have the next copy
+	//     overwrite it.
+	// "Enough samples" is accum_frame >= rt_accum_target, the count the pipeline
+	// drives to; earlier frames are noisy intermediates that are not delivered.
 	{
 		const float relief_strength = CLAMP((float)GLOBAL_GET("rendering/pathtracer/highlight_relief_strength"), 0.0f, 1.0f);
 		RTViewportState *relief_rt_state = raytracing ? raytracing->_get_viewport_state(p_render_data) : nullptr;
-		const bool relief_converged = relief_rt_state != nullptr && rt_accum_target > 0 &&
+		const bool relief_converged = rt_accumulate_active && relief_rt_state != nullptr &&
 				relief_rt_state->accum_frame >= rt_accum_target;
 		if (relief_strength > 0.0f && p_render_data->environment.is_valid() &&
-				relief_converged && !relief_rt_state->relief_applied_done) {
+				relief_converged && !relief_rt_state->relief_applied_to_current) {
 			const float relief_exposure = environment_get_exposure(p_render_data->environment);
 			if (relief_exposure > 0.0f) {
 				local_highlight->process(rb, relief_strength, relief_exposure,
 						(float)GLOBAL_GET("rendering/pathtracer/highlight_relief_knee"),
 						(bool)GLOBAL_GET("rendering/pathtracer/highlight_relief_debug"));
 			}
-			// Latch regardless of the inner exposure guard, same policy as
-			// oidn_denoise_done above: an attempted-but-degenerate frame must not
-			// spin retrying every subsequent frame either.
-			relief_rt_state->relief_applied_done = true;
+			// Latch regardless of the inner exposure guard: an attempted-but-degenerate
+			// frame must not retry on the same pixels every subsequent frame either.
+			relief_rt_state->relief_applied_to_current = true;
 		}
 	}
 

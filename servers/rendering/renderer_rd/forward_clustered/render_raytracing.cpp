@@ -4302,7 +4302,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			p_state->oidn_denoise_done = false; // a new convergence cycle must re-denoise.
 			p_state->dlss_rr_warmup_left = 0; // Phase F2: re-warm DLSS-RR final next cycle.
 			p_state->dlss_rr_final_done = false;
-			p_state->relief_applied_done = false; // a new convergence cycle must re-apply relief.
+			p_state->relief_applied_to_current = false; // a new convergence cycle must re-apply relief.
 			p_state->guide_clear_pending = true; // Gap #32: a new convergence cycle starts a new guide.
 		}
 		if (accum_enabled) {
@@ -4346,7 +4346,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				p_state->oidn_denoise_done = false; // view changed → invalidate the prior denoise.
 				p_state->dlss_rr_warmup_left = 0; // Phase F2: re-warm DLSS-RR final next cycle.
 				p_state->dlss_rr_final_done = false;
-				p_state->relief_applied_done = false; // view changed → invalidate the prior relief.
+				p_state->relief_applied_to_current = false; // view changed → invalidate the prior relief.
 			}
 		} else {
 			// One-shot mode: not accumulating; keep the running index at 0 so the
@@ -4356,7 +4356,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			p_state->oidn_denoise_done = false; // no accumulation → no final-denoise to remember.
 			p_state->dlss_rr_warmup_left = 0; // Phase F2: no accumulation → no DLSS-RR warmup.
 			p_state->dlss_rr_final_done = false;
-			p_state->relief_applied_done = false; // no accumulation → no relief application to remember.
+			p_state->relief_applied_to_current = false; // no accumulation → no relief application to remember.
 		}
 
 		// Debug: ZR_SEED_OFFSET=<n> shifts the accumulate route's sample indices so a
