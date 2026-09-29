@@ -3265,15 +3265,37 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	//
 	// Gated to a real dispatch: at strength 0 nothing is bound and no shader
 	// runs, so a frame the daylight probe did not flag is byte-identical.
+	//
+	// Fix round 1 (Critical, see task-3-report.md): strength > 0 alone is not
+	// a one-shot gate. render.gd sets highlight_relief_strength once, before
+	// the accumulation loop starts, and never clears it -- so a strength-only
+	// gate fired on every driver frame that followed: every accumulation
+	// frame, the OIDN "+1" convergence frame, and the capture force_draw,
+	// each dispatch dividing the already-relief-adjusted colour by another
+	// gain (gain^N compounding, not the gain^1 Daylight.highlight_relief()
+	// calibrated strength for). relief_applied_done on the RT viewport state
+	// is the same one-shot shape as oidn_denoise_done immediately above:
+	// latched true the one frame accum_frame first reaches the convergence
+	// target -- the same frame the OIDN block above finishes denoising, so
+	// this reads the just-re-blitted denoised image, not the raw running
+	// average -- and reset to false wherever oidn_denoise_done is (render_raytracing.cpp).
 	{
 		const float relief_strength = CLAMP((float)GLOBAL_GET("rendering/pathtracer/highlight_relief_strength"), 0.0f, 1.0f);
-		if (relief_strength > 0.0f && p_render_data->environment.is_valid()) {
+		RTViewportState *relief_rt_state = raytracing ? raytracing->_get_viewport_state(p_render_data) : nullptr;
+		const bool relief_converged = relief_rt_state != nullptr && rt_accum_target > 0 &&
+				relief_rt_state->accum_frame >= rt_accum_target;
+		if (relief_strength > 0.0f && p_render_data->environment.is_valid() &&
+				relief_converged && !relief_rt_state->relief_applied_done) {
 			const float relief_exposure = environment_get_exposure(p_render_data->environment);
 			if (relief_exposure > 0.0f) {
 				local_highlight->process(rb, relief_strength, relief_exposure,
 						(float)GLOBAL_GET("rendering/pathtracer/highlight_relief_knee"),
 						(bool)GLOBAL_GET("rendering/pathtracer/highlight_relief_debug"));
 			}
+			// Latch regardless of the inner exposure guard, same policy as
+			// oidn_denoise_done above: an attempted-but-degenerate frame must not
+			// spin retrying every subsequent frame either.
+			relief_rt_state->relief_applied_done = true;
 		}
 	}
 

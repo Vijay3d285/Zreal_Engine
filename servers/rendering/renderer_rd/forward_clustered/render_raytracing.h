@@ -490,6 +490,15 @@ struct RTViewportState {
 	// on the same events that clear the accumulator so each convergence cycle re-warms.
 	int dlss_rr_warmup_left = 0;
 	bool dlss_rr_final_done = false;
+	// Local highlight relief (spec 2026-09-28-local-highlight-relief-design.md), fix round 1:
+	// one-shot bookkeeping shaped exactly like oidn_denoise_done above. The relief operator
+	// divides the colour buffer IN PLACE, so N dispatches this convergence cycle compound to
+	// gain^N -- Daylight.highlight_relief()'s strength is calibrated for exactly one
+	// application. Without this flag the dispatch site re-fired on every driver frame once
+	// the project setting went nonzero (every accumulation frame, the OIDN +1 frame, the
+	// capture force_draw). Set true the one frame relief actually dispatches; reset to false
+	// on the same events that clear oidn_denoise_done so the next convergence cycle re-applies.
+	bool relief_applied_done = false;
 
 	// E3: the packed rt_flags this frame's TLAS was actually built against --
 	// `p_rt_flags | scene_mask`, where scene_mask is the OR of every material's
