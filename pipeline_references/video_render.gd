@@ -24,6 +24,18 @@ var _needs_auto_pan: bool = false
 # history before the real timeline starts. These get trimmed by ffmpeg.
 const DLSS_PRIME_FRAMES: int = 5
 var _dlss_prime_remaining: int = 0
+
+# Daylight exposure (spec 2026-09-19, ported from render.gd :: _daylight_probe_and_expose).
+# Physical daylight is dim in absolute terms (a real still needed 24.7x), so the sky-normalised,
+# physical-sun scene is unusable without a MEASURED exposure. A per-frame probe would make the
+# exposure move from frame to frame, which is flicker -- far worse than a slightly-off exposure --
+# so the probe runs ONCE, before DLSS priming, at DAYLIGHT_PROBE_POSITIONS camera positions spread
+# along the path (first / middle / last keyframe), the raw luminance samples are POOLED, and
+# Daylight.stats() is called once on the pooled array. That single exposure is then held for the
+# whole sequence.
+const DAYLIGHT_PROBE_POSITIONS: int = 3
+var _daylight_probing: bool = false
+var _daylight_exposure: float = 1.0 # what the probe set; logged again at the end to prove it held
 var _render_data = {} # Full parsed JSON — used by setup_fixed_fill_lights()
 var _has_fixture_lights_cache: bool = false
 var _has_authored_lights_cache: bool = false
@@ -164,6 +176,11 @@ func _setup_render(data, output_path, fallback_path):
 	_rendering = false
 
 func _process(_delta):
+	# The daylight probe owns the camera and the accumulate flag until it finishes;
+	# it calls _begin_dlss_priming() itself when it is done.
+	if _daylight_probing:
+		return
+
 	# Warmup phase - let the scene settle
 	if _warmup_frames > 0:
 		_warmup_frames -= 1
@@ -174,16 +191,15 @@ func _process(_delta):
 				_needs_auto_pan = false
 				if _keyframes.size() > 0:
 					_apply_keyframe(0)
-			
-			# Start DLSS priming phase: hold camera at frame 0 for a few extra
-			# rendered frames so DLSS Ray Reconstruction builds temporal history.
-			# These frames are captured by MovieWriter but trimmed by ffmpeg.
-			_dlss_prime_remaining = DLSS_PRIME_FRAMES
-			_log_console("Scene settled. Starting DLSS priming (%d frames at frame-0 position)..." % DLSS_PRIME_FRAMES)
-			# Capture thumbnail safely asynchronously without blocking _process
-			if not _first_frame_saved:
-				_first_frame_saved = true
-				call_deferred("_capture_thumbnail_async")
+
+			# Day renders: measure ONE exposure from the whole camera path BEFORE the DLSS
+			# priming phase, so priming and the render proceed untouched with the exposure
+			# already set. Night renders are not probe-exposed.
+			if day_render:
+				_daylight_probing = true
+				_run_daylight_probe() # coroutine; ends in _begin_dlss_priming()
+				return
+			_begin_dlss_priming()
 		return
 	
 	# DLSS priming phase: hold at frame 0 while DLSS builds temporal buffer
@@ -204,6 +220,11 @@ func _process(_delta):
 	if _current_frame >= _total_frames:
 		_log_console("============================================================")
 		_log_console("VIDEO RENDER COMPLETE - %d frames rendered." % _total_frames)
+		if day_render:
+			var env_end := _get_scene_environment()
+			if env_end != null:
+				_log_console("[Daylight] exposure at end of sequence: %.4f (set once to %.4f before priming; held for all %d frames)" % [
+						env_end.tonemap_exposure, _daylight_exposure, _total_frames])
 		_log_console("============================================================")
 		save_logs(_render_data, _output_path)
 		get_tree().quit(0)
@@ -225,6 +246,147 @@ func _process(_delta):
 		_log_console("Frame %d/%d (%d%%)" % [_current_frame, _total_frames, pct])
 	
 	_current_frame += 1
+
+# Start DLSS priming phase: hold camera at frame 0 for a few extra rendered frames so DLSS
+# Ray Reconstruction builds temporal history. These frames are captured by MovieWriter.
+# (Split out of _process so the daylight probe can run first; the priming itself is unchanged.)
+func _begin_dlss_priming() -> void:
+	_dlss_prime_remaining = DLSS_PRIME_FRAMES
+	_log_console("Scene settled. Starting DLSS priming (%d frames at frame-0 position)..." % DLSS_PRIME_FRAMES)
+	# Capture thumbnail safely asynchronously without blocking _process
+	if not _first_frame_saved:
+		_first_frame_saved = true
+		call_deferred("_capture_thumbnail_async")
+
+func _get_scene_environment() -> Environment:
+	for child in get_children():
+		if child is WorldEnvironment and (child as WorldEnvironment).environment != null:
+			return (child as WorldEnvironment).environment
+	return null
+
+# Keyframe indices to probe: p_count positions spread evenly over the path, first and last
+# included, duplicates removed (a 2-keyframe path probes 2 positions, a 1-keyframe path 1).
+func _daylight_probe_indices(p_count: int) -> Array:
+	var out: Array = []
+	var n: int = _keyframes.size() # _keyframes is an untyped Array, so := cannot infer here
+	if n <= 0 or p_count <= 0:
+		return out
+	for i in range(p_count):
+		var idx := 0
+		if p_count > 1:
+			idx = roundi(float(i) * float(n - 1) / float(p_count - 1))
+		if not out.has(idx):
+			out.append(idx)
+	return out
+
+func _finish_daylight_probe() -> void:
+	_daylight_probing = false
+	_begin_dlss_priming()
+
+# Probes the day scene at several camera positions along the path, pools the raw luminance
+# samples, calls Daylight.stats() ONCE on the pooled array, and sets tonemap_exposure once.
+#
+# Pooled samples rather than an average of per-position exposures: stats() masks windows as
+# samples above 8x the median of the array it is GIVEN, and that mask only means something on
+# the whole path's population (a position that is mostly window has a raw median that is itself
+# sky, so its own mask would keep the sky and drop the room). The pooled median is also the
+# median of every occupied pixel the camera will see, which is what the exposure is for.
+#
+# State contract with the DLSS path:
+#  * While pathtracing_accumulate is on the renderer forces SCALE_NONE, so DLSS-RR does not
+#    evaluate on accumulate frames -- probe frames never enter its temporal history.
+#  * Daylight.probe() leaves accumulate ON (the still route wants that). Here it is put back to
+#    what it was (off) and the off edge is held for RESET_SETTLE_FRAMES before priming starts.
+#  * Positions are probed LAST, MIDDLE, FIRST so the camera finishes at the frame-0 pose that the
+#    warmup and the priming both use; the first DLSS frame after the probe sees no camera motion.
+# MovieWriter records every rendered frame, probe frames included: the pre-roll length is logged.
+func _run_daylight_probe() -> void:
+	var env := _get_scene_environment()
+	var indices := _daylight_probe_indices(DAYLIGHT_PROBE_POSITIONS)
+	if env == null or indices.is_empty():
+		_log_console("[Daylight] probe skipped: %s; exposure left at 1.0" % ("no Environment" if env == null else "no keyframes"))
+		_finish_daylight_probe()
+		return
+
+	# Test hook (like render.gd's ZR_DAYLIGHT_FLOOR): force an exposure and skip the probe, so a
+	# control render has the same scene and exposure but none of the probe's frames or state changes.
+	var forced := OS.get_environment("ZR_DAYLIGHT_VIDEO_EXPOSURE")
+	if forced != "":
+		env.tonemap_exposure = float(forced)
+		_daylight_exposure = env.tonemap_exposure
+		_log_console("[Daylight] ZR_DAYLIGHT_VIDEO_EXPOSURE=%s: probe skipped, exposure forced to %.4f (test hook)" % [forced, _daylight_exposure])
+		_finish_daylight_probe()
+		return
+
+	var vp := get_viewport().get_viewport_rid()
+	var t0 := Time.get_ticks_msec()
+	var drawn0 := Engine.get_frames_drawn()
+	var prev_accumulate := env.pathtracing_accumulate
+	var prev_target := env.pathtracing_accumulation_target
+	env.tonemap_exposure = 1.0
+
+	var per_pos := {} # keyframe index -> probe result
+	var pooled := PackedFloat32Array()
+	var order := indices.duplicate()
+	order.reverse() # last, middle, first
+	for idx in order:
+		_apply_keyframe(idx)
+		var pr: Dictionary = await Daylight.probe(self, env, vp)
+		per_pos[idx] = pr
+		if pr["samples"].is_empty():
+			_log_console("[Daylight] probe: keyframe %d accumulator readback returned nothing; position dropped from the pool" % idx)
+		else:
+			pooled.append_array(pr["samples"])
+
+	# Hand the viewport back exactly as the DLSS path expects it: camera on the frame-0 pose,
+	# accumulation off (its state before the probe) with the original target, and the off edge
+	# observed by the rendering server before priming begins.
+	_apply_keyframe(0)
+	env.pathtracing_accumulate = prev_accumulate
+	env.pathtracing_accumulation_target = prev_target
+	for _i in range(Daylight.RESET_SETTLE_FRAMES):
+		await get_tree().process_frame
+	await RenderingServer.frame_post_draw
+
+	if pooled.is_empty():
+		_log_console("[Daylight] probe: every accumulator readback returned nothing; exposure left at 1.0 (the frames will be dark)")
+		_finish_daylight_probe()
+		return
+
+	var st := Daylight.stats(pooled)
+	var exposure: float = st["exposure"]
+	var lo := INF
+	var hi := 0.0
+	var ascending := indices.duplicate()
+	ascending.sort()
+	var names := ["first", "middle", "last"]
+	for k in range(ascending.size()):
+		var idx: int = ascending[k]
+		var pr: Dictionary = per_pos[idx]
+		if pr["samples"].is_empty():
+			continue
+		var own := Daylight.stats(pr["samples"])
+		lo = minf(lo, own["exposure"])
+		hi = maxf(hi, own["exposure"])
+		var label: String = names[k] if ascending.size() == 3 else "pos%d" % k
+		_log_console("[Daylight] probe %s (keyframe %d/%d): median %.5f (occupied %.1f%%), own exposure %.3f%s, p25 %.5f; at the pooled exposure median -> %.4f  [%dx%d]" % [
+				label, idx, _keyframes.size() - 1, own["median"], 100.0 * own["occupied_fraction"], own["exposure"],
+				" CLAMPED" if own["clamped"] else "", own["p25"], own["median"] * exposure, pr["width"], pr["height"]])
+	env.tonemap_exposure = exposure
+	_daylight_exposure = exposure
+	_log_console("[Daylight] probe: POOLED %d positions, %d samples: median %.5f (occupied %.1f%%), exposure %.3f%s, p25 %.5f -> %.4f after exposure  [%d ms, %d frames]" % [
+			ascending.size(), pooled.size(), st["median"], 100.0 * st["occupied_fraction"], exposure,
+			" CLAMPED -- scene is not a lit interior" if st["clamped"] else "", st["p25"], st["p25"] * exposure,
+			Time.get_ticks_msec() - t0, Engine.get_frames_drawn() - drawn0])
+	if hi > 0.0 and lo < INF:
+		_log_console("[Daylight] path spread: per-position own exposures %.3f .. %.3f (ratio %.2f); ONE exposure %.3f is held for all %d frames" % [
+				lo, hi, hi / maxf(lo, 1e-9), exposure, _total_frames])
+	if st["p25"] * exposure < Daylight.FLOOR and not st["clamped"]:
+		_log_console("[Daylight] note: the darkest occupied quarter reads %.4f after exposure, under the fill floor %.3f. The still route would add a DaylightFill here; the video route does not port the fill." % [
+				st["p25"] * exposure, Daylight.FLOOR])
+	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production trims by frame count)" % [
+			20, Engine.get_frames_drawn() - drawn0, DLSS_PRIME_FRAMES])
+	_finish_daylight_probe()
 
 func _capture_thumbnail_async():
 	await RenderingServer.frame_post_draw

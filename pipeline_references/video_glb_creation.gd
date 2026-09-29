@@ -1,4 +1,8 @@
 extends Node3D
+# Daylight design (spec 2026-09-19). Preloaded, not a global class name: the
+# live pipeline runs without an editor import, so no class cache exists there.
+# video_render.gd extends this script and inherits the constant.
+const Daylight = preload("res://daylight.gd")
 
 # Every surface of every light fixture, flushed to
 # godot_project/logs/video_emission_scan.txt during scene build. The video
@@ -669,7 +673,8 @@ func build_scene(data):
 	_build_custom_lights(geom_data)
 	
 	if day_render:
-		_create_window_portal_lights()
+		# The portal spots (_create_window_portal_lights) were removed by the daylight
+		# design (Gap #31, spec 2026-09-19); the real zero-energy portals do that job.
 		_create_window_portals()
 		if _dir_light != null and not _directional_light_authoring_locked:
 			_orient_directional_light_from_windows(_dir_light, cam_pose)
@@ -966,7 +971,8 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		if data.has("_tonemapExposureScale"):
 			_auto_exposure_scale = clampf(float(data["_tonemapExposureScale"]), 0.6, 1.6)
 		if _auto_ambient_boost != 1.0 or _auto_sun_multiplier != 1.0:
-			print("[AUTO-LIGHTING] ambientBoost=%.2f, sunMultiplier=%.2f" % [_auto_ambient_boost, _auto_sun_multiplier])
+			print("[AUTO-LIGHTING] ambientBoost=%.2f, sunMultiplier=%.2f%s" % [_auto_ambient_boost, _auto_sun_multiplier,
+					" (sunMultiplier and exposureScale are not used on day renders: probe-exposed daylight)" if day_render else ""])
 
 	# Resolve the scene-level "night lights on during day" toggle (JSON: nightLightOn).
 	_night_light_on = false
@@ -1040,12 +1046,17 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	var dir_energy = lighting["dir_energy"]
 	var dir_color = lighting["dir_color"]
 	if day_render:
-		# Reduced from 2.8 — was blowing out wall surfaces and making shadows too harsh.
-		# 2.0 gives natural 10AM brightness without overexposure.
-		dir_energy = 2.0
+		# Daylight design (spec 2026-09-19): the sky is normalised to unit
+		# horizontal irradiance below; the sun is SUN_TO_SKY (5, a 10 AM clear
+		# sky: ~90 klux direct-normal vs ~18 klux diffuse) times that, and a
+		# DirectionalLight3D of energy E is irradiance pi*E in the tracer, so
+		# light_energy = 5 / pi. The exposure is measured by Daylight.probe() in
+		# video_render.gd and held for the whole sequence, so the absolute level
+		# here is not a brightness knob; the ratio is the look.
+		dir_energy = Daylight.SUN_ENERGY # = SUN_TO_SKY / pi: energy E is irradiance pi*E in the tracer
 		# Crisp daylight white so glossy black metals (chandelier frames) reflect clean, not yellow.
 		dir_color = Color(1.0, 1.0, 1.0) # Color(1.0, 0.99, 0.97)
-		print("[Sun] Day render: 10AM sunlight energy=2.0, warm golden color (soft shadows).")
+		print("[Sun] Day render: light_energy=%.4f (sun : sky irradiance %.1f), blur=1.2, angular=0.8 (soft shadows)." % [dir_energy, Daylight.SUN_TO_SKY])
 	else:
 		# Night: read from JSON as before — authored moods still apply.
 		if data.has("_lightingSettings") and typeof(data["_lightingSettings"]) == TYPE_DICTIONARY:
@@ -1071,7 +1082,9 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 				)
 
 	if day_render:
-		dir_light.light_energy = dir_energy * _auto_sun_multiplier # automation scales for dark/light surfaces
+		# No _auto_sun_multiplier here: the physical sun-to-sky ratio is the look, and the
+		# multiplier existed only to prop up the old rig (still route: image_glb_creation.gd).
+		dir_light.light_energy = dir_energy
 		dir_light.light_color = dir_color # hardcoded golden color — no mood tint
 	else:
 		var mood_dir_color = _get_color_mood_light_color("directional")
@@ -1127,6 +1140,15 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 			var panorama_mat = PanoramaSkyMaterial.new()
 			panorama_mat.panorama = sky_tex
 			panorama_mat.filter = true
+			if day_render:
+				# Daylight design (spec 2026-09-19): the panorama is normalised so a
+				# horizontal surface receives irradiance exactly 1 from the sky,
+				# whatever file was loaded. The sun is then Daylight.SUN_TO_SKY in the
+				# same units. Night keeps the panorama as authored.
+				var e_sky = Daylight.sky_irradiance(exr_image)
+				if e_sky > 1e-6:
+					panorama_mat.energy_multiplier = 1.0 / e_sky
+				print("[Daylight] sky irradiance %.4f -> energy_multiplier %.4f" % [e_sky, panorama_mat.energy_multiplier])
 			env.sky.sky_material = panorama_mat
 			sky_material_set = true
 			print("[VideoGLB] Loaded EXR sky: ", exr_path)
@@ -1145,6 +1167,8 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		sky_mat.sun_curve = lighting["sun_curve"]
 		env.sky.sky_material = sky_mat
 		print("[VideoGLB] Using fallback procedural sky")
+		if day_render:
+			print("[Daylight] procedural sky is not normalised; sun:sky ratio undefined for this job")
 
 	# ── Ambient Light ──────────────────────────────────────────────────────────
 	# Use COLOR ambient for enclosed rooms — avoids sky-light bleeding at corners.
@@ -1183,45 +1207,18 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 
 	env.tonemap_exposure = lighting["tonemap_exposure"]
 	if day_render:
-		# Global day exposure. This multiplies EVERYTHING — sun, sky ambient, portals,
-		# fixtures — so it is the right knob when the whole frame sits too high, and the
-		# wrong one when only part of it does (for shadow/corner lift use
-		# ambient_light_energy below; for hot sun pools use the sun energy).
-		# MUST match image_glb_creation.gd: a still and the walkthrough of the same room
-		# are compared side by side, so any drift here is immediately visible. This had
-		# drifted to 1.5 while the comment still claimed it matched the image path.
-		# If this reads too dark, change BOTH builders together.
-		env.tonemap_exposure = 1.5
-		# Automation exposure compensation, deliberately damped: exposure
-		# multiplies EVERYTHING, so applying the raw boost here on top of the
-		# ambient boost below would double-count. At 0.25 a 2.0x ambient boost
-		# only adds ~25% exposure. Only lifts, never cuts — darkening is the
-		# ambient term's job. Damping factor MUST match image_glb_creation.gd.
-		if _auto_ambient_boost > 1.0:
-			var _expo_factor = 1.0 + (_auto_ambient_boost - 1.0) * 0.25
-			env.tonemap_exposure *= _expo_factor
-			print("[AUTO-LIGHTING] exposure compensation: base 1.5 × %.2f = %.2f" % [_expo_factor, env.tonemap_exposure])
-		# ambient_light_energy=6.0: sky dome energy sampled from all directions
-		# to fill dark corners and shadowed walls without casting shadows.
-		# illuminationLevel scales the day ambient, as in image_glb_creation.gd.
-		# Without this the LLM could lower illuminationLevel all it liked and the
-		# day render never moved - the level reached the night path only.
-		#
-		#   level 5 -> x1.00 (10.0)   level 3 -> x0.60 (6.0)
-		#   level 4 -> x0.80 (8.0)    level 2 -> x0.40 (4.0)
-		#                             level 1 -> x0.35 (3.5)
-		#
-		# Floored at 0.35: the ambient still has to reach into corners the sun
-		# cannot, and zero fill is a different broken render.
-		var _illum_ambient_factor = clampf(_lighting_illumination_scale / 0.5, 0.35, 1.0)
-		env.ambient_light_energy = 10.0 * _auto_ambient_boost * _illum_ambient_factor
-		print("[Lighting] Day ambient: 10.0 x boost %.2f x illumination %.2f = %.2f" % [
-				_auto_ambient_boost, _illum_ambient_factor, env.ambient_light_energy])
-		env.ambient_light_color = Color(1.0, 1.0, 1.0) # Color(1.0, 0.835, 0.50) # warm golden sky
-		# Printed from the live values, never hardcoded — the image builder's equivalent
-		# line claimed "exposure=1.0" while the constant said 1.5, which sent a brightness
-		# investigation looking in the wrong place.
-		print("[Lighting] Day: exposure=", env.tonemap_exposure, ", sky ambient energy=", env.ambient_light_energy)
+		# Daylight design (spec 2026-09-19): exposure is MEASURED, not authored.
+		# video_render.gd probes the sky-normalised, sun-lit scene at several camera
+		# positions along the path, pools the samples, and sets ONE exposure that is then
+		# held for the whole sequence (a per-frame value would flicker). 1.0 here is a
+		# placeholder that probe overwrites: physical daylight is nowhere near display-referred
+		# (a dim still job needed 24.7x, a bright one under 1x), so it must be measured.
+		# ambient_light_energy is not read by the path tracer (nothing in
+		# render_raytracing.cpp reads it), so the old 10.0 x boost x illumination value
+		# is gone with the rest of the old rig.
+		env.tonemap_exposure = 1.0
+		env.ambient_light_color = Color(1.0, 1.0, 1.0)
+		print("[Daylight] JSON lighting fields ambientBoost/illuminationLevel/exposureScale/sunEnergyMultiplier are not used on day renders (probe-exposed daylight); fixture adjustments are.")
 	if not day_render:
 		# Keep our authored ambient energy from the profile instead of crushing it
 		if mood_key == "warm":
@@ -1235,11 +1232,15 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		# when tone_mapper == TONE_MAPPER_AGX; tonemap_white is inert in that branch and
 		# was silently discarding every profile's intended value (fixed 2026-09-28).
 		env.tonemap_agx_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
-		# AGX contrast is applied via exposure adjustment (baked into exposure).
-		env.tonemap_exposure *= lighting.get("tonemap_agx_contrast", 1.0)
-		# Warm mood: slightly boost AGX exposure for richer shadows
-		if mood_key == "warm":
-			env.tonemap_exposure *= 1.08
+		# Day: the probe owns the exposure (spec 2026-09-19); a multiplier after
+		# it would move the median off 0.18. Night keeps the profile's contrast
+		# and warm-mood terms.
+		if not day_render:
+			# AGX contrast is applied via exposure adjustment (baked into exposure).
+			env.tonemap_exposure *= lighting.get("tonemap_agx_contrast", 1.0)
+			# Warm mood: slightly boost AGX exposure for richer shadows
+			if mood_key == "warm":
+				env.tonemap_exposure *= 1.08
 	else:
 		env.tonemap_white = lighting["tonemap_white"]
 
@@ -1252,7 +1253,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	# same factor - that uniformity is what identifies it as exposure
 	# rather than lighting. Fixing it here rather than by re-deflating the
 	# per-light energies keeps those tuned where they were measured.
-	if _auto_exposure_scale < 0.999 or _auto_exposure_scale > 1.001:
+	if not day_render and (_auto_exposure_scale < 0.999 or _auto_exposure_scale > 1.001):
 		var _expo_before = env.tonemap_exposure
 		env.tonemap_exposure *= _auto_exposure_scale
 		print("[AUTO-LIGHTING] exposure trim: %.3f x %.3f = %.3f" % [
@@ -3192,6 +3193,11 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					blocker.material = black_mat
 					add_child(blocker)
 
+				# Determine hole type before asset loading so is_window_for_sun is in scope
+				# throughout the asset block (window glass must stop casting shadows below).
+				var hole_type_sun := str(hole.get("type", "")).to_lower()
+				var hole_name_sun := str(hole.get("name", "")).to_lower()
+				var is_window_for_sun := hole_type_sun == "window" or "window" in hole_name_sun
 				# 4. Door / window GLB asset
 				if hole.has("asset_urls"):
 					var urls = hole["asset_urls"]
@@ -3250,11 +3256,19 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 									var flip_z = -1.0 if hole.get("flipZ", false) else 1.0
 									asset_node.scale = Vector3(scale_x * flip_x, scale_y, scale_z * flip_z)
 
-									# Smart shadow control: frame/mullion meshes keep shadows ON
-									# (cast grid pattern), glass panes get shadows OFF.
 									_apply_item_materials(asset_node, hole)
-									#_fix_glass_materials_for_shadows(asset_node)
-									print("[VideoGLB] Loaded hole asset: ", model_path, " scale: ", asset_node.scale, " (shadows: handled by material)")
+									# WINDOW GLASS DOES NOT CAST SHADOWS (Gap #30, ported from the still route).
+									# Cycles' rule -- refractive glass blocks a shadow ray -- is right for a vase
+									# and wrong for a window pane: with it, sun and sky reach the glass and stop
+									# there, and the light portals cannot deliver. Blender archviz answers this on
+									# every window with Ray Visibility > Shadow off; the tracer honours Godot's
+									# equivalent, cast_shadow = OFF, per instance (RT_INSTANCE_MASK_NO_SHADOW):
+									# camera and bounce rays still see and refract through the pane, no shadow ray
+									# does. Frames and mullions keep their shadows (_is_glass_mesh decides per mesh).
+									# Doors are left alone: an opaque door should shadow.
+									if is_window_for_sun:
+										_disable_shadow_casting_recursive(asset_node)
+									print("[VideoGLB] Loaded hole asset: ", model_path, " scale: ", asset_node.scale, " (window glass: cast_shadow OFF)" if is_window_for_sun else " (shadows: handled by material)")
 
 									# Keep the actual window GLB only.
 									# The procedural grid fallback can add visible extra bars
@@ -3278,10 +3292,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 							"path": model_path
 						})
 
-				# -- 5. Determine hole type for light collection --------
-				var hole_type_sun := str(hole.get("type", "")).to_lower()
-				var hole_name_sun := str(hole.get("name", "")).to_lower()
-				var is_window_for_sun := hole_type_sun == "window" or "window" in hole_name_sun
+				# -- 5. Hole type for light collection (hole_type_sun / is_window_for_sun are declared above the asset block) --------
 
 				# Glass detection for door fill lights
 				var hole_has_glass := false
@@ -5616,9 +5627,8 @@ func _sanitize_glb_lights(node: Node) -> void:
 # the rectangle from every point that faces it -- Cycles' portal. One per
 # window opening, in the wall plane, facing into the room. The window glass
 # itself keeps cast_shadow OFF (Gap #30) so the sky gets through.
-# The video route still carries the old portal spots (_create_window_portal_lights);
-# they are not touched here. These zero-energy portals add sky sampling only, so
-# running alongside them is look-neutral.
+# The portal spots (_create_window_portal_lights) were removed by the daylight
+# design (Gap #31, spec 2026-09-19) and are gone from the video route too.
 func _create_window_portals() -> void:
 	if not day_render or _window_sunlight_data.is_empty():
 		return
@@ -5638,137 +5648,6 @@ func _create_window_portals() -> void:
 		portal.position = center
 		portal.look_at(center + inner_dir, Vector3.UP) # -Z points into the room
 		print("  [Portal] window ", i, " at ", center, " size=", portal.area_size, " facing ", inner_dir)
-
-func _create_window_portal_lights() -> void:
-	if not day_render or _window_sunlight_data.is_empty():
-		return
-
-	# Window portal SpotLights simulate diffuse sky light entering through windows.
-	# Synced with image_glb_creation.gd portal light logic.
-	# ── Active-room gating ────────────────────────────────────────────────────
-	# A portal is an artificial interior fill, not real light transport — the path
-	# tracer already carries sky light through the opening geometry itself. So a
-	# portal is only justified for an opening that fills a room the camera actually
-	# visits. Each opening is tested at the exact position its light would occupy.
-	# Unlike the image builder this tests the WHOLE camera path, so every room in the
-	# flythrough keeps its portals. Empty polygon list = gating disabled.
-	var active_polys := _resolve_active_area_polygons()
-	var kept_windows: Array = []
-	var kept_doors: Array = []
-	for win_data in _window_sunlight_data:
-		var w_center = win_data["center"] as Vector3
-		var w_inner = win_data["inner_dir"] as Vector3
-		if _light_pos_serves_active_room(w_center + w_inner * 0.5, active_polys):
-			kept_windows.append(win_data)
-		else:
-			print("  [PortalSpot] SKIPPED window at ", w_center, " — serves a room the camera never enters.")
-	for door_data in _door_hole_data:
-		var d_center = door_data["center"] as Vector3
-		var d_inner = door_data["inner_dir"] as Vector3
-		if _light_pos_serves_active_room(d_center + d_inner * 0.4, active_polys):
-			kept_doors.append(door_data)
-		else:
-			print("  [DoorFill] SKIPPED ", door_data.get("hole_type", "opening"), " at ", d_center, " — serves a room the camera never enters.")
-
-	# ── Opening-count normalization ───────────────────────────────────────────
-	# Kept in sync with image_glb_creation.gd. N portals flooding one room add
-	# energy linearly, so a plan that survives culling with 4 windows instead of 1
-	# receives 4x the sky fill. Same sqrt(N) treatment the ceiling fixtures use:
-	#   N=1 → 1.00 (no change)  |  N=4 → 0.50  |  N=16+ → 0.25
-	# Counts are the KEPT openings: gating first and normalizing second lets the
-	# survivors return toward their calibrated level instead of double-dimming.
-	var window_norm := sqrt(float(clamp(kept_windows.size(), 1, 16)))
-	var door_norm := sqrt(float(clamp(kept_doors.size(), 1, 16)))
-
-	print("[VideoGLB] Creating window portal lights (sky diffuse): kept ",
-		kept_windows.size(), "/", _window_sunlight_data.size(), " windows, ",
-		kept_doors.size(), "/", _door_hole_data.size(), " door openings. Normalization: window /",
-		snappedf(window_norm, 0.01), " door /", snappedf(door_norm, 0.01))
-	for i in range(kept_windows.size()):
-		var win = kept_windows[i]
-		var win_center = win["center"] as Vector3
-		var inner_dir = win["inner_dir"] as Vector3
-
-		# SpotLight aimed inward from the window — simulates sky diffuse flooding in.
-		# 89 degree cone = near-hemispherical so all corners receive light.
-		# Positioned 0.5 m inside to avoid lighting the window frame mesh.
-		var portal_pos = win_center + inner_dir * 0.5
-
-		var portal_spot = SpotLight3D.new()
-		portal_spot.name = "WindowPortalSpot_" + str(i)
-		portal_spot.position = portal_pos
-
-		# Windows get slightly higher energy than doors (direct sky view)
-		portal_spot.light_energy = 0.5 / window_norm
-		portal_spot.light_color = Color(1.0, 0.835, 0.50) # 10AM warm golden sky
-
-		# 89 degree cone: near-hemispherical so every corner falls inside it
-		portal_spot.spot_angle = 89.0
-		# ── Angular falloff ──────────────────────────────────────────────────
-		# CAREFUL, this parameter is INVERTED before it reaches the shader:
-		#   light_storage.cpp -> inv_spot_attenuation = 1.0 / spot_angle_attenuation
-		#   shader            -> atten = 1.0 - pow(spot_rim, inv_spot_attenuation)
-		# where spot_rim is 0 on the cone axis and 1 at its edge. So a SMALL value
-		# here is a LARGE exponent, i.e. a flatter cone — the opposite of what the
-		# name suggests. Measured brightness at 0.1/0.25/0.5/0.75/0.9 of the way to
-		# the rim:
-		#   0.1 -> 1.00 1.00 1.00 0.94 0.65   (a flood: no gradient, kills contrast)
-		#   1.0 -> 0.90 0.75 0.50 0.25 0.10   (linear falloff from axis to rim)
-		# Do not lower this back toward 0 expecting a softer light — that makes it
-		# flatter and brighter.
-		portal_spot.spot_angle_attenuation = 0.1
-		portal_spot.spot_range = _active_room_light_range(portal_pos, active_polys)
-		portal_spot.spot_attenuation = 0.3
-		portal_spot.light_specular = 0.0
-		portal_spot.shadow_enabled = true
-
-		add_child(portal_spot)
-		# Aim 5 m deep so the cone is centered on the room interior
-		portal_spot.look_at(win_center + inner_dir * 5.0, Vector3.UP)
-		print("  [PortalSpot] Window ", i, " sky fill spot at ", portal_pos,
-			" energy=", snappedf(portal_spot.light_energy, 0.001))
-
-	# -- Subtle SpotLights for non-window holes (doors, openings) --
-	# Doors allow some light bleed into the room but should not dominate.
-	for j in range(kept_doors.size()):
-		var dh = kept_doors[j]
-		var dh_center = dh["center"] as Vector3
-		var dh_inner = dh["inner_dir"] as Vector3
-		# Place just inside the opening so it doesn't light the door frame itself
-		var dh_pos = dh_center + dh_inner * 0.4
-		# Shadow enabled only for glass doors (sliding glass door)
-		var dh_is_glass_door: bool = dh.get("has_glass", false)
-
-		var dh_spot = SpotLight3D.new()
-		dh_spot.name = "DoorFillSpot_" + str(j)
-		dh_spot.position = dh_pos
-
-		# Low energy — doors let in less light than windows (no direct sky view)
-		if dh_is_glass_door:
-			dh_spot.light_energy = 0.5 / door_norm
-		else:
-			dh_spot.light_energy = 0.2 / door_norm
-
-		dh_spot.light_color = Color(1.0, 0.835, 0.50) # warm golden
-
-		# Moderate cone — wide enough to spread into the room but not hemispherical
-		dh_spot.spot_angle = 89.0
-		# Same inverted-parameter falloff as the window portals above (1.0 = linear
-		# axis-to-rim gradient, 0.1 = flat flood). See the portal comment.
-		dh_spot.spot_angle_attenuation = 0.1
-		dh_spot.spot_range = _active_room_light_range(dh_pos, active_polys)
-		dh_spot.spot_attenuation = 0.2
-		dh_spot.light_specular = 0.0
-
-		dh_spot.shadow_enabled = false # dh_is_glass_door
-
-		add_child(dh_spot)
-		# Aim 3 m into the room from the door opening
-		var dh_target = dh_center + dh_inner * 3.0
-		dh_spot.look_at(dh_target, Vector3.UP)
-		print("  [DoorFill] ", dh["hole_type"], " fill spot at ", dh_pos, " energy=", snappedf(dh_spot.light_energy, 0.001),
-			" | glass_door=", dh_is_glass_door, " shadow=", dh_is_glass_door)
-
 
 # Every camera position along the flythrough, in world metres.
 #
