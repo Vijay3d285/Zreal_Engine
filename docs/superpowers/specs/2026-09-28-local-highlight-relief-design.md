@@ -206,3 +206,96 @@ video and real-time routes; the sunset profile, which no live job can reach
 (none of 1741 input JSONs sets `sunset_render` or a sunset time-of-day);
 the two other routes' AgX white assignment, fixed separately in
 `fa7261510a`.
+
+## Measured (2026-09-29)
+
+Gate `pt_highlight_relief_gate`, fixture at strength 0.50, knee 3.00, 9 checks,
+all green:
+
+- **H0 inert** — relief off vs a PFM captured on the pre-feature binary
+  (`0318a2b7fe`): max abs diff **0.0000000000**.
+- **H1 relief** — patch MEDIAN linear luminance **17.7500 -> 5.1289**, reduction
+  **0.711** (bar 0.40, never moved).
+- **H2 midtones** — far-wall mean **1.467576 -> 1.467576**, **+0.00%** (tol 1%).
+- **H3 halo** — 1-8 px ring **1.259452 -> 0.972679**, darkening **0.2277**
+  (bar 0.25, set from this measurement + 0.02). 8-24, 24-48 and 48-96 px all
+  read exactly 0.0000.
+- **H4 gate** — an unlit fixture: clipped fraction 0.0000 -> strength **0.000**,
+  `needed == false`.
+
+**Suite 25/25**, every gate `exit=0` (run 2026-09-29 on the shipped binary).
+
+`daylight_unit.gd` R1-R6: **45/45**, re-run 2026-09-29 against the shipped
+`RELIEF_KNEE` of 3.0 rather than carried over from Task 1's knee-4.0 run, since
+`highlight_relief` reads that constant internally. R2 strength 0.8333, R3 grows
+to 0.9583, R4 caps at 0.9998 under the 1.0 ceiling, R5/R6 return exactly 0.0.
+Re-run with `--headless --path pipeline_references -s res://tests/daylight_unit.gd`.
+
+**Two bars in this gate were measuring the wrong quantity and were corrected in
+round 3 (`a7367c2068`); neither bar was relaxed.** H1 counted patch pixels at or
+above the knee, which cannot detect this operator at all: for a uniform region
+at luminance L relief returns `L / (1 + s (L/knee - 1))`, which stays above the
+knee for every L above it, so a pixel that starts over the knee ends over it
+whatever the strength. H1 now reads the patch's median linear luminance. H3
+watched the 8-48 px ring, which reads 0.0000 *structurally* — with a hard patch
+edge the blurred luminance falls under the knee within ~8 px, so the gain is
+exactly 1.0 out there by construction — and a bar over a band that cannot move
+cannot newly fail. H3 now gates 1-8 px, where the halo is. H3's bar is anchored
+to the FIXTURE, not to production: the fixture is ~3x pessimistic (small patch
+against the shader's 32 px reach), so a production-anchored bar would fail this
+gate for fixture geometry rather than for a regression.
+
+### Production
+
+| job | route | sun-patch clip >=254 | mid-wall mean | halo 1-8 / 8-48 px | `[Relief]` |
+|---|---|---|---|---|---|
+| 201 | 1080p, OIDN | **23.25% -> 0.68%** (-97.1%, bar 40%) | **168.2244 -> 168.2244** (0.0000%, bar 1%) | 7.49% / 2.83% | clipped 5.09% past knee 3.0 -> strength **0.753** (ON) |
+| 226 | 1080p, OIDN | n/a (gate off) | **byte-identical** to the pre-relief binary, md5 `f5dd18d6f9908be013e8b69e404fab6e` | n/a | clipped 0.25% past knee 3.0 -> strength **0.000** (off) |
+
+Job 201 on the shipped binary is byte-identical to the knee-sweep's
+`knee_3.0.png` (md5 `2a17e6571e9bd26619591415cfaf0e08`), so the whole knee-3.0
+measurement set transfers to the shipped build without re-measuring. Job 226 was
+rendered twice — once on the shipped binary, once on a build with the five
+engine files that reference the pass reverted to `0318a2b7fe` — and the two PNGs
+are byte-identical. That is the claim the gating design rests on: a day job that
+does not need relief renders exactly as it did before the feature existed.
+
+### Findings
+
+1. **The headline is partly a threshold artefact, and the operator has a
+   structural ceiling.** Clipping at 254+ falls 97%, but the lit set's MEDIAN
+   only moves 255.00 -> 248.21: most of those pixels merely crossed into the
+   250-254 band. The operator asymptotes to `knee / strength` (3.0 / 0.753 =
+   3.98 post-exposure linear), which AgX still renders near-white. **At no knee
+   does the patch stop reading as white** (median 240 even at knee 2.0). This
+   softens the blowout; it does not restore the rug to normally-lit. Full
+   recovery needs the named fallbacks (edge-aware filter, exposure fusion), not
+   a different constant.
+2. **Nothing gets brighter and nothing far away moves.** On job 201, `dY > +2`
+   is 0.000% of the frame and far-from-lit `|dY| > 0` is 0.0000% over 470,585
+   pixels. The operator is strictly a local darkening of bright regions.
+3. **The knee is the halo lever, and 3.0 was chosen by sweep, not by taste.**
+   knee 4.0 / 3.0 / 2.0 give 1-8 px halo 4.09% / 7.49% / 14.42% and patch median
+   252.07 / 248.21 / 240.28. At 2.0 the weave is clear but the patch goes pearly
+   and collateral appears elsewhere (dark smudges under each downlight, dimmed
+   LED strips). 3.0 is the point where the weave and medallion read as pale
+   linework, the patch still reads as direct sun, and the halo is not visible at
+   normal viewing size.
+4. **The gate fixture is not the production case** and was nearly mistaken for
+   a design failure. Its hard-edged patch puts the entire halo inside 8 px and
+   about 3x deeper than job 201's soft, textured patch, which spreads 7.49% /
+   4.68% / 1.59% across 1-8 / 8-24 / 24-48 px. The first fixture (256 px, 1 m
+   patch) was small enough against the 32 px blur reach that it diluted the gain
+   and failed H1/H3 outright; enlarging it to 512 px / 2 m was forced by that
+   ratio, before the result was known.
+
+### Known-open
+
+- The OIDN-off route was measured only on the instrumented binary; one clean
+  OIDN-off render against `r3` would close it.
+- The DLSS-RR-final route's per-frame copy has no freeze, so relief runs before
+  its blit and would be overwritten on frames it also writes. Out of scope here.
+- Per-job wall crops: the daylight spec's job 201 crop is job 227's and lands on
+  a window sash. Job 201's measurements above use its own verified regions.
+- **Not ported to the video route.** The video route does not call
+  `highlight_relief` and is unchanged, as "Not changed" above states.

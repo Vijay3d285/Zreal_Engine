@@ -7197,3 +7197,39 @@ for the lighting rig (Gap #31), not an engine question.
 - Emissive-mesh NEE at scatter points.
 - `FogVolume` nodes as object volumes with a volume stack (approach C).
 - Heterogeneous media.
+
+## 11.31 Local highlight relief — why no global lever could fix the sun patch
+
+**DONE 2026-09-29.** Spec and full measurements:
+`docs/superpowers/specs/2026-09-28-local-highlight-relief-design.md`. A
+follow-on to Gap #31 (§11.27): it reuses that design's exposure probe and adds
+no render.
+
+Job 201 read well everywhere except where direct sun lands, which washed to
+featureless white — 23.3% of the sun-patch region at 254+. **Four global levers
+were measured and all four fail, for one reason.** Exposure at 0.5× moves the
+blown core's median only 255 → 253.7 while darkening the room ~35%. The AgX
+white point saturates (2.0 / 16.29 / 32.0 → 25.75% / 23.60% / 23.21%: 8× the
+white bought 2.1 points, a further 2× bought 0.4). The sun's own strength is
+almost inert — halving `SUN_TO_SKY` moves the patch **0.24 stops**, because the
+room is itself lit by sun bounce: the occupied median falls, the probe raises
+exposure to compensate, and the ratio is restored. **The patch and the room are
+coupled through bounce light and the probe closes the loop, so no global scalar
+can separate them.** Only a spatially selective operation can.
+
+What ships is a compute pass between the OIDN denoise and the tone curve
+(`effects/local_highlight.{cpp,h,glsl}`), gated on measured clipping and
+dispatched only when strength > 0: gain = `1 / (1 + s·max(0, Lb/knee − 1))` from
+a *blurred* luminance, so the patch slides down AgX's curve as a whole while its
+own texture survives. Job 201: clip ≥254 **23.25% → 0.68%**, mid-wall mean
+unmoved to four decimals, halo 7.49% at 1–8 px. A day job below the gate (226,
+0.25% clipped) renders **byte-identical** to a build with the pass reverted.
+`pt_highlight_relief_gate` 9/9; suite 25/25.
+
+**Recorded limit, not a to-do:** the operator asymptotes to `knee / strength`
+(3.98 post-exposure linear at the shipped knee 3.0), which AgX still renders
+near-white, so the lit set's median only moves 255.00 → 248.21 and **at no knee
+does the patch stop reading as white**. This softens the blowout; it does not
+restore the rug to normally-lit. Full recovery needs an edge-aware filter or
+exposure fusion (named in the spec as fallbacks, not built). The video route is
+unchanged — it does not call `highlight_relief`.
