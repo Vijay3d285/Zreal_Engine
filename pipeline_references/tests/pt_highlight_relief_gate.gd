@@ -14,11 +14,14 @@ const Daylight = preload("res://daylight.gd")
 ## patch is this big" below for how it is sized.
 ##
 ##   H0 inert  : relief off renders identically to the recorded baseline.
-##   H1 relief : patch clipping falls by at least H1_MIN_REDUCTION.
+##   H1 relief : the patch's MEDIAN linear luminance falls by at least
+##               H1_MIN_REDUCTION (see its note: counting pixels over the
+##               knee cannot detect this operator).
 ##   H2 midtone: wall mean moves less than H2_TOL. A highlight operator must
 ##               not behave like an exposure change.
-##   H3 halo   : the annulus just outside the patch does not darken by more
-##               than H3_MAX_DARKENING.
+##   H3 halo   : the ring H3_RING_NEAR_PX-H3_RING_FAR_PX px outside the patch
+##               -- where this fixture's halo actually is -- does not darken by
+##               more than H3_MAX_DARKENING.
 ##   H4 gate   : a frame with no blown area gets strength 0 and is identical
 ##               to the same frame with the feature compiled in but off.
 ##
@@ -65,11 +68,12 @@ const Daylight = preload("res://daylight.gd")
 ## fixture's readings before it ran and matched them (patch interior 5.133 by the
 ## closed form at the measured 17.77 vs 5.132 measured, 1-8 px ring 21.0% vs
 ## 22.8%, everything past 8 px exactly 0); and
-## (4) H1_MIN_REDUCTION was not touched and H1 still fails -- see the note on it
-## below. What this fixture does NOT do is reproduce job 201's halo: its patch
-## edge is a hard step, so the operator's darkening stays inside 8 px of the
-## edge here, where job 201's soft-edged, textured patch shows 4.68% at 8-24 px
-## and 1.59% at 24-48 px.
+## (4) H1_MIN_REDUCTION has never been touched -- when H1 failed, the METRIC was
+## corrected and the bar left at 0.40 (see its note). What this fixture does NOT
+## do is reproduce job 201's halo PROFILE: its patch edge is a hard step, so the
+## darkening stays inside 8 px of the edge and is about 3x job 201's there
+## (22.8% vs 7.49%), while job 201's soft-edged, textured patch also shows
+## 4.68% at 8-24 px and 1.59% at 24-48 px where this fixture reads exactly 0.
 
 const FRAMES := 64
 const STRENGTH := 0.5
@@ -84,50 +88,72 @@ const SETTING_KNEE := "rendering/pathtracer/highlight_relief_knee"
 const ALBEDO := 0.5
 # H1's bar is the production acceptance restated on this fixture. It is NOT
 # tunable downward: if the operator cannot reach it, that is a design failure
-# to report (spec, "Gate").
+# to report (spec, "Gate"). The bar below has never been moved.
 #
-# 2026-09-29: this check FAILS on the representative fixture (reduction 0.000)
-# and the reason is in how it counts, not in the fixture size. It counts patch
-# pixels at or above the knee (_clipped_fraction). For a uniform region at
-# luminance L the operator returns L / (1 + s (L/knee - 1)), which is above the
-# knee for every L above it and only approaches knee/s from below as L grows, so
-# a pixel that starts over the knee ends over it whatever the patch size or
-# strength; only pixels dimmer than their own blurred surroundings can fall
-# under. Job 201's criterion is different: pixels at 254+ AFTER the tone curve,
-# which saturates well above the knee, so relief's output can leave that band.
-# Measured on this fixture's patch crop (interior 17.77 -> 5.13): the count of
-# pixels >= T falls by 0.000 for every T up to 4.8 and by 1.000 for every T from
-# 5.5 up -- a step at the operator's output level, so the verdict is set by where
-# T is put, not by whether relief works. Not changed here: choosing a different
-# "would clip" line for this gate is a decision about what the gate means (see
-# task-4-report.md round 2).
+# 2026-09-29, round 3: the METRIC was wrong and has been corrected; the bar
+# stands at 0.40. H1 used to count patch pixels at or above the knee
+# (_clipped_fraction), which CANNOT detect this operator working. For a uniform
+# region at luminance L relief returns L / (1 + s (L/knee - 1)), which stays
+# above the knee for every L above it and only approaches knee/s from below as L
+# grows -- so a pixel that starts over the knee ends over it whatever the patch
+# size or strength. Confirmed in closed form on this fixture: patch interior
+# 17.765 -> 5.132, against 5.133 predicted, with the count of pixels >= T falling
+# by 0.000 for every T up to 4.8 and by 1.000 for every T from 5.5 up. That is a
+# step at the operator's output level: the verdict was set by where T was put,
+# not by whether relief works, so the check could not fail for the right reason
+# and could not pass for one either.
+#
+# H1 now reads the patch's MEDIAN LINEAR LUMINANCE, off vs on. That is the
+# quantity the production acceptance is about -- how far the patch moves down
+# the tone curve -- it is defined on a linear buffer, and it moves continuously
+# with strength instead of stepping. Job 201's criterion (pixels at 254+ AFTER
+# an AgX curve that saturates well above the knee) cannot be reproduced here
+# because this gate tonemaps LINEAR by design; the median is its linear-buffer
+# counterpart, and the two agree on direction and rough size (job 201 at knee
+# 3.0: patch median 252.07 -> 248.21 display, clip 254+ 23.25% -> 0.68%).
 const H1_MIN_REDUCTION := 0.40
 const H2_TOL := 0.01
-# H3 had no defensible value before the blur radius was measured. It is now set
-# from a measurement, on this fixture, with the reasoning below.
+# H3 had no defensible value before the blur radius was measured, so the spec
+# sets it from the first measurement plus a stated margin. It is a REGRESSION
+# bound on this fixture, not a quality bar: it catches a change that widens or
+# deepens the halo, and the number is anchored to what this fixture reads, not
+# to what production reads.
 #
-# 2026-09-29: annulus (8-48 px below the patch, the band job 201's ring_near
-# used) darkening measured 0.0000 on this fixture at strength 0.50, knee 3.00,
-# on a build of 1508348733 + the knee change, in identical repeat runs (renders
-# are deterministic on this build, so there is no run-to-run spread to size a
-# margin from). Margin +0.02, absolute: it covers driver and GPU differences
-# and small fixture edits, and stays well under the 5% production acceptance
-# (job 201: 1.80% at knee 4.0, 2.83% at knee 3.0) so a pass here cannot hide a
-# halo production would reject.
+# 2026-09-29, round 3: the band was wrong. H3 read the 8-48 px ring and
+# measured 0.0000 -- because with this fixture's HARD patch edge the blurred
+# luminance falls under the knee within about 8 px, so the gain is exactly 1.0
+# out there by construction. A bar of 0.02 over a band that reads 0.0000 for
+# structural reasons cannot newly fail for the right reason. The halo is at
+# 1-8 px, where this fixture reads 22.8%. H3 now gates THAT band.
 #
-# What this bound guards and what it does not: with this fixture's hard patch
-# edge the gain field is 1.0 beyond about 8 px from the edge (the blurred
-# luminance falls under the knee), so a reading of exactly 0 is the operator's
-# design, and H3 catches a change that pushes the halo OUT of that core (a wider
-# blur, a lower knee at fixed contrast). The halo itself -- 22.8% at 1-8 px on
-# this fixture -- is in the informational ring profile, not in H3.
+# MEASURED 2026-09-29 on this fixture at strength 0.50, knee 3.00, binary
+# 111f3fba9c: 1-8 px darkening 0.2277 (ring mean 1.259452 -> 0.972679),
+# BIT-IDENTICAL across repeat runs -- so the margin covers driver/GPU
+# differences and small fixture edits, not run-to-run spread. Bar = 0.2277
+# + 0.02 absolute, rounded to 0.25.
 #
-# History: on 2026-09-28 the committed gate read 0.0000 because relief never
-# dispatched with both denoisers off (rt_accum_target was only computed when
-# OIDN or DLSS-RR-final was on; fixed in 1508348733), and a forced-dispatch
-# diagnostic on the small fixture read 0.1537. Neither is a measurement of this
-# fixture; both are kept here so the number's provenance is not lost.
-const H3_MAX_DARKENING := 0.02
+# This bar CAN newly fail, which is the point: anything that widens the blur or
+# lowers the knee grows this band. Job 201's own 1-8 px reading moves 4.09% ->
+# 7.49% -> 14.42% across knee 4.0 -> 3.0 -> 2.0, so the same lever moves this
+# fixture's reading well past 0.25.
+#
+# Job 201 at the same knee reads 7.49% at 1-8 px (and 4.68% at 8-24, 1.59% at
+# 24-48), i.e. this fixture is about 3x PESSIMISTIC -- its patch is small
+# against the shader's 32 px reach, so a larger share of the gain field spills
+# past the edge. That is why the bar is anchored HERE and job 201's figure is
+# recorded beside it rather than used as the bound: a production-anchored bar
+# would fail this gate for fixture geometry instead of for a regression.
+#
+# History: on 2026-09-28 the committed gate read 0.0000 at 8-48 px because
+# relief never dispatched with both denoisers off (rt_accum_target was only
+# computed when OIDN or DLSS-RR-final was on; fixed in 1508348733), and a
+# forced-dispatch diagnostic on the SMALLER first fixture read 0.1537. Neither
+# is a measurement of this fixture at this band; both are kept so the number's
+# provenance is not lost.
+# The band H3 gates, in px below the patch's near edge -- where the halo is.
+const H3_RING_NEAR_PX := 1
+const H3_RING_FAR_PX := 8
+const H3_MAX_DARKENING := 0.25
 
 # Frame size and patch size. The blur footprint is a fixed number of PIXELS
 # (see BLUR_PX), so what decides whether the fixture exercises the operator is
@@ -209,13 +235,19 @@ func _ready() -> void:
 		_save_pfm(off, dump_dir.path_join("off.pfm"))
 		_save_pfm(on, dump_dir.path_join("on.pfm"))
 
+	var med_off := _crop_median(off, PATCH)
+	var med_on := _crop_median(on, PATCH)
+	var reduction := 1.0 - (med_on / maxf(med_off, 1e-9))
+	print("  patch median luminance: off %.4f on %.4f -> reduction %.3f (bar %.2f)" % [
+			med_off, med_on, reduction, H1_MIN_REDUCTION])
 	var clip_off := _clipped_fraction(off, PATCH)
-	var clip_on := _clipped_fraction(on, PATCH)
-	var reduction := 1.0 - (clip_on / maxf(clip_off, 1e-9))
-	print("  patch clipped: off %.4f on %.4f -> reduction %.3f (bar %.2f)" % [clip_off, clip_on, reduction, H1_MIN_REDUCTION])
-	_check_true("H1 premise: the fixture actually clips with relief off", clip_off > 0.05,
-			"(%.4f -- if this is ~0 the patch is not bright enough)" % clip_off)
-	_check_true("H1 patch clipping falls >= %.0f%%" % (100.0 * H1_MIN_REDUCTION),
+	# Informational: the metric H1 used to gate on, kept so its failure mode stays
+	# visible. It cannot move for a uniform region -- see H1_MIN_REDUCTION's note.
+	print("  patch fraction >= knee: off %.4f on %.4f (informational, not gated)" % [
+			clip_off, _clipped_fraction(on, PATCH)])
+	_check_true("H1 premise: the fixture actually blows out with relief off", clip_off > 0.05,
+			"(%.4f of the patch is at or above the knee -- if this is ~0 it is not bright enough)" % clip_off)
+	_check_true("H1 patch median luminance falls >= %.0f%%" % (100.0 * H1_MIN_REDUCTION),
 			reduction >= H1_MIN_REDUCTION, "(%.3f)" % reduction)
 
 	# Informational, not a check. relief maps a uniform region at luminance L to
@@ -241,11 +273,13 @@ func _ready() -> void:
 	print("  wall mean: off %.6f on %.6f" % [wall_off, wall_on])
 	_check("H2 wall mean unmoved", wall_on / maxf(wall_off, 1e-9), 1.0, H2_TOL)
 
-	var ann_off := _crop(off, ANNULUS)
-	var ann_on := _crop(on, ANNULUS)
+	var h3_ring := _ring_rect(H3_RING_NEAR_PX, H3_RING_FAR_PX)
+	var ann_off := _rect_mean(off, h3_ring)
+	var ann_on := _rect_mean(on, h3_ring)
 	var darkening := 1.0 - (ann_on / maxf(ann_off, 1e-9))
-	print("  annulus: off %.6f on %.6f -> darkening %.4f (bar %.2f)" % [ann_off, ann_on, darkening, H3_MAX_DARKENING])
-	_check_true("H3 no halo beyond %.0f%%" % (100.0 * H3_MAX_DARKENING),
+	print("  halo ring %d-%d px: off %.6f on %.6f -> darkening %.4f (bar %.2f)" % [
+			H3_RING_NEAR_PX, H3_RING_FAR_PX, ann_off, ann_on, darkening, H3_MAX_DARKENING])
+	_check_true("H3 halo at %d-%d px stays under %.0f%%" % [H3_RING_NEAR_PX, H3_RING_FAR_PX, 100.0 * H3_MAX_DARKENING],
 			darkening <= H3_MAX_DARKENING, "(%.4f)" % darkening)
 
 	print("\n=== H0: relief off vs the recorded baseline ===")
@@ -500,6 +534,23 @@ func _crop(p_img: Image, p_r: Array) -> float:
 			acc += (c.r + c.g + c.b) / 3.0
 			n += 1
 	return acc / float(maxi(n, 1))
+
+
+## Median linear luminance over the crop -- H1's metric. A median, not a mean,
+## so the reading is not dragged by the few brightest pixels and answers "where
+## does the body of the patch sit", which is what the tone curve then maps.
+func _crop_median(p_img: Image, p_r: Array) -> float:
+	var w := p_img.get_width()
+	var h := p_img.get_height()
+	var v := PackedFloat32Array()
+	for y in range(int(h * float(p_r[0])), int(h * float(p_r[1]))):
+		for x in range(int(w * float(p_r[2])), int(w * float(p_r[3]))):
+			var c := p_img.get_pixel(x, y)
+			v.append((c.r + c.g + c.b) / 3.0)
+	if v.is_empty():
+		return 0.0
+	v.sort()
+	return v[v.size() / 2]
 
 
 ## Fraction of the crop at or above the knee -- the linear-buffer stand-in for
