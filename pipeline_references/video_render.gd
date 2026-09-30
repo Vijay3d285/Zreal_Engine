@@ -365,6 +365,17 @@ func _run_daylight_probe() -> void:
 		_finish_daylight_probe()
 		return
 
+	# ZR_DAYLIGHT_VIDEO_FLOOR: test-only override of Daylight.FLOOR, i.e. the still route's
+	# ZR_DAYLIGHT_FLOOR under a video-specific name so one variable cannot silently arm both
+	# routes in a batch. The fill branch below is unreachable on every job measured so far
+	# (job 301 reads p25 0.0956 after exposure against the 0.02 floor), so without this hook the
+	# ported code could not be exercised on a real job at all.
+	var floor_v := Daylight.FLOOR
+	var floor_override := OS.get_environment("ZR_DAYLIGHT_VIDEO_FLOOR")
+	if floor_override != "":
+		floor_v = float(floor_override)
+		_log_console("[Daylight] floor override ZR_DAYLIGHT_VIDEO_FLOOR=%s" % floor_override)
+
 	var t0 := Time.get_ticks_msec()
 	var iterations0 := Engine.get_frames_drawn()
 	env.tonemap_exposure = 1.0
@@ -390,8 +401,6 @@ func _run_daylight_probe() -> void:
 	var probe_rid := probe_vp.get_viewport_rid()
 	var recorded_rid := get_viewport().get_viewport_rid()
 
-	var per_pos := {} # keyframe index -> probe result
-	var pooled := PackedFloat32Array()
 	var order := indices.duplicate()
 	order.reverse() # last, middle, first
 	# force_draw() renders every viewport in the active list, so the recorded one is skipped for
@@ -404,15 +413,80 @@ func _run_daylight_probe() -> void:
 	# recorded viewport stays a seed, the child still draws, and only the parent's draw is skipped.
 	var prev_update_mode := RenderingServer.viewport_get_update_mode(recorded_rid)
 	RenderingServer.viewport_set_update_mode(recorded_rid, RenderingServer.VIEWPORT_UPDATE_DISABLED)
-	for idx in order:
-		_apply_keyframe(idx)
-		_sync_daylight_probe_camera(probe_cam, main_cam)
-		var pr: Dictionary = Daylight.probe_offscreen(probe_env, probe_rid)
-		per_pos[idx] = pr
-		if pr["samples"].is_empty():
-			_log_console("[Daylight] probe: keyframe %d accumulator readback returned nothing; position dropped from the pool" % idx)
-		else:
-			pooled.append_array(pr["samples"])
+	var pass1 := _probe_path_pooled(probe_env, probe_rid, probe_cam, main_cam, order)
+	var pooled: PackedFloat32Array = pass1["pooled"]
+	var per_pos: Dictionary = pass1["per_pos"]
+
+	# The fallback fill, ported from render.gd:652. Decided HERE, while the probe rig is still
+	# alive, because the solve needs a SECOND pooled pass with the fill present and
+	# Daylight.solve_fill requires both sample arrays to be the same length.
+	#
+	# Same trigger as the still route, including `not clamped`: a scene whose exposure already hit
+	# EXPOSURE_MAX gets no fill on either route. (Port-2 concern #4 read this as a video-only gap;
+	# it is not -- the clamped case is unhandled in both.) Only the UNCLAMPED
+	# darkest-quarter-under-floor case is what video was missing.
+	#
+	# Cost: nothing on the normal path -- the second pass runs only inside this branch, which no
+	# job measured so far reaches. Affordable at all only because port 3 moved the probe offscreen;
+	# before that it would have added another 69 frames to the movie.
+	var st := {}
+	var exposure: float = 1.0
+	var fill_line := ""
+	if not pooled.is_empty():
+		st = Daylight.stats(pooled)
+		exposure = float(st["exposure"])
+		if float(st["p25"]) * exposure < floor_v and not bool(st["clamped"]):
+			var fill := _place_daylight_path_fill(1.0)
+			var pass2 := _probe_path_pooled(probe_env, probe_rid, probe_cam, main_cam, order)
+			var pooled1: PackedFloat32Array = pass2["pooled"]
+			if pooled1.size() != pooled.size():
+				fill_line = "[Daylight] fill probe: pooled %d samples with the fill vs %d without; no fill" % [
+						pooled1.size(), pooled.size()]
+				fill.queue_free()
+			else:
+				var sol := Daylight.solve_fill(pooled, pooled1, floor_v)
+				# What the fill would ACHIEVE, not what it was asked for: sol["p25"] and
+				# sol["exposure"] are the solver's own post-fill stats, so this is the darkest
+				# quarter the frames would actually get.
+				var before := float(st["p25"]) * float(st["exposure"])
+				var achieved := float(sol["p25"]) * float(sol["exposure"])
+				if sol["needed"] and achieved <= before:
+					# MEASURED 2026-09-30, job 301 fixtures-off: the solver stopped at
+					# FILL_SHARE_CAP with energy 393.18 and the darkest quarter went
+					# 0.0772 -> 0.0764 -- very slightly WORSE. The mechanism is in solve_fill's
+					# own definition: exposure is TARGET_MEDIAN / median(f), so a fill that lifts
+					# the median faster than it lifts the dark corners buys nothing. p25 * e stays
+					# flat while the exposure halves, the frames' median is driven to target
+					# either way, and all the fill has done is flatten contrast and add a
+					# 393-energy light. solve_fill's `capped` branch returns needed = true without
+					# checking this, so the guard lives here.
+					#
+					# The still route has the SAME branch (render.gd:659 applies sol["energy"]
+					# whenever needed is true) and therefore the same hole; its fill has never
+					# fired on a production job, so nobody has seen it. Not fixed there from here:
+					# changing Daylight.solve_fill would change still-route behaviour, and that
+					# belongs in its own change with its own gate. Recorded in video-port-4.md.
+					fill_line = "[Daylight] fill: solver stopped at share cap %.2f with energy %.4f and the darkest quarter would go %.4f -> %.4f (no better, floor %.3f); fill DISCARDED, exposure left at %.3f" % [
+							Daylight.FILL_SHARE_CAP, sol["energy"], before, achieved, floor_v,
+							float(st["exposure"])]
+					fill.queue_free()
+				elif sol["needed"]:
+					fill.light_energy = sol["energy"]
+					exposure = float(sol["exposure"])
+					fill_line = "[Daylight] fill: p25 %.4f < %.3f after exposure -> DaylightFill at %s size %s energy %.4f%s; exposure %.3f -> %.3f, darkest quarter %.4f -> %.4f (floor %.3f%s); one fill, held for all frames" % [
+							before, floor_v,
+							str(fill.global_position), str(fill.area_size), sol["energy"],
+							" (CAPPED at share %.2f)" % Daylight.FILL_SHARE_CAP if sol["capped"] else "",
+							float(st["exposure"]), exposure,
+							before, achieved, floor_v,
+							" NOT REACHED" if achieved < floor_v else " reached"]
+				elif sol["exhausted"]:
+					fill_line = "[Daylight] fill: solver exhausted (the fill moved neither the median nor the darkest quarter); no fill"
+					fill.queue_free()
+				else:
+					fill_line = "[Daylight] fill: solver found no energy under the share cap %.2f; no fill" % Daylight.FILL_SHARE_CAP
+					fill.queue_free()
+
 	RenderingServer.viewport_set_update_mode(recorded_rid, prev_update_mode)
 
 	# Hand the scene back as the DLSS path expects it: camera and sun on the frame-0 pose, the rig gone.
@@ -428,9 +502,6 @@ func _run_daylight_probe() -> void:
 		_log_console("[Daylight] probe: every accumulator readback returned nothing; exposure left at 1.0 (the frames will be dark)")
 		_finish_daylight_probe()
 		return
-
-	var st := Daylight.stats(pooled)
-	var exposure: float = st["exposure"]
 	var lo := INF
 	var hi := 0.0
 	var ascending := indices.duplicate()
@@ -450,16 +521,28 @@ func _run_daylight_probe() -> void:
 				" CLAMPED" if own["clamped"] else "", own["p25"], own["median"] * exposure, pr["width"], pr["height"]])
 	env.tonemap_exposure = exposure
 	_daylight_exposure = exposure
+	# This line describes the PROBE, so it reports the probe's own exposure, not the one a fill may
+	# have replaced it with. Mixing them produced a genuinely meaningless number in the first
+	# forced-fill run -- pre-fill p25 times post-fill exposure, "p25 0.00226 -> 0.0374", which
+	# described neither state. The fill line below owns the before/after of the change; when no
+	# fill is placed the two exposures are equal and this line reads exactly as it always has.
 	_log_console("[Daylight] probe: POOLED %d positions, %d samples: median %.5f (occupied %.1f%%), exposure %.3f%s, p25 %.5f -> %.4f after exposure  [%d ms, %d main-loop frames]" % [
-			ascending.size(), pooled.size(), st["median"], 100.0 * st["occupied_fraction"], exposure,
-			" CLAMPED -- scene is not a lit interior" if st["clamped"] else "", st["p25"], st["p25"] * exposure,
+			ascending.size(), pooled.size(), st["median"], 100.0 * st["occupied_fraction"], float(st["exposure"]),
+			" CLAMPED -- scene is not a lit interior" if st["clamped"] else "",
+			st["p25"], float(st["p25"]) * float(st["exposure"]),
 			Time.get_ticks_msec() - t0, iterations])
 	if hi > 0.0 and lo < INF:
 		_log_console("[Daylight] path spread: per-position own exposures %.3f .. %.3f (ratio %.2f); ONE exposure %.3f is held for all %d frames" % [
 				lo, hi, hi / maxf(lo, 1e-9), exposure, _total_frames])
-	if st["p25"] * exposure < Daylight.FLOOR and not st["clamped"]:
-		_log_console("[Daylight] note: the darkest occupied quarter reads %.4f after exposure, under the fill floor %.3f. The still route would add a DaylightFill here; the video route does not port the fill." % [
-				st["p25"] * exposure, Daylight.FLOOR])
+	if fill_line != "":
+		_log_console(fill_line)
+	elif float(st["p25"]) * float(st["exposure"]) < floor_v:
+		# Reachable ONLY when the exposure clamped. The trigger above excludes clamped scenes, and
+		# every non-clamped frame that reaches the floor sets fill_line, so repeating the trigger's
+		# full condition here would be a branch that can never run. A clamped scene getting no fill
+		# is the still route's rule too, not a video shortcoming -- see video-port-4.md Finding 2.
+		_log_console("[Daylight] note: the darkest occupied quarter reads %.4f after exposure, under the fill floor %.3f, but the exposure is CLAMPED so no fill is placed (same rule as the still route)." % [
+				float(st["p25"]) * float(st["exposure"]), floor_v])
 	var rec_size: Vector2 = get_viewport().get_visible_rect().size
 	_log_console("[Daylight] probe ran offscreen: SubViewport %dx%d (recorded viewport %dx%d), %d positions, %d force_draw calls, none of them main-loop frames" % [
 			probe_size.x, probe_size.y, int(rec_size.x), int(rec_size.y),
@@ -467,6 +550,63 @@ func _run_daylight_probe() -> void:
 	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production trims by frame count)" % [
 			20, iterations, DLSS_PRIME_FRAMES])
 	_finish_daylight_probe()
+
+
+# One pooled pass over the probe positions: for each keyframe it moves MainCamera and the sun,
+# copies the pose to the offscreen camera, accumulates, and concatenates the raw samples.
+# Factored out of _run_daylight_probe because the fill solve needs a SECOND pass over the SAME
+# positions with the fill present, and Daylight.solve_fill requires both sample arrays to be the
+# same length -- which holds only if both passes visit the same positions and each one returns.
+func _probe_path_pooled(p_env: Environment, p_rid: RID, p_probe_cam: Camera3D, p_main_cam: Camera3D,
+		p_order: Array) -> Dictionary:
+	var per_pos := {} # keyframe index -> probe result
+	var pooled := PackedFloat32Array()
+	for idx in p_order:
+		_apply_keyframe(idx)
+		_sync_daylight_probe_camera(p_probe_cam, p_main_cam)
+		var pr: Dictionary = Daylight.probe_offscreen(p_env, p_rid)
+		per_pos[idx] = pr
+		if pr["samples"].is_empty():
+			_log_console("[Daylight] probe: keyframe %d accumulator readback returned nothing; position dropped from the pool" % idx)
+		else:
+			pooled.append_array(pr["samples"])
+	return {"pooled": pooled, "per_pos": per_pos}
+
+
+## The video route's fallback fill. The same light the still route builds in
+## render.gd :: _place_daylight_fill -- AreaLight3D, normalised energy, no shadows, facing down,
+## 0.3 m under the ceiling, 0.6x the extent -- with ONE deliberate difference: it is placed and
+## sized from the WHOLE lighting bounds, not from _resolve_active_area_polygon().
+##
+## The still route narrows to the polygon of the area the camera stands in, which is correct for a
+## single fixed camera. A video path crosses rooms, and the probe already pools three positions
+## into one held exposure. A fill sized to one room's extent and placed at its centroid would
+## under-light the rest of the path, and the solver -- which scans against the POOLED p25 -- would
+## then over-drive it to compensate, over-lighting the room it sits in. One plan-wide fill matches
+## the one held exposure: the same trade as the pooled probe, made the same way.
+func _place_daylight_path_fill(p_energy: float) -> AreaLight3D:
+	# _extract_room_lighting_bounds() wants the parsed floor-plan geometry dict, which
+	# build_scene() stashes in _floor_plan_root_data (video_glb_creation.gd:256) -- NOT the raw
+	# job JSON, whose floor_plan_data can be a STRING in some jobs and would silently fall back
+	# to the (0,0,0)/6x6/2.8 defaults. Same reasoning as render.gd's copy.
+	var bounds := _extract_room_lighting_bounds(_floor_plan_root_data)
+	var center: Vector3 = bounds["center"]
+	var extent: Vector2 = bounds["extent"]
+	var ceiling_y: float = bounds["ceiling_y"]
+	var fill := AreaLight3D.new()
+	fill.name = "DaylightFill"
+	fill.area_size = extent * 0.6
+	fill.area_normalize_energy = true
+	fill.light_energy = p_energy
+	fill.light_color = Color(1.0, 1.0, 1.0)
+	fill.light_specular = 0.0
+	fill.shadow_enabled = false
+	fill.set_param(Light3D.PARAM_RANGE, 2.0 * extent.length() + 4.0)
+	fill.set_param(Light3D.PARAM_ATTENUATION, 1.0)
+	add_child(fill)
+	fill.position = Vector3(center.x, ceiling_y - 0.3, center.z)
+	fill.rotation_degrees = Vector3(-90.0, 0.0, 0.0) # -Z points down
+	return fill
 
 func _capture_thumbnail_async():
 	await RenderingServer.frame_post_draw
