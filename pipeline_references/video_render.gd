@@ -33,7 +33,14 @@ var _dlss_prime_remaining: int = 0
 # along the path (first / middle / last keyframe), the raw luminance samples are POOLED, and
 # Daylight.stats() is called once on the pooled array. That single exposure is then held for the
 # whole sequence.
+# The probe runs in an offscreen SubViewport (see _run_daylight_probe), so none of its frames reach
+# the viewport MovieWriter records.
 const DAYLIGHT_PROBE_POSITIONS: int = 3
+# The probe's SubViewport is at most this wide (its height follows the recorded viewport's aspect).
+# The probe reads 4x4 box averages (Daylight.PROBE_STEP), so it does not need the output's pixel
+# count; the exposure it measures is compared against a full-size probe in
+# .superpowers/sdd/2026-09-28-local-highlight-relief/video-port-3.md.
+const DAYLIGHT_PROBE_MAX_WIDTH: int = 960
 var _daylight_probing: bool = false
 var _daylight_exposure: float = 1.0 # what the probe set; logged again at the end to prove it held
 var _render_data = {} # Full parsed JSON — used by setup_fixed_fill_lights()
@@ -283,6 +290,28 @@ func _finish_daylight_probe() -> void:
 	_daylight_probing = false
 	_begin_dlss_priming()
 
+# Size of the probe's SubViewport: DAYLIGHT_PROBE_MAX_WIDTH wide (or the recorded viewport's
+# width, if that is smaller) at the recorded viewport's aspect ratio. Same aspect means the same
+# frustum, so the probe sees the same instances the recorded viewport does.
+func _daylight_probe_size() -> Vector2i:
+	var rec: Vector2 = get_viewport().get_visible_rect().size
+	if rec.x < 2.0 or rec.y < 2.0:
+		return Vector2i(DAYLIGHT_PROBE_MAX_WIDTH, DAYLIGHT_PROBE_MAX_WIDTH * 9 / 16)
+	var w: int = mini(DAYLIGHT_PROBE_MAX_WIDTH, int(rec.x))
+	return Vector2i(w, maxi(2, roundi(float(w) * rec.y / rec.x)))
+
+# Puts the probe camera exactly where MainCamera is. _apply_keyframe() has just moved MainCamera
+# and re-oriented the sun (it does so for frame index % 5 == 0, and _current_frame is 0 here);
+# Godot defers the resulting transform notifications to the end of the frame, and the probe
+# renders inside this one, so they are flushed by hand.
+func _sync_daylight_probe_camera(p_probe: Camera3D, p_main: Camera3D) -> void:
+	if _dir_light != null:
+		_dir_light.force_update_transform()
+	p_main.force_update_transform()
+	p_probe.global_transform = p_main.global_transform
+	p_probe.fov = p_main.fov
+	p_probe.force_update_transform()
+
 # Probes the day scene at several camera positions along the path, pools the raw luminance
 # samples, calls Daylight.stats() ONCE on the pooled array, and sets tonemap_exposure once.
 #
@@ -292,14 +321,26 @@ func _finish_daylight_probe() -> void:
 # sky, so its own mask would keep the sky and drop the room). The pooled median is also the
 # median of every occupied pixel the camera will see, which is what the exposure is for.
 #
-# State contract with the DLSS path:
-#  * While pathtracing_accumulate is on the renderer forces SCALE_NONE, so DLSS-RR does not
-#    evaluate on accumulate frames -- probe frames never enter its temporal history.
-#  * Daylight.probe() leaves accumulate ON (the still route wants that). Here it is put back to
-#    what it was (off) and the off edge is held for RESET_SETTLE_FRAMES before priming starts.
-#  * Positions are probed LAST, MIDDLE, FIRST so the camera finishes at the frame-0 pose that the
-#    warmup and the priming both use; the first DLSS frame after the probe sees no camera motion.
-# MovieWriter records every rendered frame, probe frames included: the pre-roll length is logged.
+# OFFSCREEN, and in ZERO main-loop iterations. MovieWriter records one frame per main-loop
+# iteration (Main::iteration -> movie_writer->add_frame) and always reads the MAIN viewport's
+# texture, so it does not matter which viewport does the tracing: a probe paced on process_frame
+# (Daylight.probe) puts one movie frame in the video per probe frame, 69 of them. Two things
+# remove them:
+#  * the tracing runs in a private SubViewport that shares the main World3D (same geometry,
+#    lights and sun) and has its own Camera3D, whose `environment` is a DUPLICATE of the scene's
+#    Environment. The accumulate flag is an Environment property, so a shared Environment would
+#    switch accumulation on for the recorded viewport too; the duplicate leaves the recorded
+#    viewport's Environment, its DLSS-RR history and its accumulation state untouched;
+#  * Daylight.probe_offscreen() paces the SubViewport with RenderingServer.force_draw() and
+#    returns in the same call, so the whole probe happens inside one _process() call. The
+#    recorded viewport is deactivated for that call so force_draw() draws only the probe; it is
+#    reactivated below, before this function returns and long before the iteration's own draw.
+# The recorded viewport never renders a probe frame and MovieWriter never sees one.
+#
+# State contract with the DLSS path: nothing is left toggled. The recorded viewport's Environment
+# is only read (duplicated), MainCamera finishes on the frame-0 pose that the warmup and the
+# priming both use, and the rig is freed before priming starts.
+# Positions are probed LAST, MIDDLE, FIRST (the order the on-screen version used).
 func _run_daylight_probe() -> void:
 	var env := _get_scene_environment()
 	var indices := _daylight_probe_indices(DAYLIGHT_PROBE_POSITIONS)
@@ -309,7 +350,7 @@ func _run_daylight_probe() -> void:
 		return
 
 	# Test hook (like render.gd's ZR_DAYLIGHT_FLOOR): force an exposure and skip the probe, so a
-	# control render has the same scene and exposure but none of the probe's frames or state changes.
+	# control render has the same scene and exposure but none of the probe's work.
 	var forced := OS.get_environment("ZR_DAYLIGHT_VIDEO_EXPOSURE")
 	if forced != "":
 		env.tonemap_exposure = float(forced)
@@ -318,35 +359,70 @@ func _run_daylight_probe() -> void:
 		_finish_daylight_probe()
 		return
 
-	var vp := get_viewport().get_viewport_rid()
+	var main_cam := get_node_or_null("MainCamera") as Camera3D
+	if main_cam == null:
+		_log_console("[Daylight] probe skipped: no MainCamera; exposure left at 1.0")
+		_finish_daylight_probe()
+		return
+
 	var t0 := Time.get_ticks_msec()
-	var drawn0 := Engine.get_frames_drawn()
-	var prev_accumulate := env.pathtracing_accumulate
-	var prev_target := env.pathtracing_accumulation_target
+	var iterations0 := Engine.get_frames_drawn()
 	env.tonemap_exposure = 1.0
+
+	# The offscreen rig: SubViewport + Camera3D + a private copy of the Environment.
+	var probe_env: Environment = env.duplicate()
+	var probe_size := _daylight_probe_size()
+	var probe_vp := SubViewport.new()
+	probe_vp.name = "DaylightProbeViewport"
+	probe_vp.size = probe_size
+	probe_vp.render_target_update_mode = SubViewport.UPDATE_ALWAYS # the default only draws when something samples its texture
+	probe_vp.world_3d = get_viewport().find_world_3d() # the SAME world: same instances, lights and sun
+	probe_vp.mesh_lod_threshold = get_viewport().mesh_lod_threshold # the recorded viewport sets 0.0; a SubViewport defaults to 1.0
+	var probe_cam := Camera3D.new()
+	probe_cam.name = "DaylightProbeCamera"
+	probe_cam.environment = probe_env
+	probe_cam.near = main_cam.near
+	probe_cam.far = main_cam.far
+	probe_cam.keep_aspect = main_cam.keep_aspect
+	probe_vp.add_child(probe_cam)
+	add_child(probe_vp)
+	probe_cam.make_current()
+	var probe_rid := probe_vp.get_viewport_rid()
+	var recorded_rid := get_viewport().get_viewport_rid()
 
 	var per_pos := {} # keyframe index -> probe result
 	var pooled := PackedFloat32Array()
 	var order := indices.duplicate()
 	order.reverse() # last, middle, first
+	# force_draw() renders every viewport in the active list, so the recorded one is skipped for
+	# the duration -- but it must stay ACTIVE. _sort_active_viewports() (renderer_viewport.cpp)
+	# seeds its list with ROOT viewports only and then walks down to THEIR children, so
+	# deactivating the recorded viewport takes this SubViewport out of the draw list with it: the
+	# probe viewport is then never drawn, never gets render buffers, and the accumulator readback
+	# returns nothing at every position (measured 2026-09-29, exposure fell back to 1.0).
+	# VIEWPORT_UPDATE_DISABLED is checked per viewport INSIDE draw_viewports' own loop, so the
+	# recorded viewport stays a seed, the child still draws, and only the parent's draw is skipped.
+	var prev_update_mode := RenderingServer.viewport_get_update_mode(recorded_rid)
+	RenderingServer.viewport_set_update_mode(recorded_rid, RenderingServer.VIEWPORT_UPDATE_DISABLED)
 	for idx in order:
 		_apply_keyframe(idx)
-		var pr: Dictionary = await Daylight.probe(self, env, vp)
+		_sync_daylight_probe_camera(probe_cam, main_cam)
+		var pr: Dictionary = Daylight.probe_offscreen(probe_env, probe_rid)
 		per_pos[idx] = pr
 		if pr["samples"].is_empty():
 			_log_console("[Daylight] probe: keyframe %d accumulator readback returned nothing; position dropped from the pool" % idx)
 		else:
 			pooled.append_array(pr["samples"])
+	RenderingServer.viewport_set_update_mode(recorded_rid, prev_update_mode)
 
-	# Hand the viewport back exactly as the DLSS path expects it: camera on the frame-0 pose,
-	# accumulation off (its state before the probe) with the original target, and the off edge
-	# observed by the rendering server before priming begins.
+	# Hand the scene back as the DLSS path expects it: camera and sun on the frame-0 pose, the rig gone.
 	_apply_keyframe(0)
-	env.pathtracing_accumulate = prev_accumulate
-	env.pathtracing_accumulation_target = prev_target
-	for _i in range(Daylight.RESET_SETTLE_FRAMES):
-		await get_tree().process_frame
-	await RenderingServer.frame_post_draw
+	if _dir_light != null:
+		_dir_light.force_update_transform()
+	main_cam.force_update_transform()
+	remove_child(probe_vp)
+	probe_vp.free() # immediately, not queue_free(): nothing of the rig may outlive this call
+	var iterations: int = Engine.get_frames_drawn() - iterations0
 
 	if pooled.is_empty():
 		_log_console("[Daylight] probe: every accumulator readback returned nothing; exposure left at 1.0 (the frames will be dark)")
@@ -374,18 +450,22 @@ func _run_daylight_probe() -> void:
 				" CLAMPED" if own["clamped"] else "", own["p25"], own["median"] * exposure, pr["width"], pr["height"]])
 	env.tonemap_exposure = exposure
 	_daylight_exposure = exposure
-	_log_console("[Daylight] probe: POOLED %d positions, %d samples: median %.5f (occupied %.1f%%), exposure %.3f%s, p25 %.5f -> %.4f after exposure  [%d ms, %d frames]" % [
+	_log_console("[Daylight] probe: POOLED %d positions, %d samples: median %.5f (occupied %.1f%%), exposure %.3f%s, p25 %.5f -> %.4f after exposure  [%d ms, %d main-loop frames]" % [
 			ascending.size(), pooled.size(), st["median"], 100.0 * st["occupied_fraction"], exposure,
 			" CLAMPED -- scene is not a lit interior" if st["clamped"] else "", st["p25"], st["p25"] * exposure,
-			Time.get_ticks_msec() - t0, Engine.get_frames_drawn() - drawn0])
+			Time.get_ticks_msec() - t0, iterations])
 	if hi > 0.0 and lo < INF:
 		_log_console("[Daylight] path spread: per-position own exposures %.3f .. %.3f (ratio %.2f); ONE exposure %.3f is held for all %d frames" % [
 				lo, hi, hi / maxf(lo, 1e-9), exposure, _total_frames])
 	if st["p25"] * exposure < Daylight.FLOOR and not st["clamped"]:
 		_log_console("[Daylight] note: the darkest occupied quarter reads %.4f after exposure, under the fill floor %.3f. The still route would add a DaylightFill here; the video route does not port the fill." % [
 				st["p25"] * exposure, Daylight.FLOOR])
+	var rec_size: Vector2 = get_viewport().get_visible_rect().size
+	_log_console("[Daylight] probe ran offscreen: SubViewport %dx%d (recorded viewport %dx%d), %d positions, %d force_draw calls, none of them main-loop frames" % [
+			probe_size.x, probe_size.y, int(rec_size.x), int(rec_size.y),
+			ascending.size(), ascending.size() * (Daylight.RESET_SETTLE_FRAMES * 2 + Daylight.PROBE_FRAMES)])
 	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production trims by frame count)" % [
-			20, Engine.get_frames_drawn() - drawn0, DLSS_PRIME_FRAMES])
+			20, iterations, DLSS_PRIME_FRAMES])
 	_finish_daylight_probe()
 
 func _capture_thumbnail_async():

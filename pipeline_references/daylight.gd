@@ -302,6 +302,48 @@ static func probe(p_node: Node, p_env: Environment, p_vp: RID, p_frames: int = P
 	return {"samples": subsample(img, p_step), "width": img.get_width(), "height": img.get_height()}
 
 
+## Offscreen counterpart of probe(): the same measurement, taken from a viewport
+## that is NOT the one being recorded, in ZERO main-loop iterations.
+##
+## probe() paces itself on process_frame, so every probe frame is also a frame of
+## the main viewport. A video written with --write-movie gets one movie frame per
+## main-loop iteration (Main::iteration -> movie_writer->add_frame, which reads the
+## MAIN viewport's texture), so a probe spanning 69 iterations puts 69 frames in the
+## movie whichever viewport did the tracing. This function spends no iterations: it
+## drives RenderingServer.force_draw() itself (force_draw does not reach
+## movie_writer->add_frame and does not advance Engine.get_frames_drawn()) and
+## returns in the same call. Same protocol and the same number of draws as probe():
+## accumulate off for RESET_SETTLE_FRAMES, on for RESET_SETTLE_FRAMES + p_frames,
+## read back, subsample.
+##
+## Contract with the caller (video_render.gd :: _run_daylight_probe):
+##  * p_vp is the RID of a 3D SubViewport with render_target_update_mode ALWAYS,
+##    sharing the scene's World3D, whose Camera3D resolves p_env through
+##    Camera3D.environment; the camera is already on the pose to measure.
+##  * p_env is a DUPLICATE of the scene's Environment that no other camera uses:
+##    this function writes its accumulate flag and target. (Those are Environment
+##    properties, so writing them on the scene's own Environment would switch
+##    accumulation on for the recorded viewport too.)
+##  * force_draw() draws every viewport in the active list on every call, so the
+##    caller must set the recorded viewport's update mode to VIEWPORT_UPDATE_DISABLED
+##    for the duration. It must NOT deactivate it: _sort_active_viewports() seeds its
+##    list with ROOT viewports and walks down to their children, so a deactivated
+##    recorded viewport takes p_vp out of the draw list with it -- p_vp is then never
+##    drawn, never gets render buffers, and this function returns nothing.
+static func probe_offscreen(p_env: Environment, p_vp: RID, p_frames: int = PROBE_FRAMES, p_step: int = PROBE_STEP) -> Dictionary:
+	p_env.pathtracing_accumulate = false
+	for _i in range(RESET_SETTLE_FRAMES):
+		RenderingServer.force_draw(false)
+	p_env.pathtracing_accumulate = true
+	p_env.pathtracing_accumulation_target = p_frames
+	for _i in range(RESET_SETTLE_FRAMES + p_frames):
+		RenderingServer.force_draw(false)
+	var img: Image = RenderingServer.viewport_get_pathtracing_accum_image(p_vp)
+	if img == null or img.is_empty():
+		return {"samples": PackedFloat32Array(), "width": 0, "height": 0}
+	return {"samples": subsample(img, p_step), "width": img.get_width(), "height": img.get_height()}
+
+
 ## Resets the accumulator the same way probe() does, without rendering
 ## anything: call before the final still so it starts from a cleared buffer.
 static func reset_accumulator(p_node: Node, p_env: Environment) -> void:
