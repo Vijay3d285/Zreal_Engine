@@ -24,6 +24,10 @@ var _needs_auto_pan: bool = false
 # history before the real timeline starts. These get trimmed by ffmpeg.
 const DLSS_PRIME_FRAMES: int = 5
 var _dlss_prime_remaining: int = 0
+# Wall clock at the first DELIVERED frame, for the budget projection in _process().
+var _sequence_t0: int = 0
+# Wall clock at the end of the budget warm-up window (see BUDGET_WARMUP_FRAMES).
+var _budget_t_warm: int = 0
 
 # Daylight exposure (spec 2026-09-19, ported from render.gd :: _daylight_probe_and_expose).
 # Physical daylight is dim in absolute terms (a real still needed 24.7x), so the sky-normalised,
@@ -41,6 +45,19 @@ const DAYLIGHT_PROBE_POSITIONS: int = 3
 # count; the exposure it measures is compared against a full-size probe in
 # .superpowers/sdd/2026-09-28-local-highlight-relief/video-port-3.md.
 const DAYLIGHT_PROBE_MAX_WIDTH: int = 960
+# Delivered frames to time before projecting the total. Large enough that DLSS and the driver
+# have settled, small enough that the warning arrives while the job could still be acted on:
+# at ~7 s/frame this fires about a minute into the sequence.
+const BUDGET_WARMUP_FRAMES: int = 10
+# ...then TIME the next BUDGET_WINDOW_FRAMES and project from THAT. Measuring from frame 0
+# over-predicts: the first delivered frames run while DLSS and the driver are still settling.
+# Measured 2026-09-30 on urbanvideotest1: 8.10 s/frame over frames 0-10 against a true long-run
+# average of 7.07, which would have projected 3694 s for a 421-frame job that takes 3260 and
+# fits -- a false 'WILL BE KILLED' on a healthy render. A warning that cries wolf gets ignored.
+const BUDGET_WINDOW_FRAMES: int = 20
+# Mirrors main.py's int(os.getenv("VIDEO_RENDER_TIMEOUT_SECONDS", "1800")). Not authoritative --
+# the env var is read first and wins whenever production sets one.
+const BUDGET_DEFAULT_SECONDS: int = 1800
 var _daylight_probing: bool = false
 var _daylight_exposure: float = 1.0 # what the probe set; logged again at the end to prove it held
 var _render_data = {} # Full parsed JSON — used by setup_fixed_fill_lights()
@@ -217,6 +234,7 @@ func _process(_delta):
 			_apply_keyframe(0)
 		if _dlss_prime_remaining == 0:
 			_rendering = true
+			_sequence_t0 = Time.get_ticks_msec()
 			_log_console("DLSS priming complete. Starting video render...")
 		return
 	
@@ -251,7 +269,36 @@ func _process(_delta):
 	if _current_frame % 10 == 0 or _current_frame == _total_frames - 1:
 		var pct = int(float(_current_frame) / float(_total_frames) * 100.0)
 		_log_console("Frame %d/%d (%d%%)" % [_current_frame, _total_frames, pct])
-	
+
+	# Budget projection, logged ONCE, early enough to still be actionable.
+	# MEASURED, not estimated: per-frame cost is a property of the SCENE, not of the pipeline
+	# (2026-09-30: ~7.1 s/frame on urbanvideotest1 at 3840x2160 vs ~1.7 s/frame on the lighter
+	# job 301), so a hardcoded constant would be wrong on the next job.
+	#
+	# Why it exists: main.py waits VIDEO_RENDER_TIMEOUT_SECONDS and then KILLS Godot.
+	# urbanvideotest1 (421 frames at 4K) takes 3260 s -- over the 1800 s default and 91% of the
+	# 3600 s it was raised to. Without this the first sign of trouble is a killed process, no
+	# partial output, and nothing in the log saying why.
+	if _current_frame == BUDGET_WARMUP_FRAMES:
+		_budget_t_warm = Time.get_ticks_msec()
+	elif _current_frame == BUDGET_WARMUP_FRAMES + BUDGET_WINDOW_FRAMES and _budget_t_warm > 0 \
+			and _total_frames > BUDGET_WARMUP_FRAMES + BUDGET_WINDOW_FRAMES:
+		var now := float(Time.get_ticks_msec()) / 1000.0
+		var per_frame := (now - float(_budget_t_warm) / 1000.0) / float(BUDGET_WINDOW_FRAMES)
+		var remaining := float(_total_frames - _current_frame)
+		var projected := now + per_frame * remaining
+		var budget := float(BUDGET_DEFAULT_SECONDS)
+		var budget_env := OS.get_environment("VIDEO_RENDER_TIMEOUT_SECONDS")
+		if budget_env != "":
+			budget = float(budget_env)
+		var verdict := "fits"
+		if projected > budget:
+			verdict = "WILL BE KILLED -- raise VIDEO_RENDER_TIMEOUT_SECONDS, halve the fps, or shorten the clip"
+		elif projected > 0.9 * budget:
+			verdict = "fits, under 10% margin"
+		_log_console("[Budget] %.2f s/frame measured over delivered frames %d-%d -> about %.0f s for all %d (%.0f s spent so far); VIDEO_RENDER_TIMEOUT_SECONDS %.0f: %s" % [
+				per_frame, BUDGET_WARMUP_FRAMES, _current_frame, projected, _total_frames, now, budget, verdict])
+
 	_current_frame += 1
 
 # Start DLSS priming phase: hold camera at frame 0 for a few extra rendered frames so DLSS
