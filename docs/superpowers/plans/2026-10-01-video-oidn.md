@@ -21,6 +21,7 @@
 - **Never run two Godot renders at once** — two 4K path tracers on one GPU lose the device. Launch long runs with the harness's own background mechanism, never a shell `&` or `nohup` (a `&` launch has survived its tool call before and rendered concurrently into the same log). After any `VK_ERROR_DEVICE_LOST`, first check the log for two `Godot Engine v4.7` banners.
 - **Scope:** repo only (engine + `pipeline_references/`). Nothing is copied to `C:\Zlendo2026\ZlenderRender_stage_copy` — the owner ships.
 - **Test project copies:** video jobs without an `environment_url` (urbanvideotest1) need `day.exr`, which is NOT in the repo (201 MB, lives in `C:/Zlendo2026/ZlenderRender_stage_copy/godot_project/day.exr`). Run every render from a scratch copy of `pipeline_references/` without `.godot/` (production has none), made by the helper in Task 1 Step 1.
+- **Disk is 98% full (15 GB free on 2026-10-02).** `make_test_project.sh` hardlinks `day.exr` rather than copying it. Once a run's numbers are recorded, delete that run's `proj/` copy; delete 4K PNG sequences once their metric, crops and side-by-sides are written (keep logs, `done` files, metrics and composites). Check `df -h /c` before each long run; stop and report if under 5 GB.
 - **Exact environment-variable names:** `ZR_VIDEO_DENOISER` (`dlssrr`|`oidn`|`none`), `ZR_VIDEO_ACCUM_TARGET` (int), `ZR_VIDEO_FLICKER_TEST` (`1`), `ZR_OIDN_DIAG` (`1`), `ZR_OIDN_DUMP` (dir, existing).
 - **Commit attribution:** every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -103,7 +104,11 @@ D="$1"
 rm -rf "$D"; mkdir -p "$D"
 cp -r "$R/pipeline_references" "$D/"
 rm -rf "$D/pipeline_references/.godot"
-cp /c/Zlendo2026/ZlenderRender_stage_copy/godot_project/day.exr "$D/pipeline_references/day.exr"
+# HARDLINK, not copy: C: is 98% full (15 GB free on 2026-10-02) and this helper runs about a
+# dozen times. Same NTFS volume, so the link costs no space; deleting the copy later leaves
+# the original untouched. Falls back to a real copy only if linking fails.
+ln /c/Zlendo2026/ZlenderRender_stage_copy/godot_project/day.exr "$D/pipeline_references/day.exr" 2>/dev/null \
+  || cp /c/Zlendo2026/ZlenderRender_stage_copy/godot_project/day.exr "$D/pipeline_references/day.exr"
 echo "test project ready: $D/pipeline_references"
 ```
 
