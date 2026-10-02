@@ -38,6 +38,55 @@ const ENABLE_PROCEDURAL_WINDOW_GRID_CASTER = false
 #          white corner reflections from SSR + Fresnel at grazing angles.
 # false -> keep raw material values (disable fix)
 const USE_REFLECTION_PROBE_HOTSPOT_FIX = true
+# Video denoiser (spec docs/superpowers/specs/2026-10-01-video-oidn-design.md).
+#   "dlssrr" -- DLSS Ray Reconstruction, the realtime temporal denoiser. The default; unchanged.
+#   "oidn"   -- the still route's Phase A for every delivered frame: VIDEO_OIDN_ACCUM_TARGET
+#               sub-frames of VIDEO_OIDN_SPP samples through the Blackman-Harris pixel filter,
+#               then OpenImageDenoise on CUDA. Cycles' own architecture for an OIDN animation.
+#   "none"   -- Phase A without OIDN. A test control only (T4's negative control); without the
+#               OIDN latch the main loop's own draw adds one more sub-frame, so it captures
+#               (target + 1) x spp raw samples.
+# ZR_VIDEO_DENOISER overrides it for one process; ZR_VIDEO_ACCUM_TARGET overrides the target
+# (T4 measures 16, i.e. 48 spp).
+const VIDEO_DENOISER := "dlssrr"
+const VIDEO_OIDN_SPP := 3 # the still route's day value (PT_SPP_DAY), kept under the 8 s TDR watchdog
+const VIDEO_OIDN_ACCUM_TARGET := 2 # 2 x 3 = 6 spp: the owner's 1-hour, 4K/60fps budget
+const VIDEO_OIDN_CLAMP_INDIRECT := 10.0 # Cycles' sample_clamp_indirect; fireflies are what OIDN smears into blotches
+var _video_denoiser := ""
+var _flicker_test := false
+
+
+# Resolved ONCE, by whichever caller runs first: set_resolution() (viewport mode) runs before
+# build_scene() (the Environment), so both must see the same answer.
+func _resolve_video_denoiser() -> String:
+	if _video_denoiser != "":
+		return _video_denoiser
+	var mode := VIDEO_DENOISER
+	var env_mode := OS.get_environment("ZR_VIDEO_DENOISER").strip_edges().to_lower()
+	if env_mode != "":
+		mode = env_mode
+	if not (mode in ["dlssrr", "oidn", "none"]):
+		print("[VideoDenoiser] unknown mode '%s'; using dlssrr" % mode)
+		mode = "dlssrr"
+	_video_denoiser = mode
+	# T4 test hook: force an accumulator reset every delivered frame, so a static camera yields
+	# independent renders of identical content. Phase A modes only; production never sets it.
+	_flicker_test = mode != "dlssrr" and OS.get_environment("ZR_VIDEO_FLICKER_TEST") == "1"
+	print("[VideoDenoiser] %s%s" % [mode, " (FLICKER TEST: reset every frame)" if _flicker_test else ""])
+	return mode
+
+
+func _video_phase_a() -> bool:
+	return _resolve_video_denoiser() != "dlssrr"
+
+
+func _video_accum_target() -> int:
+	var t := VIDEO_OIDN_ACCUM_TARGET
+	var e := OS.get_environment("ZR_VIDEO_ACCUM_TARGET")
+	if e.is_valid_int():
+		t = maxi(1, e.to_int())
+	return t
+
 # Post-E3: GLB-INTERNAL GLASS. Assets author their panes as `alphaMode: BLEND`,
 # which Godot imports as TRANSPARENCY_ALPHA_DEPTH_PRE_PASS. Every surface in the
 # alpha family is dropped from the TLAS -- render_raytracing.cpp, "Skip surfaces
@@ -1419,10 +1468,28 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	#   PT_DENOISER_DLSS_RAY_RECONSTRUCTION = 1
 	env.set_pathtracing_enabled(true)
 	env.set_pathtracing_max_bounces(6) # 6 bounces — DLSS RR denoises so fewer bounces suffice
-	env.set_pathtracing_samples_per_pixel(6) # 4 SPP — DLSS RR handles the rest (denoising + AA)
-	env.set_pathtracing_denoiser(1) # 1 = PT_DENOISER_DLSS_RAY_RECONSTRUCTION
-	env.set("raytracing_params", PackedFloat32Array([0.0, 0.0, 0.0, 1.0]))
-	print("[VideoGLB] NVIDIA PT enabled: bounces=6, spp=4, denoiser=DLSS_RR")
+	if _video_phase_a():
+		# Phase A per delivered frame (spec 2026-10-01-video-oidn-design.md): a mirror of the still
+		# route's settings (image_glb_creation.gd, PHASE_A_*), keeping video's 6 bounces so the A/B
+		# against DLSS-RR is equal-cost and isolates the denoiser.
+		var target := _video_accum_target()
+		env.set_pathtracing_samples_per_pixel(VIDEO_OIDN_SPP)
+		env.set_pathtracing_denoiser(0) # PT_DENOISER_NONE: DLSS-RR is not the integrator here
+		env.set_pathtracing_accumulate(true)
+		env.set_pathtracing_accumulation_target(target)
+		env.set_pathtracing_oidn_denoise(_video_denoiser == "oidn")
+		env.set_pathtracing_dlss_rr_final(false)
+		env.set_pathtracing_clamp_direct(0.0)
+		env.set_pathtracing_clamp_indirect(VIDEO_OIDN_CLAMP_INDIRECT)
+		env.set_pathtracing_noise_threshold(0.0)
+		ProjectSettings.set_setting("rendering/pathtracer/oidn_device", 1) # CUDA (Task 1)
+		print("[VideoGLB] NVIDIA PT enabled: bounces=6, Phase A %d x %d spp, final=%s, oidn_device=CUDA" % [
+				target, VIDEO_OIDN_SPP, _video_denoiser])
+	else:
+		env.set_pathtracing_samples_per_pixel(6) # 4 SPP — DLSS RR handles the rest (denoising + AA)
+		env.set_pathtracing_denoiser(1) # 1 = PT_DENOISER_DLSS_RAY_RECONSTRUCTION
+		env.set("raytracing_params", PackedFloat32Array([0.0, 0.0, 0.0, 1.0]))
+		print("[VideoGLB] NVIDIA PT enabled: bounces=6, spp=4, denoiser=DLSS_RR")
 
 	# Reflection probes are now localized per room and generated automatically via _generate_localized_reflection_probes.
 

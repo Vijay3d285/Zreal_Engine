@@ -257,6 +257,8 @@ func _process(_delta):
 	
 	# Apply current keyframe
 	_apply_keyframe(_current_frame)
+	if _video_phase_a():
+		_render_phase_a_frame()
 	
 	# PNG fallback: manually save frame
 	if _use_png_fallback and _base_filename != "":
@@ -305,12 +307,60 @@ func _process(_delta):
 # Ray Reconstruction builds temporal history. These frames are captured by MovieWriter.
 # (Split out of _process so the daylight probe can run first; the priming itself is unchanged.)
 func _begin_dlss_priming() -> void:
+	if _video_phase_a():
+		# Phase A has no temporal denoiser to prime. It starts from a CLEARED accumulator instead,
+		# so delivered frame 0 renders the final scene -- exposure, sun and any DaylightFill the
+		# probe placed. Without this, frame 0 would reuse the warmup's frozen denoise: the camera
+		# is already on pose 0, so nothing resets, and the warmup ran before the probe.
+		_reset_video_accumulator()
+		_rendering = true
+		_sequence_t0 = Time.get_ticks_msec()
+		_log_console("Phase A (%s): no DLSS priming; accumulator reset. Starting video render..." % _video_denoiser)
+		if not _first_frame_saved:
+			_first_frame_saved = true
+			call_deferred("_capture_thumbnail_async")
+		return
 	_dlss_prime_remaining = DLSS_PRIME_FRAMES
 	_log_console("Scene settled. Starting DLSS priming (%d frames at frame-0 position)..." % DLSS_PRIME_FRAMES)
 	# Capture thumbnail safely asynchronously without blocking _process
 	if not _first_frame_saved:
 		_first_frame_saved = true
 		call_deferred("_capture_thumbnail_async")
+
+
+# Clears the recorded viewport's accumulator WITHOUT spending a main-loop iteration: the same
+# off/on protocol and settle count as Daylight.probe_offscreen, paced by force_draw, which never
+# reaches movie_writer->add_frame. Switching accumulate on starts a new convergence cycle and
+# clears the OIDN latch with it (render_raytracing.cpp, accum_enabled edge).
+func _reset_video_accumulator() -> void:
+	var env := _get_scene_environment()
+	if env == null:
+		return
+	env.pathtracing_accumulate = false
+	for _i in range(Daylight.RESET_SETTLE_FRAMES):
+		RenderingServer.force_draw(false)
+	env.pathtracing_accumulate = true
+
+
+# One delivered frame in Phase A. _apply_keyframe() has just moved the camera and (every 5th
+# frame) the sun; Godot defers those transform notifications to the end of the frame, and the
+# draws below happen inside this one, so they are flushed by hand (video port 3 met exactly
+# this). The camera moved, so the first draw resets the accumulator and clears the OIDN latch;
+# the last reaches the target and OIDN fires. force_draw never reaches movie_writer->add_frame,
+# so no sub-frame is recorded. The main loop's own draw then finds an unchanged camera and a set
+# latch, skips the trace (render_forward_clustered.cpp, oidn_denoise_done), and re-shows the
+# denoised image -- that draw is the frame MovieWriter captures. On a held shot the camera does
+# not move, so the frame freezes: no flicker, at the cost of ignoring a sun re-orientation.
+func _render_phase_a_frame() -> void:
+	var cam := get_node_or_null("MainCamera") as Camera3D
+	if cam != null:
+		cam.force_update_transform()
+	if _dir_light != null:
+		_dir_light.force_update_transform()
+	if _flicker_test:
+		_reset_video_accumulator()
+	for _i in range(_video_accum_target()):
+		RenderingServer.force_draw(false)
 
 func _get_scene_environment() -> Environment:
 	for child in get_children():
@@ -429,6 +479,10 @@ func _run_daylight_probe() -> void:
 
 	# The offscreen rig: SubViewport + Camera3D + a private copy of the Environment.
 	var probe_env: Environment = env.duplicate()
+	# Phase A video sets oidn_denoise on the scene Environment, and duplicate() copies it. The
+	# probe reads only the raw accumulator (viewport_get_pathtracing_accum_image), so a denoise in
+	# here is wasted -- and at 960x540 it would make the CUDA buffers reallocate against 4K.
+	probe_env.pathtracing_oidn_denoise = false
 	var probe_size := _daylight_probe_size()
 	var probe_vp := SubViewport.new()
 	probe_vp.name = "DaylightProbeViewport"
@@ -1057,9 +1111,19 @@ func set_resolution(data):
 	# The DLSS-RR denoiser only runs inside the SCALE_DLSS code path in
 	# render_forward_clustered.cpp. scale = 1.0 → no resolution change,
 	# pure denoising pass only.
-	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_DLSS
-	get_viewport().scaling_3d_scale = 1.0
-	print("[VideoRender] PT + DLSS Ray Reconstruction denoising")
+	if _video_phase_a():
+		# Phase A: the path tracer's Blackman-Harris pixel filter is the only anti-aliasing. Under
+		# DLSS scaling the renderer bakes a per-frame Halton jitter into the projection and the
+		# filter jitters again on top -- "a soft image with ragged edges" (render.gd, the still
+		# route's identical fix). BILINEAR is spatial, so jitter_phase_count stays 0; at 1.0 there
+		# is no resampling. use_taa is already false above.
+		get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+		get_viewport().scaling_3d_scale = 1.0
+		print("[VideoRender] PT + Phase A (%s): viewport BILINEAR @1.0, no projection jitter" % _video_denoiser)
+	else:
+		get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_DLSS
+		get_viewport().scaling_3d_scale = 1.0
+		print("[VideoRender] PT + DLSS Ray Reconstruction denoising")
 
 	# 16x Anisotropic Filtering (value 4 = 16x in Godot 4)
 	ProjectSettings.set_setting("rendering/textures/default_filters/anisotropic_filter_level", 16)
