@@ -48,6 +48,9 @@ void uninitialize_raycaster_oidn_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SERVERS) {
 		return;
 	}
+	// The CUDA path's device, buffers and filters live for the process (spec
+	// 2026-10-01-video-oidn-design.md); this is where they end.
+	OIDNDenoiser::release_shared_cuda();
 	// Clear the factory so the renderer stops reaching into a torn-down module. Concrete
 	// OIDNDenoiser instances created earlier are RefCounted and freed when their last
 	// reference drops (held by the RT render path's local scope).

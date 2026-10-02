@@ -1935,6 +1935,29 @@ void RenderForwardClustered::_process_sss(Ref<RenderSceneBuffersRD> p_render_buf
 	}
 }
 
+// [OIDN-DIAG] rate limit (spec 2026-10-01-video-oidn-design.md). Measured: a still prints 2
+// denoises (the exposure probe's and the final one) and 15-18 skip lines (job 201, targets 2
+// and 256); a 421-frame video would print about 2,100. The first OIDN_DIAG_MAX_FIRES denoises
+// and OIDN_DIAG_MAX_SKIPS skip lines of a process print in full -- above a still's count, so a
+// still's log is unchanged -- and then stop. ZR_OIDN_DIAG=1 restores every line. Failures
+// still print: they go through the ERR_* macros, not these lines.
+static constexpr int OIDN_DIAG_MAX_FIRES = 8;
+static constexpr int OIDN_DIAG_MAX_SKIPS = 64;
+static int s_oidn_diag_fires = 0;
+static int s_oidn_diag_skips = 0;
+
+static bool _oidn_diag_take(int &r_count, int p_max) {
+	static const bool unlimited = !OS::get_singleton()->get_environment("ZR_OIDN_DIAG").is_empty();
+	if (unlimited) {
+		return true;
+	}
+	if (r_count >= p_max) {
+		return false;
+	}
+	r_count++;
+	return true;
+}
+
 // Phase F: one-shot OIDN final-denoise of the converged accumulator, for still capture.
 //
 // This is a best-effort CPU round trip: download the converged accumulator + the diffuse
@@ -1963,16 +1986,20 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 			!p_rt_state->accum_enabled) {
 		// DIAG: log why we skipped (only first few frames, to confirm the gate values).
 		// NOTE: Godot vformat supports only %d/%s/%f/%x/%c — NOT %u nor %.4f precision.
-		if (p_rt_state->accum_frame < 5 || p_rt_state->accum_frame == p_accum_target) {
+		if ((p_rt_state->accum_frame < 5 || p_rt_state->accum_frame == p_accum_target) &&
+				_oidn_diag_take(s_oidn_diag_skips, OIDN_DIAG_MAX_SKIPS)) {
 			print_line(vformat("[OIDN-DIAG] skip: done=%d accum_frame=%d target=%d accum_enabled=%d",
 					(int)p_rt_state->oidn_denoise_done, (int)p_rt_state->accum_frame,
 					(int)p_accum_target, (int)p_rt_state->accum_enabled));
 		}
 		return;
 	}
-	print_line(vformat("[OIDN-DIAG] FIRE: accum_frame=%d target=%d dims=%dx%d",
-			(int)p_rt_state->accum_frame, (int)p_accum_target,
-			(int)p_rb->get_internal_size().width, (int)p_rb->get_internal_size().height));
+	const bool oidn_diag = _oidn_diag_take(s_oidn_diag_fires, OIDN_DIAG_MAX_FIRES);
+	if (oidn_diag) {
+		print_line(vformat("[OIDN-DIAG] FIRE: accum_frame=%d target=%d dims=%dx%d",
+				(int)p_rt_state->accum_frame, (int)p_accum_target,
+				(int)p_rb->get_internal_size().width, (int)p_rb->get_internal_size().height));
+	}
 
 
 	// The factory returns a null Ref when the raycaster_oidn module isn't linked; in that
@@ -2088,9 +2115,11 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		const float diag_in_r = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 0] : -1.0f;
 		const float diag_in_g = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 1] : -1.0f;
 		const float diag_in_b = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 2] : -1.0f;
-		print_line(vformat("[OIDN-DIAG] view=%d albedo=%d normal=%d | accum_bytes=%d albedo_bytes=%d normal_bytes=%d",
-				(int)v, (int)has_albedo, (int)has_normal,
-				(int)accum_bytes.size(), (int)albedo_bytes.size(), (int)normal_bytes.size()));
+		if (oidn_diag) {
+			print_line(vformat("[OIDN-DIAG] view=%d albedo=%d normal=%d | accum_bytes=%d albedo_bytes=%d normal_bytes=%d",
+					(int)v, (int)has_albedo, (int)has_normal,
+					(int)accum_bytes.size(), (int)albedo_bytes.size(), (int)normal_bytes.size()));
+		}
 		// Debug: ZR_OIDN_DUMP=<dir> writes the exact OIDN inputs (colour, albedo,
 		// normal) as little-endian PFM so oidnDenoise.exe can re-run the denoise
 		// offline with any subset of guides. Used for the Gap #30 follow-up
@@ -2125,10 +2154,28 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		const float diag_out_r = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 0] : -1.0f;
 		const float diag_out_g = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 1] : -1.0f;
 		const float diag_out_b = (diag_px * 3 < (size_t)pixel_count * 3) ? color_f.ptr()[diag_px * 3 + 2] : -1.0f;
-		print_line(vformat("[OIDN-DIAG] view=%d ok=%d | center in=(%f,%f,%f) out=(%f,%f,%f)",
-				(int)v, (int)ok, diag_in_r, diag_in_g, diag_in_b, diag_out_r, diag_out_g, diag_out_b));
+		if (oidn_diag) {
+			print_line(vformat("[OIDN-DIAG] view=%d ok=%d | center in=(%f,%f,%f) out=(%f,%f,%f)",
+					(int)v, (int)ok, diag_in_r, diag_in_g, diag_in_b, diag_out_r, diag_out_g, diag_out_b));
+		}
 
 		ERR_CONTINUE_MSG(!ok, "OIDN final-denoise failed; keeping raw converged image for this view.");
+
+		// ZR_OIDN_DUMP also writes the DENOISED colour (spec 2026-10-01-video-oidn-design.md,
+		// T1): comparing devices on real content needs the engine's own OIDN output in linear,
+		// before tone mapping. Same PFM layout as the input dump above. Production never sets it.
+		{
+			const String out_dump_dir = OS::get_singleton()->get_environment("ZR_OIDN_DUMP");
+			if (!out_dump_dir.is_empty()) {
+				Ref<FileAccess> f = FileAccess::open(out_dump_dir.path_join("oidn_output.pfm"), FileAccess::WRITE);
+				if (f.is_valid()) {
+					f->store_string(vformat("PF%c%d %d%c-1.0%c", 10, width, height, 10, 10));
+					for (int y = height - 1; y >= 0; y--) {
+						f->store_buffer((const uint8_t *)(color_f.ptr() + (size_t)y * width * 3), (size_t)width * 3 * sizeof(float));
+					}
+				}
+			}
+		}
 
 		// Convert denoised RGB float3 back into the internal_texture format (R16G16B16A16_SFLOAT),
 		// preserving the original alpha channel from the accumulator (so transparency/coverage

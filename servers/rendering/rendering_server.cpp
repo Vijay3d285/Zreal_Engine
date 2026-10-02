@@ -3863,6 +3863,12 @@ void RenderingServer::init() {
 	// 3.0 is the value measured on job 201 (2026-09-29 knee sweep; see the comment
 	// on RELIEF_KNEE in daylight.gd for the numbers).
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/highlight_relief_knee", PROPERTY_HINT_RANGE, "0.5,32.0,0.1"), 3.0);
+	// OIDN device for the path tracer's final denoise (spec
+	// docs/superpowers/specs/2026-10-01-video-oidn-design.md). 0 = CPU: the original path,
+	// which the still route uses unchanged. 1 = CUDA: one device, buffer set and filter set for
+	// the whole process -- 157 ms vs 5270 ms per 4K frame, and on a real frame no pixel 2 or more
+	// display levels from the CPU result. The video route's OIDN mode sets 1; nothing else does.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/oidn_device", PROPERTY_HINT_ENUM, "CPU,CUDA"), 0);
 	// Path guiding for diffuse bounces (roadmap Gap #32, spec
 	// docs/superpowers/specs/2026-09-22-path-guiding-design.md). The mixture
 	// probability between the learnt directional histogram and cosine sampling

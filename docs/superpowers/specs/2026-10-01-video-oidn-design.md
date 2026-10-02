@@ -118,9 +118,15 @@ CUDA unusable for the process, and denoises that frame and every later one on th
 The video completes, more slowly, and the budget line reports the slowdown.
 
 **Log rate-limit.** In `_oidn_final_denoise_accumulator`, the `[OIDN-DIAG]` FIRE, view
-and ok lines print for the first 3 denoises of a process; the skip lines likewise for the
-first 3 cycles. Failures always print. A still performs one denoise, so its log does not
-change.
+and ok lines print for the first 8 denoises of a process, and the skip lines for the first 64.
+Measured before choosing: a still performs 2 denoises (the exposure probe's at `target=16`,
+then the final one) and prints 15-18 skip lines, so these limits leave a still's log
+unchanged; a 421-frame video would otherwise print about 2,100 lines. `ZR_OIDN_DIAG=1`
+restores every line. Failures always print.
+
+**Debug dump of the denoised output.** `ZR_OIDN_DUMP=<dir>`, which already writes the OIDN
+inputs, also writes `oidn_output.pfm` -- the engine's own denoised colour in linear. T1 compares
+devices on real content with it. Production never sets the variable.
 
 **Not done now (YAGNI, with a stated trigger).** The host round trip -- three synchronous
 `texture_get_data` readbacks at 4K, single-threaded format conversion over 8.3 M pixels,
