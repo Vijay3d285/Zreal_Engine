@@ -1958,6 +1958,25 @@ static bool _oidn_diag_take(int &r_count, int p_max) {
 	return true;
 }
 
+// The PFM writer behind ZR_OIDN_DUMP: ONE definition for the input dump (oidn_color / oidn_albedo /
+// oidn_normal) and the denoised-output dump (oidn_output), because oidnDenoise.exe and compare_pfm.py
+// read those files as pairs -- two copies of the layout could drift apart without anything failing.
+// Little-endian float RGB, rows bottom-up. A null p_data writes nothing; a file that cannot be
+// opened is skipped silently (a debug aid, never worth failing a render over).
+static void _oidn_write_pfm(const String &p_dir, const String &p_name, const float *p_data, int p_width, int p_height) {
+	if (!p_data) {
+		return;
+	}
+	Ref<FileAccess> f = FileAccess::open(p_dir.path_join(p_name), FileAccess::WRITE);
+	if (f.is_null()) {
+		return;
+	}
+	f->store_string(vformat("PF%c%d %d%c-1.0%c", 10, p_width, p_height, 10, 10));
+	for (int y = p_height - 1; y >= 0; y--) {
+		f->store_buffer((const uint8_t *)(p_data + (size_t)y * p_width * 3), (size_t)p_width * 3 * sizeof(float));
+	}
+}
+
 // Phase F: one-shot OIDN final-denoise of the converged accumulator, for still capture.
 //
 // This is a best-effort CPU round trip: download the converged accumulator + the diffuse
@@ -2127,22 +2146,9 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		{
 			const String dump_dir = OS::get_singleton()->get_environment("ZR_OIDN_DUMP");
 			if (!dump_dir.is_empty()) {
-				auto write_pfm = [&](const String &p_name, const float *p_data) {
-					if (!p_data) {
-						return;
-					}
-					Ref<FileAccess> f = FileAccess::open(dump_dir.path_join(p_name), FileAccess::WRITE);
-					if (f.is_null()) {
-						return;
-					}
-					f->store_string(vformat("PF%c%d %d%c-1.0%c", 10, width, height, 10, 10));
-					for (int y = height - 1; y >= 0; y--) {
-						f->store_buffer((const uint8_t *)(p_data + (size_t)y * width * 3), (size_t)width * 3 * sizeof(float));
-					}
-				};
-				write_pfm("oidn_color.pfm", color_f.ptr());
-				write_pfm("oidn_albedo.pfm", has_albedo ? albedo_f.ptr() : nullptr);
-				write_pfm("oidn_normal.pfm", has_normal ? normal_f.ptr() : nullptr);
+				_oidn_write_pfm(dump_dir, "oidn_color.pfm", color_f.ptr(), width, height);
+				_oidn_write_pfm(dump_dir, "oidn_albedo.pfm", has_albedo ? albedo_f.ptr() : nullptr, width, height);
+				_oidn_write_pfm(dump_dir, "oidn_normal.pfm", has_normal ? normal_f.ptr() : nullptr, width, height);
 			}
 		}
 		bool ok = denoiser->denoise_rt(width, height,
@@ -2167,13 +2173,7 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 		{
 			const String out_dump_dir = OS::get_singleton()->get_environment("ZR_OIDN_DUMP");
 			if (!out_dump_dir.is_empty()) {
-				Ref<FileAccess> f = FileAccess::open(out_dump_dir.path_join("oidn_output.pfm"), FileAccess::WRITE);
-				if (f.is_valid()) {
-					f->store_string(vformat("PF%c%d %d%c-1.0%c", 10, width, height, 10, 10));
-					for (int y = height - 1; y >= 0; y--) {
-						f->store_buffer((const uint8_t *)(color_f.ptr() + (size_t)y * width * 3), (size_t)width * 3 * sizeof(float));
-					}
-				}
+				_oidn_write_pfm(out_dump_dir, "oidn_output.pfm", color_f.ptr(), width, height);
 			}
 		}
 
