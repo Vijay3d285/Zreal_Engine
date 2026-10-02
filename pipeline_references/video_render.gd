@@ -649,7 +649,7 @@ func _run_daylight_probe() -> void:
 			probe_size.x, probe_size.y, int(rec_size.x), int(rec_size.y),
 			ascending.size(), ascending.size() * (Daylight.RESET_SETTLE_FRAMES * 2 + Daylight.PROBE_FRAMES)])
 	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production trims by frame count)" % [
-			20, iterations, DLSS_PRIME_FRAMES])
+			20, iterations, 0 if _video_phase_a() else DLSS_PRIME_FRAMES])
 	_finish_daylight_probe()
 
 
