@@ -259,6 +259,12 @@ func _process(_delta):
 	_apply_keyframe(_current_frame)
 	if _video_phase_a():
 		_render_phase_a_frame()
+		# The thumbnail waits for frame 0's sub-frames: _capture_thumbnail_async() reads the
+		# viewport after the NEXT main-loop draw, which is only the denoised frozen re-show once
+		# the target is reached (a capture at priming time would be a raw 3-spp sub-frame).
+		if _current_frame == 0 and not _first_frame_saved:
+			_first_frame_saved = true
+			call_deferred("_capture_thumbnail_async")
 	
 	# PNG fallback: manually save frame
 	if _use_png_fallback and _base_filename != "":
@@ -316,9 +322,9 @@ func _begin_dlss_priming() -> void:
 		_rendering = true
 		_sequence_t0 = Time.get_ticks_msec()
 		_log_console("Phase A (%s): no DLSS priming; accumulator reset. Starting video render..." % _video_denoiser)
-		if not _first_frame_saved:
-			_first_frame_saved = true
-			call_deferred("_capture_thumbnail_async")
+		# The thumbnail is NOT captured here: the accumulator was just cleared, so the next draw
+		# is sub-frame 1 of the target -- a raw, un-denoised image. _process() captures it after
+		# delivered frame 0's sub-frames instead.
 		return
 	_dlss_prime_remaining = DLSS_PRIME_FRAMES
 	_log_console("Scene settled. Starting DLSS priming (%d frames at frame-0 position)..." % DLSS_PRIME_FRAMES)
