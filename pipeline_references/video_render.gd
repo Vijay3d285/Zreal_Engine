@@ -322,6 +322,12 @@ func _begin_dlss_priming() -> void:
 		_rendering = true
 		_sequence_t0 = Time.get_ticks_msec()
 		_log_console("Phase A (%s): no DLSS priming; accumulator reset. Starting video render..." % _video_denoiser)
+		# Finish frame 0's accumulation now, so this iteration's own main-loop draw -- which
+		# MovieWriter records as the last pre-roll frame -- re-shows a denoised image instead of a
+		# raw sub-frame. The camera is already on pose 0, so delivered frame 0 then finds the latch
+		# set and an unchanged camera, and re-shows the same image.
+		for _i in range(_video_accum_target()):
+			RenderingServer.force_draw(false)
 		# The thumbnail is NOT captured here: the accumulator was just cleared, so the next draw
 		# is sub-frame 1 of the target -- a raw, un-denoised image. _process() captures it after
 		# delivered frame 0's sub-frames instead.
