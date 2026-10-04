@@ -1626,19 +1626,21 @@ Fill the angle-bracketed parts from `results.txt` before committing.
 
 ---
 
-### Task 4: Production acceptance — budget, VRAM, the owner's review, closeout
+### Task 4: Production acceptance — budget, VRAM, the owner's review, closeout (REVISED 2026-10-04)
 
-Runs only if T4 passed.
+**Runs by owner decision (2026-10-04).** T4's two numeric instruments could not be validated (see the facts in Step 4); the owner chose to decide A vs B by eye on the T7 material this task builds.
+
+**Movie layout (measured in Task 2 — use it, do not re-derive it):** every movie is the pre-roll, then the delivered frames, then ONE trailing frame. Pre-roll is **20** frames in OIDN mode and **25** in DLSS-RR mode (20 warmup + 5 priming). So the full 421-frame job is **442** frames in OIDN mode (20 + 421 + 1, delivered = indices 20..440) and **447** in DLSS-RR mode (25 + 421 + 1, delivered = indices 25..445).
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-10-01-video-oidn-design.md` (Measured section)
+- Modify: `docs/superpowers/specs/2026-10-01-video-oidn-design.md` (T4 row, Measured section, frame-layout corrections)
 - Modify: `PATH_TRACER_QUALITY_ROADMAP.md` (new section after the last one)
 
 **Interfaces:**
-- Consumes (Tasks 1-3): `ZR_VIDEO_DENOISER=oidn`; the `[Budget]` line; `[OIDN] denoising on CUDA`.
-- Produces: the measured T5/T6/T7 results and the owner's sign-off.
+- Consumes (Tasks 1-2): `ZR_VIDEO_DENOISER=oidn`; the `[Budget]` line; `[OIDN] denoising on CUDA`; `$IN/uvt1_dlssrr_full_20260930.avi` and its `.log` — the full urbanvideotest1 job rendered on the DLSS-RR path on 2026-09-30. T3 proved that path frame-identical after Tasks 1-2, so it is today's DLSS-RR output for this job.
+- Produces: T5/T6 numbers, the T7 review material (Step 2), then — **after the owner's decision is relayed to you** — the closeout (Steps 4-5).
 
-- [ ] **Step 1: T5 + T6 — the full job, with VRAM sampled**
+- [ ] **Step 1: T5 + T6 — the full job in OIDN mode, VRAM sampled**
 
 Create `$W/run_t5.sh`:
 
@@ -1649,6 +1651,7 @@ W=$R/.superpowers/sdd/2026-10-01-video-oidn
 BIN=$R/bin/godot.windows.editor.x86_64.console.exe
 D=$W/t5; rm -rf "$D"; mkdir -p "$D"
 $W/make_test_project.sh "$D/proj" > /dev/null
+powershell -NoProfile -Command "query session" 2>&1 | grep -i aiadmin > "$D/session_before.txt"
 nvidia-smi --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -l 5 > "$D/vram.csv" &
 SMI=$!
 start=$(date +%s)
@@ -1656,59 +1659,76 @@ start=$(date +%s)
     --write-movie "$D/movie.avi" --fixed-fps 60 res://video_main.tscn -- $W/inputs/urbanvideotest1.json "$D/out.mp4" "$D/frame.png" > "$D/run.log" 2>&1 )
 echo "exit=$? secs=$(( $(date +%s) - start ))" > "$D/done"
 kill $SMI
+powershell -NoProfile -Command "query session" 2>&1 | grep -i aiadmin > "$D/session_after.txt"
+rm -rf "$D/proj"
 ```
 
 (The `nvidia-smi` sampler is the only process started with `&` — it is not a renderer.) Run `bash $W/run_t5.sh` in the background; it takes about an hour. Then:
 
 ```bash
-cat $W/t5/done
-grep -a "\[Budget\]\|\[OIDN\] \|VIDEO RENDER COMPLETE\|Godot Engine v4.7\|CUDA unavailable\|DEVICE_LOST\|Couldn't wait for Vulkan fence" $W/t5/run.log
+cat $W/t5/done $W/t5/session_before.txt $W/t5/session_after.txt
+grep -a "\[Budget\]\|\[OIDN\] \|VIDEO RENDER COMPLETE\|Godot Engine v4.7\|CUDA unavailable\|DEVICE_LOST\|Couldn't wait for Vulkan fence\|exposure at end of sequence" $W/t5/run.log
 python -c "import csv;r=[float(x[1]) for x in csv.reader(open(r'$W/t5/vram.csv'))];print('VRAM peak %.0f MiB of %s' % (max(r), open(r'$W/t5/vram.csv').readline().split(',')[2].strip()))"
 $FP -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 $W/t5/movie.avi
 ```
 
 Expected:
-- **T5:** `secs` under **3600**; the `[Budget]` projection within a few percent of it; `VIDEO RENDER COMPLETE - 421 frames`; **442** frames in the movie (1 + 20 + 421).
-- **T6:** no `DEVICE_LOST` / fence errors, one banner, no CUDA fallback; VRAM peak with clear margin under 16376 MiB.
+- **T5:** `secs` under **3600**; the `[Budget]` projection within a few percent of it; `VIDEO RENDER COMPLETE - 421 frames`; **442** frames in the movie.
+- **T6:** no `DEVICE_LOST` / fence errors, one banner, no `CUDA unavailable/failed`; VRAM peak with clear margin under 16376 MiB.
 
-If `secs` ≥ 3600: **stop**. Record the per-frame time from the `[Budget]` line and the total, report to the owner, and plan the spec's named remedy -- multithreading the conversion loops in `_oidn_final_denoise_accumulator` -- as a separate Task 5 with its own code and its own T1/T2 re-run. Do not improvise it inside this step.
+If `secs` ≥ 3600: **stop**. Record the per-frame time from the `[Budget]` line and the total, and report — the spec's named remedy (multithreading the conversion loops in `_oidn_final_denoise_accumulator`) becomes a separate Task 5 with its own code and its own T1/T2 re-run. Do not improvise it.
 
-- [ ] **Step 2: T7 — material for the owner's review**
+- [ ] **Step 2: T7 — build the owner's review material**
 
-Render the dense production-speed path in both modes, losslessly:
-
-```bash
-for m in oidn dlssrr; do
-  D=$W/t7/$m; rm -rf $D; mkdir -p $D/png; $W/make_test_project.sh $D/proj > /dev/null
-  ( cd $D && env ZR_VIDEO_DENOISER=$m $BIN --path $D/proj/pipeline_references --write-movie $D/png/f.png --fixed-fps 30 \
-      res://video_main.tscn -- $IN/job301_dense30.json $D/out.mp4 $D/frame.png > $D/run.log 2>&1 )
-done
-```
-
-(One after the other.) Then build the review material from the last 30 PNGs of each mode:
+First confirm the two movies are like-for-like:
 
 ```bash
-for m in oidn dlssrr; do
-  mkdir -p $W/t7/$m/last30
-  i=0; for f in $(ls $W/t7/$m/png/*.png | tail -30); do cp "$f" $(printf "$W/t7/$m/last30/%03d.png" $i); i=$((i+1)); done
-done
-$FF -y -loglevel error -framerate 30 -i $W/t7/oidn/last30/%03d.png -framerate 30 -i $W/t7/dlssrr/last30/%03d.png -filter_complex hstack -c:v libx264 -crf 12 -pix_fmt yuv420p $W/t7/side_by_side.mp4
+$FP -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of csv=p=0 $IN/uvt1_dlssrr_full_20260930.avi
+grep -a "exposure at end of sequence" $W/t5/run.log $IN/uvt1_dlssrr_full_20260930.log
 ```
 
-Write `$W/t7/crops.py`:
+Expected: **447** frames in the DLSS-RR movie; the same held exposure in both logs (the probe is independent of the denoiser). If either differs, stop and report — the comparison would not be like-for-like.
+
+Look at one delivered frame of each first, to place the 1:1 crop on a region holding a flat wall AND an edge:
+
+```bash
+mkdir -p $W/t7
+$FF -y -loglevel error -i $W/t5/movie.avi -vf "select=eq(n\,230)" -vsync 0 -frames:v 1 $W/t7/oidn_kf210.png
+$FF -y -loglevel error -i $IN/uvt1_dlssrr_full_20260930.avi -vf "select=eq(n\,235)" -vsync 0 -frames:v 1 $W/t7/dlssrr_kf210.png
+```
+
+(Index 230 = OIDN pre-roll 20 + keyframe 210; index 235 = DLSS-RR pre-roll 25 + keyframe 210: the same pose.) Read both PNGs, choose `CX,CY` (top-left of a 1280x720 region at 3840x2160) on a flat wall with an edge, and record the choice and why. Defaults if nothing better: `CX=1280 CY=540`.
+
+Then build, with OIDN on the LEFT and DLSS-RR on the RIGHT, the 421 delivered frames aligned:
+
+```bash
+CX=1280; CY=540   # replace with the chosen region
+$FF -y -loglevel error -i $W/t5/movie.avi -i $IN/uvt1_dlssrr_full_20260930.avi -filter_complex \
+  "[0:v]trim=start_frame=20:end_frame=441,setpts=PTS-STARTPTS,scale=1920:1080[a];[1:v]trim=start_frame=25:end_frame=446,setpts=PTS-STARTPTS,scale=1920:1080[b];[a][b]hstack" \
+  -r 60 -c:v libx264 -crf 14 -pix_fmt yuv420p $W/t7/side_by_side_full.mp4
+$FF -y -loglevel error -i $W/t5/movie.avi -i $IN/uvt1_dlssrr_full_20260930.avi -filter_complex \
+  "[0:v]trim=start_frame=20:end_frame=441,setpts=PTS-STARTPTS,crop=1280:720:$CX:$CY[a];[1:v]trim=start_frame=25:end_frame=446,setpts=PTS-STARTPTS,crop=1280:720:$CX:$CY[b];[a][b]hstack" \
+  -r 60 -c:v libx264 -crf 12 -pix_fmt yuv420p $W/t7/side_by_side_crop_1to1.mp4
+$FP -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames,width,height -of csv=p=0 $W/t7/side_by_side_full.mp4
+$FP -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames,width,height -of csv=p=0 $W/t7/side_by_side_crop_1to1.mp4
+```
+
+Expected: `3840,1080,421` and `2560,720,421`.
+
+Write `$W/t7/crops.py` for the still crops (staircase / checkerboard check at keyframe 210):
 
 ```python
 from PIL import Image, ImageDraw
 
 W = r"C:/Users/aiadmin/Desktop/Engine_Build_test/Zreal_Engine/.superpowers/sdd/2026-10-01-video-oidn/t7"
-# (x0, y0, x1, y1) at 3840x2160: an edge-heavy region and a plain wall. Look at 015.png first and
-# move the boxes onto a furniture outline and a flat wall if they land elsewhere.
+# (x0, y0, x1, y1) at 3840x2160: an edge-heavy region and a plain wall. Move them onto a furniture
+# outline and a flat wall if they land elsewhere (look at oidn_kf210.png first).
 boxes = {"edges": (1500, 1000, 1800, 1200), "flat wall": (400, 300, 700, 500)}
 rows = []
 for name, box in boxes.items():
     pair = []
     for m in ("oidn", "dlssrr"):
-        im = Image.open(W + "/" + m + "/last30/015.png").convert("RGB").crop(box)
+        im = Image.open(W + "/" + m + "_kf210.png").convert("RGB").crop(box)
         im = im.resize((im.width * 2, im.height * 2), Image.NEAREST)  # 2x, nearest: staircase stays visible
         t = Image.new("RGB", (im.width, im.height + 24), (30, 30, 30))
         t.paste(im, (0, 24))
@@ -1727,20 +1747,35 @@ out.save(W + "/crops.png")
 print("wrote crops.png")
 ```
 
-Run `python $W/t7/crops.py`, then send `side_by_side.mp4` and `crops.png` to the owner and ask for sign-off on the look. **Shipping A requires that approval.**
+Run `python $W/t7/crops.py`.
 
-- [ ] **Step 3: Close out the spec and the roadmap**
+- [ ] **Step 3: STOP — report for the owner's review**
 
-Append to the spec a `## Measured (<the run date>)` section with: T1 (fixture and job 201), T2 (md5), T3 (frames identical), T4 (the four lines), T5 (seconds, per-frame, budget projection), T6 (VRAM peak), T7 (owner's decision, date). Add a section to `PATH_TRACER_QUALITY_ROADMAP.md` after the last one, titled `## 11.32 Video OIDN -- per-frame OpenImageDenoise, as Cycles animates`, summarising: why video left DLSS-RR, that Cycles has no temporal OIDN, the CUDA path, the measured numbers, and the recorded follow-ups (approach B if detail is wanted; stills to CUDA; the still route's wasted probe denoise).
+Do not write the closeout yet. Reply with status DONE_WITH_CONCERNS and the first line `AWAITING OWNER REVIEW`, then the T5/T6 numbers and the paths of `side_by_side_full.mp4`, `side_by_side_crop_1to1.mp4` and `crops.png` (OIDN left, DLSS-RR right in all three). The controller shows them to the owner and resumes you with the decision.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Close out the spec and the roadmap (after the owner's decision)**
+
+In the spec:
+
+1. **Frame layout.** Correct every frame decomposition to "pre-roll, delivered, 1 trailing": 33 = 20 + 12 + 1 (OIDN, 12 keyframes), 38 = 20 + 5 + 12 + 1 (DLSS-RR), 442 = 20 + 421 + 1 (OIDN, full job).
+2. **T4 row.** Replace its description and bar with: "**Not validated.** Two instruments were built; each failed its own pre-registered negative control, so no numeric gate decided A vs B. The owner decided by eye at T7 (2026-10-04)." Then add a `**T4, measured (2026-10-03):**` paragraph under the testing table with exactly these facts:
+   - *Design 1* (one pose held 30 frames, accumulator force-reset each frame): blind. Raw 9-spp frames read mean 0.033 levels; all 30 delivered frames were md5-identical in both the raw and the OIDN runs. Cause: the accumulate route seeds from `accum_frame`, which resets with the accumulator (`scene_raytracing_raygen.glsl:417-421`), so every cycle replays the same Sobol sequence — as Cycles gives every frame one seed by default (`use_animated_seed = False`, `blender/addon/properties.py:905-908`; `blender/sync.cpp:408`). Consequence for production: on static content OIDN video cannot flicker.
+   - *Design 2* (urbanvideotest1 keyframes 0-29 at production speed; per-pixel temporal second difference on the flattest half of the frame, one mask from the 48-spp run): d2 rms raw 28.717, oidn6 14.033, oidn48 13.801, dlssrr 13.215. Negative control raw/dlssrr = 2.17 against a pre-registered 3.0: FAILED. A content floor of about 13.8 levels (texture sliding past at constant speed; the motion-smeared mean made the "flat" mask permissive) swamps the noise. The gate's 1.062 is therefore not a verdict, and is biased besides: DLSS-RR reads 4.2% *below* the near-noise-free 48-spp reference because its temporal smoothing also damps moving texture.
+   - *Descriptive, post-hoc, not a gate:* in quadrature against the 48-spp run, raw adds 25.18 levels of temporal noise and 6-spp OIDN 2.54; 6 spp reads 1.7% above 48 spp (same denoiser, same frames, only the samples differ) — 8x the samples barely moved stability.
+   - *Defect found in the plan's metric code:* the flat-mask box blur summed in float32 over a 4K frame (sums ~2e9, float32 spacing 128-256), wrong on 43.8% of pixels in a synthetic check; fixed to float64. The plan-verbatim version gave control 1.92 and gate 1.047 — the same outcomes.
+3. **Measured section.** Append `## Measured (<the run date>)` with: T1 (fixture: 83.61% of floats differing, 0 pixels at 2+ levels, max 1; job 201: 100.00% differing, 0.0000% at 2+ levels, max 1, 61.46 dB, input md5s identical); T2 (still route unchanged: the new and the pre-change binaries both give `befe659d…` with the session connected — the archived `2a17e657…` is no longer reproducible on unchanged code, so "stills unchanged" is an A/B of binaries in one session state); T3 (38 of 38 frames identical); T4 (see above); T5 (seconds, per-frame, budget projection); T6 (VRAM peak); T7 (the owner's decision and its date, verbatim as relayed).
+
+Add to `PATH_TRACER_QUALITY_ROADMAP.md`, after the last section, `## 11.32 Video OIDN -- per-frame OpenImageDenoise, as Cycles animates`: why video left DLSS-RR (the still route's staircase / checkerboard finding); that Cycles has no temporal OIDN and gives every frame one seed by default, and that this route does both the same way; the CUDA path (157 vs 5270 ms per 4K frame, visually identical to CPU); T4's outcome as recorded above; T5-T7; the follow-ups — approach B only if more detail is wanted, moving stills to CUDA, the still route's wasted denoise inside its exposure probe.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 cd $R && git add docs/superpowers/specs/2026-10-01-video-oidn-design.md PATH_TRACER_QUALITY_ROADMAP.md
 git commit -F - <<'EOF'
-docs(video): video OIDN closeout -- budget, VRAM and the owner's review measured
+docs(video): video OIDN closeout -- budget, VRAM, T4's outcome and the owner's review
 
-<T5 seconds and per-frame; T6 VRAM peak; T7 sign-off; anything that surprised.>
+<T5 seconds and per-frame; T6 VRAM peak; T4 recorded as not validated with the two designs'
+numbers; T7 decision; anything that surprised.>
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
