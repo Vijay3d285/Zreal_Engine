@@ -1317,75 +1317,98 @@ Fill the angle-bracketed paragraph from `$W/task2.md`.
 
 ---
 
-### Task 3: T4 — the flicker measurement that decides A vs B
+### Task 3: T4 — the flicker measurement that decides A vs B (REVISED 2026-10-03)
+
+**Why revised.** The first T4 design (one camera pose held for 30 frames, the accumulator force-reset every frame) is blind, and its negative control proved it: raw 9-spp frames passed with mean 0.033 levels, and all 30 delivered frames of both the raw and the OIDN runs were md5-identical. The accumulate route seeds its samples from `accum_frame`, which resets with the accumulator (`scene_raytracing_raygen.glsl:417-421`: "makes a given accum_frame draw the same point every time it recurs"), so every accumulation cycle replays the same Sobol sequence. Cycles does the same by default: `use_animated_seed` defaults to `False` (`blender/addon/properties.py:905-908`), and `blender/sync.cpp:408` then gives every frame the same seed. Consequence for production: on static content OIDN video cannot flicker at all. The risk is under MOTION — denoiser residue tied to a screen-fixed sample pattern while the scene slides past. The owner chose (2026-10-03) to measure exactly that: 30 consecutive production frames, OIDN against today's DLSS-RR on the same frames.
 
 **Files:**
-- Create: `pipeline_references/tests/video_oidn/make_static_job.py`
-- Create: `pipeline_references/tests/video_oidn/flicker_metric.py`
-- Modify: `docs/superpowers/specs/2026-10-01-video-oidn-design.md` (correction 2 and the measured result)
+- Create: `pipeline_references/tests/video_oidn/make_segment_job.py`
+- Create: `pipeline_references/tests/video_oidn/flicker_metric.py` (replaces the untracked first version)
+- Delete (untracked, never committed): `pipeline_references/tests/video_oidn/make_static_job.py`
+- Modify: `docs/superpowers/specs/2026-10-01-video-oidn-design.md` (T4 row and a Measured paragraph)
 
 **Interfaces:**
-- Consumes (Task 2): `ZR_VIDEO_DENOISER`, `ZR_VIDEO_ACCUM_TARGET`, `ZR_VIDEO_FLICKER_TEST=1`.
-- Produces: the verdict. **PASS → Task 4. FAIL → stop; approach B gets its own spec.**
+- Consumes (Task 2): `ZR_VIDEO_DENOISER` (`oidn` | `none` | `dlssrr`), `ZR_VIDEO_ACCUM_TARGET`. **Not** `ZR_VIDEO_FLICKER_TEST` — this design measures production behaviour.
+- Facts measured in Task 2 that this task relies on: every movie ends with ONE trailing frame after the delivered frames; the pre-roll is 20 frames in `oidn`/`none` and 25 in `dlssrr`. So 30 delivered frames give **51** PNGs (`oidn`/`none`) or **56** (`dlssrr`), and the delivered frames are `files[-31:-1]`. `none` mode captures 3 sub-frames per delivered frame (9 spp raw).
+- Produces: the verdict. **PASS → Task 4. FAIL → commit, stop and report; the owner decides between proceeding and approach B.**
 
-- [ ] **Step 1: Write the static-job builder**
+- [ ] **Step 1: Clean up the blind first attempt**
 
-Create `pipeline_references/tests/video_oidn/make_static_job.py`:
+```bash
+rm -f $R/pipeline_references/tests/video_oidn/make_static_job.py $R/pipeline_references/tests/video_oidn/flicker_metric.py
+rm -rf $W/t4/raw/png $W/t4/oidn6/png
+```
+
+(The evidence that the first design was blind — one distinct md5 across delivered frames in both runs — is recorded in the ledger. The PNGs are ~1.8 GB on a nearly full disk.)
+
+- [ ] **Step 2: Write the segment-job builder**
+
+Create `pipeline_references/tests/video_oidn/make_segment_job.py`:
 
 ```python
-"""T4 input: a video job whose every keyframe is ONE pose of a real production job.
+"""T4 input: N CONSECUTIVE keyframes of a production video job, at their real speed.
 
-Spec docs/superpowers/specs/2026-10-01-video-oidn-design.md, T4. With the camera static,
-ZR_VIDEO_FLICKER_TEST=1 makes every delivered frame an independent render of identical content
-(camera AND sun: _apply_keyframe re-orients the sun from cam.position and cam.basis.z, which
-never change here), so any frame-to-frame change is the denoiser's alone.
+Spec docs/superpowers/specs/2026-10-01-video-oidn-design.md, T4 (revised 2026-10-03). The
+camera moves as it does in production, so the measurement sees what a viewer sees.
 
-usage: python make_static_job.py <source_job.json> <out.json> [--frame K] [--count N]
+usage: python make_segment_job.py <source_job.json> <out.json> [--start S] [--count N]
 """
 import argparse
-import copy
 import json
 
 ap = argparse.ArgumentParser()
 ap.add_argument("source")
 ap.add_argument("out")
-ap.add_argument("--frame", type=int, default=0, help="keyframe index whose pose is held")
-ap.add_argument("--count", type=int, default=30, help="delivered frames")
+ap.add_argument("--start", type=int, default=0, help="first keyframe index of the segment")
+ap.add_argument("--count", type=int, default=30, help="consecutive keyframes (= delivered frames)")
 a = ap.parse_args()
 
 with open(a.source, encoding="utf-8") as f:
     job = json.load(f)
 anim = job["video_animation"]
-pose = anim["keyframes"][a.frame]
-frames = []
-for i in range(a.count):
-    kf = copy.deepcopy(pose)
+frames = anim["keyframes"][a.start:a.start + a.count]
+if len(frames) != a.count:
+    raise SystemExit("source has only %d keyframes from %d" % (len(frames), a.start))
+for i, kf in enumerate(frames):
     kf["frame"] = i
-    frames.append(kf)
 anim["keyframes"] = frames
 anim["duration_seconds"] = a.count / float(anim.get("fps", 60.0))
 with open(a.out, "w", encoding="utf-8") as f:
     json.dump(job, f)
-print("wrote %s: %d frames holding keyframe %d" % (a.out, a.count, a.frame))
+print("wrote %s: keyframes %d..%d (%d consecutive)" % (a.out, a.start, a.start + a.count - 1, a.count))
 ```
 
-- [ ] **Step 2: Write the metric (and test it on synthetic data first)**
+- [ ] **Step 3: Write the metric, and prove it with its selftest first**
 
 Create `pipeline_references/tests/video_oidn/flicker_metric.py`:
 
 ```python
-"""T4 metric: per-pixel temporal standard deviation of 8-bit display luma.
+"""T4 metric (revised 2026-10-03): temporal second difference on a MOVING camera, flat regions.
 
-Spec docs/superpowers/specs/2026-10-01-video-oidn-design.md, T4. Reads a lossless PNG sequence
-(MovieWriter writes one when the movie path ends in .png), keeps the LAST --frames frames (the
-delivered ones; the pre-roll comes first), computes each pixel's std across them, and judges the
-mean and 99th percentile over all pixels against the bar:
+Spec docs/superpowers/specs/2026-10-01-video-oidn-design.md, T4. Video OIDN replays the same
+sample sequence every frame (the accumulate route seeds from accum_frame, which resets with each
+delivered frame -- as Cycles' default, use_animated_seed = False, gives every frame one seed), so
+identical content renders identically and a static-camera test measures nothing. What can go
+wrong happens under motion, so this reads 30 consecutive production frames.
 
-    mean <= 1.0 level  AND  p99 <= 2.0 levels
+Per pixel, d2[t] = L[t+1] - 2 L[t] + L[t-1] cancels any change that is linear in time -- smooth
+camera motion over a few frames -- and keeps erratic frame-to-frame change: boiling, or denoiser
+residue tied to the screen while the scene slides past.
 
-The 8-bit quantisation floor alone is ~0.29 levels (1/sqrt(12)).
+FLAT REGIONS ONLY. A per-frame denoiser (OIDN) keeps moving edges sharp; a temporal one
+(DLSS-RR) softens them, which lowers d2 at edges without being any more stable. So the mask is
+the flattest half of the frame -- lowest spatial gradient of the REFERENCE run's temporal mean,
+box-blurred 5x5 -- excluding near-black (<= 5) and near-white (>= 250) pixels, and the SAME mask
+is applied to every run.
 
-usage: python flicker_metric.py <png_dir> [--frames 30] [--label name]
+Verdicts (fixed before measuring, owner decision 2026-10-03):
+  negative control  rms(raw) >= 3 x rms(dlssrr), else the instrument cannot see noise
+  gate              rms(oidn6) <= rms(dlssrr): OIDN no less stable than today's DLSS-RR
+
+Every movie ends with ONE trailing frame after the delivered frames (measured in Task 2), so the
+delivered frames are files[-(N+1):-1].
+
+usage: python flicker_metric.py --ref oidn48 raw=<png_dir> oidn6=<png_dir> oidn48=<png_dir> dlssrr=<png_dir>
        python flicker_metric.py --selftest
 """
 import argparse
@@ -1396,134 +1419,169 @@ import sys
 import numpy as np
 from PIL import Image
 
-BAR_MEAN = 1.0
-BAR_P99 = 2.0
+FRAMES = 30
+FLAT_FRACTION = 0.5
+NEG_CONTROL_RATIO = 3.0
 
 
 def luma8(path):
-    a = np.asarray(Image.open(path).convert("RGB"), dtype=np.float64)
+    a = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
     return 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
 
 
-def measure(stack):
-    std = stack.std(axis=0)
+def delivered(png_dir, n):
+    files = sorted(glob.glob(os.path.join(png_dir, "*.png")))
+    if len(files) < n + 1:
+        sys.exit("only %d PNGs in %s, need %d delivered + 1 trailing" % (len(files), png_dir, n))
+    return np.stack([luma8(p) for p in files[-(n + 1):-1]])
+
+
+def flat_mask(stack, frac=FLAT_FRACTION):
+    m = stack.mean(axis=0)
+    k = 5
+    pad = np.pad(m, k // 2, mode="edge")
+    c = np.pad(pad.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    blur = (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
+    gy, gx = np.gradient(blur)
+    g = np.hypot(gx, gy)
+    valid = (m > 5) & (m < 250)
+    return valid & (g <= np.percentile(g[valid], 100 * frac))
+
+
+def d2_stats(stack, mask):
+    d2 = stack[2:] - 2.0 * stack[1:-1] + stack[:-2]
+    sq = d2 * d2
+    per_px = np.sqrt(sq.mean(axis=0))
     return {
-        "frames": stack.shape[0],
-        "mean": float(std.mean()),
-        "p95": float(np.percentile(std, 95)),
-        "p99": float(np.percentile(std, 99)),
-        "ge1": float((std >= 1.0).mean()),
-        "ge2": float((std >= 2.0).mean()),
+        "rms": float(np.sqrt(sq[:, mask].mean())),
+        "p99": float(np.percentile(per_px[mask], 99)),
+        "rms_all": float(np.sqrt(sq.mean())),
     }
-
-
-def verdict(m):
-    return m["mean"] <= BAR_MEAN and m["p99"] <= BAR_P99
-
-
-def report(label, m):
-    ok = verdict(m)
-    print("%-22s frames %d  mean %.3f  p95 %.3f  p99 %.3f  std>=1 %.2f%%  std>=2 %.2f%%  -> %s" % (
-        label, m["frames"], m["mean"], m["p95"], m["p99"], 100 * m["ge1"], 100 * m["ge2"],
-        "PASS" if ok else "FAIL"))
-    return ok
 
 
 def selftest():
     rng = np.random.default_rng(1)
-    base = rng.uniform(20, 230, size=(64, 64))
-    still = np.stack([np.round(base) for _ in range(30)])
-    noisy = np.stack([np.clip(np.round(base + rng.normal(0, 8, base.shape)), 0, 255) for _ in range(30)])
-    s, n = measure(still), measure(noisy)
-    assert s["mean"] == 0.0 and verdict(s), s
-    assert n["mean"] > 5.0 and not verdict(n), n
-    print("selftest OK: identical frames PASS (mean 0), sigma-8 noise FAILS (mean %.2f)" % n["mean"])
+    yy, xx = np.mgrid[0:64, 0:64]
+    base = 60.0 + 0.5 * xx + 0.3 * yy
+    lin = np.stack([np.round(base + 0.7 * t) for t in range(FRAMES)]).astype(np.float32)
+    noisy = np.stack([np.clip(np.round(base + rng.normal(0, 8, base.shape)), 0, 255)
+                      for _ in range(FRAMES)]).astype(np.float32)
+    every = np.ones(base.shape, bool)
+    a, b = d2_stats(lin, every), d2_stats(noisy, every)
+    assert a["rms"] < 1.0, ("linear drift must cancel", a)
+    assert b["rms"] > 10.0, ("sigma-8 noise must be seen", b)
+    edge = np.stack([np.where(xx < 32, 50.0, 200.0) for _ in range(FRAMES)]).astype(np.float32)
+    assert not flat_mask(edge)[:, 30:34].any(), "edge pixels must be excluded from the flat mask"
+    print("selftest OK: linear drift rms %.3f (cancels), sigma-8 noise rms %.2f (seen), edge excluded"
+          % (a["rms"], b["rms"]))
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("png_dir", nargs="?")
-    ap.add_argument("--frames", type=int, default=30)
-    ap.add_argument("--label", default="")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--ref", default="oidn48", help="run whose temporal mean defines the flat mask")
+    ap.add_argument("--frames", type=int, default=FRAMES)
+    ap.add_argument("runs", nargs="*", help="label=png_dir")
     a = ap.parse_args()
     if a.selftest:
         selftest()
         sys.exit(0)
-    files = sorted(glob.glob(os.path.join(a.png_dir, "*.png")))
-    if len(files) < a.frames:
-        sys.exit("only %d PNGs in %s, need %d" % (len(files), a.png_dir, a.frames))
-    stack = np.stack([luma8(p) for p in files[-a.frames:]])
-    sys.exit(0 if report(a.label or os.path.basename(a.png_dir.rstrip("/\\")), measure(stack)) else 1)
+    runs = dict(r.split("=", 1) for r in a.runs)
+    mask = flat_mask(delivered(runs[a.ref], a.frames))
+    print("flat mask from %s: %.1f%% of pixels" % (a.ref, 100.0 * mask.mean()))
+    res = {}
+    for label, d in runs.items():
+        res[label] = d2_stats(delivered(d, a.frames), mask)
+        r = res[label]
+        print("%-8s d2 rms (flat) %.3f   p99 per-pixel (flat) %.3f   rms (all pixels) %.3f"
+              % (label, r["rms"], r["p99"], r["rms_all"]))
+    ok = True
+    if "raw" in res and "dlssrr" in res:
+        ratio = res["raw"]["rms"] / max(res["dlssrr"]["rms"], 1e-9)
+        nc = ratio >= NEG_CONTROL_RATIO
+        print("NEGATIVE CONTROL raw / dlssrr = %.2f (must be >= %.1f) -> %s"
+              % (ratio, NEG_CONTROL_RATIO, "OK" if nc else "FAIL: the instrument cannot see noise"))
+        ok = ok and nc
+    if "oidn6" in res and "dlssrr" in res:
+        ratio = res["oidn6"]["rms"] / max(res["dlssrr"]["rms"], 1e-9)
+        gate = res["oidn6"]["rms"] <= res["dlssrr"]["rms"]
+        print("GATE oidn6 / dlssrr = %.3f (must be <= 1.000) -> %s" % (ratio, "PASS" if gate else "FAIL"))
+        ok = ok and gate
+    sys.exit(0 if ok else 1)
 ```
 
 Run: `python $R/pipeline_references/tests/video_oidn/flicker_metric.py --selftest`
 
-Expected: `selftest OK: identical frames PASS (mean 0), sigma-8 noise FAILS (mean ~8)`. If it does not print that, fix the script before rendering anything.
+Expected: `selftest OK: linear drift rms <1 (cancels), sigma-8 noise rms ~19.6 (seen), edge excluded`. If it does not print that, fix the script before rendering anything.
 
-- [ ] **Step 3: Build the static job**
+- [ ] **Step 4: Build the segment job**
 
 ```bash
-python $R/pipeline_references/tests/video_oidn/make_static_job.py $IN/urbanvideotest1.json $IN/uvt1_static30.json --frame 0 --count 30
+python $R/pipeline_references/tests/video_oidn/make_segment_job.py $IN/urbanvideotest1.json $IN/uvt1_seg30.json --start 0 --count 30
 ```
 
-Expected: `wrote ...: 30 frames holding keyframe 0`.
+Expected: `wrote ...: keyframes 0..29 (30 consecutive)`.
 
-- [ ] **Step 4: Render the four configurations, one at a time**
+- [ ] **Step 5: Render the four configurations, one at a time**
 
-Create `$W/run_t4.sh`:
+Create `$W/run_t4m.sh`:
 
 ```bash
 #!/bin/bash
-# usage: run_t4.sh <label> <env assignments...>
+# usage: run_t4m.sh <label> <env assignments...>
 R=/c/Users/aiadmin/Desktop/Engine_Build_test/Zreal_Engine
 W=$R/.superpowers/sdd/2026-10-01-video-oidn
 BIN=$R/bin/godot.windows.editor.x86_64.console.exe
 L="$1"; shift
-D=$W/t4/$L; rm -rf "$D"; mkdir -p "$D/png"
+D=$W/t4m/$L; rm -rf "$D"; mkdir -p "$D/png"
 $W/make_test_project.sh "$D/proj" > /dev/null
+powershell -NoProfile -Command "query session" 2>&1 | grep -i aiadmin > "$D/session_before.txt"
 start=$(date +%s)
 ( cd "$D" && env "$@" $BIN --path "$D/proj/pipeline_references" --write-movie "$D/png/f.png" --fixed-fps 60 \
-    res://video_main.tscn -- $W/inputs/uvt1_static30.json "$D/out.mp4" "$D/frame.png" > "$D/run.log" 2>&1 )
+    res://video_main.tscn -- $W/inputs/uvt1_seg30.json "$D/out.mp4" "$D/frame.png" > "$D/run.log" 2>&1 )
 echo "exit=$? secs=$(( $(date +%s) - start ))" > "$D/done"
+powershell -NoProfile -Command "query session" 2>&1 | grep -i aiadmin > "$D/session_after.txt"
+rm -rf "$D/proj"
+echo "PNGs: $(ls $D/png/*.png | wc -l)"; cat "$D/done" "$D/session_before.txt" "$D/session_after.txt"
 grep -a "\[VideoDenoiser\]\|\[OIDN\] \|Godot Engine v4.7" "$D/run.log"
 ```
 
-Run each of these in the background, **waiting for one to finish before starting the next**:
+Run each in the background, **waiting for one to finish before starting the next**:
 
 ```bash
-bash $W/run_t4.sh oidn6   ZR_VIDEO_DENOISER=oidn ZR_VIDEO_FLICKER_TEST=1
-bash $W/run_t4.sh raw     ZR_VIDEO_DENOISER=none ZR_VIDEO_FLICKER_TEST=1
-bash $W/run_t4.sh oidn48  ZR_VIDEO_DENOISER=oidn ZR_VIDEO_FLICKER_TEST=1 ZR_VIDEO_ACCUM_TARGET=16
-bash $W/run_t4.sh dlssrr  ZR_VIDEO_DENOISER=dlssrr
+bash $W/run_t4m.sh oidn6   ZR_VIDEO_DENOISER=oidn
+bash $W/run_t4m.sh raw     ZR_VIDEO_DENOISER=none
+bash $W/run_t4m.sh oidn48  ZR_VIDEO_DENOISER=oidn ZR_VIDEO_ACCUM_TARGET=16
+bash $W/run_t4m.sh dlssrr  ZR_VIDEO_DENOISER=dlssrr
 ```
 
-After each: check `done` shows `exit=0`, exactly one `Godot Engine v4.7` banner, and the expected `[VideoDenoiser]` line (`oidn (FLICKER TEST: reset every frame)`, `none (FLICKER TEST...)`, `oidn (FLICKER TEST...)`, `dlssrr`). Approximate times at 4K: oidn6 and raw ~12 min, oidn48 ~35 min, dlssrr ~6 min.
+After each: `exit=0`; **51** PNGs (`oidn6`, `raw`, `oidn48`) or **56** (`dlssrr`) — stop if different; exactly one `Godot Engine v4.7` banner; the expected `[VideoDenoiser]` line (`oidn`, `none`, `oidn`, `dlssrr`, with NO "FLICKER TEST" suffix). If the session state differs between `session_before.txt` and `session_after.txt`, re-run that configuration and keep both. Approximate times at 4K: oidn6, raw and dlssrr ~6-8 min each, oidn48 ~30 min.
 
-- [ ] **Step 5: Measure**
+- [ ] **Step 6: Measure**
 
 ```bash
-for l in oidn6 raw oidn48 dlssrr; do python $R/pipeline_references/tests/video_oidn/flicker_metric.py $W/t4/$l/png --frames 30 --label $l; done | tee $W/t4/results.txt
+cd $W/t4m && python $R/pipeline_references/tests/video_oidn/flicker_metric.py --ref oidn48 \
+    raw=$W/t4m/raw/png oidn6=$W/t4m/oidn6/png oidn48=$W/t4m/oidn48/png dlssrr=$W/t4m/dlssrr/png | tee $W/t4m/results.txt
 ```
 
 Expected:
-- `raw` → **FAIL**. This is the negative control: if raw 9-spp frames pass, the instrument cannot see noise — stop and find out why before trusting any other line.
-- `oidn6` → the verdict for approach A.
-- `oidn48` and `dlssrr` → context, not gated. `dlssrr` holds a static camera without resets, so it is DLSS-RR's best case, not a like-for-like.
+- `NEGATIVE CONTROL ... -> OK`. If it prints FAIL, the instrument is blind again: STOP and report before judging anything else.
+- `GATE oidn6 / dlssrr ... -> PASS` or `FAIL` — the verdict for approach A.
+- `oidn48` and the `rms (all pixels)` and `p99` columns are context, not gated.
 
-Also build a side-by-side for the owner -- the same 600x400 region from the last frame of each mode, labelled. Write `$W/t4/crops.py`:
+Build the owner's crops — the same 600x400 region of the LAST DELIVERED frame (`files[-2]`) of each run. Write `$W/t4m/crops.py`:
 
 ```python
 import glob
 from PIL import Image, ImageDraw
 
-W = r"C:/Users/aiadmin/Desktop/Engine_Build_test/Zreal_Engine/.superpowers/sdd/2026-10-01-video-oidn/t4"
-# (x0, y0, x1, y1) at 3840x2160. Look at the last oidn6 frame first and move the box onto a
-# textured wall if it lands elsewhere -- texture is where boiling shows.
+W = r"C:/Users/aiadmin/Desktop/Engine_Build_test/Zreal_Engine/.superpowers/sdd/2026-10-01-video-oidn/t4m"
+# (x0, y0, x1, y1) at 3840x2160. Look at oidn6's last delivered frame first and move the box onto a
+# flat wall if it lands elsewhere -- flat walls are what the metric measures.
 box = (1600, 900, 2200, 1300)
 tiles = []
 for m in ("oidn6", "oidn48", "dlssrr", "raw"):
-    im = Image.open(sorted(glob.glob(W + "/" + m + "/png/*.png"))[-1]).convert("RGB").crop(box)
+    im = Image.open(sorted(glob.glob(W + "/" + m + "/png/*.png"))[-2]).convert("RGB").crop(box)
     t = Image.new("RGB", (600, 424), (30, 30, 30))
     t.paste(im, (0, 24))
     ImageDraw.Draw(t).text((6, 6), m, fill=(255, 255, 255))
@@ -1535,38 +1593,36 @@ out.save(W + "/compare_crops.png")
 print("wrote compare_crops.png")
 ```
 
-Run: `python $W/t4/crops.py`
+Run `python $W/t4m/crops.py`. Then delete the four `png/` directories (keep `results.txt`, `compare_crops.png`, logs, `done` and session files).
 
-- [ ] **Step 6: Record and decide**
+- [ ] **Step 7: Record and update the spec**
 
-Write `$W/t4/verdict.md` with the four result lines, run times, and the verdict. Then update the spec's T4 row: replace the alternating-pose description with
+Write `$W/t4m/verdict.md` with the result lines, PNG counts, session states, run times and the verdict. In the spec, replace the T4 row's description with:
 
 ```markdown
-urbanvideotest1, keyframe 0 held for 30 frames (`tests/video_oidn/make_static_job.py`), with
-`ZR_VIDEO_FLICKER_TEST=1` forcing an accumulator reset every delivered frame: 30 independent
-renders of identical content. (The earlier alternating-pose design was dropped: `_apply_keyframe`
-re-orients the sun from `cam.position` and `cam.basis.z` every 5th frame, so offset frames leak
-a sun change into later frames.) Metric `tests/video_oidn/flicker_metric.py`.
+| T4 | **Flicker under motion -- decides A vs B** (revised 2026-10-03). urbanvideotest1 keyframes 0-29, consecutive, at production speed (`tests/video_oidn/make_segment_job.py`). Metric (`tests/video_oidn/flicker_metric.py`): per-pixel temporal second difference of 8-bit display luma, which cancels change linear in time (smooth camera motion) and keeps erratic frame-to-frame change; measured on the flattest half of the frame (one mask, from the oidn48 run, for every run), because a per-frame denoiser keeps moving edges sharp where a temporal one softens them. The first, static-camera design was blind: the accumulate route replays the same Sobol sequence each cycle (`scene_raytracing_raygen.glsl:417-421`), as Cycles gives every frame one seed by default (`use_animated_seed = False`), so identical content renders identically. | **rms(oidn6) <= rms(dlssrr)** on the flat mask: OIDN no less stable than today's DLSS-RR on the same frames. **Negative control:** rms(raw) >= 3 x rms(dlssrr). Context, not gated: oidn48, p99, all-pixel rms. |
 ```
 
-and add a "Measured (T4)" paragraph with the four result lines.
+and add a `**Measured (T4):**` paragraph under the testing table with the result lines from `results.txt`.
 
-- **If `oidn6` PASSES:** continue to Task 4.
-- **If `oidn6` FAILS:** stop after committing. Report the numbers and `compare_crops.png` to the owner. Approach B (temporal reuse of radiance before OIDN) gets its own spec; Tasks 1–2 are kept — B reuses the CUDA path and the Phase A loop.
+- **If the GATE PASSES:** continue to Task 4.
+- **If it FAILS:** stop after committing. Report the numbers and `compare_crops.png`; the owner decides between proceeding to Task 4 and approach B. Tasks 1-2 are kept either way — B reuses the CUDA path and the Phase A loop.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-cd $R && git add pipeline_references/tests/video_oidn/make_static_job.py pipeline_references/tests/video_oidn/flicker_metric.py docs/superpowers/specs/2026-10-01-video-oidn-design.md
+cd $R && git add pipeline_references/tests/video_oidn/make_segment_job.py pipeline_references/tests/video_oidn/flicker_metric.py docs/superpowers/specs/2026-10-01-video-oidn-design.md
 git commit -F - <<'EOF'
-test(video): T4 flicker measurement for video OIDN -- <PASS|FAIL> at 6 spp
+test(video): T4 flicker under motion for video OIDN -- <PASS|FAIL> at 6 spp
 
-<the four result lines verbatim from results.txt; that raw failed as the negative control;
-why the static-camera method replaced the alternating-pose one; the decision.>
+<the result lines verbatim from results.txt; that the negative control held; why the static
+design was replaced (accum_frame seeding, Cycles' default fixed seed); the decision.>
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
 ```
+
+Fill the angle-bracketed parts from `results.txt` before committing.
 
 ---
 
