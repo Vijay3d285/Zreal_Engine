@@ -251,3 +251,62 @@ also red there, otherwise it is reported as informative.
   at most about 4%), and coat and sheen are not counted.
 - The deferred throughput is stored at 8 bits per channel.
 - A deferred miss writes our direction normal; Cycles writes no normal for a background.
+
+## Measured (2026-10-04)
+
+All paths are under `.superpowers/sdd/2026-10-01-video-oidn/` (untracked working notes).
+Binary pair: `godot_pre5` (the build before the change) and the fixed build; desktop
+session Active for every run.
+
+**Gate as built** (`pipeline_references/tests/pt_oidn_guide_passthrough_gate.gd`): 12
+checks. F1's band is [0.95, 1.05] (the pane's colour ratio reads 0.9911 sky / 1.0245
+checker on both builds). F6 is **informative, not a check**: it passed on the build before
+the fix (output std ratio 0.9790 alpha / 0.9745 glass, raw colour 0.9761 / 0.9753), so it
+cannot tell the builds apart; the 4-px checker's contrast lives in the colour and OIDN keeps
+it whatever the guides say. The visible effect is judged on the production window below.
+
+| check | before the fix (`t5g_pre.log`) | after the fix, runs 1-3 identical (`t5g_post_{1,2,3}.log`) | threshold |
+|---|---|---|---|
+| F1 colour ratio sky / checker | 0.9911 / 1.0245 | 0.9911 / 1.0245 | [0.95, 1.05] |
+| F2 alpha pane unwritten, sky / checker | 80.76% / 80.23% (red) | 0.00% / 0.00% | <= 1% |
+| F2 glass unwritten, sky / checker | 0.00% / 0.00% | 0.00% / 0.00% | <= 1% |
+| F3 alpha-pane albedo / authored mix, sky | 0.0577 / 0.5966 = 0.0967 (red) | 0.5964 / 0.5966 = 0.9996 | +-5% |
+| F3 same, checker | 0.0587 / 0.4079 = 0.1440 (red) | 0.4065 / 0.4079 = 0.9967 | +-5% |
+| F4 glass guide checker std / open | 0.0000 (red) | 0.9655 | >= 0.85 |
+| F5 open sky albedo / authored | 0.59289 / 0.59318 | 0.59289 / 0.59318 (bit-identical) | 1e-3 |
+| F5 open checker albedo mean / texture mean | 0.39768 / 0.39872 | 0.39768 / 0.39872 (bit-identical) | 2% |
+| F6 output std ratio alpha / glass (informative) | 0.9790 / 0.9745 | 0.9520 / 0.9589 | none |
+
+**Regression suite** (`suite/summary.txt`, pre-change copy `suite_pre5_summary.txt`): all
+26 gate scenes pass, including the new one. `pt_oidn_guide_gate` G1-G3 print the same
+lines on both binaries in the same session. `pt_transmission_gate` passes 45/45 on both
+binaries in this session (the earlier 1-of-45 was the desktop-session effect); probe 6
+reads 4.0695 (old) and 4.0694-4.0699 (new) against 4.069, inside the run-to-run floor of
+both (`suite_old_control/`).
+
+**DLSS-RR unchanged** (`t5_dlssrr_a/` pre-change binary, `t5_dlssrr_b/` fixed build,
+`job301_12kf.json`, default mode, 60 fps movie): 38 frames each, `ffmpeg -f framemd5`
+identical (38 of 38, file md5 `e1b3b26b38239faa590de8785860289a`); `t5_dlssrr_diff.txt`
+is empty.
+
+**The window, keyframe 210 static job** (`dump_base/` vs `dump_post5/`, region x 1620-1820,
+y 720-880): guide pixels never written **92.69% -> 0.00%** (limit 1%). Region albedo mean
+0.0400 -> 0.3482. The colour dump is bit-identical between the two runs (0.000% of pixels
+differ), so only the guides moved. Away from glass, a wall at x 2400-2600, y 600-700,
+albedo and normal are identical in both dumps. Images: `t5g/window_guides.png`,
+`t5g/window_crop_before_after_dlssrr.png`; changed-guide map `t5g/albedo_changed_kf210.png`
+(12.1% of the frame, all on glass, alpha, smooth metal and the like).
+
+**Job 201 at 1080p** (`t5g/job201_old/`, `t5g/job201_new/`): md5 `befe659dbb23ebc332f144806f3dec38`
+-> `21745d660e4046a0c4b3796c494cf78c`; whole-frame 8-bit PNG mean ratio new/old
+**0.99980** (limit 0.5%); mean |diff| 0.35 levels, 1.03% of pixels differ by 8 or more
+levels. Heat-map `t5g/job201_diff.png`. (The pre-change reference is `befe659d`, the
+same-session baseline; the archived `2a17e657` quoted above appears about one run in six on
+the pre-change binary.)
+
+**Known consequence, as in Cycles:** a smooth metal surface (the window's metal frame)
+defers, so its normal guide becomes the average of the surfaces it reflects and is noisy
+before OIDN: the mullion at x 1838-1846, y 740-900 reads normal per-axis std 0.011 before
+and 0.279 after, albedo mean 0.004 -> 0.125. OIDN's output there stays clean (std 0.0058 ->
+0.0032). Cycles later added `follow_reflections` to control exactly this (see "What Cycles
+does").

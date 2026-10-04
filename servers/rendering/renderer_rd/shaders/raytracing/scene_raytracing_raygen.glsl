@@ -162,6 +162,10 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	ps.sss_restart = vec3(0.0);
 	ps.sss_exit = false;
 	ps.guide_record = false;
+	// OIDN guides: one guide sample per Phase A sample. One-shot mode (DLSS-RR,
+	// realtime) never sets it, so that path does no extra work.
+	ps.feat_throughput = vec3(1.0);
+	ps.feat_pending = p_is_sample_zero && get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5;
 
 	vec3 ray_origin = p_origin;
 	vec3 ray_dir = p_dir;
@@ -327,6 +331,16 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 		}
 		ray_dir = ps.next_ray_dir;
 	}
+
+#ifdef DLSS_RR_ENABLED
+	// A path that ended with its guide still pending (it was deferring through a smooth
+	// surface when a cap, roulette or absorption stopped it) contributes a zero sample,
+	// as in Cycles, where it contributes nothing to the summed pass. Runs before main()
+	// stores n + 1, so rt_accum_guide_sample's weight is this sample's.
+	if (ps.feat_pending) {
+		rt_accum_guide_sample(ivec2(p_pixel), vec3(0.0), vec3(0.0));
+	}
+#endif
 
 	// Gap #32: train from the finished path. `ps.radiance - guide_rad[k]` is
 	// exact for the contributions added AFTER vertex k, because both are reads
@@ -523,9 +537,16 @@ void main() {
 			imageStore(dlss_rr_specular_albedo, pixel, vec4(0.0));
 			imageStore(dlss_rr_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 1.0));
 			imageStore(dlss_rr_specular_hit_dist, pixel, vec4(-1.0));
-			rt_accum_guide_sample(pixel, volume_albedo(), -gl_WorldRayDirectionEXT);
 #endif
 		}
+#ifdef DLSS_RR_ENABLED
+		if (ps.feat_pending) {
+			float t_avg = (ps.feat_throughput.r + ps.feat_throughput.g + ps.feat_throughput.b) / 3.0;
+			rt_accum_guide_sample(ivec2(gl_LaunchIDEXT.xy), volume_albedo() * ps.feat_throughput,
+					-gl_WorldRayDirectionEXT * t_avg);
+			ps.feat_pending = false;
+		}
+#endif
 		path_pack(payload, ps);
 		return;
 	}
@@ -597,7 +618,12 @@ void main() {
 			imageStore(dlss_rr_specular_albedo, pixel, vec4(0.0));
 			imageStore(dlss_rr_normal_roughness, pixel, vec4(-gl_WorldRayDirectionEXT, 0.0));
 			imageStore(dlss_rr_specular_hit_dist, pixel, vec4(-1.0));
-			rt_accum_guide_sample(pixel, sky_color, -gl_WorldRayDirectionEXT);
+		}
+		if (ps.feat_pending) {
+			float t_avg = (ps.feat_throughput.r + ps.feat_throughput.g + ps.feat_throughput.b) / 3.0;
+			rt_accum_guide_sample(ivec2(gl_LaunchIDEXT.xy), sky_color * ps.feat_throughput,
+					-gl_WorldRayDirectionEXT * t_avg);
+			ps.feat_pending = false;
 		}
 	}
 #endif

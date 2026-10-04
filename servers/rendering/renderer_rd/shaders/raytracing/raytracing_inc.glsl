@@ -98,6 +98,11 @@ struct PathPayload {
 	// Cycles keeps ray.P at the scattering vertex across a transparent bounce
 	// (shade_surface.h:573-576) for the same reason. 12 bytes; struct is 92.
 	vec3 mis_origin;
+	// OIDN guides (spec 2026-10-04-oidn-guide-feature-passthrough-design.md): Cycles'
+	// PATH_RAY_DENOISING_FEATURES and denoising_feature_throughput. packUnorm4x8 of
+	// (throughput.rgb, pending ? 1 : 0). The throughput is a product of albedos, in
+	// [0, 1]; 1.0 round-trips exactly. 4 bytes; struct is 96.
+	uint feat_state;
 };
 
 /// Sentinel: this ray has no meaningful BSDF pdf, so anything it hits takes the
@@ -182,6 +187,8 @@ struct PathState {
 	bool sss_exit;
 	bool guide_record; // this vertex drew the diffuse lobe at density mis_ray_pdf (Gap #32)
 	vec3 mis_origin;
+	vec3 feat_throughput; // OIDN guide: product of the specular albedos deferred through
+	bool feat_pending; // OIDN guide: this sample has not written its guide yet
 };
 
 PathState path_unpack(PathPayload p) {
@@ -202,6 +209,9 @@ PathState path_unpack(PathPayload p) {
 	s.sss_exit = (sss_bits & 1u) != 0u;
 	s.guide_record = (sss_bits & 2u) != 0u;
 	s.mis_origin = p.mis_origin;
+	vec4 feat = unpackUnorm4x8(p.feat_state);
+	s.feat_throughput = feat.rgb;
+	s.feat_pending = feat.a > 0.5;
 	return s;
 }
 
@@ -218,6 +228,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.skip_prim = s.skip_prim;
 	p.sss_restart = vec4(s.sss_restart, float((s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u)));
 	p.mis_origin = s.mis_origin;
+	p.feat_state = packUnorm4x8(vec4(s.feat_throughput, s.feat_pending ? 1.0 : 0.0));
 }
 
 // Bounce count helpers.

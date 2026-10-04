@@ -1363,6 +1363,59 @@ void debug_visualize(
 // SHADE AND BOUNCE
 // ============================================================================
 
+#ifdef DLSS_RR_ENABLED
+// Cycles' denoising-feature rule as shipped through 2026-03-03 (film/denoising_passes.h at
+// the parent of 44be56fd493): a closure whose GGX alpha exceeds 0.075 is diffuse-like, and
+// a surface writes its features when diffuse-like closures hold more than a quarter of the
+// weight; otherwise the features wait for the next bounce, carried by the specular albedo.
+// Spec 2026-10-04-oidn-guide-feature-passthrough-design.md, section 3. Estimated from our
+// one-material model: no coat or sheen, and no (1 - F) layering factor on the diffuse.
+bool rt_guide_defers(MaterialProperties p_mat, float p_NdotV, vec3 p_specularF0, out vec3 r_spec_albedo) {
+	r_spec_albedo = vec3(0.0);
+	if (p_mat.roughness * p_mat.roughness > 0.075) {
+		return false;
+	}
+	vec3 d = baseColorToDiffuseReflectance(p_mat.baseColor, p_mat.metalness, p_mat.transmissivness);
+	vec3 spec = DLSSRR_computeSpecularAlbedo(p_mat.baseColor, p_mat.metalness, p_mat.dielectricF0, p_mat.roughness, p_NdotV);
+	if (p_mat.transmissivness > 0.0) {
+		vec3 refl;
+		vec3 trans;
+		float cos_theta_t = 0.0;
+		dielectricFresnelSplit(p_NdotV, p_mat.eta, p_specularF0, p_mat.transmissivness, refl, trans, cos_theta_t);
+		spec += (1.0 - p_mat.metalness) * trans;
+	}
+	r_spec_albedo = spec;
+	float w_diff = (d.r + d.g + d.b) / 3.0;
+	float w_spec = (spec.r + spec.g + spec.b) / 3.0;
+	return (w_diff + w_spec > 0.0) && !(w_diff * 4.0 > w_diff + w_spec);
+}
+
+// One guide sample per path (spec section 2): runs at every surface while the sample's
+// guide is pending, and writes at the first surface that does not defer. With
+// feat_throughput == 1 it writes exactly what the bounce-0 write always wrote.
+void rt_guide_features_surface(inout PathState p_ps, MaterialProperties p_mat, vec3 p_diffuse_albedo,
+		vec3 p_N, float p_NdotV, vec3 p_specularF0) {
+	if (!p_ps.feat_pending) {
+		return;
+	}
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+	vec3 spec_albedo;
+	if (rt_guide_defers(p_mat, p_NdotV, p_specularF0, spec_albedo)) {
+		p_ps.feat_throughput *= clamp(spec_albedo, vec3(0.0), vec3(1.0));
+		if (max(max(p_ps.feat_throughput.r, p_ps.feat_throughput.g), p_ps.feat_throughput.b) <= 1e-4) {
+			// Cycles clears the flag and the path contributes nothing; the running mean
+			// still needs this sample's one write.
+			rt_accum_guide_sample(pixel, vec3(0.0), vec3(0.0));
+			p_ps.feat_pending = false;
+		}
+		return;
+	}
+	float t_avg = (p_ps.feat_throughput.r + p_ps.feat_throughput.g + p_ps.feat_throughput.b) / 3.0;
+	rt_accum_guide_sample(pixel, p_diffuse_albedo * p_ps.feat_throughput, p_N * t_avg);
+	p_ps.feat_pending = false;
+}
+#endif
+
 /// Production shading: emissive + NEE direct lighting + BRDF importance sampling + next bounce.
 /// Also handles DLSS-RR G-buffer output on primary ray.
 void shade_and_bounce(HitData h, MaterialResult m) {
@@ -1831,7 +1884,6 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
 
 		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
-		rt_accum_guide_sample(pixel, diffuse_albedo, N);
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;
@@ -1858,6 +1910,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		}
 		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
 	}
+	rt_guide_features_surface(ps, brdf_mat, DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness), N, NdotV, specularF0);
 #endif
 
 	// =================================================================
