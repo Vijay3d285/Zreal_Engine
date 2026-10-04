@@ -1628,6 +1628,8 @@ Fill the angle-bracketed parts from `results.txt` before committing.
 
 ### Task 4: Production acceptance — budget, VRAM, the owner's review, closeout (REVISED 2026-10-04)
 
+**PAUSED at Step 3 (2026-10-04) for Task 5.** The owner's review found the window view blotchy in OIDN; Task 5 fixes the cause. When Task 5 is complete, re-run Steps 1-2 on the fixed build, then Step 3 again.
+
 **Runs by owner decision (2026-10-04).** T4's two numeric instruments could not be validated (see the facts in Step 4); the owner chose to decide A vs B by eye on the T7 material this task builds.
 
 **Movie layout (measured in Task 2 — use it, do not re-derive it):** every movie is the pre-roll, then the delivered frames, then ONE trailing frame. Pre-roll is **20** frames in OIDN mode and **25** in DLSS-RR mode (20 warmup + 5 priming). So the full 421-frame job is **442** frames in OIDN mode (20 + 421 + 1, delivered = indices 20..440) and **447** in DLSS-RR mode (25 + 421 + 1, delivered = indices 25..445).
@@ -1782,3 +1784,622 @@ EOF
 ```
 
 Ship manifest for the owner: the engine binary (Task 1 changed C++) **plus** `pipeline_references/video_glb_creation.gd` and `pipeline_references/video_render.gd`. Unlike the earlier GDScript-only video ports, this one needs the rebuilt engine in `C:\Zlendo2026\ZlenderRender_stage_copy\godot\bin\`.
+
+---
+
+### Task 5: Engine — OIDN guides follow Cycles' denoising features through transparency and smooth specular (INSERTED 2026-10-04)
+
+**Why this task exists.** Task 4's review material showed the window view blotchy in OIDN and clean in DLSS-RR. The owner decided (2026-10-04): "fix the glass the Blender way first". **Spec:** `docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md` — read it first; it holds the measurements, the root cause and the Cycles references. **Task 4 is paused at its Step 3 and resumes after this task** (its Steps 1-2 are re-run on the fixed build).
+
+**Global-constraint exception (owner, 2026-10-04).** "Stills must not change" does not hold for this task: still guides change wherever a window, glass or mirror is in view, which is the point. Everything else stands. In particular, DLSS-RR output must stay frame-identical (Step 6), because the DLSS-RR G-buffer writes are not touched.
+
+**Files:**
+- Modify: `servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl` (payload field, PathState fields, pack/unpack)
+- Modify: `servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl` (init, path-end write, two miss sites)
+- Modify: `servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl` (rule + surface write)
+- Modify: `servers/rendering/renderer_rd/shaders/raytracing/raytracing_lights_inc.glsl` (shadow-ray init)
+- Create: `pipeline_references/tests/pt_oidn_guide_passthrough_gate.gd` + `pt_oidn_guide_passthrough_gate_scene.tscn`
+- Modify: `docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md` (append "Measured")
+
+**Evidence already on disk (cite, do not repeat):** `$W/dump_base/` (keyframe-210 OIDN inputs, current build: 92.7% of the pane region unwritten), `$W/probe/` (the 256x256 reproduction: 80% unwritten), `$W/t7/` (Task 4's review material), `$W/run_dump.sh` (re-dumps keyframe 210 into `$W/dump_<tag>/`).
+
+- [ ] **Step 1: Keep the pre-change binary for A/B**
+
+```bash
+cd $R && cp bin/godot.windows.editor.x86_64.exe bin/godot_pre5.windows.editor.x86_64.exe && cp bin/godot.windows.editor.x86_64.console.exe bin/godot_pre5.windows.editor.x86_64.console.exe
+OLD=$R/bin/godot_pre5.windows.editor.x86_64.console.exe
+```
+
+It sits in `bin/` so it finds the same DLLs. The console wrapper launches its sibling by name, so check that `$OLD --version` prints a version and that a process listing during a run shows `godot_pre5...exe`. Delete both files at the end of the task (Step 9).
+
+- [ ] **Step 2: Write the gate**
+
+Create `pipeline_references/tests/pt_oidn_guide_passthrough_gate_scene.tscn`:
+
+```
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://tests/pt_oidn_guide_passthrough_gate.gd" id="1_gate"]
+
+[node name="PTOidnGuidePassthroughGate" type="Node"]
+script = ExtResource("1_gate")
+```
+
+Create `pipeline_references/tests/pt_oidn_guide_passthrough_gate.gd`:
+
+```gdscript
+extends "res://tests/pt_validation.gd"
+
+## OIDN guide pass-through gate (spec 2026-10-04-oidn-guide-feature-passthrough-design.md).
+##
+##   bin\godot.windows.editor.x86_64.console.exe --rendering-driver vulkan \
+##       --path pipeline_references res://tests/pt_oidn_guide_passthrough_gate_scene.tscn
+##
+## 256x256. Top half: a uniform sky. Bottom half: a 4-px checker card. Three columns,
+## seen through a plane 5 m from the camera: OPEN | an ALPHA pane authored like the
+## production window (Mat_A38_Window_Glass_001) | a smooth thin GLASS pane (the material
+## _apply_glb_transmissive_glass produces). 6 accumulated samples -- the video route's
+## count -- then OIDN, with ZR_OIDN_DUMP pointed at a temp dir so the gate reads the
+## guides OIDN actually received.
+##
+##   F0 dumps  : the four OIDN dumps exist at 256x256 and OIDN changed the image
+##   F1 premise: colour behind the alpha pane / open, per row, in [F1_MIN, F1_MAX]
+##   F2 written: unwritten guide pixels behind each pane <= UNWRITTEN_MAX, per row
+##   F3 alpha  : guide albedo behind the alpha pane within ALPHA_TOL of the authored mix
+##   F4 glass  : checker guide-albedo std behind the glass / open >= GLASS_DETAIL_MIN
+##   F5 open   : open guides as authored -- sky albedo == sky colour, checker mean ==
+##               the texture's linear mean
+##   F6 result : OIDN output checker std behind each pane / open >= OUT_DETAIL_MIN
+##
+## On the build before the fix, a surface seen through an alpha pane is bounce 1
+## (inc_transmission_bounce adds to the total) and writes no guide: F2 reads about 80%
+## unwritten, and F3 about 0.09x. The glass's guide is the pane's own flat white: F4
+## about 0.
+
+const FRAMES := 6
+const SKY := Color(0.5, 0.6, 0.8)
+const PANE_ALPHA := 0.033
+const PANE_BASE_LINEAR := 0.7067
+const PANE_ROUGHNESS := 0.0916
+const CAM_DIST := 10.0
+const CAM_FOV := 10.0
+const PANE_Z := 5.0
+
+const F1_MIN := 0.95
+const F1_MAX := 1.05
+const UNWRITTEN_MAX := 0.01
+const ALPHA_TOL := 0.05
+const GLASS_DETAIL_MIN := 0.85
+const F5_SKY_TOL := 1e-3
+const F5_CHECK_TOL := 0.02
+const OUT_DETAIL_MIN := 0.80
+
+# Regions [x0, x1) x [y0, y1) in pixels, image y down. Column edges are 85.3 and 170.7;
+# every region keeps a margin and spans whole 8-px checker periods.
+const COLS := {"open": [8, 72], "alpha": [96, 160], "glass": [184, 248]}
+const ROWS := {"sky": [8, 120], "checker": [136, 248]}
+
+var _failures: Array[String] = []
+var _checks: int = 0
+
+
+func _ready() -> void:
+	get_window().content_scale_mode = Window.CONTENT_SCALE_MODE_DISABLED
+	get_window().size = Vector2i(256, 256)
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	Engine.max_fps = 0
+	# The still route's viewport contract, as pt_oidn_guide_gate.gd.
+	get_viewport().msaa_3d = Viewport.MSAA_DISABLED
+	get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	get_viewport().use_taa = false
+	get_viewport().use_debanding = false
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	get_viewport().scaling_3d_scale = 1.0
+	get_viewport().use_hdr_2d = true
+	await get_tree().process_frame
+	await get_tree().process_frame
+
+	var dump_dir := ProjectSettings.globalize_path("user://pt_oidn_guide_passthrough_gate")
+	DirAccess.make_dir_recursive_absolute(dump_dir)
+	for n in ["oidn_color.pfm", "oidn_albedo.pfm", "oidn_normal.pfm", "oidn_output.pfm"]:
+		DirAccess.remove_absolute(dump_dir.path_join(n))
+	OS.set_environment("ZR_OIDN_DUMP", dump_dir)
+
+	var env := _new_env(SKY)
+	env.set_pathtracing_max_bounces(6)
+	env.set_pathtracing_oidn_denoise(true)
+
+	var side := 2.0 * CAM_DIST * tan(deg_to_rad(CAM_FOV) * 0.5)
+
+	# Checker card, bottom half, 1:1 with the pixels (256 x 128 texels), 4-px cells.
+	var img := Image.create(256, 128, false, Image.FORMAT_RGB8)
+	for y in range(128):
+		for x in range(256):
+			var on := ((x / 4) + (y / 4)) % 2 == 0
+			img.set_pixel(x, y, Color(0.9, 0.9, 0.9) if on else Color(0.1, 0.1, 0.1))
+	var card := MeshInstance3D.new()
+	var cq := QuadMesh.new()
+	cq.size = Vector2(side, side * 0.5)
+	card.mesh = cq
+	card.position = Vector3(0, -side * 0.25, 0)
+	var cm := StandardMaterial3D.new()
+	cm.albedo_texture = ImageTexture.create_from_image(img)
+	cm.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	cm.metallic = 0.0
+	cm.metallic_specular = 0.0
+	cm.roughness = 1.0
+	card.material_override = cm
+	add_child(card)
+
+	# The two panes, each one column wide and the full frame tall at PANE_Z.
+	var w := 2.0 * (CAM_DIST - PANE_Z) * tan(deg_to_rad(CAM_FOV) * 0.5)
+
+	# Authored like Mat_A38_Window_Glass_001. albedo_color is sRGB-encoded; glTF's
+	# baseColorFactor is linear, so author the linear 0.7067 through linear_to_srgb().
+	var am := StandardMaterial3D.new()
+	var pane_srgb := Color(PANE_BASE_LINEAR, PANE_BASE_LINEAR, PANE_BASE_LINEAR).linear_to_srgb()
+	am.albedo_color = Color(pane_srgb.r, pane_srgb.g, pane_srgb.b, PANE_ALPHA)
+	am.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	am.cull_mode = BaseMaterial3D.CULL_DISABLED
+	am.metallic = 0.0
+	am.roughness = PANE_ROUGHNESS
+	_add_pane(Vector3(0.0, 0.0, PANE_Z), w, am)
+
+	# The material _apply_glb_transmissive_glass produces (video_glb_creation.gd).
+	var gm := StandardMaterial3D.new()
+	gm.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED
+	gm.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_OPAQUE_ONLY
+	gm.no_depth_test = false
+	gm.metallic = 0.0
+	gm.transmission = 1.0
+	gm.ior = 1.5
+	gm.metallic_specular = 0.5
+	gm.thickness = 0.0
+	gm.albedo_color = Color(1.0, 1.0, 1.0, 1.0)
+	gm.roughness = 0.0
+	_add_pane(Vector3(w / 3.0, 0.0, PANE_Z), w, gm)
+
+	var cam := Camera3D.new()
+	cam.fov = CAM_FOV
+	cam.near = 0.1
+	cam.far = 100.0
+	cam.position = Vector3(0, 0, CAM_DIST)
+	add_child(cam)
+	cam.make_current()
+	await get_tree().create_timer(1.0).timeout
+
+	await _render_accum(env, get_viewport().get_viewport_rid(), FRAMES)
+	# OIDN fires on the frame the accumulator reaches its target; give it two frames.
+	await get_tree().process_frame
+	await get_tree().process_frame
+	await RenderingServer.frame_post_draw
+
+	var col := _read_pfm(dump_dir.path_join("oidn_color.pfm"))
+	var alb := _read_pfm(dump_dir.path_join("oidn_albedo.pfm"))
+	var nrm := _read_pfm(dump_dir.path_join("oidn_normal.pfm"))
+	var out := _read_pfm(dump_dir.path_join("oidn_output.pfm"))
+
+	print("\n=== F0: OIDN dumps ===")
+	_checks += 1
+	var have := not col.is_empty() and not alb.is_empty() and not nrm.is_empty() and not out.is_empty()
+	if not have or col.w != 256 or col.h != 256:
+		_failures.append("F0 dumps missing or not 256x256 under %s" % dump_dir)
+		_finish()
+		return
+	var changed := absf(_luma_std(out, COLS.open, ROWS.checker) - _luma_std(col, COLS.open, ROWS.checker)) > 1e-6
+	print("  four dumps present; OIDN changed the image: %s" % changed)
+	if not changed:
+		_failures.append("F0 OIDN output equals its input -- OIDN did not run")
+
+	print("\n=== F1: premise (colour behind the alpha pane / open) ===")
+	for row in ["sky", "checker"]:
+		_checks += 1
+		var r := _luma_mean(col, COLS.alpha, ROWS[row]) / maxf(_luma_mean(col, COLS.open, ROWS[row]), 1e-6)
+		print("  %-8s %.4f  (want [%.2f, %.2f])" % [row, r, F1_MIN, F1_MAX])
+		if r < F1_MIN or r > F1_MAX:
+			_failures.append("F1 %s colour ratio %.4f outside [%.2f, %.2f]" % [row, r, F1_MIN, F1_MAX])
+
+	print("\n=== F2: guides written behind each pane ===")
+	for pane in ["alpha", "glass"]:
+		for row in ["sky", "checker"]:
+			_checks += 1
+			var u := _unwritten(alb, nrm, COLS[pane], ROWS[row])
+			print("  %-6s %-8s unwritten %.2f%%  (max %.0f%%)" % [pane, row, u * 100.0, UNWRITTEN_MAX * 100.0])
+			if u > UNWRITTEN_MAX:
+				_failures.append("F2 %s/%s unwritten %.2f%% > %.0f%%" % [pane, row, u * 100.0, UNWRITTEN_MAX * 100.0])
+
+	print("\n=== F3: guide albedo behind the alpha pane ===")
+	for row in ["sky", "checker"]:
+		_checks += 1
+		var open_m := _luma_mean(alb, COLS.open, ROWS[row])
+		var want := (1.0 - PANE_ALPHA) * open_m + PANE_ALPHA * PANE_BASE_LINEAR
+		var got := _luma_mean(alb, COLS.alpha, ROWS[row])
+		var rel := got / maxf(want, 1e-6)
+		print("  %-8s got %.4f want %.4f  ratio %.4f  (tol %.0f%%)" % [row, got, want, rel, ALPHA_TOL * 100.0])
+		if absf(rel - 1.0) > ALPHA_TOL:
+			_failures.append("F3 %s alpha-pane albedo %.4f vs %.4f (ratio %.4f)" % [row, got, want, rel])
+
+	print("\n=== F4: checker detail in the guide behind the glass ===")
+	_checks += 1
+	var g4 := _luma_std(alb, COLS.glass, ROWS.checker) / maxf(_luma_std(alb, COLS.open, ROWS.checker), 1e-6)
+	print("  std ratio %.4f  (min %.2f)" % [g4, GLASS_DETAIL_MIN])
+	if g4 < GLASS_DETAIL_MIN:
+		_failures.append("F4 glass guide detail %.4f < %.2f" % [g4, GLASS_DETAIL_MIN])
+
+	print("\n=== F5: open guides as authored ===")
+	_checks += 1
+	var sky_l := 0.2126 * SKY.r + 0.7152 * SKY.g + 0.0722 * SKY.b
+	var sky_got := _luma_mean(alb, COLS.open, ROWS.sky)
+	print("  sky albedo %.5f want %.5f" % [sky_got, sky_l])
+	if absf(sky_got - sky_l) > F5_SKY_TOL:
+		_failures.append("F5 open sky albedo %.5f != %.5f" % [sky_got, sky_l])
+	_checks += 1
+	var tex_mean := 0.5 * (Color(0.9, 0.9, 0.9).srgb_to_linear().r + Color(0.1, 0.1, 0.1).srgb_to_linear().r)
+	var chk_got := _luma_mean(alb, COLS.open, ROWS.checker)
+	print("  checker albedo mean %.5f want %.5f" % [chk_got, tex_mean])
+	if absf(chk_got / tex_mean - 1.0) > F5_CHECK_TOL:
+		_failures.append("F5 open checker albedo %.5f vs %.5f" % [chk_got, tex_mean])
+
+	print("\n=== F6: denoised checker detail behind each pane ===")
+	var open_out := _luma_std(out, COLS.open, ROWS.checker)
+	for pane in ["alpha", "glass"]:
+		_checks += 1
+		var r6 := _luma_std(out, COLS[pane], ROWS.checker) / maxf(open_out, 1e-6)
+		var r6raw := _luma_std(col, COLS[pane], ROWS.checker) / maxf(_luma_std(col, COLS.open, ROWS.checker), 1e-6)
+		print("  %-6s output std ratio %.4f (raw colour ratio %.4f)  (min %.2f)" % [pane, r6, r6raw, OUT_DETAIL_MIN])
+		if r6 < OUT_DETAIL_MIN:
+			_failures.append("F6 %s denoised detail %.4f < %.2f" % [pane, r6, OUT_DETAIL_MIN])
+
+	_finish()
+
+
+func _add_pane(p_pos: Vector3, p_w: float, p_mat: StandardMaterial3D) -> void:
+	var mi := MeshInstance3D.new()
+	var q := QuadMesh.new()
+	q.size = Vector2(p_w / 3.0, p_w)
+	mi.mesh = q
+	mi.position = p_pos
+	mi.material_override = p_mat
+	add_child(mi)
+
+
+# Little-endian PFM as _oidn_write_pfm writes it: "PF\n<w> <h>\n-1.0\n", rows bottom-up.
+func _read_pfm(p_path: String) -> Dictionary:
+	var f := FileAccess.open(p_path, FileAccess.READ)
+	if f == null:
+		return {}
+	var magic := f.get_line().strip_edges()
+	var dims := f.get_line().strip_edges().split(" ", false)
+	var scale := float(f.get_line().strip_edges())
+	if magic != "PF" or dims.size() != 2 or scale >= 0.0:
+		return {}
+	var w := int(dims[0])
+	var h := int(dims[1])
+	var buf := f.get_buffer(w * h * 12)
+	if buf.size() != w * h * 12:
+		return {}
+	return {"w": w, "h": h, "data": buf}
+
+
+func _px(p_img: Dictionary, p_x: int, p_y: int) -> Vector3:
+	var o: int = (((p_img.h - 1 - p_y) * p_img.w) + p_x) * 12
+	var d: PackedByteArray = p_img.data
+	return Vector3(d.decode_float(o), d.decode_float(o + 4), d.decode_float(o + 8))
+
+
+func _luma(p_c: Vector3) -> float:
+	return 0.2126 * p_c.x + 0.7152 * p_c.y + 0.0722 * p_c.z
+
+
+func _luma_mean(p_img: Dictionary, p_cols: Array, p_rows: Array) -> float:
+	var acc := 0.0
+	var n := 0
+	for y in range(p_rows[0], p_rows[1]):
+		for x in range(p_cols[0], p_cols[1]):
+			acc += _luma(_px(p_img, x, y))
+			n += 1
+	return acc / float(n)
+
+
+func _luma_std(p_img: Dictionary, p_cols: Array, p_rows: Array) -> float:
+	var m := _luma_mean(p_img, p_cols, p_rows)
+	var acc := 0.0
+	var n := 0
+	for y in range(p_rows[0], p_rows[1]):
+		for x in range(p_cols[0], p_cols[1]):
+			var dl := _luma(_px(p_img, x, y)) - m
+			acc += dl * dl
+			n += 1
+	return sqrt(acc / float(n))
+
+
+# A guide pixel nothing wrote: albedo exactly 0 and the readback's (0, 0, 1) fallback
+# for a zero-length normal (render_forward_clustered.cpp, the normal conversion).
+func _unwritten(p_alb: Dictionary, p_nrm: Dictionary, p_cols: Array, p_rows: Array) -> float:
+	var bad := 0
+	var n := 0
+	for y in range(p_rows[0], p_rows[1]):
+		for x in range(p_cols[0], p_cols[1]):
+			var a := _px(p_alb, x, y)
+			var nn := _px(p_nrm, x, y)
+			if a.x + a.y + a.z == 0.0 and nn.distance_to(Vector3(0, 0, 1)) < 1e-4:
+				bad += 1
+			n += 1
+	return float(bad) / float(n)
+
+
+func _finish() -> void:
+	print("")
+	if _failures.is_empty():
+		print("PASS: all %d OIDN guide pass-through checks passed." % _checks)
+		get_tree().quit(0)
+	else:
+		for f in _failures:
+			print("FAIL - %s" % f)
+		print("FAIL: %d of %d checks failed." % [_failures.size(), _checks])
+		get_tree().quit(1)
+
+
+func _new_env(p_bg: Color) -> Environment:
+	var pano := Image.create(8, 4, false, Image.FORMAT_RGBF)
+	pano.fill(p_bg)
+	var sky_mat := PanoramaSkyMaterial.new()
+	sky_mat.panorama = ImageTexture.create_from_image(pano)
+	var sky := Sky.new()
+	sky.sky_material = sky_mat
+	sky.process_mode = Sky.PROCESS_MODE_QUALITY
+	var env := Environment.new()
+	env.background_mode = Environment.BG_SKY
+	env.sky = sky
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_DISABLED
+	env.tonemap_mode = Environment.TONE_MAPPER_LINEAR
+	var we := WorldEnvironment.new()
+	we.environment = env
+	add_child(we)
+	env.set_pathtracing_enabled(true)
+	env.set_pathtracing_samples_per_pixel(1)
+	env.set_pathtracing_denoiser(0)
+	env.set_pathtracing_oidn_denoise(false)
+	env.set_pathtracing_dlss_rr_final(false)
+	env.set_pathtracing_clamp_direct(0.0)
+	env.set_pathtracing_clamp_indirect(0.0)
+	env.set_pathtracing_noise_threshold(0.0)
+	return env
+```
+
+Two facts the code relies on, already verified: the sky pano `FORMAT_RGBF` reaches the guide as exactly `SKY` (the probe read (0.50, 0.60, 0.80)), and an `RGB8` checker texture is sRGB, so its linear mean is the `srgb_to_linear` mean (the probe read 0.397 for 0.3987). If either is wrong, F5 says so on the CURRENT build. Fix the gate then, not the threshold.
+
+- [ ] **Step 3: Run the gate on the CURRENT build. It must fail the right checks.**
+
+```bash
+cd $R && $BIN --rendering-driver vulkan --path pipeline_references res://tests/pt_oidn_guide_passthrough_gate_scene.tscn > $W/t5g_pre.log 2>&1; echo exit=$?; grep -aE "^  |FAIL|PASS" $W/t5g_pre.log
+```
+
+Expected on the current build: F0, F1 and F5 pass. F2 alpha (both rows) fails at about 80%, F3 fails at about 0.09x, and F4 fails near 0. F2 glass passes on this build, since that pane's guide is written, just wrong; it guards the glass path against regressing into "unwritten". F6: record both values. **F6 counts as a check only if it fails here.** If it passes on the current build, demote it to an informative print in Step 5 (no `_checks += 1`, no failure) and say so in the report. If F2-alpha, F3 or F4 does not fail, STOP and report: the gate is not measuring the defect.
+
+- [ ] **Step 4: The shader changes**
+
+All four files are in `servers/rendering/renderer_rd/shaders/raytracing/`. Make each edit exactly. Apply edits with the Edit tool, never a shell heredoc (heredocs eat trailing backslashes).
+
+**4a. `raytracing_inc.glsl`, `struct PathPayload`.** After the `vec3 mis_origin;` member (and its comment block), add:
+
+```glsl
+	// OIDN guides (spec 2026-10-04-oidn-guide-feature-passthrough-design.md): Cycles'
+	// PATH_RAY_DENOISING_FEATURES and denoising_feature_throughput. packUnorm4x8 of
+	// (throughput.rgb, pending ? 1 : 0). The throughput is a product of albedos, in
+	// [0, 1]; 1.0 round-trips exactly. 4 bytes; struct is 96.
+	uint feat_state;
+```
+
+**4b. `raytracing_inc.glsl`, `struct PathState`.** After `vec3 mis_origin;` add:
+
+```glsl
+	vec3 feat_throughput; // OIDN guide: product of the specular albedos deferred through
+	bool feat_pending; // OIDN guide: this sample has not written its guide yet
+```
+
+**4c. `path_unpack`.** Before `return s;` add:
+
+```glsl
+	vec4 feat = unpackUnorm4x8(p.feat_state);
+	s.feat_throughput = feat.rgb;
+	s.feat_pending = feat.a > 0.5;
+```
+
+**4d. `path_pack`.** After `p.mis_origin = s.mis_origin;` add:
+
+```glsl
+	p.feat_state = packUnorm4x8(vec4(s.feat_throughput, s.feat_pending ? 1.0 : 0.0));
+```
+
+**4e. `raytracing_lights_inc.glsl`, the shadow-ray state (`PathState shadow_ps;`, about :308).** After `shadow_ps.guide_record = false;` add:
+
+```glsl
+	shadow_ps.feat_throughput = vec3(1.0);
+	shadow_ps.feat_pending = false;
+```
+
+Then search all four files for any other `PathState` built field by field (`grep -n "PathState [a-z_]*;"`). The known sites are raygen `trace_one_sample` (4f) and the shadow ray (4e). Any other site gets the same two lines, and you list it in the report.
+
+**4f. `scene_raytracing_raygen.glsl`, `trace_one_sample`.** After `ps.guide_record = false;` (about :164) add:
+
+```glsl
+	// OIDN guides: one guide sample per Phase A sample. One-shot mode (DLSS-RR,
+	// realtime) never sets it, so that path does no extra work.
+	ps.feat_throughput = vec3(1.0);
+	ps.feat_pending = p_is_sample_zero && get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5;
+```
+
+At the end of the same function, immediately after the bounce loop's closing brace and BEFORE the `// Gap #32: train from the finished path.` comment, add:
+
+```glsl
+#ifdef DLSS_RR_ENABLED
+	// A path that ended with its guide still pending (it was deferring through a smooth
+	// surface when a cap, roulette or absorption stopped it) contributes a zero sample,
+	// as in Cycles, where it contributes nothing to the summed pass. Runs before main()
+	// stores n + 1, so rt_accum_guide_sample's weight is this sample's.
+	if (ps.feat_pending) {
+		rt_accum_guide_sample(ivec2(p_pixel), vec3(0.0), vec3(0.0));
+	}
+#endif
+```
+
+**4g. Miss stage, fog scatter (about :518-527).** In the block
+
+```glsl
+		if (get_total_bounces(ps.packed_bounces_flags) == 0u && is_sample_zero(ps.packed_bounces_flags)) {
+			ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+			imageStore(rt_depth_image, pixel, vec4(0.0));
+#ifdef DLSS_RR_ENABLED
+			...four imageStore lines...
+			rt_accum_guide_sample(pixel, volume_albedo(), -gl_WorldRayDirectionEXT);
+#endif
+		}
+```
+
+delete the `rt_accum_guide_sample(...)` line. Then, after that `if` block's closing brace and before `path_pack(payload, ps);`, add:
+
+```glsl
+#ifdef DLSS_RR_ENABLED
+		if (ps.feat_pending) {
+			float t_avg = (ps.feat_throughput.r + ps.feat_throughput.g + ps.feat_throughput.b) / 3.0;
+			rt_accum_guide_sample(ivec2(gl_LaunchIDEXT.xy), volume_albedo() * ps.feat_throughput,
+					-gl_WorldRayDirectionEXT * t_avg);
+			ps.feat_pending = false;
+		}
+#endif
+```
+
+**4h. Miss stage, sky (about :589-602).** In the `#ifdef DLSS_RR_ENABLED` block, delete `rt_accum_guide_sample(pixel, sky_color, -gl_WorldRayDirectionEXT);`. Then, after the inner `if (total_bounces == 0u && ...) { ... }` closes, still inside the `#ifdef`'s braces, add:
+
+```glsl
+		if (ps.feat_pending) {
+			float t_avg = (ps.feat_throughput.r + ps.feat_throughput.g + ps.feat_throughput.b) / 3.0;
+			rt_accum_guide_sample(ivec2(gl_LaunchIDEXT.xy), sky_color * ps.feat_throughput,
+					-gl_WorldRayDirectionEXT * t_avg);
+			ps.feat_pending = false;
+		}
+```
+
+The miss stage packs `ps` at its end (`path_pack(payload, ps);`, about :659), so the cleared flag reaches raygen.
+
+**4i. `raytracing_closest_hit_common_inc.glsl`, the rule and the surface write.** Immediately above `void shade_and_bounce(HitData h, MaterialResult m) {` (about :1368) add:
+
+```glsl
+#ifdef DLSS_RR_ENABLED
+// Cycles' denoising-feature rule as shipped through 2026-03-03 (film/denoising_passes.h at
+// the parent of 44be56fd493): a closure whose GGX alpha exceeds 0.075 is diffuse-like, and
+// a surface writes its features when diffuse-like closures hold more than a quarter of the
+// weight; otherwise the features wait for the next bounce, carried by the specular albedo.
+// Spec 2026-10-04-oidn-guide-feature-passthrough-design.md, section 3. Estimated from our
+// one-material model: no coat or sheen, and no (1 - F) layering factor on the diffuse.
+bool rt_guide_defers(MaterialProperties p_mat, float p_NdotV, vec3 p_specularF0, out vec3 r_spec_albedo) {
+	r_spec_albedo = vec3(0.0);
+	if (p_mat.roughness * p_mat.roughness > 0.075) {
+		return false;
+	}
+	vec3 d = baseColorToDiffuseReflectance(p_mat.baseColor, p_mat.metalness, p_mat.transmissivness);
+	vec3 spec = DLSSRR_computeSpecularAlbedo(p_mat.baseColor, p_mat.metalness, p_mat.dielectricF0, p_mat.roughness, p_NdotV);
+	if (p_mat.transmissivness > 0.0) {
+		vec3 refl;
+		vec3 trans;
+		float cos_theta_t = 0.0;
+		dielectricFresnelSplit(p_NdotV, p_mat.eta, p_specularF0, p_mat.transmissivness, refl, trans, cos_theta_t);
+		spec += (1.0 - p_mat.metalness) * trans;
+	}
+	r_spec_albedo = spec;
+	float w_diff = (d.r + d.g + d.b) / 3.0;
+	float w_spec = (spec.r + spec.g + spec.b) / 3.0;
+	return (w_diff + w_spec > 0.0) && !(w_diff * 4.0 > w_diff + w_spec);
+}
+
+// One guide sample per path (spec section 2): runs at every surface while the sample's
+// guide is pending, and writes at the first surface that does not defer. With
+// feat_throughput == 1 it writes exactly what the bounce-0 write always wrote.
+void rt_guide_features_surface(inout PathState p_ps, MaterialProperties p_mat, vec3 p_diffuse_albedo,
+		vec3 p_N, float p_NdotV, vec3 p_specularF0) {
+	if (!p_ps.feat_pending) {
+		return;
+	}
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+	vec3 spec_albedo;
+	if (rt_guide_defers(p_mat, p_NdotV, p_specularF0, spec_albedo)) {
+		p_ps.feat_throughput *= clamp(spec_albedo, vec3(0.0), vec3(1.0));
+		if (max(max(p_ps.feat_throughput.r, p_ps.feat_throughput.g), p_ps.feat_throughput.b) <= 1e-4) {
+			// Cycles clears the flag and the path contributes nothing; the running mean
+			// still needs this sample's one write.
+			rt_accum_guide_sample(pixel, vec3(0.0), vec3(0.0));
+			p_ps.feat_pending = false;
+		}
+		return;
+	}
+	float t_avg = (p_ps.feat_throughput.r + p_ps.feat_throughput.g + p_ps.feat_throughput.b) / 3.0;
+	rt_accum_guide_sample(pixel, p_diffuse_albedo * p_ps.feat_throughput, p_N * t_avg);
+	p_ps.feat_pending = false;
+}
+#endif
+```
+
+Then at the DLSS-RR output block (about :1823-1866): delete the line `rt_accum_guide_sample(pixel, diffuse_albedo, N);` (about :1834). After that block's closing `}` and BEFORE its `#endif` (the one just above the `// NEE: Next Event Estimation` banner and its `path_pack(payload, ps);`), add:
+
+```glsl
+	rt_guide_features_surface(ps, brdf_mat, DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness), N, NdotV, specularF0);
+```
+
+`brdf_mat`, `NdotV` (about :1467) and `specularF0` (about :1786) are all in scope there; check each. The DLSS-RR `imageStore`s, the depth and velocity writes, and the spec-hit-distance query are not changed by any of this.
+
+- [ ] **Step 5: Build, then run the gate three times**
+
+```bash
+cd $R && python -m SCons platform=windows target=editor > $W/build_task5.log 2>&1; tail -3 $W/build_task5.log
+for i in 1 2 3; do $BIN --rendering-driver vulkan --path pipeline_references res://tests/pt_oidn_guide_passthrough_gate_scene.tscn > $W/t5g_post_$i.log 2>&1; echo "run $i exit=$?"; grep -aE "^PASS|^FAIL" $W/t5g_post_$i.log; done
+```
+
+The build must end with `scons: done building targets.` A clean build proves nothing about the GLSL (no glslang runs at build time). The first render compiles the shaders, so read the gate log for `SHADER` / `ERROR` lines before reading any number. All checks must pass in all three runs. If a check fails while the guides plainly look right, or a value sits within 10% of its threshold, STOP and report the numbers; do not move a threshold.
+
+- [ ] **Step 6: Regressions: the gate suite, and DLSS-RR frame-identity**
+
+(a) The full suite on the new build: `bash $W/run_suite.sh` (it overwrites `$W/suite/`; copy the old `$W/suite/summary.txt` to `$W/suite_pre5_summary.txt` first). Every gate that passed before must pass. `pt_oidn_guide_gate` G1-G3 must keep their values, because no pass-through or smooth surface is in its scene. If `pt_transmission_gate` probe 6 moves, run it on `$OLD` in the same session before suspecting the change (memory: probe 6 moves with the desktop session on every binary).
+
+(b) DLSS-RR output unchanged: render `$IN/job301_12kf.json` in the default mode (no `ZR_VIDEO_DENOISER`), once with `$OLD` and once with `$BIN`, each into its own scratch project (`make_test_project.sh`), `--write-movie <dir>/movie.avi --fixed-fps 60 res://video_main.tscn -- <job> <out.mp4> <frame.png>`, one at a time. Compare `$FF -i movie.avi -f framemd5 -`, which must be identical. If not, run `$OLD` twice to measure the floor (memory: some builds are not run-to-run deterministic) before concluding anything, and report.
+
+- [ ] **Step 7: Asset checks**
+
+(a) The window, re-dumped on the new build: `bash $W/run_dump.sh post5`. In `$W/dump_post5/pfm`, measure the pane region x 1620-1820, y 720-880 (image y down; PFM rows are bottom-up). Unwritten fraction: `dump_base` 92.7% -> must be <= 1%. Write `$W/t5g/window_guides.png`: for each dump (`dump_base` on top, `dump_post5` below), the same 2x2 crop layout as `$W/dump_base/window_guides.png` (box (1560, 700)-(2160, 1100); colour and output as `clip(x * 2, 0, 1) ** (1 / 2.2)`, albedo as `clip(x, 0, 1) ** (1 / 2.2)`, normal as `x * 0.5 + 0.5`).
+
+(b) The 1:1 window crop: box (1560, 700)-(2160, 1100) of `oidn_output.pfm`, through `dump_post5` and `dump_base` at the same display transform (`clip(x * 2, 0, 1) ** (1 / 2.2)`), side by side, plus `$W/t7/dlssrr_kf210.png`'s same crop. Save as `$W/t5g/window_crop_before_after_dlssrr.png`, labelled.
+
+(c) Job 201 still at 1080p, old vs new, same command as `$W/step13d.sh`, once per binary: md5s; whole-frame linear-ish mean (8-bit PNG mean) ratio, which must be within 0.5%; and a diff heat-map `$W/t5g/job201_diff.png` (|new - old| x 8, clipped). The md5 is expected to change: job 201 has three windows.
+
+- [ ] **Step 8: Spec "Measured", then commit**
+
+Append a `## Measured (2026-10-04)` section to the spec: the gate's pre and post numbers (all three post runs), F6's status (check or informative), suite result, the DLSS-RR framemd5 result, the window unwritten fraction before/after, and the job 201 mean ratio, each with its file path. Then two commits, gate first:
+
+```bash
+git add pipeline_references/tests/pt_oidn_guide_passthrough_gate.gd pipeline_references/tests/pt_oidn_guide_passthrough_gate_scene.tscn
+git commit -m "test(pt): OIDN guide pass-through gate -- red on the current build
+
+Surfaces seen through an alpha pane write no OIDN guide (about 80% unwritten
+behind an alpha-0.033 pane at 6 samples), and smooth glass writes its own flat
+albedo. Spec 2026-10-04-oidn-guide-feature-passthrough-design.md.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git add servers/rendering/renderer_rd/shaders/raytracing/raytracing_inc.glsl servers/rendering/renderer_rd/shaders/raytracing/scene_raytracing_raygen.glsl servers/rendering/renderer_rd/shaders/raytracing/raytracing_closest_hit_common_inc.glsl servers/rendering/renderer_rd/shaders/raytracing/raytracing_lights_inc.glsl docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md
+git commit -m "fix(pt): OIDN guides follow Cycles' denoising features through transparency and smooth specular
+
+The guide write was gated on total_bounces == 0, and an alpha pass-through
+counts as a bounce (inc_transmission_bounce), so the view through a window
+pane reached OIDN as black and featureless. Each Phase A sample now carries
+Cycles' pending-features flag and feature throughput: transparency passes them
+through, a surface whose GGX alpha <= 0.075 and whose diffuse share is a
+quarter or less defers them by its specular albedo, and the first other
+surface or the sky writes them. DLSS-RR's G-buffers are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+`git add` only the paths named. Never `-A`: `pipeline_references/.godot/` and the `.uid` files are untracked and stay that way.
+
+- [ ] **Step 9: Clean up**
+
+Delete `bin/godot_pre5.windows.editor.x86_64.exe` and `bin/godot_pre5.windows.editor.x86_64.console.exe`, the scratch projects, and the job-201 PNGs once their numbers are written. Keep logs, the `t5g/` images, and `dump_post5/` until Task 4's re-run has used it.
