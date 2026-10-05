@@ -141,31 +141,57 @@ G-buffer, depth and velocity writes are **not touched**: they stay at `total_bou
 
 ### 3. The rule: `rt_guide_defers`
 
-Inputs are the hit's `brdf_mat`, `m`, `NdotV` and `specularF0` at the write site.
+Inputs are the hit's `brdf_mat`, `m` and `NdotV` at the write site.
 
 ```
 alpha = brdf_mat.roughness * brdf_mat.roughness   // brdf_inc.glsl:2054 convention
 if alpha > 0.075: write                           // every lobe is diffuse-like
-w_diff = avg(baseColorToDiffuseReflectance(base, metalness, transmissivness))
-spec   = DLSSRR_computeSpecularAlbedo(base, metalness, dielectricF0, roughness, NdotV)
-if transmissivness > 0:
-    dielectricFresnelSplit(NdotV, eta, specularF0, transmissivness, R, T, ct)
-    spec += (1 - metalness) * T
+(R, T) = dielectricFresnelSplit(NdotV, eta, dielectricF0, transmissivness)
+metal  = evalFresnelSchlick(base, 1, NdotV)       // Cycles' F82 tint, at the default white tint
+spec   = metalness * metal + (1 - metalness) * (R + T)
+d      = baseColorToDiffuseReflectance(base, metalness, transmissivness) * (1 - R)
+w_diff = avg(d)
 w_spec = avg(spec)
 write  if (w_diff + w_spec == 0) or (w_diff * 4 > w_diff + w_spec)
 else   defer, with spec_albedo = spec
 ```
 
-`avg` is `(r + g + b) / 3`. The reflection term reuses the DLSS-RR specular-albedo
-helper (`brdf_inc.glsl:4255`), and the transmission term reuses the single source of
-truth for the reflect/transmit split (`dielectricFresnelSplit`, colourless
-`(1 - R) * transmission`). For clear glass, R + T is about 1, so the guide behind a
-window carries what is outside at full strength.
+`avg` is `(r + g + b) / 3`. Cycles weights each closure by its `bsdf_albedo`, which for a
+near-delta closure is its Fresnel at the view direction, so both shares come from the
+engine's own Fresnel sources: the metal share is Schlick with `f90 = 1` (what Cycles'
+F82 tint reduces to at the default white tint, see `evalFresnelBase`), and the dielectric
+share is the exact remap `dielectricFresnelSplit` performs for the transmissive lobe
+(`R` is the specular layer's albedo, `T = (1 - R) * transmission`, colourless; with
+`transmissivness` 0 it gives `T = 0`, and under total internal reflection `R = 1`,
+`T = 0`). Cycles layers the diffuse closure under the dielectric's specular layer, so
+its weight carries `(1 - R)`. For clear glass R + T is 1 at every angle, so the guide
+behind a window carries what is outside at full strength.
 
-Worked cases: smooth clear glass (w_diff 0) defers. A smooth metal (w_diff 0) defers.
-A glossy white wall (roughness 0.2, alpha 0.04): w_diff 0.8 vs w_spec ~0.05, so it
-writes, as today. The window pane's alpha share (base 0.7067, metallic 0, alpha 0.0084)
-writes the pane. A rough anything writes.
+The DLSS-RR specular-albedo helper (`DLSSRR_computeSpecularAlbedo`, `brdf_inc.glsl:4255`)
+is **not** used here: it returns Karis' EnvBRDFApprox multiplied by 2.0
+(`DLSSRR_envBRDFApprox`, `brdf_inc.glsl:4247`), twice the Fresnel scale Cycles weighs by.
+An earlier cut of this rule used it (round 0) and measured a smooth white metal passing
+`clamp(2 * F0)` instead of `F0` and a dark glossy dielectric deferring instead of writing.
+
+Worked cases (hand-computed from the formula, real Fresnel for ior 1.5 and
+`dielectricF0` 0.04; not measured):
+
+- Smooth clear thin glass (transmission 1, base white): `R + T = 1.0`, `w_diff = 0`, so it
+  defers with throughput 1.0 at every angle. Thick glass seen from inside under total
+  internal reflection: `R = 1`, `T = 0`, `spec = 1.0`, defers with 1.0.
+- Smooth metal, base 0.5, normal incidence: `spec = 0.5`, `w_diff = 0`, so it defers with
+  throughput 0.5 (the gate's F7). A gold-like `F0 = (1.0, 0.78, 0.34)` passes its own F0,
+  tint kept (the 2x helper gave `(2.0, 1.56, 0.69)`, clamped to `(1.0, 1.0, 0.69)`).
+- Dark glossy dielectric, base 0.02, normal incidence: `w_diff = 0.02 * 0.96 = 0.0192`,
+  `w_spec = 0.04`, and `4 * 0.0192 = 0.0768 > 0.0592`, so it writes its diffuse albedo
+  0.02 (F8). The boundary for an opaque smooth dielectric is `base > R / (3 * (1 - R))`:
+  0.0139 at normal incidence (R 0.040), 0.0326 at NdotV 0.5 (R 0.089), 0.171 at NdotV 0.2
+  (R 0.339). Round 0 put the same boundary at 0.030 / 0.056 / 0.213.
+- Glossy white wall (roughness 0.2, alpha 0.04, base 0.8): `w_diff = 0.8 * 0.96 = 0.768`
+  against `w_spec = 0.04`, so it writes, as today.
+- The window pane's alpha share (base 0.7067, metallic 0, alpha 0.0084): `w_diff` 0.678
+  against `w_spec` 0.04, so it writes the pane.
+- A rough anything (alpha above 0.075, roughness above 0.274) writes.
 
 ### 4. Invariance
 
@@ -189,30 +215,44 @@ Job 201's still (three windows) is expected to leave its md5
 `ZR_OIDN_DUMP` pointed at a gate temp dir with `OS.set_environment` before the
 accumulation, PFMs read back after. 6 accumulated samples (video's count), max bounces
 6, OIDN on. Uniform sky (0.5, 0.6, 0.8). Top row: sky; bottom row: a 4-px checker card
-(0.9 / 0.1). Three columns: **open**, **behind an alpha pane** (authored like
-`Mat_A38_Window_Glass_001`: alpha 0.033, base 0.7067, roughness 0.0916, metallic 0,
-cull disabled), **behind a smooth thin glass** (transmission 1, ior 1.5, roughness 0,
-thickness 0, metallic 0, white; the material `_apply_glb_transmissive_glass`
-produces). Each check measures an interior region with a margin from the region edges.
+(0.9 / 0.1). Five columns, each a pane of width w / 5 at 5 m (or open air): **open**,
+**behind an alpha pane** (authored like `Mat_A38_Window_Glass_001`: alpha 0.033, base
+0.7067, roughness 0.0916, metallic 0, cull disabled), **behind a smooth thin glass**
+(transmission 1, ior 1.5, roughness 0, thickness 0, metallic 0, white; the material
+`_apply_glb_transmissive_glass` produces), a **mirror** (metallic 1, roughness 0, linear
+base 0.5; it faces the camera, so its reflection leaves past the camera into the sky) and
+a **dark gloss** dielectric (metallic 0, roughness 0, `metallic_specular` 0.5, linear base
+0.02). Each check measures an interior region with a margin from the column edges
+(columns at multiples of 51.2 px; regions open [8, 48), alpha [58, 96), glass [110, 148),
+mirror [162, 200), dark [212, 250), rows sky [8, 120) and checker [136, 248)).
 
 - **F1 premise (colour):** colour mean behind the alpha pane / open, per row, in
-  [0.95, 1.01]. The pane is what we think it is. Invariance check: passes on both
+  [0.95, 1.05]. The pane is what we think it is. Invariance check: passes on both
   builds.
 - **F2 written:** unwritten guide pixels (albedo 0 and the zero-length-normal
-  fallback) behind each pane <= 1%, per row. Current build: about 80% behind the alpha
-  pane.
+  fallback) behind the alpha and the glass pane <= 1%, per row. Round-0 build: about
+  80% behind the alpha pane.
 - **F3 alpha-pane albedo:** guide albedo mean behind the alpha pane within 5% of
-  `0.967 * open + 0.033 * 0.7067`, per row. Current build: about 0.09x.
+  `0.967 * open + 0.033 * 0.7067`, per row. Pre-fix build: 0.10x (sky), 0.14x (checker).
 - **F4 glass detail:** the checker's guide-albedo std behind the smooth glass / open
-  >= 0.85. Current build: about 0 (flat white).
-- **F5 open unchanged:** open-region guides equal today's, sky albedo == sky colour
-  and checker albedo mean == the texture mean, within 1e-3. Invariance check.
-- **F6 denoised result:** OIDN output behind each pane vs the open region, per row:
-  mean within 3%, and the checker's output std ratio >= 0.85.
+  >= 0.85. Pre-fix build: about 0 (flat white).
+- **F5 open unchanged:** open-region guides equal today's: sky albedo luma == the sky
+  colour's luma within 1e-3 absolute, checker albedo mean == the texture's linear mean
+  within 2% relative. Invariance check.
+- **F6 denoised result: informative, not a check.** OIDN output behind each pane vs the
+  open region, the checker's output std ratio. It passed on the build before the fix
+  (0.979 alpha, 0.975 glass), because a 4-px high-contrast checker keeps its detail in the
+  colour whatever the guides say, so it cannot tell the two builds apart. The visible
+  effect is judged on the production window instead (Measured, below).
+- **F7 mirror:** guide albedo luma behind the mirror within 5% (relative) of `0.5 *` the
+  open sky's guide albedo luma, per row. A smooth metal defers with its Fresnel, 0.5 at
+  normal incidence. Round-0 build: ratio 2.00 (the 2x helper saturated at 1).
+- **F8 dark gloss:** guide albedo luma on the dark gloss within 5% (relative) of its
+  diffuse albedo 0.02, per row. Cycles writes here (`w_diff` 0.0192 against `w_spec` 0.04,
+  and `4 * 0.0192 > 0.0592`). Round-0 build: ratio 2.67 (it deferred).
 
-Thresholds are confirmed against three runs of the fixed build. F2-F4 must be shown
-**red on the current binary** before the fix lands; F6 counts as a check only if it is
-also red there, otherwise it is reported as informative.
+Thresholds are confirmed against three runs of the fixed build. F2-F4 were shown **red on
+the pre-fix binary**, F7 and F8 **red on the round-0 binary**, before each fix landed.
 
 ## Asset checks
 
@@ -247,8 +287,7 @@ also red there, otherwise it is reported as informative.
 
 - One write per sample with the hard rule, as above.
 - The rule's weights are estimated from our one-material model rather than per closure:
-  the diffuse weight omits Cycles' `(1 - F)` layering factor (it shifts the boundary by
-  at most about 4%), and coat and sheen are not counted.
+  coat and sheen are not counted.
 - The deferred throughput is stored at 8 bits per channel.
 - A deferred miss writes our direction normal; Cycles writes no normal for a background.
 
@@ -257,6 +296,11 @@ also red there, otherwise it is reported as informative.
 All paths are under `.superpowers/sdd/2026-10-01-video-oidn/` (untracked working notes).
 Binary pair: `godot_pre5` (the build before the change) and the fixed build; desktop
 session Active for every run.
+
+This first part is **round 0** (commit `661d950aa7`, gate of 12 checks over three
+columns); it measured the rule with the DLSS-RR specular helper, which round 1 (the last
+subsection) replaced after review found the helper weighs smooth lobes at twice their
+Fresnel.
 
 **Gate as built** (`pipeline_references/tests/pt_oidn_guide_passthrough_gate.gd`): 12
 checks. F1's band is [0.95, 1.05] (the pane's colour ratio reads 0.9911 sky / 1.0245
@@ -310,3 +354,55 @@ before OIDN: the mullion at x 1838-1846, y 740-900 reads normal per-axis std 0.0
 and 0.279 after, albedo mean 0.004 -> 0.125. OIDN's output there stays clean (std 0.0058 ->
 0.0032). Cycles later added `follow_reflections` to control exactly this (see "What Cycles
 does").
+
+### Fix round 1 (2026-10-05): the deferral weights smooth lobes by their Fresnel
+
+Review found that round 0's `rt_guide_defers` weighed the smooth lobes with
+`DLSSRR_computeSpecularAlbedo`, whose `DLSSRR_envBRDFApprox` returns Karis' fit times 2.0
+(`brdf_inc.glsl:4247`), twice the Fresnel scale Cycles' `bsdf_albedo` gives. Effects: a
+smooth dielectric of F0 0.04 read 0.091 instead of 0.046 (0.0902 measured through the
+gate), so the deferral band for dark glossy dielectrics doubled; a smooth white metal's
+throughput was `clamp(2 * F0)`; and the reflection share was dropped under total internal
+reflection. Section 3 now uses `dielectricFresnelSplit` and `evalFresnelSchlick` (formula
+and worked cases there), and the zero-write threshold is `0.5 / 255`, the value
+`packUnorm4x8` rounds to zero. The DLSS-RR helpers are untouched. Paths as above, under
+`.superpowers/sdd/2026-10-01-video-oidn/`.
+
+**Gate widened to five columns, 16 checks** (F7 mirror, F8 dark gloss added; regions in the
+Gate section). Run FIRST on the round-0 binary (`t5g_r1_pre.log`): F0-F5 pass in the
+narrower regions, **F7 red** (mirror guide 0.5929 against the wanted 0.2964, ratio 2.0000
+on both rows: `clamp(2 * 0.5)` = 1, so the guide equals the sky) and **F8 red** (dark gloss
+0.0535 against 0.0200, ratio 2.6732: it deferred, 0.0535 = 0.0902 x 0.593).
+
+After the shader change (`t5g_r1_post_{1,2,3}.log`, three runs with byte-identical
+numbers, 16 of 16 pass, no shader-compile errors in the first log):
+
+| check | round-0 binary | round-1 binary | threshold |
+|---|---|---|---|
+| F1 colour ratio sky / checker | 0.9907 / 1.0237 | 0.9907 / 1.0237 | [0.95, 1.05] |
+| F2 alpha and glass unwritten (4 values) | 0.00% | 0.00% | <= 1% |
+| F3 alpha-pane albedo ratio sky / checker | 0.9996 / 0.9976 | 0.9996 / 0.9976 | +-5% |
+| F4 glass guide std ratio | 0.9686 | 0.9686 | >= 0.85 |
+| F5 open sky albedo / checker mean | 0.59289 vs 0.59318; 0.39764 vs 0.39872 | same | 1e-3 abs; 2% rel |
+| F6 (informative) alpha / glass | 0.9559 / 0.9805 | 0.9554 / 0.9740 | none |
+| F7 mirror, sky / checker (ratio to 0.5 x open sky) | 2.0000 / 2.0000 (red) | 1.0034 / 1.0034 | +-5% |
+| F8 dark gloss, sky / checker (ratio to 0.02) | 2.6732 / 2.6732 (red) | 0.9995 / 0.9995 | +-5% |
+
+**Regressions on the round-1 binary.** `suite/summary.txt`: all 26 gate scenes pass,
+including the 16-check gate; `pt_oidn_guide_gate` G1-G3 print the same lines as the
+pre-change binary; against `suite_pre5_summary.txt` the only change is
+`pt_transmission_gate` (the pre-change run's 1-of-45 was the Disc-session effect; 45/45
+now). DLSS-RR, `job301_12kf.json`, default mode: 38 frames, `framemd5` identical to the
+preserved pre-change reference `t5_dlssrr_a/movie.framemd5` (md5
+`e1b3b26b38239faa590de8785860289a`; `t5_dlssrr_diff_r1.txt` empty). Keyframe-210 re-dump
+`dump_post5r1/`: pane region unwritten **92.69% -> 0.00%**; colour bit-identical to the
+base dump; the wall control region is unchanged; the metal mullion's albedo mean is now
+0.071 (round 0: 0.125; base 0.004) with its normal still noisy (per-axis std 0.278), OIDN
+output there clean (std 0.0038). Images `t5g/window_crop_before_after_dlssrr.png` (after =
+round 1; round 0 kept as `..._round0.png`) and `t5g/window_guides.png`.
+
+**Job 201 at 1080p, round-1 binary, twice (warm):** 224 s then 205 s, both md5
+`10c98486960c8bca460f63f8e146f75c`, so the 208 s -> 248 s of round 0 was a first-run
+effect. Against the pre-change still `knee-sweep/knee_3.0.png` (md5 `2a17e657...`): whole-frame
+8-bit mean ratio **0.99981** (limit 0.5%), mean |diff| 0.322 levels, 0.905% of pixels differ
+by 8 or more levels; heat-map `t5g/job201_diff.png` (regenerated against `knee_3.0.png`).

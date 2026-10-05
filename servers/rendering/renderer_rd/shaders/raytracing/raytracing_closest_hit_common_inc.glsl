@@ -1369,21 +1369,28 @@ void debug_visualize(
 // a surface writes its features when diffuse-like closures hold more than a quarter of the
 // weight; otherwise the features wait for the next bounce, carried by the specular albedo.
 // Spec 2026-10-04-oidn-guide-feature-passthrough-design.md, section 3. Estimated from our
-// one-material model: no coat or sheen, and no (1 - F) layering factor on the diffuse.
-bool rt_guide_defers(MaterialProperties p_mat, float p_NdotV, vec3 p_specularF0, out vec3 r_spec_albedo) {
+// one-material model: no coat or sheen.
+bool rt_guide_defers(MaterialProperties p_mat, float p_NdotV, out vec3 r_spec_albedo) {
 	r_spec_albedo = vec3(0.0);
 	if (p_mat.roughness * p_mat.roughness > 0.075) {
 		return false;
 	}
-	vec3 d = baseColorToDiffuseReflectance(p_mat.baseColor, p_mat.metalness, p_mat.transmissivness);
-	vec3 spec = DLSSRR_computeSpecularAlbedo(p_mat.baseColor, p_mat.metalness, p_mat.dielectricF0, p_mat.roughness, p_NdotV);
-	if (p_mat.transmissivness > 0.0) {
-		vec3 refl;
-		vec3 trans;
-		float cos_theta_t = 0.0;
-		dielectricFresnelSplit(p_NdotV, p_mat.eta, p_specularF0, p_mat.transmissivness, refl, trans, cos_theta_t);
-		spec += (1.0 - p_mat.metalness) * trans;
-	}
+	// Albedo of the smooth lobes at this view angle, from the engine's own Fresnel sources
+	// (Cycles weights by bsdf_albedo, which for a near-delta closure is its Fresnel at wi).
+	// Metal share: Cycles' F82-tint collapses to Schlick with f90 = 1 at the default white
+	// tint (see evalFresnelBase). Dielectric share: the exact remap dielectricFresnelSplit
+	// performs for the transmissive lobe; transmissivness 0 gives T = 0 (an opaque
+	// dielectric's specular layer), and total internal reflection gives R = 1, T = 0.
+	// NOT DLSSRR_computeSpecularAlbedo: DLSSRR_envBRDFApprox is Karis' fit x 2.0.
+	vec3 refl;
+	vec3 trans;
+	float cos_theta_t = 0.0;
+	dielectricFresnelSplit(p_NdotV, p_mat.eta, p_mat.dielectricF0, p_mat.transmissivness, refl, trans, cos_theta_t);
+	vec3 metal = evalFresnelSchlick(p_mat.baseColor, 1.0, p_NdotV);
+	vec3 spec = p_mat.metalness * metal + (1.0 - p_mat.metalness) * (refl + trans);
+	// Cycles layers the diffuse closure under the dielectric's specular layer, so its weight
+	// carries (1 - that layer's albedo).
+	vec3 d = baseColorToDiffuseReflectance(p_mat.baseColor, p_mat.metalness, p_mat.transmissivness) * (vec3(1.0) - refl);
 	r_spec_albedo = spec;
 	float w_diff = (d.r + d.g + d.b) / 3.0;
 	float w_spec = (spec.r + spec.g + spec.b) / 3.0;
@@ -1394,15 +1401,17 @@ bool rt_guide_defers(MaterialProperties p_mat, float p_NdotV, vec3 p_specularF0,
 // guide is pending, and writes at the first surface that does not defer. With
 // feat_throughput == 1 it writes exactly what the bounce-0 write always wrote.
 void rt_guide_features_surface(inout PathState p_ps, MaterialProperties p_mat, vec3 p_diffuse_albedo,
-		vec3 p_N, float p_NdotV, vec3 p_specularF0) {
+		vec3 p_N, float p_NdotV) {
 	if (!p_ps.feat_pending) {
 		return;
 	}
 	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 	vec3 spec_albedo;
-	if (rt_guide_defers(p_mat, p_NdotV, p_specularF0, spec_albedo)) {
+	if (rt_guide_defers(p_mat, p_NdotV, spec_albedo)) {
 		p_ps.feat_throughput *= clamp(spec_albedo, vec3(0.0), vec3(1.0));
-		if (max(max(p_ps.feat_throughput.r, p_ps.feat_throughput.g), p_ps.feat_throughput.b) <= 1e-4) {
+		// 0.5 / 255 is the value packUnorm4x8 rounds to zero: anything above it survives the
+		// payload as a non-zero throughput, anything at or below it would be zero by the next hit.
+		if (max(max(p_ps.feat_throughput.r, p_ps.feat_throughput.g), p_ps.feat_throughput.b) <= 0.5 / 255.0) {
 			// Cycles clears the flag and the path contributes nothing; the running mean
 			// still needs this sample's one write.
 			rt_accum_guide_sample(pixel, vec3(0.0), vec3(0.0));
@@ -1910,7 +1919,7 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		}
 		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
 	}
-	rt_guide_features_surface(ps, brdf_mat, DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness), N, NdotV, specularF0);
+	rt_guide_features_surface(ps, brdf_mat, DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness), N, NdotV);
 #endif
 
 	// =================================================================
