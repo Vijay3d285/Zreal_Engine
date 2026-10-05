@@ -662,6 +662,14 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 			flags |= RT_FLAG_DEBUG_VIS_ENABLED;
 		}
 		sample_count = MAX(1u, (uint32_t)p_env_params[RT_PARAM_SAMPLE_COUNT]);
+		// Accumulate (Phase A) packs sample count 0: that raygen branch never reads the
+		// count, and 0 is the variant key for the OIDN guide-feature code
+		// (`#define RT_OIDN_FEATURES`, injected by _ensure_variant_compile_context). One-shot
+		// always packs >= 1. Same test and index as render_forward_clustered.cpp's
+		// `rt_accumulate_active`, on the same params pointer.
+		if (p_env_params[RT_PARAM_ACCUM_FLAG] >= 0.5f) {
+			sample_count = 0;
+		}
 		// Cycles' shipped default total is 12 (blender/addon/properties.py); 8 was
 		// clipping requests the pipeline already makes. This is a specialization
 		// constant, so a higher ceiling costs nothing until a scene asks for it.
@@ -778,6 +786,15 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 
 	if (p_rt_flags & RT_FLAG_DEBUG_VIS_ENABLED) {
 		inject_define(sources, "#define RT_DEBUG_ENABLED\n");
+	}
+
+	// Sample-count field 0 is the accumulate (Phase A) key (compute_rt_flags): only that
+	// variant compiles the OIDN guide-feature code. Injected here, before the custom
+	// hit-group templates are cut from the base stage sources below, so every stage of
+	// the pipeline (custom material hit groups and the intersection stage included) sees
+	// the same define.
+	if (((p_rt_flags >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK) == 0u) {
+		inject_define(sources, "#define RT_OIDN_FEATURES\n");
 	}
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.

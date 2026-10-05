@@ -79,15 +79,34 @@ struct PathPayload {
 	// behind a pane is hit instead of being skipped by a distance margin.
 	uint skip_geom; //  4 bytes - gl_InstanceCustomIndexEXT, or RT_SKIP_NONE
 	uint skip_prim; //  4 bytes - gl_PrimitiveID within that geometry
-	// E3. xyz: where the next ray starts after a random walk -- the walk's exit
-	// is not on the current ray, so origin + dir * hit_t cannot express it.
-	// w: 1.0 while that restart is pending (the "SSS exit" flag), else 0.0.
-	// The flag lives HERE and not in packed_bounces_flags because that word
-	// has no free bit: [total:8][diffuse:8][glossy:8] then 24 sample-zero,
-	// 25 shadow, 26 terminated, 27-30 the transmission counter, 31 inside-
-	// medium. A first cut put it at bit 27 and every path with an odd number
-	// of glass crossings restarted from (0,0,0). 16 bytes; the struct is 80.
+	// E3. sss_restart: where the next ray starts after a random walk -- the walk's
+	// exit is not on the current ray, so origin + dir * hit_t cannot express it.
+	// The path's small flags ride in the 4th word. Without RT_OIDN_FEATURES that is
+	// sss_restart.w, a float carrying 0..3: 1.0 while that restart is pending (the
+	// "SSS exit" flag), 2 = guide_record (Gap #32). The flags live HERE and not in
+	// packed_bounces_flags because that word has no free bit: [total:8][diffuse:8]
+	// [glossy:8] then 24 sample-zero, 25 shadow, 26 terminated, 27-30 the transmission
+	// counter, 31 inside-medium. A first cut put the SSS flag at bit 27 and every path
+	// with an odd number of glass crossings restarted from (0,0,0). 16 bytes; the
+	// struct is 80.
+	//
+	// RT_OIDN_FEATURES (the accumulate / Phase A pipeline only: sample-count field 0 in
+	// the RT flags word, see scene_shader_raytracing.cpp) turns that word into a plain
+	// uint, sss_bits: bit 0 sss_exit, bit 1 guide_record, bit 2 feat_pending (OIDN
+	// guides), bits 8-15 / 16-23 / 24-31 the OIDN feature throughput r / g / b as unorm8
+	// (spec 2026-10-04-oidn-guide-feature-passthrough-design.md; Cycles'
+	// denoising_feature_throughput, a product of albedos in [0, 1], quantised exactly as
+	// packUnorm4x8 does, so 1.0 round-trips). Same 16 bytes, so the payload stays 92:
+	// every NEE shadow ray copies the whole payload and keeps it live across its
+	// traceRayEXT, and a dedicated 4-byte word cost the DLSS-RR one-shot path 2.9% per
+	// frame although the new code never runs there. That path compiles without the define,
+	// i.e. the pre-feature source and layout.
+#ifdef RT_OIDN_FEATURES
+	vec3 sss_restart;
+	uint sss_bits;
+#else
 	vec4 sss_restart;
+#endif
 	// Light portals. The vertex whose BSDF sample produced this ray -- the
 	// point its NEE used. The sky pdf now depends on the position (which
 	// portals face it, and their solid angle from it), so the miss stage must
@@ -98,11 +117,6 @@ struct PathPayload {
 	// Cycles keeps ray.P at the scattering vertex across a transparent bounce
 	// (shade_surface.h:573-576) for the same reason. 12 bytes; struct is 92.
 	vec3 mis_origin;
-	// OIDN guides (spec 2026-10-04-oidn-guide-feature-passthrough-design.md): Cycles'
-	// PATH_RAY_DENOISING_FEATURES and denoising_feature_throughput. packUnorm4x8 of
-	// (throughput.rgb, pending ? 1 : 0). The throughput is a product of albedos, in
-	// [0, 1]; 1.0 round-trips exactly. 4 bytes; struct is 96.
-	uint feat_state;
 };
 
 /// Sentinel: this ray has no meaningful BSDF pdf, so anything it hits takes the
@@ -187,8 +201,10 @@ struct PathState {
 	bool sss_exit;
 	bool guide_record; // this vertex drew the diffuse lobe at density mis_ray_pdf (Gap #32)
 	vec3 mis_origin;
+#ifdef RT_OIDN_FEATURES
 	vec3 feat_throughput; // OIDN guide: product of the specular albedos deferred through
 	bool feat_pending; // OIDN guide: this sample has not written its guide yet
+#endif
 };
 
 PathState path_unpack(PathPayload p) {
@@ -203,15 +219,22 @@ PathState path_unpack(PathPayload p) {
 	s.mis_ray_pdf = p.mis_ray_pdf;
 	s.skip_geom = p.skip_geom;
 	s.skip_prim = p.skip_prim;
+#ifdef RT_OIDN_FEATURES
+	s.sss_restart = p.sss_restart;
+	// sss_bits: bit 0 sss_exit, bit 1 guide_record, bit 2 feat_pending, bits 8-31 the
+	// OIDN feature throughput as three unorm8 (see PathPayload).
+	s.sss_exit = (p.sss_bits & 1u) != 0u;
+	s.guide_record = (p.sss_bits & 2u) != 0u;
+	s.feat_pending = (p.sss_bits & 4u) != 0u;
+	s.feat_throughput = unpackUnorm4x8(p.sss_bits >> 8u).rgb;
+#else
 	s.sss_restart = p.sss_restart.xyz;
 	// sss_restart.w carries two bits as a small integer: 1 = sss_exit, 2 = guide_record.
 	uint sss_bits = uint(p.sss_restart.w + 0.5);
 	s.sss_exit = (sss_bits & 1u) != 0u;
 	s.guide_record = (sss_bits & 2u) != 0u;
+#endif
 	s.mis_origin = p.mis_origin;
-	vec4 feat = unpackUnorm4x8(p.feat_state);
-	s.feat_throughput = feat.rgb;
-	s.feat_pending = feat.a > 0.5;
 	return s;
 }
 
@@ -226,9 +249,16 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.mis_ray_pdf = s.mis_ray_pdf;
 	p.skip_geom = s.skip_geom;
 	p.skip_prim = s.skip_prim;
+#ifdef RT_OIDN_FEATURES
+	p.sss_restart = s.sss_restart;
+	// packUnorm4x8(vec4(t.rgb, 0)) puts r, g, b in bits 0-23; << 8 moves them to 8-31 and
+	// drops the empty w byte. Same quantisation as the old dedicated word.
+	p.sss_bits = (s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u) | (s.feat_pending ? 4u : 0u) |
+			(packUnorm4x8(vec4(s.feat_throughput, 0.0)) << 8u);
+#else
 	p.sss_restart = vec4(s.sss_restart, float((s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u)));
+#endif
 	p.mis_origin = s.mis_origin;
-	p.feat_state = packUnorm4x8(vec4(s.feat_throughput, s.feat_pending ? 1.0 : 0.0));
 }
 
 // Bounce count helpers.
@@ -314,7 +344,7 @@ bool is_shadow_ray(uint packed) {
 
 const uint PATH_TERMINATED_FLAG = (1u << 26);
 
-// E3's subsurface-exit flag is PathState.sss_exit / PathPayload.sss_restart.w,
+// E3's subsurface-exit flag is PathState.sss_exit / bit 0 of PathPayload.sss_bits,
 // not a bit here -- bits 27-30 are the transmission counter below.
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;

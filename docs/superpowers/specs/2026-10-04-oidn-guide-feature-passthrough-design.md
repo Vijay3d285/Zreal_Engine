@@ -96,11 +96,14 @@ missing write, but it describes the pane rather than what is seen through it.
 
 ### 1. Feature state on the path (payload)
 
-`PathPayload` gains one field, `uint feat_state` = `packUnorm4x8(vec4(feat_throughput,
-feat_pending ? 1.0 : 0.0))`; the struct grows 92 -> 96 bytes. `PathState` gains
-`vec3 feat_throughput` and `bool feat_pending`, converted in `path_unpack` / `path_pack`.
-The throughput is a product of albedos, so it lives in [0, 1] and 8 bits per channel is
-ample for a guide; 1.0 round-trips exactly (255/255).
+`PathState` gains `vec3 feat_throughput` and `bool feat_pending`, converted in
+`path_unpack` / `path_pack`. In the payload they ride in the word that already carried the
+SSS and guide-record flags (fix round 2; round 0/1 had a dedicated `uint feat_state`,
+which grew the struct 92 -> 96 bytes): `PathPayload.sss_restart` is now `vec3` followed by
+`uint sss_bits`, with bit 0 `sss_exit`, bit 1 `guide_record`, bit 2 `feat_pending` and bits
+8-15 / 16-23 / 24-31 the throughput r / g / b as unorm8 (`packUnorm4x8` quantisation); the
+struct stays 92 bytes. The throughput is a product of albedos, so it lives in [0, 1] and 8
+bits per channel is ample for a guide; 1.0 round-trips exactly (255/255).
 
 **Every construction site initialises both fields** -- an uninitialised payload field
 has moved gate results before (`raytracing_lights_inc.glsl:317-321`, probe 6):
@@ -119,7 +122,8 @@ G-buffer, depth and velocity writes are **not touched**: they stay at `total_bou
 - **Closest hit.** The call at :1834 leaves the DLSS-RR block. After that block, a new
   `rt_guide_features_surface(...)` runs when `ps.feat_pending`:
   - if the surface **defers** (rule below): `feat_throughput *= clamp(spec_albedo, 0,
-    1)`; if the result's largest channel is <= 1e-4, write a zero sample and clear
+    1)`; if the result's largest channel is <= 0.5 / 255 (the value `packUnorm4x8` rounds to
+    zero), write a zero sample and clear
     `feat_pending` (Cycles clears the flag and contributes nothing; our running mean
     needs its one write);
   - otherwise write `rt_accum_guide_sample(pixel, diffuse_albedo * feat_throughput, N *
@@ -208,6 +212,32 @@ arithmetic is untouched in both modes. So:
 Stills **do change** wherever a window, glass or mirror is in view; that is the point.
 Job 201's still (three windows) is expected to leave its md5
 `2a17e6571e9bd26619591415cfaf0e08`.
+
+### 5. Compile-time gate (fix round 3)
+
+All of the code above exists only in the **accumulate (Phase A) pipeline**. Measured
+reason: the DLSS-RR one-shot path ran 2.9% slower per frame (6059 vs 5891 ms) with this
+feature compiled in, although `feat_pending` is never set there; moving the feature state
+into the SSS bitfield (payload back to 92 bytes) recovered only 0.8% of it, because the
+code that never executes still costs registers and code size in the hit and miss stages.
+
+- **Key.** The RT flags word's sample-count field (bits 20-26) means *0 = accumulate;
+  one-shot always packs >= 1*. `compute_rt_flags` packs 0 when the environment's
+  accumulate flag is set (`>= 0.5`, the test and params pointer `rt_accumulate_active`
+  uses); the accumulate raygen branch never reads the sample count, and
+  `RT_GET_SAMPLE_COUNT()` is `max(1u, field)`.
+- **Define.** `_ensure_variant_compile_context` injects `#define RT_OIDN_FEATURES` into
+  every stage source when the field is 0, before the custom hit-group templates are cut,
+  so a pipeline's raygen, miss, closest-hit, any-hit and intersection stages (custom
+  material hit groups included) agree. Contexts and bundles are keyed by the full word, so
+  accumulate and one-shot are separate pipelines; accumulate already had its own word
+  (DLSS_RR forced for OIDN / DLSS-RR-final), so the still and OIDN-video routes gain no
+  variant, and DLSS-RR video never accumulates.
+- **Source.** Every Task 5 shader line sits under `#ifdef RT_OIDN_FEATURES`, with the
+  pre-Task-5 text in the `#else` (the payload keeps its `vec4 sss_restart`, the miss and
+  closest-hit bounce-0 writes keep their original `rt_accum_guide_sample` calls). Without
+  the define the raytracing shader sources are the pre-Task-5 source: stripping comments, the
+  macro-off text equals `git show 429e896fdf:<file>` line for line.
 
 ## Gate: `pt_oidn_guide_passthrough_gate`
 
@@ -406,3 +436,45 @@ round 1; round 0 kept as `..._round0.png`) and `t5g/window_guides.png`.
 effect. Against the pre-change still `knee-sweep/knee_3.0.png` (md5 `2a17e657...`): whole-frame
 8-bit mean ratio **0.99981** (limit 0.5%), mean |diff| 0.322 levels, 0.905% of pixels differ
 by 8 or more levels; heat-map `t5g/job201_diff.png` (regenerated against `knee_3.0.png`).
+
+### Fix round 2 (2026-10-05): the payload stays 92 bytes
+
+Alternating A/B of the DLSS-RR one-shot path (`job301_12kf.json`, default mode, GPU render
+time per frame, session Active) found the round-1 build 2.9% slower than the pre-Task-5
+build (6059 vs 5891 ms) although the new code never runs there; the suspect was the payload
+growing 92 -> 96 bytes, since every NEE shadow ray copies it and keeps it live across its
+trace. Fix A moved the feature state into the SSS/guide-record bitfield (`sss_bits`, see
+section 1), so the payload is 92 bytes again. Result: OIDN output unchanged (gate log
+identical to round 1 apart from the banner; the four kf210 PFMs byte-identical to
+`dump_post5r1`; suite 26/26), but the cost only fell to **+2.0%** (new 6009.9 ms, n = 4,
+sd 6.7; old 5891.1 ms, n = 3, sd 15, plus two old outliers reported in the notes), outside
+the 0.5% bar. The remainder is code that is present in the one-shot pipeline but never
+executes; removing it took a compile-time variant for that pipeline (round 3, below).
+
+### Fix round 3 (2026-10-05): the feature code compiles only into the accumulate variant
+
+Section 5 of the Design: sample-count field 0 = accumulate, `#define RT_OIDN_FEATURES`
+injected for it, pre-Task-5 source in the `#else`. Checks, on the round-3 binary:
+
+- **Source identity.** With the macro off, `raytracing_inc.glsl`,
+  `scene_raytracing_raygen.glsl`, `raytracing_closest_hit_common_inc.glsl`,
+  `raytracing_lights_inc.glsl`, `raytracing_guiding_inc.glsl` and `raytracing_common_inc.glsl`
+  equal `git show 429e896fdf:<file>` after stripping comments (293 / 709 / 1114 / 451 / 147 /
+  93 code lines); the same check on the ungated round-2 files reports a difference.
+- **DLSS-RR one-shot timing** (`job301_12kf.json`, default mode, GPU render time,
+  ms/frame, 12 alternating runs, every framemd5 body `b55e6e77`): in the stable-session set
+  (ab5, session Active throughout, new/old interleaved) old 5905.9 (sd 4.1, n = 3), new
+  5916.4 (sd 10.1, n = 3): **+0.18%**. The earlier set (ab4) straddled RDP session switches:
+  old 5856.5 / 5772.2 / 5885.6, new 5870.3 / 5887.7 / 5903.1; over every run that was Active
+  throughout (old n = 4, new n = 5) the means are 5900.8 and 5908.0, **+0.12%**. Over all
+  12 runs the ratio is +0.51%, pulled by the one old run (5772.2) that straddled a session
+  switch. For comparison: pre-Task-5 steady 5891.1 (round 2), Fix A alone 6009.9 (+2.0%),
+  round 1 6059.3 (+2.9%). Files `ab4_summary.txt`, `ab5_summary.txt`.
+- **OIDN output unchanged.** The 16-check gate passes 3 of 3 with numeric lines identical to
+  round 1's log; the four kf210 PFMs (`dump_post5r3`) have the same md5 as `dump_post5r1`
+  (colour `fa1157d5ecbf`, albedo `4eb1d0a01fcd`, normal `b2a1d45126c7`, output
+  `f47fb7de52b6`); job 201 at 1080p twice, md5 `10c98486960c8bca460f63f8e146f75c` both
+  times, 231 s then 206 s (round 1: 205 s). Suite 26/26.
+- **Pipeline count.** The engine prints no line when it builds a raytracing bundle (only
+  failure warnings, none seen), so there is no log count; by construction the one-shot word
+  is unchanged and the accumulate word differs only in its sample-count field.

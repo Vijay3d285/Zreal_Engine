@@ -19,6 +19,9 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
 #define RT_FLAG_FOG_ENABLED (1u << 2)
 
+// The field's meaning: 0 = accumulate (Phase A); one-shot always packs >= 1. The C++ side
+// turns 0 into `#define RT_OIDN_FEATURES`, which gates the OIDN guide-feature code
+// (compute_rt_flags / _ensure_variant_compile_context in scene_shader_raytracing.cpp).
 #define RT_SAMPLE_COUNT_SHIFT 20u
 // 7 bits since F2 (max 127 samples per dispatch; the pipeline uses 1-3): bit
 // 27 is RT_FLAG_VOLUME_ENABLED. MUST match RT_SAMPLE_COUNT_MASK in

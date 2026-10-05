@@ -114,6 +114,13 @@ public:
 		RT_FLAG_VOLUME_ENABLED = (1 << 27),
 	};
 
+	// The sample-count field's meaning: 0 = accumulate (Phase A), anything else = the
+	// one-shot samples-per-pixel (always packed >= 1). compute_rt_flags() packs 0 when the
+	// environment's accumulate flag is set, because the accumulate raygen branch never reads
+	// the sample count, and _ensure_variant_compile_context() turns the 0 into
+	// `#define RT_OIDN_FEATURES`, which compiles the OIDN guide-feature code into that
+	// variant only. The DLSS-RR one-shot pipeline therefore compiles exactly the
+	// pre-feature shader source. MUST match raytracing_common_inc.glsl.
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
 	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0x7F; // 7 bits since F2; bit 27 is RT_FLAG_VOLUME_ENABLED
 

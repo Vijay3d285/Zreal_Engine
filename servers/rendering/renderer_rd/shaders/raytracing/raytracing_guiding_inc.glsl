@@ -26,7 +26,7 @@
 // training (raygen arrays like `vec3 guide_pos[GUIDE_RECORD]`, bounded by
 // `guide_n < GUIDE_RECORD`). This is an ARRAY SIZE, not a bitmask -- it is
 // unrelated to the guide_record PathState flag, whose bit value in
-// sss_restart.w is 2 (see raytracing_inc.glsl's path_pack/path_unpack).
+// sss_bits is 2 (see raytracing_inc.glsl's path_pack/path_unpack).
 // Dead in this commit (Task 2: pure functions only, nothing records yet);
 // the raygen training loop that consumes it lands in Task 4.
 #define GUIDE_RECORD 4

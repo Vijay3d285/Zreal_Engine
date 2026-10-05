@@ -1363,7 +1363,7 @@ void debug_visualize(
 // SHADE AND BOUNCE
 // ============================================================================
 
-#ifdef DLSS_RR_ENABLED
+#if defined(DLSS_RR_ENABLED) && defined(RT_OIDN_FEATURES)
 // Cycles' denoising-feature rule as shipped through 2026-03-03 (film/denoising_passes.h at
 // the parent of 44be56fd493): a closure whose GGX alpha exceeds 0.075 is diffuse-like, and
 // a surface writes its features when diffuse-like closures hold more than a quarter of the
@@ -1893,6 +1893,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.0), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
 
 		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
+#ifndef RT_OIDN_FEATURES
+		rt_accum_guide_sample(pixel, diffuse_albedo, N);
+#endif
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;
@@ -1919,7 +1922,9 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		}
 		imageStore(dlss_rr_specular_hit_dist, pixel, vec4(spec_hit_dist));
 	}
+#ifdef RT_OIDN_FEATURES
 	rt_guide_features_surface(ps, brdf_mat, DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness), N, NdotV);
+#endif
 #endif
 
 	// =================================================================

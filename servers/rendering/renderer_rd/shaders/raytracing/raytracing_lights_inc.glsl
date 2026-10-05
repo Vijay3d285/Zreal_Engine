@@ -324,8 +324,10 @@ vec3 lights_trace_shadow_ray_geometry(vec3 origin, vec3 direction, float max_dis
 	shadow_ps.sss_restart = vec3(0.0);
 	shadow_ps.sss_exit = false;
 	shadow_ps.guide_record = false;
+#ifdef RT_OIDN_FEATURES
 	shadow_ps.feat_throughput = vec3(1.0);
 	shadow_ps.feat_pending = false;
+#endif
 	path_pack(payload, shadow_ps);
 
 	traceRayEXT(tlas,
