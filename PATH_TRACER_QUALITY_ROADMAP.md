@@ -6604,7 +6604,8 @@ detail from removed noise here and was not used for the verdict.)
 - Job 224's scene at 4K by the user, and the like-for-like far-picture crop
   against the Blender still.
 - Cycles' `denoising_depth` guide and feature deferral through specular
-  surfaces are not ported.
+  surfaces are not ported. *(Feature deferral through specular surfaces was ported for
+  the accumulate path on 2026-10-05, §11.32.)*
 
 ## 11.26 Gap #30 — the daylight was outside the window
 
@@ -7233,3 +7234,79 @@ does the patch stop reading as white**. This softens the blowout; it does not
 restore the rug to normally-lit. Full recovery needs an edge-aware filter or
 exposure fusion (named in the spec as fallbacks, not built). The video route is
 unchanged — it does not call `highlight_relief`.
+
+## 11.32 Video OIDN — per-frame OpenImageDenoise, as Cycles animates
+
+**DONE 2026-10-06.** Specs and every measurement:
+`docs/superpowers/specs/2026-10-01-video-oidn-design.md` (Measured) and
+`docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md`. OIDN is the
+**selectable** video denoiser (`ZR_VIDEO_DENOISER=oidn`, 12 spp); **DLSS-RR stays the
+default**, frame-identical to before.
+
+The still route left DLSS-RR on 2026-09-16 for a one-pixel staircase on edges and a
+checkerboard on flat walls. Video now has the same route available. Cycles has no temporal
+OIDN and gives every frame one seed by default (`use_animated_seed = False`), so this route
+does both the same way: each delivered frame is an independent accumulate (Blackman-Harris
+pixel filter, `VIDEO_OIDN_ACCUM_TARGET` sub-frames of 3 spp) followed by OIDN, and on static
+content it cannot flicker at all.
+
+### What shipped
+
+- **CUDA OIDN** (`modules/raycaster_oidn`): one process-lifetime device, OIDN-owned buffers,
+  three filters committed once, `quality = HIGH` set explicitly, colour and output in place;
+  any CUDA failure falls back to CPU for the rest of the process. **157 ms vs 5270 ms per 4K
+  frame**, and no pixel 2 or more display levels from the CPU result on real content (max 1,
+  61.5 dB). Project setting `rendering/pathtracer/oidn_device`, default CPU: stills are
+  unchanged by it.
+- **Pipeline mode** (`video_glb_creation.gd`, `video_render.gd`): per frame, the sub-frames
+  run inside one `_process()` call (`force_draw`), so MovieWriter only captures the denoised
+  re-show. **12 spp** = `VIDEO_OIDN_ACCUM_TARGET := 4`.
+
+### Cost and quality (urbanvideotest1, 421 frames, 4K / 60 fps)
+
+| spp | seconds (limit 3600) | VRAM peak (of 16376 MiB) |
+|---|---|---|
+| 6 | 1512 | 15984 |
+| **12 (shipped)** | **2380** | 15947 |
+| 24 | 4150 (over) | 15997 |
+
+Each 3-spp sub-frame is about 1.02 s of GPU, 1010 ms of it the path tracer (the GPU profile),
+so the cost is the tracing itself; 24 spp needs a faster tracer. OIDN adds no VRAM over
+DLSS-RR (the ~16 GB is the scene).
+
+Against a 768-spp reference of keyframe 210 (lossless, RMSE in display levels), **12 spp is
+closer than DLSS-RR** on the whole frame (2.81 vs 4.05), the door (2.50 vs 5.61), the bicycle
+(4.46 vs 5.62), the plant and the pictures. DLSS-RR is closer on fine text (the AC label,
+2.50 vs 4.03; it needs about 24 spp) and, by 0.05 of a level, on the flat wall. DLSS-RR's
+fine mesh on the door is an artefact (absent from the reference).
+
+The flicker gate (T4) could not be validated: both instruments failed their own negative
+controls (a held pose replays one Sobol sequence, so it reads zero; moving content puts a
+13.8-level texture floor under the noise). The owner chose by eye. Descriptive motion numbers:
+flat walls and window glass level with or quieter than DLSS-RR; the thin black window mullion
+about twice DLSS-RR's frame-to-frame residual.
+
+### Guide fix: Cycles' denoising-feature pass-through and specular deferral (Task 5)
+
+The first 6-spp review showed the window view blotchy in OIDN. Every OIDN guide write was gated
+on `total_bounces == 0`, and an alpha pass-through counts as a bounce, so a surface seen
+through an alpha pane wrote **no guide** (keyframe-210 window: 92.7% unwritten, now 0.00%).
+The fix ports Cycles' behaviour: transparency passes the features through, and a closure
+that is mostly specular (GGX alpha at or below 0.075, weighted by its Fresnel, not the 2x
+DLSS-RR helper) defers its guide to the next surface or the sky, through smooth glass and
+mirrors. It is compiled **only into the accumulate variant**, so DLSS-RR output is
+frame-identical (38 of 38 frames; GPU time +0.18%). The still route uses the same accumulate
+variant, so stills changed too, by design (job 201 at 1080p: mean ratio 0.9998, 1.03% of
+pixels 8 or more levels off). Cycles' newer smooth blend and
+`follow_reflections` options, and DLSS-RR's own unwritten G-buffers behind alpha panes, are
+recorded as out of scope; the "feature deferral through specular surfaces" item in §11.25's
+Open list is now ported for the accumulate path.
+
+### Recorded, not done
+
+- Approach B (temporal reuse before OIDN) only if more fine detail is wanted than 12 spp gives.
+- Stills on CUDA OIDN (about 5 s per 4K still); the still route's wasted denoise inside its
+  exposure probe.
+- DLSS-RR's output lags the camera by one frame (delivered idx 25 == 26 == keyframe 0,
+  keyframe 420 in the "trailing" frame); a frame-count trim of 25 on a DLSS-RR movie is
+  therefore off by one. Pre-existing, unmodified path.

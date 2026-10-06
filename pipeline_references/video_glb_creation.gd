@@ -50,7 +50,12 @@ const USE_REFLECTION_PROBE_HOTSPOT_FIX = true
 # (T4 measures 16, i.e. 48 spp).
 const VIDEO_DENOISER := "dlssrr"
 const VIDEO_OIDN_SPP := 3 # the still route's day value (PT_SPP_DAY), kept under the 8 s TDR watchdog
-const VIDEO_OIDN_ACCUM_TARGET := 2 # 2 x 3 = 6 spp: the owner's 1-hour, 4K/60fps budget
+# 4 x 3 = 12 spp (owner, 2026-10-06). The 7 s urbanvideotest1 job measured 1512 s at 6 spp and
+# 4150 s at 24 spp against VIDEO_RENDER_TIMEOUT_SECONDS 3600: each 3-spp sub-frame is ~1.02 s of
+# pure path tracing at 4K (GPU profile: the tracer is 99% of it), so 12 spp projects to ~2400 s
+# and leaves room for slightly longer clips. Against a 768-spp reference of keyframe 210, 12 spp
+# is closer than DLSS-RR everywhere except fine text (the AC label needs ~24 spp).
+const VIDEO_OIDN_ACCUM_TARGET := 4
 const VIDEO_OIDN_CLAMP_INDIRECT := 10.0 # Cycles' sample_clamp_indirect; fireflies are what OIDN smears into blotches
 var _video_denoiser := ""
 var _flicker_test := false
