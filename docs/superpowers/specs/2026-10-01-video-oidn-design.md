@@ -148,7 +148,9 @@ devices on real content with it. Production never sets the variable.
 
 **Not done now (YAGNI, with a stated trigger).** The host round trip -- three synchronous
 `texture_get_data` readbacks at 4K, single-threaded format conversion over 8.3 M pixels,
-`texture_update` back -- stays. Estimated 0.4-0.6 s per frame against ~7 s of tracing. If
+`texture_update` back -- stays. Estimated 0.4-0.6 s per frame against ~7 s of tracing (the
+DLSS-RR job's per-frame cost, which this design assumed; the shipped 4 samples trace about 4 s,
+see Measured). If
 T5 measures the full job over 3600 s, the conversion loops are moved to
 `WorkerThreadPool` and T5 is re-run. Zero-copy Vulkan-CUDA interop is out of scope.
 *(T5 measured 2380 s at the shipped 4 samples, so the trigger did not fire. The 8-sample job
@@ -405,8 +407,8 @@ Moving segment, keyframes 180-215, 8 samples, `--gpu-profile` with the timestamp
 raised to 8192 in the scratch project (0 overflows, 139 profile blocks over delivered frames
 10-30 of the segment): each drawn frame, i.e. one sub-frame (one sample), costs a **median 1017.8 ms
 of GPU, of which the "Pathtracer" task is 1010.3 ms**; all raster, post and TLAS work together
-is about 8 ms. That is about 1.0 s per sample at 4K (the 0.34 s first written divided by 3
-samples that were never traced). The `[Budget]` of 9.39 s/frame at 8 samples
+is about 8 ms. That is about 1.0 s per sample at 4K (the 0.34 s first written was this 1.02 s
+divided by the 3 samples per sub-frame that Phase A never traces). The `[Budget]` of 9.39 s/frame at 8 samples
 in that run decomposes as 8 x 1.02 s + the OIDN denoise and conversions + about 1.1 s fixed
 per frame. The profile covers GPU time only: the fixed non-tracer cost of about 1.1 s per
 frame (about 11% of an 8-sample frame) was not decomposed. Per-frame cost did not vary with the
@@ -488,6 +490,15 @@ keyframes 0..420, idx 441 == 440. **Aligning the two takes `trim=start_frame=26:
 on the DLSS-RR movie**; a frame-count trim of 25 on a DLSS-RR movie ships a duplicated first
 frame and leaves the last pose out of the delivered range. This is a property of the
 unmodified DLSS-RR path (owner rule: not changed here), recorded rather than fixed.
+
+**Production does not trim the pre-roll (found in the final fix pass, pre-existing, both
+modes).** main.py's `_run_godot_video_render` converts the whole AVI with one ffmpeg call
+(libx264, no `-ss` / `-t` / trim filter), so every delivered video begins with the 20 warm-up
+frames (25 in DLSS-RR mode, with the 5 priming frames) and ends with the trailing frame. Clips
+longer than `VIDEO_RENDER_MAX_CHUNK_SECONDS` (default 10) are rendered as separate Godot runs and
+joined with `ffmpeg -f concat -c copy`, so the pre-roll repeats at every chunk start. The trims
+quoted above are for this plan's measurements only. Changing it is a main.py change, the
+owner's decision.
 
 **The glass blotches and Task 5.** The first 2-sample review (2026-10-04) showed the view through
 the window blotchy in OIDN and clean in DLSS-RR. Root cause: `inc_transmission_bounce()` adds a

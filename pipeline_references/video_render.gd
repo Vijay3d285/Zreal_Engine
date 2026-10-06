@@ -23,7 +23,8 @@ var _needs_auto_pan: bool = false
 # DLSS priming: extra frames at frame-0 position so DLSS RR builds temporal
 # history before the real timeline starts. NOT trimmed: MovieWriter records them and
 # main.py's AVI -> MP4 ffmpeg call (libx264, no -ss / -t / trim filter) ships every frame,
-# so they are the first frames of the delivered video.
+# so they are the first frames of the delivered video -- and of every chunk, since main.py
+# renders clips over VIDEO_RENDER_MAX_CHUNK_SECONDS as separate runs joined with concat.
 const DLSS_PRIME_FRAMES: int = 5
 var _dlss_prime_remaining: int = 0
 # Wall clock at the first DELIVERED frame, for the budget projection in _process().
@@ -664,7 +665,7 @@ func _run_daylight_probe() -> void:
 	_log_console("[Daylight] probe ran offscreen: SubViewport %dx%d (recorded viewport %dx%d), %d positions, %d force_draw calls, none of them main-loop frames" % [
 			probe_size.x, probe_size.y, int(rec_size.x), int(rec_size.y),
 			ascending.size(), ascending.size() * (Daylight.RESET_SETTLE_FRAMES * 2 + Daylight.PROBE_FRAMES)])
-	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production does NOT trim them: main.py converts the whole AVI, so they ship as the video's first frames)" % [
+	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production does NOT trim them: main.py converts the whole AVI, so they ship as the first frames of the video, or of each chunk of a chunked clip)" % [
 			20, iterations, 0 if _video_phase_a() else DLSS_PRIME_FRAMES])
 	_finish_daylight_probe()
 
