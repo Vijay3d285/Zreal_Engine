@@ -41,23 +41,31 @@ const USE_REFLECTION_PROBE_HOTSPOT_FIX = true
 # Video denoiser (spec docs/superpowers/specs/2026-10-01-video-oidn-design.md).
 #   "dlssrr" -- DLSS Ray Reconstruction, the realtime temporal denoiser. The default; unchanged.
 #   "oidn"   -- the still route's Phase A for every delivered frame: VIDEO_OIDN_ACCUM_TARGET
-#               sub-frames of VIDEO_OIDN_SPP samples through the Blackman-Harris pixel filter,
-#               then OpenImageDenoise on CUDA. Cycles' own architecture for an OIDN animation.
+#               sub-frames, ONE sample per pixel each (a Phase A draw traces a single sample;
+#               see VIDEO_OIDN_SPP), through the Blackman-Harris pixel filter, then
+#               OpenImageDenoise on CUDA. Cycles' own architecture for an OIDN animation.
 #   "none"   -- Phase A without OIDN. A test control only (T4's negative control); without the
 #               OIDN latch the main loop's own draw adds one more sub-frame, so it captures
-#               (target + 1) x spp raw samples.
+#               (target + 1) raw samples per pixel.
 # ZR_VIDEO_DENOISER overrides it for one process; ZR_VIDEO_ACCUM_TARGET overrides the target
-# (for example 8, i.e. 24 spp, as measured on 2026-10-05).
+# (for example 8, i.e. 8 samples per pixel, as measured on 2026-10-05).
 const VIDEO_DENOISER := "dlssrr"
-const VIDEO_OIDN_SPP := 3 # the still route's day value (PT_SPP_DAY), kept under the 8 s TDR watchdog
-# 4 x 3 = 12 spp (owner, 2026-10-06). The 7 s urbanvideotest1 job measured 1512 s at 6 spp and
-# 4150 s at 24 spp against VIDEO_RENDER_TIMEOUT_SECONDS 3600: each 3-spp sub-frame is ~1.02 s of
-# GPU at 4K, 99% of it the path tracer; 12 spp measured 2380 s and leaves room for slightly
-# longer clips. Against a 768-spp reference of keyframe 210, on lossless frames, 12 spp is closer
-# than DLSS-RR on the whole frame and on the door, spokes, plant and pictures; DLSS-RR is closer
-# on fine text (the AC label is legible at 24 spp: RMSE 2.62 vs DLSS-RR 2.50) and level on flat
-# walls (0.43 vs 0.48). In the delivered MJPEG movie the whole-frame error is level with DLSS-RR
-# (4.75 vs 4.64).
+# NOT the image's sample count. Phase A's accumulate branch traces ONE sample per draw and never
+# reads samples_per_pixel, so the delivered frame holds VIDEO_OIDN_ACCUM_TARGET samples per pixel
+# and this value does not change that. It only sets the one-shot (accumulate off) draws:
+# _reset_video_accumulator's settle draws, and the daylight probe's, whose Environment is a copy.
+# The value 3 is the still route's day value (PT_SPP_DAY), kept under the 8 s TDR watchdog for
+# one such draw at 4K. Corrected 2026-10-06: it was documented as a per-sub-frame multiplier.
+const VIDEO_OIDN_SPP := 3
+# Target 4 = 4 samples per pixel (owner, 2026-10-06; a sub-frame is one sample, so the target IS
+# the sample count). The 7 s urbanvideotest1 job measured 1512 s at target 2 and 4150 s at target
+# 8 against VIDEO_RENDER_TIMEOUT_SECONDS 3600: each sub-frame is ~1.02 s of GPU at 4K, 99% of it
+# the path tracer; target 4 measured 2380 s and leaves room for slightly longer clips. Against a
+# 256-sample reference of keyframe 210, on lossless frames, 4 samples per pixel is closer than
+# DLSS-RR (6 samples per pixel per frame plus its temporal reuse) on the whole frame and on the
+# door, spokes, plant and pictures; DLSS-RR is closer on fine text (the AC label is legible at 8
+# samples: RMSE 2.62 vs DLSS-RR 2.50) and level on flat walls (0.43 vs 0.48). In the delivered
+# MJPEG movie the whole-frame error is level with DLSS-RR (4.75 vs 4.64).
 const VIDEO_OIDN_ACCUM_TARGET := 4
 const VIDEO_OIDN_CLAMP_INDIRECT := 10.0 # Cycles' sample_clamp_indirect; fireflies are what OIDN smears into blotches
 var _video_denoiser := ""
@@ -1479,7 +1487,8 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	if _video_phase_a():
 		# Phase A per delivered frame (spec 2026-10-01-video-oidn-design.md): a mirror of the still
 		# route's settings (image_glb_creation.gd, PHASE_A_*), keeping video's 6 bounces so the A/B
-		# against DLSS-RR is equal-cost and isolates the denoiser.
+		# against DLSS-RR holds the bounces equal. The samples per pixel are not equal: VIDEO_OIDN_
+		# ACCUM_TARGET here (4), against the 6 the DLSS-RR branch below sets.
 		var target := _video_accum_target()
 		env.set_pathtracing_samples_per_pixel(VIDEO_OIDN_SPP)
 		env.set_pathtracing_denoiser(0) # PT_DENOISER_NONE: DLSS-RR is not the integrator here
@@ -1491,13 +1500,13 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		env.set_pathtracing_clamp_indirect(VIDEO_OIDN_CLAMP_INDIRECT)
 		env.set_pathtracing_noise_threshold(0.0)
 		ProjectSettings.set_setting("rendering/pathtracer/oidn_device", 1) # CUDA (Task 1)
-		print("[VideoGLB] NVIDIA PT enabled: bounces=6, Phase A %d x %d spp, final=%s, oidn_device=CUDA" % [
-				target, VIDEO_OIDN_SPP, _video_denoiser])
+		print("[VideoGLB] NVIDIA PT enabled: bounces=6, Phase A %d spp (one sample per sub-frame), final=%s, oidn_device=CUDA" % [
+				target, _video_denoiser])
 	else:
-		env.set_pathtracing_samples_per_pixel(6) # 4 SPP — DLSS RR handles the rest (denoising + AA)
+		env.set_pathtracing_samples_per_pixel(6) # 6 SPP — DLSS RR handles the rest (denoising + AA)
 		env.set_pathtracing_denoiser(1) # 1 = PT_DENOISER_DLSS_RAY_RECONSTRUCTION
 		env.set("raytracing_params", PackedFloat32Array([0.0, 0.0, 0.0, 1.0]))
-		print("[VideoGLB] NVIDIA PT enabled: bounces=6, spp=4, denoiser=DLSS_RR")
+		print("[VideoGLB] NVIDIA PT enabled: bounces=6, spp=6, denoiser=DLSS_RR")
 
 	# Reflection probes are now localized per room and generated automatically via _generate_localized_reflection_probes.
 

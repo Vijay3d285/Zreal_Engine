@@ -18,7 +18,8 @@ window_glass_1to1.png`). Walls and edges are otherwise equivalent.
 ## What was measured
 
 1. **The engine's own OIDN inputs at the window** (`ZR_OIDN_DUMP`, keyframe 210 held
-   static, video Phase A 2 x 3 spp, `dump_base/`). Inside the upper-left pane
+   static, video Phase A, 2 samples per pixel (a sub-frame is one sample; first written as
+   "2 x 3 spp"), `dump_base/`). Inside the upper-left pane
    (x 1620-1820, y 720-880 of 3840x2160): **92.7% of pixels have albedo exactly 0 and a
    zero-length normal** (the readback's `(0, 0, 1)` fallback,
    `render_forward_clustered.cpp:2111-2124`) -- the guide buffers were cleared at the
@@ -40,7 +41,8 @@ window_glass_1to1.png`). Walls and edges are otherwise equivalent.
    | checker, behind pane | **79.4%** | (0.20, 0.24, 0.32) |
 
    80% = 0.967^6: a pixel's guide is written only if one of its 6 samples happened to
-   shade the pane, and then it holds the pane.
+   shade the pane, and then it holds the pane. (The real window's 92.7% in item 1 is close to
+   what the video's 2 samples give, 0.967^2 = 93.5%; 6 samples would give the 80% above.)
 
 ## Root cause
 
@@ -57,7 +59,8 @@ Every OIDN guide write is gated on `total_bounces == 0u && is_sample_zero(...)`:
 So the surface or sky seen *through* an alpha pane is bounce 1 and writes no guide. OIDN
 is then told "black, featureless" over a region whose colour is a lit exterior, and it
 smears that region into blotches. The fewer the samples, the worse: at a still's 256+
-samples the colour is nearly clean and OIDN leans on it; at video's 6 it cannot.
+samples the colour is nearly clean and OIDN leans on it; at the 2 samples the video route had
+then (it ships 4 now) it cannot.
 
 A second, related gap applies to the converted glass (`_apply_glb_transmissive_glass`:
 transmission 1, metallic 0, white base, thickness 0): its guide is written at the pane
@@ -223,8 +226,10 @@ code that never executes still costs registers and code size in the hit and miss
 
 - **Key.** The RT flags word's sample-count field (bits 20-26) means *0 = accumulate;
   one-shot always packs >= 1*. `compute_rt_flags` packs 0 when the environment's
-  accumulate flag is set (`>= 0.5`, the test and params pointer `rt_accumulate_active`
-  uses); the accumulate raygen branch never reads the sample count, and
+  accumulate flag is set (`> 0.5`, the raygen branch's own test; `rt_accumulate_active` in
+  `render_forward_clustered.cpp` reads `>= 0.5`, the same params pointer, differing only at
+  exactly 0.5, a value the Environment never packs); the accumulate raygen branch never reads
+  the sample count, and
   `RT_GET_SAMPLE_COUNT()` is `max(1u, field)`.
 - **Define.** `_ensure_variant_compile_context` injects `#define RT_OIDN_FEATURES` into
   every stage source when the field is 0, before the custom hit-group templates are cut,
@@ -232,7 +237,14 @@ code that never executes still costs registers and code size in the hit and miss
   material hit groups included) agree. Contexts and bundles are keyed by the full word, so
   accumulate and one-shot are separate pipelines; accumulate already had its own word
   (DLSS_RR forced for OIDN / DLSS-RR-final), so the still and OIDN-video routes gain no
-  variant, and DLSS-RR video never accumulates.
+  variant. DLSS-RR video does accumulate, in one place: every DLSS-RR job runs the daylight
+  probe (`Daylight.probe_offscreen`) on a duplicate Environment with the DLSS-RR denoiser and
+  accumulate on, whose word is `DLSS_RR` | sample-count field 0 -- this same variant. The
+  recorded frames use the one-shot word, so they do not. The probe's output sets the exposure,
+  so the invariant is: code under `RT_OIDN_FEATURES` must never touch radiance or the RNG, or
+  DLSS-RR video exposure (and with it every DLSS-RR frame) would change. It writes only the
+  guide buffers and payload guide state; the Task 5 A/B (DLSS-RR framemd5 38 of 38 identical
+  before and after, probe exposure included) is the evidence.
 - **Source.** Every Task 5 shader line sits under `#ifdef RT_OIDN_FEATURES`, with the
   pre-Task-5 text in the `#else` (the payload keeps its `vec4 sss_restart`, the miss and
   closest-hit bounce-0 writes keep their original `rt_accum_guide_sample` calls). Without
@@ -243,7 +255,7 @@ code that never executes still costs registers and code size in the hit and miss
 
 256x256, `use_hdr_2d`, the still route's viewport contract (as `pt_oidn_guide_gate`),
 `ZR_OIDN_DUMP` pointed at a gate temp dir with `OS.set_environment` before the
-accumulation, PFMs read back after. 6 accumulated samples (video's count), max bounces
+accumulation, PFMs read back after. 6 accumulated samples (not the OIDN video route's count: it ships 4), max bounces
 6, OIDN on. Uniform sky (0.5, 0.6, 0.8). Top row: sky; bottom row: a 4-px checker card
 (0.9 / 0.1). Five columns, each a pane of width w / 5 at 5 m (or open air): **open**,
 **behind an alpha pane** (authored like `Mat_A38_Window_Glass_001`: alpha 0.033, base

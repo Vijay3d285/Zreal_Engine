@@ -1,11 +1,13 @@
 # Video OIDN: per-frame OpenImageDenoise for the video route
 
 **Date:** 2026-10-01. **Status:** landed 2026-10-06 in `pipeline_references` as the selectable
-video mode (`ZR_VIDEO_DENOISER=oidn`) at **12 samples per pixel** (4 sub-frames of 3); DLSS-RR
-stays the default. The owner ships to production; "shipped" below means the committed
-default. The design below is the 2026-10-01 text; where it says 6 spp or "2 sub-frames"
-the shipped value is 12 spp / 4 sub-frames, and the corrected figures and the outcome of
-every test are in **Measured (2026-10-06)** at the end. **Scope:** engine
+video mode (`ZR_VIDEO_DENOISER=oidn`) at **4 samples per pixel** (4 sub-frames, one sample
+each); DLSS-RR stays the default. The owner ships to production; "shipped" below means the
+committed default. **Corrected 2026-10-06 (final review): every OIDN sample count in this
+document was 3 times too high** -- see the Correction at the top of Measured. The design below
+is the 2026-10-01 text, relabelled; where it says 2 samples or "2 sub-frames" the shipped
+value is 4 samples / 4 sub-frames, and the corrected figures and the outcome of every test are
+in **Measured (2026-10-06)** at the end. **Scope:** engine
 (`modules/raycaster_oidn`, one settings line, one log rate-limit) and the video pipeline
 (`video_glb_creation.gd`, `video_render.gd`).
 **Predecessors:** the still route's Phase A (accumulate + Blackman-Harris pixel filter +
@@ -29,9 +31,12 @@ artefacts and without lowering quality.
 1. **Budget about one hour** for a 7-second video -- today's cost, inside the
    `VIDEO_RENDER_TIMEOUT_SECONDS = 3600` the owner set on 2026-09-30.
 2. **Keep 4K at 60 fps.** No resolution or frame-rate trade. Together with (1) this fixes
-   the sample count at **about 6 samples per pixel per frame**, the same as today.
-   *(Superseded 2026-10-06: the full job measured 1512 s at 6 spp, so there was room; the
-   owner chose 12 spp, about 2400 s. See Measured.)*
+   the sample count at **about 6 samples per pixel per frame**, the same as today (DLSS-RR's
+   one-shot value). *(Correction 2026-10-06: the design reached "6" as 2 sub-frames of 3 spp,
+   but a sub-frame is one sample, so what was built and measured is 2 samples per pixel, a
+   third of DLSS-RR's. Superseded 2026-10-06: the full job measured 1512 s at 2 samples, so
+   there was room; the owner chose 4 samples, labelled 12 spp at the time, about 2400 s. See
+   Measured.)*
 3. **Approach A first** (per-frame OIDN, measured against a flicker bar); **approach B**
    (temporal reuse of radiance before OIDN) only if A fails that bar, under its own spec.
    *(Outcome 2026-10-06: the flicker bar could not be validated; the owner judged by eye,
@@ -49,11 +54,11 @@ artefacts and without lowering quality.
    high 156.63 ms; balanced 76.74 ms). The engine never sets `quality`, so it has never
    been silently degraded.
 3. **CUDA OIDN is visually identical to CPU OIDN on a real frame.** Job 201 at 1080p,
-   6 spp, the engine's own OIDN inputs dumped with `ZR_OIDN_DUMP`, denoised by
+   2 samples per pixel, the engine's own OIDN inputs dumped with `ZR_OIDN_DUMP`, denoised by
    `oidnDenoise -q high --clean_aux` on each device, compared after exposure: **no pixel
    2 or more display levels apart, maximum 1 level, display PSNR 61.8 dB**; relative error
    p50 0.09%, p99 0.38%, max 2.2%.
-4. **6 spp + OIDN against 768 spp + OIDN**, identical pipeline (job 201, same probe,
+4. **2 samples + OIDN against 256 samples + OIDN**, identical pipeline (job 201, same probe,
    exposure, relief and tone curve; only the sample count differs): frame mean -1.04%,
    PSNR 28.2 dB, 14.8% of pixels 10 or more levels off. Visually clean and noise-free,
    lighting correct; it loses fine detail -- a faint glossy streak on the TV, crispness in
@@ -146,11 +151,11 @@ devices on real content with it. Production never sets the variable.
 `texture_update` back -- stays. Estimated 0.4-0.6 s per frame against ~7 s of tracing. If
 T5 measures the full job over 3600 s, the conversion loops are moved to
 `WorkerThreadPool` and T5 is re-run. Zero-copy Vulkan-CUDA interop is out of scope.
-*(T5 measured 2380 s at the shipped 12 spp, so the trigger did not fire. The 24-spp job did
-exceed 3600 s; the GPU profile shows the path tracer's 1.02 s per sub-frame dominates it. The
-fixed non-tracer cost is about 1.1 s per frame (about 11% of a 24-spp frame) and was not
-decomposed; removing all of it would take the 24-spp job from 4150 s to about 3690 s, still
-over 3600 s. See Measured.)*
+*(T5 measured 2380 s at the shipped 4 samples, so the trigger did not fire. The 8-sample job
+did exceed 3600 s; the GPU profile shows the path tracer's 1.02 s per sub-frame (one sample)
+dominates it. The fixed non-tracer cost is about 1.1 s per frame (about 11% of an 8-sample
+frame) and was not decomposed; removing all of it would take the 8-sample job from 4150 s to
+about 3690 s, still over 3600 s. See Measured.)*
 
 ### 2. Pipeline: a video OIDN mode
 
@@ -164,11 +169,11 @@ changes -- T3 proves it frame-for-frame.
 |---|---|---|
 | `pathtracing_denoiser` | 0 | DLSS-RR is not the integrator |
 | `pathtracing_accumulate` | true | Phase A |
-| `pathtracing_accumulation_target` | 4 (`VIDEO_OIDN_ACCUM_TARGET`; designed as 2) | 4 sub-frames x 3 spp = **12 spp**, the shipped value (owner, 2026-10-06; 6 spp was the 2026-10-01 design) |
-| `pathtracing_samples_per_pixel` | 3 | the still route's day value, kept under the TDR watchdog |
+| `pathtracing_accumulation_target` | 4 (`VIDEO_OIDN_ACCUM_TARGET`; designed as 2) | 4 sub-frames of one sample each = **4 samples per pixel**, the shipped value (owner, 2026-10-06; 2 samples, then labelled 6 spp, was the 2026-10-01 design) |
+| `pathtracing_samples_per_pixel` | 3 | read only by the one-shot (accumulate off) draws, i.e. the settle draws of the accumulator reset; Phase A's accumulate branch traces one sample per draw and ignores it, so it is NOT the image's sample count. The still route's day value, kept under the TDR watchdog |
 | `pathtracing_oidn_denoise` | true | |
 | `pathtracing_dlss_rr_final` | false | |
-| `pathtracing_max_bounces` | 6 | today's video value: the A/B against DLSS-RR is equal-cost and isolates the denoiser |
+| `pathtracing_max_bounces` | 6 | today's video value: the A/B against DLSS-RR holds the bounces equal (the samples per pixel are not: 4 here, 6 for DLSS-RR; see the Correction) |
 | `pathtracing_clamp_indirect` | 10.0 | Cycles' default; stills measured unclamped fireflies are what OIDN smears into blotches |
 | `pathtracing_noise_threshold` | 0.0 | as stills |
 | viewport | `SCALING_3D_MODE_BILINEAR` @ 1.0, `use_taa` off | under DLSS scaling the renderer bakes a Halton jitter into the projection and the tracer's own pixel filter jitters again -- "a soft image with ragged edges" (`render.gd`, Phase A comment) |
@@ -231,24 +236,25 @@ fail, so it can be shown to see a real defect.
 specified separately; A's engine work (the CUDA path) is reused by it unchanged.
 *(Outcome: T1-T3, T5, T6 passed; T4 could not be validated. T7 was not recorded as an
 approval: the record shows the owner's decisions to render the converged frame first, to test
-12 and 24 samples first, to render the full video at 24 samples, and (2026-10-06) to set the
-recommended 12 spp; A was chosen and B is not pursued now. See Measured.)*
+4 and 8 samples first (then labelled 12 and 24 spp), to render the full video at 8 samples
+(24 spp), and (2026-10-06) to set the recommended 4 samples (12 spp); A was chosen and B is not
+pursued now. See Measured.)*
 
 ## Risks, recorded
 
 Each risk below is written as designed on 2026-10-01; the note after it is what was measured.
 
-- **Boiling at 6 spp** is the central risk and is exactly what T4 measures. The fallback is
+- **Boiling at 2 samples** is the central risk and is exactly what T4 measures. The fallback is
   B, already agreed. *Measured: T4 could not separate boiling from texture sliding past the
-  camera; descriptive numbers at 24 spp show flat walls level with DLSS-RR and only the thin
+  camera; descriptive numbers at 8 samples show flat walls level with DLSS-RR and only the thin
   window mullion edge about twice DLSS-RR's frame-to-frame residual. The owner judged by eye
   and chose A; B is not pursued now.*
-- **Fine detail at 6 spp** is below the still's (measured, finding 4). That is the cost of
+- **Fine detail at 2 samples** is below the still's (measured, finding 4). That is the cost of
   the owner's budget and is not changed by the denoiser choice; B recovers some of it.
-  *Measured: against a 768-spp reference, on lossless frames, the shipped 12 spp is closer
-  than DLSS-RR on the whole frame, door, bicycle, plant and pictures; in the delivered MJPEG
-  movie the whole-frame error is level with DLSS-RR (4.75 vs 4.64). Fine text (the AC label)
-  is legible at 24 spp (label RMSE 2.62 vs DLSS-RR 2.50).*
+  *Measured: against a 256-sample reference, on lossless frames, the shipped 4 samples are
+  closer than DLSS-RR on the whole frame, door, bicycle, plant and pictures; in the delivered
+  MJPEG movie the whole-frame error is level with DLSS-RR (4.75 vs 4.64). Fine text (the AC
+  label) is legible at 8 samples (label RMSE 2.62 vs DLSS-RR 2.50).*
 - **VRAM.** OIDN's CUDA scratch at 4K is added to a render that peaked at 10.8 GB on the
   worst still. T6 measures; if needed, OIDN's `maxMemoryMB` makes it tile. *Measured: the
   video job peaks at 15947-16001 MiB of 16376 (97.4-97.7%) in both modes (one run each for
@@ -259,7 +265,7 @@ Each risk below is written as designed on 2026-10-01; the note after it is what 
   full-job run.*
 - **Budget margin.** Removing the per-frame DLSS-RR evaluation saves some time; the OIDN
   round trip and a second dispatch per frame cost some. Net unknown until T5. *Measured: the
-  cost is dominated by path tracing, about 1.02 s per 3-spp sub-frame; see Measured, T5 and
+  cost is dominated by path tracing, about 1.02 s per sub-frame (one sample); see Measured, T5 and
   the GPU profile.*
 
 ## Out of scope (recorded)
@@ -282,6 +288,39 @@ Runs 2026-10-02 to 2026-10-06 on the RTX A4000, urbanvideotest1 (421 keyframes, 
 unless stated; raw logs and images are under `.superpowers/sdd/2026-10-01-video-oidn/`
 (untracked working notes). The engine is the build of commit `a098ece884` for every run from
 T5 onward.
+
+**Correction (final review, 2026-10-06): every OIDN sample count in this document was 3 times
+too high.** A Phase A draw traces ONE sample per pixel. The raygen accumulate branch calls
+`trace_one_sample` once per launch and blends the result into the running average
+(`scene_raytracing_raygen.glsl`, "blend one 1-SPP sample per launch"); the C++ issues one
+`trace_rays` per draw and then advances `accum_frame` (`render_forward_clustered.cpp`).
+`pathtracing_samples_per_pixel` feeds only the one-shot branch, which Phase A never takes, so a
+delivered frame holds `VIDEO_OIDN_ACCUM_TARGET` samples per pixel, not target x 3. The times,
+images, RMSE values and cost figures in this section are measurements and did not change; the
+labels did:
+
+| written | actual samples per pixel |
+|---|---|
+| 6 spp (target 2) | 2 |
+| 12 spp (target 4, the shipped default) | 4 |
+| 24 spp (target 8) | 8 |
+| 48 spp (target 16) | 16 |
+| 768 spp (target 256) | 256 |
+| "9-spp" raw frames (target 2 plus the main loop's own draw, no OIDN latch) | 3 |
+
+Per-sample cost is about 1.0 s at 4K (the GPU profile: "Pathtracer" 1010 ms per draw, one
+sample per draw), not 0.34 s. The shipped configuration is therefore **4 samples per pixel per
+frame**. Its comparison partner, the DLSS-RR video, traces **6** samples per pixel per frame
+(`set_pathtracing_samples_per_pixel(6)` in the DLSS-RR branch of `video_glb_creation.gd`, the
+one-shot path, whose raygen loop runs the packed count) plus its temporal reuse. The DLSS-RR
+log line said "spp=4" and the comment beside the 6 said "4 SPP": stale text, not the value
+(the production copy of the script also sets 6); both now read 6, text only. So the 2026-10-01 design's "6 spp, the same as today" was 2
+samples against DLSS-RR's 6, and the shipped 4 is two thirds of them. A corroboration that does
+not depend on reading the code: the keyframe-210 window's 92.7% unwritten guide pixels
+(`2026-10-04-oidn-guide-feature-passthrough-design.md`) is close to what two samples through a
+pane that passes 96.7% of rays give (0.967^2 = 93.5%); six samples would give 80.2%, which that
+spec's own 6-sample 256x256 probe measured. Where this section says "OIDN at 6 / 12 / 24 spp" read 2 / 4 /
+8 samples; run directories and file names (`spp_6`, `oidn6`, `oidn48`) keep their old labels.
 
 **T1 -- CUDA == CPU in-engine: passed.** Fixture: 83.61% of floats differ between the devices,
 **0 pixels 2 or more display levels apart**, maximum 1 level. Job 201 at 1080p (the engine's
@@ -313,7 +352,7 @@ failed its own pre-registered negative control, so no numeric gate decided A vs 
 decided by eye at T7.
 
 - *Design 1* (one pose held for 30 frames, accumulator force-reset each frame): **blind.** The
-  raw 9-spp frames read a mean of 0.033 levels, and all 30 delivered frames were
+  raw 3-sample frames read a mean of 0.033 levels, and all 30 delivered frames were
   md5-identical in both the raw and the OIDN runs. Cause: the accumulate route seeds from
   `accum_frame`, which resets with the accumulator (`scene_raytracing_raygen.glsl:417-421`),
   so every cycle replays the same Sobol sequence -- as Cycles gives every frame one seed by
@@ -321,21 +360,22 @@ decided by eye at T7.
   `blender/sync.cpp:408`). Consequence for production: **on static content, OIDN video cannot
   flicker.**
 - *Design 2* (urbanvideotest1 keyframes 0-29 at production speed; per-pixel temporal second
-  difference on the flattest half of the frame, one mask from the 48-spp run): d2 rms raw
-  28.717, oidn6 14.033, oidn48 13.801, dlssrr 13.215. The negative control (raw / dlssrr)
+  difference on the flattest half of the frame, one mask from the 16-sample run): d2 rms raw
+  28.717, oidn6 (2 samples; the run keeps its old name) 14.033, oidn48 (16 samples) 13.801,
+  dlssrr 13.215. The negative control (raw / dlssrr)
   read 2.17 against a pre-registered 3.0: **FAILED.** A content floor of about 13.8 levels
   (texture sliding past at constant speed; the motion-smeared mean made the "flat" mask
   permissive) swamps the noise. The gate's 1.062 is therefore not a verdict, and is biased
-  besides: DLSS-RR reads 4.2% *below* the near-noise-free 48-spp reference because its
+  besides: DLSS-RR reads 4.2% *below* the near-noise-free 16-sample reference because its
   temporal smoothing also damps moving texture.
-- *Descriptive, post-hoc, not a gate:* in quadrature against the 48-spp run, raw adds 25.18
-  levels of temporal noise and 6-spp OIDN 2.54; 6 spp reads 1.7% above 48 spp (same
+- *Descriptive, post-hoc, not a gate:* in quadrature against the 16-sample run, raw adds 25.18
+  levels of temporal noise and 2-sample OIDN 2.54; 2 samples read 1.7% above 16 samples (same
   denoiser, same frames, only the samples differ) -- 8x the samples barely moved stability.
 - *Defect found in the plan's metric code:* the flat-mask box blur summed in float32 over a 4K
   frame (sums about 2e9, float32 spacing 128-256), wrong on 43.8% of pixels in a synthetic
   check; fixed to float64. The plan-verbatim version gave control 1.92 and gate 1.047 -- the
   same outcomes.
-- *Descriptive motion numbers at 24 spp (2026-10-05, keyframes 203-217, camera motion
+- *Descriptive motion numbers at 8 samples (2026-10-05, keyframes 203-217, camera motion
   included, not a gate):* flat walls level with DLSS-RR (first-difference rms 0.249 / 0.262 vs
   0.250 / 0.255); window glass quieter than DLSS-RR (0.43 / 0.51 vs 1.18 / 0.80); AC label,
   plant and bicycle within 5-11% of DLSS-RR on a translation-registered residual; the thin
@@ -345,37 +385,38 @@ decided by eye at T7.
 **T5 -- budget (full 421-frame job, `VIDEO_RENDER_TIMEOUT_SECONDS` 3600).** Same job, same
 scene; only the sub-frame count differs:
 
-| run | spp | seconds | `[Budget]` projection (delivered frames 10-30) | VRAM peak (MiB of 16376) | movie frames | held exposure |
+| run | samples per pixel | seconds | `[Budget]` projection (delivered frames 10-30) | VRAM peak (MiB of 16376) | movie frames | held exposure |
 |---|---|---|---|---|---|---|
-| before the guide fix (2026-10-04) | 6 | 1501 | 3.28 s/frame -> 1510 s | 15987 | 442 | 0.7659 |
-| after the guide fix | 6 | 1512 | 3.30 s/frame -> 1523 s | 15984 | 442 | 0.7659 |
-| after the guide fix | 24 | **4150** | 9.79 s/frame -> 4262 s, "WILL BE KILLED" | 15997 | 442 | 0.7659 |
-| **shipped default** | **12** | **2380** | 5.42 s/frame -> 2413 s, "fits" | 15947 | 442 | 0.7659 |
+| before the guide fix (2026-10-04) | 2 | 1501 | 3.28 s/frame -> 1510 s | 15987 | 442 | 0.7659 |
+| after the guide fix | 2 | 1512 | 3.30 s/frame -> 1523 s | 15984 | 442 | 0.7659 |
+| after the guide fix | 8 | **4150** | 9.79 s/frame -> 4262 s, "WILL BE KILLED" | 15997 | 442 | 0.7659 |
+| **shipped default** | **4** | **2380** | 5.42 s/frame -> 2413 s, "fits" | 15947 | 442 | 0.7659 |
 
 Every run: `[OIDN] denoising on CUDA (quality HIGH, 3840x2160)` once and no fallback, no
 device loss, no fence error, one engine banner. DLSS-RR's own run of this job (2026-09-30)
 held 0.7660; the 0.7659 vs 0.7660 difference is the exposure probe's run-to-run noise (the
-same job on the same binary differs by 1-2e-4 in other pairs of runs). The shipped 12 spp fits
-the hour with 34% to spare; 24 spp does not (production `main.py` would kill Godot at 3600 s,
+same job on the same binary differs by 1-2e-4 in other pairs of runs). The shipped 4 samples fit
+the hour with 34% to spare; 8 samples do not (production `main.py` would kill Godot at 3600 s,
 around frames 350-365: 432 s were spent at frame 30, then 9.5-9.8 s/frame). The test harness
 does not enforce the timeout; it only feeds the `[Budget]` verdict.
 
 **The GPU profile (2026-10-06): the cost is dominated by the path tracer.**
-Moving segment, keyframes 180-215, 24 spp, `--gpu-profile` with the timestamp-query limit
+Moving segment, keyframes 180-215, 8 samples, `--gpu-profile` with the timestamp-query limit
 raised to 8192 in the scratch project (0 overflows, 139 profile blocks over delivered frames
-10-30 of the segment): each drawn frame, i.e. one 3-spp sub-frame, costs a **median 1017.8 ms
+10-30 of the segment): each drawn frame, i.e. one sub-frame (one sample), costs a **median 1017.8 ms
 of GPU, of which the "Pathtracer" task is 1010.3 ms**; all raster, post and TLAS work together
-is about 8 ms. That is about 0.34 s per sample at 4K. The `[Budget]` of 9.39 s/frame at 24 spp
+is about 8 ms. That is about 1.0 s per sample at 4K (the 0.34 s first written divided by 3
+samples that were never traced). The `[Budget]` of 9.39 s/frame at 8 samples
 in that run decomposes as 8 x 1.02 s + the OIDN denoise and conversions + about 1.1 s fixed
 per frame. The profile covers GPU time only: the fixed non-tracer cost of about 1.1 s per
-frame (about 11% of a 24-spp frame) was not decomposed. Per-frame cost did not vary with the
+frame (about 11% of an 8-sample frame) was not decomposed. Per-frame cost did not vary with the
 view beyond the run-to-run spread (10.51 s/frame at keyframes 190-210 and 9.39 in the clean
 profiled run, against 9.79 at keyframes 10-30: a spread of about 12%). Earlier static-job
 timings are invalid: after the first converged
 frame a static job holds the OIDN latch and skips the trace (2 denoises per 5-frame run),
-which is why a projection built on them (0.387 s per sub-frame, 24 spp about 2490 s) was 40%
-low. Removing all of the fixed cost would take the 24-spp job from 4150 s to about 3690 s,
-still over 3600 s, so 24 spp needs a faster tracer.
+which is why a projection built on them (0.387 s per sub-frame, the 8-sample job about 2490 s)
+was 40% low. Removing all of the fixed cost would take the 8-sample job from 4150 s to about
+3690 s, still over 3600 s, so 8 samples per pixel need a faster tracer.
 
 **T6 -- VRAM and stability: passed, with a thin margin.** Peak
 15947-15997 MiB of 16376 MiB in every full run (margin 2.3-2.6%), flat for the whole job, no
@@ -384,16 +425,16 @@ device loss. Attribution run (urbanvideotest1 segment, 1 s samples): DLSS-RR pea
 Both sit at 97.4-97.7% of capacity (n = 1 each), so attributing the ceiling to the scene plus
 the driver is plausible but not demonstrated.
 
-**Converged reference (2026-10-05) -- OIDN against DLSS-RR, both against 768 spp.** Keyframe
-210 held static, 256 sub-frames of 3 spp (768 spp) through the same OIDN path, exposure forced
+**Converged reference (2026-10-05) -- OIDN against DLSS-RR, both against 256 samples.** Keyframe
+210 held static, 256 sub-frames of one sample (256 samples per pixel) through the same OIDN path, exposure forced
 to 0.7659 (no fill was placed in the full run, so forcing is equivalent), lossless PNG; the
-reference's frames 20-23 are identical (frame 24 RMSE 0.22). OIDN at 6, 12 and 24 spp from
+reference's frames 20-23 are identical (frame 24 RMSE 0.22). OIDN at 2, 4 and 8 samples from
 static renders of the same frame, lossless; DLSS-RR lossless from a moving segment
 (keyframes 180-215, exposure 0.7660, delivered keyframe 210 = idx 56, whose RMSE against its
-neighbours is at least 19.7, so it is the right frame). RMSE against the 768-spp frame in
+neighbours is at least 19.7, so it is the right frame). RMSE against the 256-sample frame in
 8-bit display levels, lower is better:
 
-| region | OIDN 6 spp | OIDN **12 spp** (shipped) | OIDN 24 spp | DLSS-RR |
+| region | OIDN 2 samples | OIDN **4 samples** (shipped) | OIDN 8 samples | DLSS-RR (6 spp + temporal) |
 |---|---|---|---|---|
 | whole frame, lossless | 3.53 | **2.81** | 2.27 | 4.05 |
 | whole frame, delivered MJPEG movie frame (OIDN idx 230, DLSS-RR idx 236) | 5.15 | 4.75 | 4.52 | **4.64** |
@@ -404,27 +445,27 @@ neighbours is at least 19.7, so it is the right frame). RMSE against the 768-spp
 | plant | 5.26 | **4.03** | 3.21 | 5.69 |
 | pictures | 5.72 | **4.09** | 3.20 | 5.07 |
 
-**On lossless frames** OIDN at 12 spp is closer to the reference than DLSS-RR on the whole
+**On lossless frames** OIDN at 4 samples is closer to the reference than DLSS-RR on the whole
 frame, door, bicycle, plant and pictures. DLSS-RR is closer on the label (the "SAMSUNG"
-letters are an unreadable bar at 12 spp and legible at 24 spp, label RMSE 2.62 vs DLSS-RR
+letters are an unreadable bar at 4 samples and legible at 8, label RMSE 2.62 vs DLSS-RR
 2.50) and, by 0.05 of a level, on the flat wall. DLSS-RR's regular mesh on the door is an
 artefact: it is absent from the reference.
 
 **In the delivered MJPEG movie the whole-frame error is level with DLSS-RR** (4.75 vs 4.64 at
-12 spp; DLSS-RR 0.11 closer; 24 spp is 0.12 closer than DLSS-RR). The MJPEG row decodes the
-delivered movie frames at the aligned keyframe (OIDN idx 230 of the 6 / 12 / 24 spp job movies,
+4 samples; DLSS-RR 0.11 closer; 8 samples is 0.12 closer than DLSS-RR). The MJPEG row decodes the
+delivered movie frames at the aligned keyframe (OIDN idx 230 of the 2 / 4 / 8-sample job movies,
 DLSS-RR idx 236 of the 2026-09-30 movie) and compares each with the reference (frame 22 or
 frame 24; they agree to 0.001), whole-frame RGB RMSE recomputed 2026-10-06: 5.155 / 4.748 /
 4.517 / 4.641 before rounding. Taking the codec's error to add in quadrature, it is about
-3.8 levels on the OIDN frames (3.76 / 3.82 / 3.91 at 6 / 12 / 24 spp) and about 2.3 on
+3.8 levels on the OIDN frames (3.76 / 3.82 / 3.91 at 2 / 4 / 8 samples) and about 2.3 on
 DLSS-RR's; these are estimates, because every lossless frame is a separate render from the
 job movie (a static run, or a moving segment for DLSS-RR) and so also carries
 render-to-render noise. The per-region rows are lossless on purpose (the codec noise would swamp them),
 but the MJPEG movie is what is delivered, so the tie is the headline. It is a single
 frame; temporal behaviour is covered under T4 and T7.
 
-*Why OIDN keeps the label at 768 spp and not at 6:* the 6-spp albedo guide carries the text
-sharply, yet OIDN erases it. An offline test on the engine's own 6-spp inputs (`oidnDenoise`)
+*Why OIDN keeps the label at 256 samples and not at 2:* the 2-sample albedo guide carries the
+text sharply, yet OIDN erases it. An offline test on the engine's own 2-sample inputs (`oidnDenoise`)
 compared the engine's configuration (prefiltered guides + `cleanAux`, which is Cycles'
 `ACCURATE`) with two alternatives. Whole-frame / label error: engine configuration 4.02 /
 6.27; raw (unfiltered) guides with `cleanAux` 10.08 / 10.16 with door speckle (door 35.7);
@@ -448,34 +489,36 @@ on the DLSS-RR movie**; a frame-count trim of 25 on a DLSS-RR movie ships a dupl
 frame and leaves the last pose out of the delivered range. This is a property of the
 unmodified DLSS-RR path (owner rule: not changed here), recorded rather than fixed.
 
-**The glass blotches and Task 5.** The first 6-spp review (2026-10-04) showed the view through
+**The glass blotches and Task 5.** The first 2-sample review (2026-10-04) showed the view through
 the window blotchy in OIDN and clean in DLSS-RR. Root cause: `inc_transmission_bounce()` adds a
 bounce and every OIDN guide write is gated on `total_bounces == 0`, so a surface seen through
 an alpha pane wrote no guide (keyframe-210 window: **92.7% of guide pixels unwritten**) and
 OIDN smeared the exterior. The fix ported Cycles' denoising-feature pass-through and its
 deferral through smooth specular surfaces (glass, mirrors, smooth metal) to the accumulate
 path (window: 92.7% -> 0.00% unwritten; blotches gone; aligned MSE against DLSS-RR 6.36 ->
-5.79 at 6 spp), compiled only into the accumulate variant so DLSS-RR output is
+5.79 at 2 samples), compiled only into the accumulate variant so DLSS-RR output is
 frame-identical. The full account, gate and measurements are in
 `docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md`; it is the
-reason the window blotches are gone, at the shipped 12 spp too. Known consequence, as in
+reason the window blotches are gone, at the shipped 4 samples too. Known consequence, as in
 Cycles: a smooth metal frame defers, so its guide follows its reflection; the window mullions
 read clean but their frame-to-frame residual is about twice DLSS-RR's (T4, motion numbers).
 
-**T7 -- the owner's decision (relayed 2026-10-06).** The review ran on the 6-spp material
-(2026-10-04), the guide fix and re-render, the converged reference and the 12 / 24 spp tests
-(2026-10-05), and the 24-spp full job and the GPU profile (2026-10-05 and 06). The decision,
-as relayed: "OIDN video runs at 12 spp", and DLSS-RR stays the video default
+**T7 -- the owner's decision (relayed 2026-10-06).** The review ran on the 2-sample material
+(2026-10-04), the guide fix and re-render, the converged reference and the 4 / 8-sample tests
+(2026-10-05), and the 8-sample full job and the GPU profile (2026-10-05 and 06). The decision,
+as relayed: "OIDN video runs at 12 spp" (the label of the time; the setting is 4 samples per
+pixel), and DLSS-RR stays the video default
 (`VIDEO_DENOISER := "dlssrr"`, unchanged); OIDN is the selectable mode
 (`ZR_VIDEO_DENOISER=oidn`). Approach A was chosen; approach B (temporal reuse) is not pursued
-now. The constant is `VIDEO_OIDN_ACCUM_TARGET := 4` (4 x 3 = 12 spp) in
+now. The constant is `VIDEO_OIDN_ACCUM_TARGET := 4` (4 samples per pixel) in
 `pipeline_references/video_glb_creation.gd`. The record holds these decisions rather than an
-explicit approval of the look: "render the converged frame first", "test 12 and 24 samples
-first", "render the full video at 24 samples", and "set the recommended 12".
+explicit approval of the look, quoted in the labels of the time (12 spp = 4 samples, 24 spp = 8):
+"render the converged frame first", "test 12 and 24 samples first", "render the full video at 24
+samples", and "set the recommended 12".
 
-**Follow-ups, not done:** approach B only if more fine detail is wanted than 12 spp gives;
+**Follow-ups, not done:** approach B only if more fine detail is wanted than 4 samples give;
 moving stills to CUDA OIDN (about 5 s per 4K still); the still route's wasted denoise inside
-its exposure probe; a faster tracer or a per-clip sample choice if 24 spp (legible fine text,
-label RMSE 2.62 vs DLSS-RR 2.50) is ever wanted inside an hour; DLSS-RR's one-frame lag, if the DLSS-RR path is ever opened.
+its exposure probe; a faster tracer or a per-clip sample choice if 8 samples (legible fine text,
+label RMSE 2.62 vs DLSS-RR 2.50) are ever wanted inside an hour; DLSS-RR's one-frame lag, if the DLSS-RR path is ever opened.
 Ship manifest: the engine binary (the CUDA path and the guide fix are C++ and GLSL) plus
 `pipeline_references/video_glb_creation.gd` and `pipeline_references/video_render.gd`.

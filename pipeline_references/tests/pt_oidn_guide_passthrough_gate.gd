@@ -9,8 +9,9 @@ extends "res://tests/pt_validation.gd"
 ## seen through a plane 5 m from the camera: OPEN | an ALPHA pane authored like the
 ## production window (Mat_A38_Window_Glass_001) | a smooth thin GLASS pane (the material
 ## _apply_glb_transmissive_glass produces) | a MIRROR (smooth metal, linear base 0.5) |
-## a DARK GLOSS dielectric (smooth, linear base 0.02). 6 accumulated samples -- the video
-## route's count -- then OIDN, with ZR_OIDN_DUMP pointed at a temp dir so the gate reads
+## a DARK GLOSS dielectric (smooth, linear base 0.02). 6 accumulated samples -- NOT the OIDN
+## video route's count (it ships 4, VIDEO_OIDN_ACCUM_TARGET; 6 is the DLSS-RR video job's
+## one-shot count) -- then OIDN, with ZR_OIDN_DUMP pointed at a temp dir so the gate reads
 ## the guides OIDN actually received.
 ##
 ##   F0 dumps  : the four OIDN dumps exist at 256x256 and OIDN changed the image

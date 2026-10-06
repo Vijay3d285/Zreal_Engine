@@ -7241,14 +7241,24 @@ unchanged — it does not call `highlight_relief`.
 measurement:
 `docs/superpowers/specs/2026-10-01-video-oidn-design.md` (Measured) and
 `docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md`. OIDN is the
-**selectable** video denoiser (`ZR_VIDEO_DENOISER=oidn`, 12 spp); **DLSS-RR stays the
-default**, frame-identical to before.
+**selectable** video denoiser (`ZR_VIDEO_DENOISER=oidn`, 4 samples per pixel); **DLSS-RR stays
+the default**, frame-identical to before.
+
+**Correction (final review, 2026-10-06): every sample count first written in this section was 3
+times too high.** A Phase A draw traces ONE sample per pixel (the accumulate branch runs
+`trace_one_sample` once per launch; `pathtracing_samples_per_pixel` feeds only the one-shot
+branch), so a delivered frame holds `VIDEO_OIDN_ACCUM_TARGET` samples per pixel, not target x 3.
+Times, images and RMSE values are unchanged; the labels were: 6 spp -> 2, 12 spp (the shipped
+default) -> 4, 24 spp -> 8, 768 spp -> 256, and the per-sample cost is about 1.0 s at 4K, not
+0.34 s. The shipped OIDN video is 4 samples per pixel per frame against the DLSS-RR video's 6
+(`set_pathtracing_samples_per_pixel(6)`, one-shot; its log line and comment used to say 4,
+stale text, now 6) plus that path's temporal reuse. Details and the full mapping: the design spec, Measured.
 
 The still route left DLSS-RR on 2026-09-16 for a one-pixel staircase on edges and a
 checkerboard on flat walls. Video now has the same route available. Cycles has no temporal
 OIDN and gives every frame one seed by default (`use_animated_seed = False`), so this route
 does both the same way: each delivered frame is an independent accumulate (Blackman-Harris
-pixel filter, `VIDEO_OIDN_ACCUM_TARGET` sub-frames of 3 spp) followed by OIDN, and on static
+pixel filter, `VIDEO_OIDN_ACCUM_TARGET` sub-frames of one sample each) followed by OIDN, and on static
 content it cannot flicker at all.
 
 ### What landed
@@ -7261,50 +7271,56 @@ content it cannot flicker at all.
   unchanged by it.
 - **Pipeline mode** (`video_glb_creation.gd`, `video_render.gd`): per frame, the sub-frames
   run inside one `_process()` call (`force_draw`), so MovieWriter only captures the denoised
-  re-show. **12 spp** = `VIDEO_OIDN_ACCUM_TARGET := 4`.
+  re-show. **4 samples per pixel** = `VIDEO_OIDN_ACCUM_TARGET := 4`.
 
 ### Cost and quality (urbanvideotest1, 421 frames, 4K / 60 fps)
 
-| spp | seconds (limit 3600) | VRAM peak (of 16376 MiB) |
+| samples per pixel | seconds (limit 3600) | VRAM peak (of 16376 MiB) |
 |---|---|---|
-| 6 | 1512 | 15984 |
-| **12 (default)** | **2380** | 15947 |
-| 24 | 4150 (over) | 15997 |
+| 2 | 1512 | 15984 |
+| **4 (default)** | **2380** | 15947 |
+| 8 | 4150 (over) | 15997 |
 
-Each 3-spp sub-frame is about 1.02 s of GPU, 1010 ms of it the path tracer (the GPU profile),
-so the cost is dominated by the tracing. The fixed non-tracer cost, about 1.1 s per frame
-(about 11% of a 24-spp frame), was not decomposed; removing all of it would take the 24-spp
-job from 4150 s to about 3690 s, still over 3600 s, so 24 spp needs a faster tracer. OIDN
+Each sub-frame (one sample) is about 1.02 s of GPU, 1010 ms of it the path tracer (the GPU
+profile), so the cost is dominated by the tracing. The fixed non-tracer cost, about 1.1 s per
+frame (about 11% of an 8-sample frame), was not decomposed; removing all of it would take the
+8-sample job from 4150 s to about 3690 s, still over 3600 s, so 8 samples per pixel need a
+faster tracer. OIDN
 uses no more VRAM than DLSS-RR (peaks 15950 and 16001 MiB, 97.4% and 97.7% of capacity, one
 run each), so attributing the ~16 GB to the scene is plausible but not demonstrated.
 
-Against a 768-spp reference of keyframe 210, **on lossless frames** (RMSE in display levels),
-12 spp is closer than DLSS-RR on the whole frame (2.81 vs 4.05), the door (2.50 vs 5.61), the
-bicycle (4.46 vs 5.62), the plant and the pictures. DLSS-RR is closer on fine text (the AC
-label, 2.50 vs 4.03; OIDN's label is legible at 24 spp, RMSE 2.62 vs 2.50) and, by 0.05 of a
+Against a 256-sample reference of keyframe 210, **on lossless frames** (RMSE in display
+levels), 4 samples are closer than DLSS-RR on the whole frame (2.81 vs 4.05), the door (2.50
+vs 5.61), the bicycle (4.46 vs 5.62), the plant and the pictures. DLSS-RR is closer on fine
+text (the AC label, 2.50 vs 4.03; OIDN's label is legible at 8 samples, RMSE 2.62 vs 2.50) and, by 0.05 of a
 level, on the flat wall. DLSS-RR's fine mesh on the door is an artefact (absent from the
 reference). **In the delivered MJPEG movie the whole-frame error is level with DLSS-RR**
-(4.75 vs 4.64 at 12 spp, DLSS-RR 0.11 closer; 5.15 at 6 spp, 4.52 at 24 spp): the codec adds
+(4.75 vs 4.64 at 4 samples, DLSS-RR 0.11 closer; 5.15 at 2 samples, 4.52 at 8): the codec adds
 about 3.8 levels (in quadrature, an estimate) to OIDN's frames and about 2.3 to DLSS-RR's.
 
 The flicker gate (T4) could not be validated: both instruments failed their own negative
 controls (a held pose replays one Sobol sequence, so it reads zero; moving content puts a
-13.8-level texture floor under the noise). The owner chose A at 12 spp after reviewing the
-material. Descriptive motion numbers, **measured on the 24-spp movie; 12 spp was not
-measured; at 6 spp flat walls were 15-20% above DLSS-RR**: at 24 spp flat walls and window
+13.8-level texture floor under the noise). The owner chose A at 4 samples after reviewing the
+material. Descriptive motion numbers, **measured on the 8-sample movie; 4 samples were not
+measured; at 2 samples flat walls were 15-20% above DLSS-RR**: at 8 samples flat walls and window
 glass are level with or quieter than DLSS-RR, and the thin black window mullion has about
 twice DLSS-RR's frame-to-frame residual.
 
 ### Guide fix: Cycles' denoising-feature pass-through and specular deferral (Task 5)
 
-The first 6-spp review showed the window view blotchy in OIDN. Every OIDN guide write was gated
+The first 2-sample review showed the window view blotchy in OIDN. Every OIDN guide write was gated
 on `total_bounces == 0`, and an alpha pass-through counts as a bounce, so a surface seen
 through an alpha pane wrote **no guide** (keyframe-210 window: 92.7% unwritten, now 0.00%).
 The fix ports Cycles' behaviour: transparency passes the features through, and a closure
 that is mostly specular (GGX alpha at or below 0.075, weighted by its Fresnel, not the 2x
 DLSS-RR helper) defers its guide to the next surface or the sky, through smooth glass and
 mirrors. It is compiled **only into the accumulate variant**, so DLSS-RR output is
-frame-identical (38 of 38 frames; GPU time +0.18%). The still route uses the same accumulate
+frame-identical (38 of 38 frames; GPU time +0.18%). That variant is not only the OIDN jobs':
+every DLSS-RR video job's daylight probe accumulates on a duplicate Environment with the
+DLSS-RR denoiser, so the probe's pipeline compiles the same feature code (the recorded frames
+use the one-shot variant); the code under `RT_OIDN_FEATURES` must therefore never touch
+radiance or the RNG, or the DLSS-RR exposure would move (a doctest pins the variant key,
+`test_pt_rt_flags_variant_key.cpp`). The still route uses the same accumulate
 variant, so stills changed too, by design (job 201 at 1080p on the final fix build: mean ratio
 0.99981, 0.905% of pixels 8 or more levels off). Cycles' newer smooth blend and
 `follow_reflections` options, and DLSS-RR's own unwritten G-buffers behind alpha panes, are
@@ -7313,7 +7329,7 @@ Open list is now ported for the accumulate path.
 
 ### Recorded, not done
 
-- Approach B (temporal reuse before OIDN) only if more fine detail is wanted than 12 spp gives.
+- Approach B (temporal reuse before OIDN) only if more fine detail is wanted than 4 samples give.
 - Stills on CUDA OIDN (about 5 s per 4K still); the still route's wasted denoise inside its
   exposure probe.
 - DLSS-RR's output lags the camera by one frame (delivered idx 25 == 26 == keyframe 0,

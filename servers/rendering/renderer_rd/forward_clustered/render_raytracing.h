@@ -470,9 +470,13 @@ struct RTViewportState {
 	// drops every custom-hit-group instance from the TLAS until its HGs finish
 	// compiling asynchronously, so without this the geometry holes of that first
 	// frame would be taken into the running average wholesale at accum_frame 0.
-	// 0 is not a reachable settled value (rt_flags always carries a sample count),
-	// so the initializer forces one reset on the first accumulating frame, which
-	// the "accumulation just switched on" branch already performs anyway.
+	// 0 is not a reachable settled value, so the initializer forces one reset on
+	// the first accumulating frame, which the "accumulation just switched on"
+	// branch already performs anyway. The reason is the min-bounce field: it is
+	// stored +1-biased (scene_shader_raytracing.h rt_flags_pack), so every packed
+	// word has a non-zero field there whatever the sample count. The sample-count
+	// field alone cannot carry the argument: the accumulate word packs sample count
+	// 0 on purpose (it selects the RT_OIDN_FEATURES variant).
 	uint32_t accum_last_rt_flags = 0;
 	bool accum_reset_pending = true;     // clear accum/accum_n to 0 before the next trace.
 	// Phase F: one-shot OIDN final-denoise bookkeeping. Set true once a converged OIDN

@@ -21,7 +21,9 @@ var _use_movie_writer: bool = false
 var _use_png_fallback: bool = false
 var _needs_auto_pan: bool = false
 # DLSS priming: extra frames at frame-0 position so DLSS RR builds temporal
-# history before the real timeline starts. These get trimmed by ffmpeg.
+# history before the real timeline starts. NOT trimmed: MovieWriter records them and
+# main.py's AVI -> MP4 ffmpeg call (libx264, no -ss / -t / trim filter) ships every frame,
+# so they are the first frames of the delivered video.
 const DLSS_PRIME_FRAMES: int = 5
 var _dlss_prime_remaining: int = 0
 # Wall clock at the first DELIVERED frame, for the budget projection in _process().
@@ -259,9 +261,11 @@ func _process(_delta):
 	_apply_keyframe(_current_frame)
 	if _video_phase_a():
 		_render_phase_a_frame()
-		# The thumbnail waits for frame 0's sub-frames: _capture_thumbnail_async() reads the
-		# viewport after the NEXT main-loop draw, which is only the denoised frozen re-show once
-		# the target is reached (a capture at priming time would be a raw 3-spp sub-frame).
+		# The thumbnail is captured after frame 0's sub-frames: _capture_thumbnail_async() reads
+		# the viewport after the NEXT main-loop draw, and the sub-frames just drawn reached the
+		# target, so that draw is the denoised frozen re-show of frame 0 (latch set, camera
+		# unchanged, no trace). _begin_dlss_priming() also reaches the target before its own
+		# iteration's draw, so a capture there would be denoised too; the site was left here.
 		if _current_frame == 0 and not _first_frame_saved:
 			_first_frame_saved = true
 			call_deferred("_capture_thumbnail_async")
@@ -328,9 +332,9 @@ func _begin_dlss_priming() -> void:
 		# set and an unchanged camera, and re-shows the same image.
 		for _i in range(_video_accum_target()):
 			RenderingServer.force_draw(false)
-		# The thumbnail is NOT captured here: the accumulator was just cleared, so the next draw
-		# is sub-frame 1 of the target -- a raw, un-denoised image. _process() captures it after
-		# delivered frame 0's sub-frames instead.
+		# The thumbnail is not captured here: _process() captures it after delivered frame 0's
+		# sub-frames. The loop above reached the target, so the next draw (this iteration's own)
+		# is a denoised re-show, not a raw sub-frame -- a capture here would also be denoised.
 		return
 	_dlss_prime_remaining = DLSS_PRIME_FRAMES
 	_log_console("Scene settled. Starting DLSS priming (%d frames at frame-0 position)..." % DLSS_PRIME_FRAMES)
@@ -660,7 +664,7 @@ func _run_daylight_probe() -> void:
 	_log_console("[Daylight] probe ran offscreen: SubViewport %dx%d (recorded viewport %dx%d), %d positions, %d force_draw calls, none of them main-loop frames" % [
 			probe_size.x, probe_size.y, int(rec_size.x), int(rec_size.y),
 			ascending.size(), ascending.size() * (Daylight.RESET_SETTLE_FRAMES * 2 + Daylight.PROBE_FRAMES)])
-	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production trims by frame count)" % [
+	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production does NOT trim them: main.py converts the whole AVI, so they ship as the video's first frames)" % [
 			20, iterations, 0 if _video_phase_a() else DLSS_PRIME_FRAMES])
 	_finish_daylight_probe()
 
