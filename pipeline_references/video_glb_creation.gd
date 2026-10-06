@@ -47,14 +47,15 @@ const USE_REFLECTION_PROBE_HOTSPOT_FIX = true
 #               OIDN latch the main loop's own draw adds one more sub-frame, so it captures
 #               (target + 1) x spp raw samples.
 # ZR_VIDEO_DENOISER overrides it for one process; ZR_VIDEO_ACCUM_TARGET overrides the target
-# (T4 measures 16, i.e. 48 spp).
+# (for example 8, i.e. 24 spp, as measured on 2026-10-05).
 const VIDEO_DENOISER := "dlssrr"
 const VIDEO_OIDN_SPP := 3 # the still route's day value (PT_SPP_DAY), kept under the 8 s TDR watchdog
 # 4 x 3 = 12 spp (owner, 2026-10-06). The 7 s urbanvideotest1 job measured 1512 s at 6 spp and
 # 4150 s at 24 spp against VIDEO_RENDER_TIMEOUT_SECONDS 3600: each 3-spp sub-frame is ~1.02 s of
-# pure path tracing at 4K (GPU profile: the tracer is 99% of it), so 12 spp projects to ~2400 s
-# and leaves room for slightly longer clips. Against a 768-spp reference of keyframe 210, 12 spp
-# is closer than DLSS-RR everywhere except fine text (the AC label needs ~24 spp).
+# pure path tracing at 4K (GPU profile: the tracer is 99% of it); 12 spp measured 2380 s and
+# leaves room for slightly longer clips. Against a 768-spp reference of keyframe 210, 12 spp is
+# closer than DLSS-RR on the whole frame and on the door, spokes, plant and pictures; DLSS-RR is
+# closer on fine text (the AC label needs ~24 spp) and level on flat walls (0.43 vs 0.48).
 const VIDEO_OIDN_ACCUM_TARGET := 4
 const VIDEO_OIDN_CLAMP_INDIRECT := 10.0 # Cycles' sample_clamp_indirect; fireflies are what OIDN smears into blotches
 var _video_denoiser := ""
