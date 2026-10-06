@@ -16,7 +16,10 @@ extends "res://tests/pt_validation.gd"
 ##      ZR_OIDN_GATE_DEVICE=cuda ZR_OIDN_DEVICE_REF=<dir>/oidn_device_cpu.pfm godot ...
 ##
 ## Without ZR_OIDN_DEVICE_REF (the gate suite) only D1/D2 run: the denoise executes on the
-## requested device and actually removes noise.
+## requested device and actually removes noise. Suite mode CANNOT detect a silent CPU fallback
+## -- a CPU denoise removes the noise just as well, so D1/D2 pass either way. Only the
+## ZR_OIDN_DEVICE_REF mode can (D3 below: identical output to the CPU reference means CUDA
+## never ran).
 ##
 ##   D1 premise : the raw accumulation is noisy (else OIDN has nothing to do and D4 is vacuous)
 ##   D2 denoise : OIDN reduces the noise in a flat region by more than half

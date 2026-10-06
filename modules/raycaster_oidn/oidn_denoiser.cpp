@@ -162,6 +162,11 @@ bool OIDNDenoiser::denoise_rt(int p_width, int p_height,
 		float *p_albedo,
 		float *p_normal,
 		int p_input_spp) {
+	// The same guards denoise_rt_cpu() applies, taken BEFORE the CUDA path: a null colour buffer
+	// or a non-positive size is the caller's bug, and must not reach cuda_denoise() where it
+	// would mark CUDA failed for the rest of the process.
+	ERR_FAIL_NULL_V_MSG(p_color, false, "OIDN denoise: color buffer is null.");
+	ERR_FAIL_COND_V_MSG(p_width <= 0 || p_height <= 0, false, "OIDN denoise: invalid dimensions.");
 	const int requested = (int)GLOBAL_GET("rendering/pathtracer/oidn_device");
 	if (requested == DEVICE_SETTING_CUDA && !cuda.failed) {
 		if (cuda_denoise(p_width, p_height, p_color, p_albedo, p_normal)) {
@@ -331,11 +336,16 @@ bool OIDNDenoiser::cuda_configure(int p_width, int p_height, bool p_albedo, bool
 		return false;
 	}
 
+	// The host scratch the output is read back into. Checked: a failed resize leaves the vector at
+	// its previous (possibly smaller) size, and oidnReadBuffer would then write past its end.
+	if (cuda.readback.resize((Vector<float>::Size)(w * h * 3)) != OK) {
+		cuda_fail(vformat("readback scratch allocation failed (%d floats)", (int64_t)(w * h * 3)));
+		return false;
+	}
 	cuda.width = p_width;
 	cuda.height = p_height;
 	cuda.has_albedo = p_albedo;
 	cuda.has_normal = p_normal;
-	cuda.readback.resize((int)(w * h * 3));
 	return true;
 }
 

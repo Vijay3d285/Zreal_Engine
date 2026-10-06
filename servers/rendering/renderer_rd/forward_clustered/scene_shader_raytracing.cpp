@@ -665,9 +665,10 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		// Accumulate (Phase A) packs sample count 0: that raygen branch never reads the
 		// count, and 0 is the variant key for the OIDN guide-feature code
 		// (`#define RT_OIDN_FEATURES`, injected by _ensure_variant_compile_context). One-shot
-		// always packs >= 1. Same test and index as render_forward_clustered.cpp's
-		// `rt_accumulate_active`, on the same params pointer.
-		if (p_env_params[RT_PARAM_ACCUM_FLAG] >= 0.5f) {
+		// always packs >= 1. Strictly greater than 0.5, the raygen branch's own test
+		// (`get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5`, scene_raytracing_raygen.glsl), so
+		// the variant key and the shader branch agree on every value, 0.5 included.
+		if (p_env_params[RT_PARAM_ACCUM_FLAG] > 0.5f) {
 			sample_count = 0;
 		}
 		// Cycles' shipped default total is 12 (blender/addon/properties.py); 8 was
@@ -793,6 +794,15 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	// hit-group templates are cut from the base stage sources below, so every stage of
 	// the pipeline (custom material hit groups and the intersection stage included) sees
 	// the same define.
+	//
+	// Which jobs compile this variant is not only the OIDN ones. EVERY DLSS-RR video job
+	// does too: its daylight probe (Daylight.probe_offscreen, driven by video_render.gd
+	// _run_daylight_probe) runs on a duplicate Environment with the DLSS-RR denoiser and
+	// accumulate on, so the probe's word is DLSS_RR | sample-count 0 -- this variant --
+	// while the recorded frames use the one-shot word. The probe's output feeds the
+	// exposure, hence the invariant: code under RT_OIDN_FEATURES must NEVER touch radiance
+	// or the RNG, or DLSS-RR video exposure changes (and with it every DLSS-RR frame). It
+	// may only carry guide state through the payload and write the guide buffers.
 	if (((p_rt_flags >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK) == 0u) {
 		inject_define(sources, "#define RT_OIDN_FEATURES\n");
 	}
