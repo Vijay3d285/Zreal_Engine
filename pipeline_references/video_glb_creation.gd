@@ -52,10 +52,12 @@ const VIDEO_DENOISER := "dlssrr"
 const VIDEO_OIDN_SPP := 3 # the still route's day value (PT_SPP_DAY), kept under the 8 s TDR watchdog
 # 4 x 3 = 12 spp (owner, 2026-10-06). The 7 s urbanvideotest1 job measured 1512 s at 6 spp and
 # 4150 s at 24 spp against VIDEO_RENDER_TIMEOUT_SECONDS 3600: each 3-spp sub-frame is ~1.02 s of
-# pure path tracing at 4K (GPU profile: the tracer is 99% of it); 12 spp measured 2380 s and
-# leaves room for slightly longer clips. Against a 768-spp reference of keyframe 210, 12 spp is
-# closer than DLSS-RR on the whole frame and on the door, spokes, plant and pictures; DLSS-RR is
-# closer on fine text (the AC label needs ~24 spp) and level on flat walls (0.43 vs 0.48).
+# GPU at 4K, 99% of it the path tracer; 12 spp measured 2380 s and leaves room for slightly
+# longer clips. Against a 768-spp reference of keyframe 210, on lossless frames, 12 spp is closer
+# than DLSS-RR on the whole frame and on the door, spokes, plant and pictures; DLSS-RR is closer
+# on fine text (the AC label is legible at 24 spp: RMSE 2.62 vs DLSS-RR 2.50) and level on flat
+# walls (0.43 vs 0.48). In the delivered MJPEG movie the whole-frame error is level with DLSS-RR
+# (4.75 vs 4.64).
 const VIDEO_OIDN_ACCUM_TARGET := 4
 const VIDEO_OIDN_CLAMP_INDIRECT := 10.0 # Cycles' sample_clamp_indirect; fireflies are what OIDN smears into blotches
 var _video_denoiser := ""

@@ -7237,7 +7237,8 @@ unchanged — it does not call `highlight_relief`.
 
 ## 11.32 Video OIDN — per-frame OpenImageDenoise, as Cycles animates
 
-**DONE 2026-10-06.** Specs and every measurement:
+**DONE 2026-10-06** (landed in `pipeline_references`; the owner ships). Specs and every
+measurement:
 `docs/superpowers/specs/2026-10-01-video-oidn-design.md` (Measured) and
 `docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md`. OIDN is the
 **selectable** video denoiser (`ZR_VIDEO_DENOISER=oidn`, 12 spp); **DLSS-RR stays the
@@ -7250,7 +7251,7 @@ does both the same way: each delivered frame is an independent accumulate (Black
 pixel filter, `VIDEO_OIDN_ACCUM_TARGET` sub-frames of 3 spp) followed by OIDN, and on static
 content it cannot flicker at all.
 
-### What shipped
+### What landed
 
 - **CUDA OIDN** (`modules/raycaster_oidn`): one process-lifetime device, OIDN-owned buffers,
   three filters committed once, `quality = HIGH` set explicitly, colour and output in place;
@@ -7267,24 +7268,32 @@ content it cannot flicker at all.
 | spp | seconds (limit 3600) | VRAM peak (of 16376 MiB) |
 |---|---|---|
 | 6 | 1512 | 15984 |
-| **12 (shipped)** | **2380** | 15947 |
+| **12 (default)** | **2380** | 15947 |
 | 24 | 4150 (over) | 15997 |
 
 Each 3-spp sub-frame is about 1.02 s of GPU, 1010 ms of it the path tracer (the GPU profile),
-so the cost is the tracing itself; 24 spp needs a faster tracer. OIDN adds no VRAM over
-DLSS-RR (the ~16 GB is the scene).
+so the cost is dominated by the tracing. The fixed non-tracer cost, about 1.1 s per frame
+(about 11% of a 24-spp frame), was not decomposed; removing all of it would take the 24-spp
+job from 4150 s to about 3690 s, still over 3600 s, so 24 spp needs a faster tracer. OIDN
+uses no more VRAM than DLSS-RR (peaks 15950 and 16001 MiB, 97.4% and 97.7% of capacity, one
+run each), so attributing the ~16 GB to the scene is plausible but not demonstrated.
 
-Against a 768-spp reference of keyframe 210 (lossless, RMSE in display levels), **12 spp is
-closer than DLSS-RR** on the whole frame (2.81 vs 4.05), the door (2.50 vs 5.61), the bicycle
-(4.46 vs 5.62), the plant and the pictures. DLSS-RR is closer on fine text (the AC label,
-2.50 vs 4.03; it needs about 24 spp) and, by 0.05 of a level, on the flat wall. DLSS-RR's
-fine mesh on the door is an artefact (absent from the reference).
+Against a 768-spp reference of keyframe 210, **on lossless frames** (RMSE in display levels),
+12 spp is closer than DLSS-RR on the whole frame (2.81 vs 4.05), the door (2.50 vs 5.61), the
+bicycle (4.46 vs 5.62), the plant and the pictures. DLSS-RR is closer on fine text (the AC
+label, 2.50 vs 4.03; OIDN's label is legible at 24 spp, RMSE 2.62 vs 2.50) and, by 0.05 of a
+level, on the flat wall. DLSS-RR's fine mesh on the door is an artefact (absent from the
+reference). **In the delivered MJPEG movie the whole-frame error is level with DLSS-RR**
+(4.75 vs 4.64 at 12 spp, DLSS-RR 0.11 closer; 5.15 at 6 spp, 4.52 at 24 spp): the codec adds
+about 3.8 levels (in quadrature, an estimate) to OIDN's frames and about 2.3 to DLSS-RR's.
 
 The flicker gate (T4) could not be validated: both instruments failed their own negative
 controls (a held pose replays one Sobol sequence, so it reads zero; moving content puts a
-13.8-level texture floor under the noise). The owner chose by eye. Descriptive motion numbers:
-flat walls and window glass level with or quieter than DLSS-RR; the thin black window mullion
-about twice DLSS-RR's frame-to-frame residual.
+13.8-level texture floor under the noise). The owner chose A at 12 spp after reviewing the
+material. Descriptive motion numbers, **measured on the 24-spp movie; 12 spp was not
+measured; at 6 spp flat walls were 15-20% above DLSS-RR**: at 24 spp flat walls and window
+glass are level with or quieter than DLSS-RR, and the thin black window mullion has about
+twice DLSS-RR's frame-to-frame residual.
 
 ### Guide fix: Cycles' denoising-feature pass-through and specular deferral (Task 5)
 
@@ -7296,8 +7305,8 @@ that is mostly specular (GGX alpha at or below 0.075, weighted by its Fresnel, n
 DLSS-RR helper) defers its guide to the next surface or the sky, through smooth glass and
 mirrors. It is compiled **only into the accumulate variant**, so DLSS-RR output is
 frame-identical (38 of 38 frames; GPU time +0.18%). The still route uses the same accumulate
-variant, so stills changed too, by design (job 201 at 1080p: mean ratio 0.9998, 1.03% of
-pixels 8 or more levels off). Cycles' newer smooth blend and
+variant, so stills changed too, by design (job 201 at 1080p on the final fix build: mean ratio
+0.99981, 0.905% of pixels 8 or more levels off). Cycles' newer smooth blend and
 `follow_reflections` options, and DLSS-RR's own unwritten G-buffers behind alpha panes, are
 recorded as out of scope; the "feature deferral through specular surfaces" item in §11.25's
 Open list is now ported for the accumulate path.

@@ -1,8 +1,9 @@
 # Video OIDN: per-frame OpenImageDenoise for the video route
 
-**Date:** 2026-10-01. **Status:** shipped 2026-10-06 as the selectable video mode
-(`ZR_VIDEO_DENOISER=oidn`) at **12 samples per pixel** (4 sub-frames of 3); DLSS-RR stays
-the default. The design below is the 2026-10-01 text; where it says 6 spp or "2 sub-frames"
+**Date:** 2026-10-01. **Status:** landed 2026-10-06 in `pipeline_references` as the selectable
+video mode (`ZR_VIDEO_DENOISER=oidn`) at **12 samples per pixel** (4 sub-frames of 3); DLSS-RR
+stays the default. The owner ships to production; "shipped" below means the committed
+default. The design below is the 2026-10-01 text; where it says 6 spp or "2 sub-frames"
 the shipped value is 12 spp / 4 sub-frames, and the corrected figures and the outcome of
 every test are in **Measured (2026-10-06)** at the end. **Scope:** engine
 (`modules/raycaster_oidn`, one settings line, one log rate-limit) and the video pipeline
@@ -82,8 +83,9 @@ artefacts and without lowering quality.
   still that is harmless; per video frame a CUDA context initialisation would consume
   much of the speed-up.
 - `[OIDN-DIAG]` prints three lines per denoise, plus a skip line whenever
-  `accum_frame < 5`. With target 2 that is every sub-frame: about 1,700 lines over 421
-  frames (about twice that at the shipped target 4).
+  `accum_frame < 5`. With target 2 that is 1 skip line + 3 denoise lines = 4 per frame, about
+  1,700 lines over 421 frames (at the shipped target 4 it is 3 + 3 = 6 per frame, about 2,500,
+  i.e. 1.5x).
 
 ## Design
 
@@ -145,8 +147,10 @@ devices on real content with it. Production never sets the variable.
 T5 measures the full job over 3600 s, the conversion loops are moved to
 `WorkerThreadPool` and T5 is re-run. Zero-copy Vulkan-CUDA interop is out of scope.
 *(T5 measured 2380 s at the shipped 12 spp, so the trigger did not fire. The 24-spp job did
-exceed 3600 s, but the GPU profile showed that is the path tracer's 1.02 s per sub-frame,
-not the round trip; multithreading the conversions would not have helped. See Measured.)*
+exceed 3600 s; the GPU profile shows the path tracer's 1.02 s per sub-frame dominates it. The
+fixed non-tracer cost is about 1.1 s per frame (about 11% of a 24-spp frame) and was not
+decomposed; removing all of it would take the 24-spp job from 4150 s to about 3690 s, still
+over 3600 s. See Measured.)*
 
 ### 2. Pipeline: a video OIDN mode
 
@@ -225,8 +229,10 @@ fail, so it can be shown to see a real defect.
 
 **A ships when T1-T6 pass and the owner approves T7.** If T4 fails, approach B is
 specified separately; A's engine work (the CUDA path) is reused by it unchanged.
-*(Outcome: T1-T3, T5, T6 passed; T4 could not be validated; the owner approved T7 and chose A
-at 12 spp on 2026-10-06. See Measured.)*
+*(Outcome: T1-T3, T5, T6 passed; T4 could not be validated. T7 was not recorded as an
+approval: the record shows the owner's decisions to render the converged frame first, to test
+12 and 24 samples first, to render the full video at 24 samples, and (2026-10-06) to set the
+recommended 12 spp; A was chosen and B is not pursued now. See Measured.)*
 
 ## Risks, recorded
 
@@ -239,19 +245,22 @@ Each risk below is written as designed on 2026-10-01; the note after it is what 
   and chose A; B is not pursued now.*
 - **Fine detail at 6 spp** is below the still's (measured, finding 4). That is the cost of
   the owner's budget and is not changed by the denoiser choice; B recovers some of it.
-  *Measured: against a 768-spp reference the shipped 12 spp is closer than DLSS-RR on the
-  whole frame, door, bicycle, plant and pictures; fine text (the AC label) needs about 24 spp.*
+  *Measured: against a 768-spp reference, on lossless frames, the shipped 12 spp is closer
+  than DLSS-RR on the whole frame, door, bicycle, plant and pictures; in the delivered MJPEG
+  movie the whole-frame error is level with DLSS-RR (4.75 vs 4.64). Fine text (the AC label)
+  is legible at 24 spp (label RMSE 2.62 vs DLSS-RR 2.50).*
 - **VRAM.** OIDN's CUDA scratch at 4K is added to a render that peaked at 10.8 GB on the
   worst still. T6 measures; if needed, OIDN's `maxMemoryMB` makes it tile. *Measured: the
-  video scene sits at about 16 GB (15.95-16.00 GB peak of 16.38 GB) in both modes; OIDN adds
-  none over DLSS-RR. The margin is thin but it is the scene's, not OIDN's.*
+  video job peaks at 15947-16001 MiB of 16376 (97.4-97.7%) in both modes (one run each for
+  the DLSS-RR / OIDN comparison); OIDN uses no more than DLSS-RR. The margin is thin; that it
+  is the scene's is plausible but not demonstrated.*
 - **CUDA and Vulkan on one GPU.** Separate contexts on the same device. OIDN's kernels at
   4K total about 157 ms, far below the 8 s TDR watchdog. *Measured: no device loss in any
   full-job run.*
 - **Budget margin.** Removing the per-frame DLSS-RR evaluation saves some time; the OIDN
   round trip and a second dispatch per frame cost some. Net unknown until T5. *Measured: the
-  cost is path tracing, about 1.02 s per 3-spp sub-frame; see Measured, T5 and the GPU
-  profile.*
+  cost is dominated by path tracing, about 1.02 s per 3-spp sub-frame; see Measured, T5 and
+  the GPU profile.*
 
 ## Out of scope (recorded)
 
@@ -289,10 +298,10 @@ and `2a17e657` 2 of 5 (and `befe659d` 4 of 4 with `ZR_OIDN_DUMP` set, with ident
 input and output hashes); the pre-change binary gave `befe659d` 5 of 6 and `2a17e657` 1 of 6;
 every run printed the same 24 `[OIDN-DIAG]` lines. So "stills unchanged" is a comparison of
 two binaries in one session state. **The later guide fix did change stills, deliberately** (see
-below): on its first measurement job 201 at 1080p moved by a mean-pixel ratio of 0.9998 with
-1.03% of pixels 8 or more levels off, and after the last fix round it settles on md5
-`10c98486960c8bca460f63f8e146f75c` (`2026-10-04-oidn-guide-feature-passthrough-design.md`,
-Measured).
+below): against the pre-change still, job 201 at 1080p on the final fix build has a mean-pixel
+ratio of 0.99981 with 0.905% of pixels 8 or more levels off (the first fix commit read
+1.03%), md5 `10c98486960c8bca460f63f8e146f75c`
+(`2026-10-04-oidn-guide-feature-passthrough-design.md`, Measured).
 
 **T3 -- the video default is untouched: passed.** `VIDEO_DENOISER = dlssrr`, job 301, 12
 keyframes, 38 frames: `ffmpeg -f framemd5` **38 of 38 frames identical** before and after the
@@ -348,27 +357,32 @@ device loss, no fence error, one engine banner. DLSS-RR's own run of this job (2
 held 0.7660; the 0.7659 vs 0.7660 difference is the exposure probe's run-to-run noise (the
 same job on the same binary differs by 1-2e-4 in other pairs of runs). The shipped 12 spp fits
 the hour with 34% to spare; 24 spp does not (production `main.py` would kill Godot at 3600 s,
-around frame 340). The test harness does not enforce the timeout; it only feeds the
-`[Budget]` verdict.
+around frames 350-365: 432 s were spent at frame 30, then 9.5-9.8 s/frame). The test harness
+does not enforce the timeout; it only feeds the `[Budget]` verdict.
 
-**The GPU profile (2026-10-06): the cost is the path tracer, and nothing is removable.**
+**The GPU profile (2026-10-06): the cost is dominated by the path tracer.**
 Moving segment, keyframes 180-215, 24 spp, `--gpu-profile` with the timestamp-query limit
 raised to 8192 in the scratch project (0 overflows, 139 profile blocks over delivered frames
 10-30 of the segment): each drawn frame, i.e. one 3-spp sub-frame, costs a **median 1017.8 ms
 of GPU, of which the "Pathtracer" task is 1010.3 ms**; all raster, post and TLAS work together
 is about 8 ms. That is about 0.34 s per sample at 4K. The `[Budget]` of 9.39 s/frame at 24 spp
 in that run decomposes as 8 x 1.02 s + the OIDN denoise and conversions + about 1.1 s fixed
-per frame. Per-frame cost is not view-dependent along the path (10.51 s/frame at keyframes
-190-210 vs 9.79 at 10-30). Earlier static-job timings are invalid: after the first converged
+per frame. The profile covers GPU time only: the fixed non-tracer cost of about 1.1 s per
+frame (about 11% of a 24-spp frame) was not decomposed. Per-frame cost did not vary with the
+view beyond the run-to-run spread (10.51 s/frame at keyframes 190-210 and 9.39 in the clean
+profiled run, against 9.79 at keyframes 10-30: a spread of about 12%). Earlier static-job
+timings are invalid: after the first converged
 frame a static job holds the OIDN latch and skips the trace (2 denoises per 5-frame run),
 which is why a projection built on them (0.387 s per sub-frame, 24 spp about 2490 s) was 40%
-low. Conclusion: 24 spp cannot fit an hour without a faster tracer.
+low. Removing all of the fixed cost would take the 24-spp job from 4150 s to about 3690 s,
+still over 3600 s, so 24 spp needs a faster tracer.
 
-**T6 -- VRAM and stability: passed, with a thin margin that is the scene's.** Peak
+**T6 -- VRAM and stability: passed, with a thin margin.** Peak
 15947-15997 MiB of 16376 MiB in every full run (margin 2.3-2.6%), flat for the whole job, no
 device loss. Attribution run (urbanvideotest1 segment, 1 s samples): DLSS-RR peak 16001 MiB
-(late median 15891), OIDN 15950 (late median 15822): **OIDN adds no VRAM over DLSS-RR**; the
-roughly 16 GB ceiling is the scene plus the driver.
+(late median 15891), OIDN 15950 (late median 15822): **OIDN uses no more VRAM than DLSS-RR**.
+Both sit at 97.4-97.7% of capacity (n = 1 each), so attributing the ceiling to the scene plus
+the driver is plausible but not demonstrated.
 
 **Converged reference (2026-10-05) -- OIDN against DLSS-RR, both against 768 spp.** Keyframe
 210 held static, 256 sub-frames of 3 spp (768 spp) through the same OIDN path, exposure forced
@@ -381,7 +395,8 @@ neighbours is at least 19.7, so it is the right frame). RMSE against the 768-spp
 
 | region | OIDN 6 spp | OIDN **12 spp** (shipped) | OIDN 24 spp | DLSS-RR |
 |---|---|---|---|---|
-| whole frame | 3.53 | **2.81** | 2.27 | 4.05 |
+| whole frame, lossless | 3.53 | **2.81** | 2.27 | 4.05 |
+| whole frame, delivered MJPEG movie frame (OIDN idx 230, DLSS-RR idx 236) | 5.15 | 4.75 | 4.52 | **4.64** |
 | AC label (fine text) | 4.90 | 4.03 | 2.62 | **2.50** |
 | door (window exterior) | 3.25 | **2.50** | 2.10 | 5.61 |
 | bicycle (thin spokes) | 6.04 | **4.46** | 3.62 | 5.62 |
@@ -389,13 +404,24 @@ neighbours is at least 19.7, so it is the right frame). RMSE against the 768-spp
 | plant | 5.26 | **4.03** | 3.21 | 5.69 |
 | pictures | 5.72 | **4.09** | 3.20 | 5.07 |
 
-At 12 spp OIDN is closer to the reference than DLSS-RR on the whole frame, door, bicycle,
-plant and pictures. DLSS-RR is closer on the label (fine text needs about 24 spp; at 12 the
-"SAMSUNG" letters are an unreadable bar, at 24 they read) and, by 0.05 of a level, on the
-flat wall. DLSS-RR's regular mesh on the door is an artefact: it is absent from the
-reference. The delivered MJPEG video frames carry the codec's own error (OIDN 6 spp whole
-frame 5.16 in the video vs 3.53 lossless; DLSS-RR 4.64 vs 4.05), so the table is lossless on
-purpose. It is a single frame; temporal behaviour is covered under T4 and T7.
+**On lossless frames** OIDN at 12 spp is closer to the reference than DLSS-RR on the whole
+frame, door, bicycle, plant and pictures. DLSS-RR is closer on the label (the "SAMSUNG"
+letters are an unreadable bar at 12 spp and legible at 24 spp, label RMSE 2.62 vs DLSS-RR
+2.50) and, by 0.05 of a level, on the flat wall. DLSS-RR's regular mesh on the door is an
+artefact: it is absent from the reference.
+
+**In the delivered MJPEG movie the whole-frame error is level with DLSS-RR** (4.75 vs 4.64 at
+12 spp; DLSS-RR 0.11 closer; 24 spp is 0.12 closer than DLSS-RR). The MJPEG row decodes the
+delivered movie frames at the aligned keyframe (OIDN idx 230 of the 6 / 12 / 24 spp job movies,
+DLSS-RR idx 236 of the 2026-09-30 movie) and compares each with the reference (frame 22 or
+frame 24; they agree to 0.001), whole-frame RGB RMSE recomputed 2026-10-06: 5.155 / 4.748 /
+4.517 / 4.641 before rounding. Taking the codec's error to add in quadrature, it is about
+3.8 levels on the OIDN frames (3.76 / 3.82 / 3.91 at 6 / 12 / 24 spp) and about 2.3 on
+DLSS-RR's; these are estimates, because every lossless frame is a separate render from the
+job movie (a static run, or a moving segment for DLSS-RR) and so also carries
+render-to-render noise. The per-region rows are lossless on purpose (the codec noise would swamp them),
+but the MJPEG movie is what is delivered, so the tie is the headline. It is a single
+frame; temporal behaviour is covered under T4 and T7.
 
 *Why OIDN keeps the label at 768 spp and not at 6:* the 6-spp albedo guide carries the text
 sharply, yet OIDN erases it. An offline test on the engine's own 6-spp inputs (`oidnDenoise`)
@@ -434,8 +460,7 @@ frame-identical. The full account, gate and measurements are in
 `docs/superpowers/specs/2026-10-04-oidn-guide-feature-passthrough-design.md`; it is the
 reason the window blotches are gone, at the shipped 12 spp too. Known consequence, as in
 Cycles: a smooth metal frame defers, so its guide follows its reflection; the window mullions
-read clean but their edge wobbles by up to about a pixel from frame to frame (T4, motion
-numbers).
+read clean but their frame-to-frame residual is about twice DLSS-RR's (T4, motion numbers).
 
 **T7 -- the owner's decision (relayed 2026-10-06).** The review ran on the 6-spp material
 (2026-10-04), the guide fix and re-render, the converged reference and the 12 / 24 spp tests
@@ -444,11 +469,13 @@ as relayed: "OIDN video runs at 12 spp", and DLSS-RR stays the video default
 (`VIDEO_DENOISER := "dlssrr"`, unchanged); OIDN is the selectable mode
 (`ZR_VIDEO_DENOISER=oidn`). Approach A was chosen; approach B (temporal reuse) is not pursued
 now. The constant is `VIDEO_OIDN_ACCUM_TARGET := 4` (4 x 3 = 12 spp) in
-`pipeline_references/video_glb_creation.gd`.
+`pipeline_references/video_glb_creation.gd`. The record holds these decisions rather than an
+explicit approval of the look: "render the converged frame first", "test 12 and 24 samples
+first", "render the full video at 24 samples", and "set the recommended 12".
 
 **Follow-ups, not done:** approach B only if more fine detail is wanted than 12 spp gives;
 moving stills to CUDA OIDN (about 5 s per 4K still); the still route's wasted denoise inside
-its exposure probe; a faster tracer or a per-clip sample choice if 24 spp (legible fine text)
-is ever wanted inside an hour; DLSS-RR's one-frame lag, if the DLSS-RR path is ever opened.
+its exposure probe; a faster tracer or a per-clip sample choice if 24 spp (legible fine text,
+label RMSE 2.62 vs DLSS-RR 2.50) is ever wanted inside an hour; DLSS-RR's one-frame lag, if the DLSS-RR path is ever opened.
 Ship manifest: the engine binary (the CUDA path and the guide fix are C++ and GLSL) plus
 `pipeline_references/video_glb_creation.gd` and `pipeline_references/video_render.gd`.
