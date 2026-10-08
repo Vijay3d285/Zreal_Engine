@@ -22,7 +22,7 @@ anti_aliasing/quality/use_debanding=true
 
 [editor]
 
-movie_writer/mjpeg_quality=0.85
+movie_writer/video_quality=1.0
 
 [debug/file_logging]
 
