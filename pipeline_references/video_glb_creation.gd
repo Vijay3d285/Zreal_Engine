@@ -61,7 +61,7 @@ const USE_REFLECTION_PROBE_HOTSPOT_FIX = true
 #               (target + 1) raw samples per pixel.
 # ZR_VIDEO_DENOISER overrides it for one process; ZR_VIDEO_ACCUM_TARGET overrides the target
 # (for example 8, i.e. 8 samples per pixel, as measured on 2026-10-05).
-const VIDEO_DENOISER := "dlssrr"
+const VIDEO_DENOISER := "oidn" # "dlssrr"
 # NOT the image's sample count. Phase A's accumulate branch traces ONE sample per draw and never
 # reads samples_per_pixel, so the delivered frame holds VIDEO_OIDN_ACCUM_TARGET samples per pixel
 # and this value does not change that. It only sets the one-shot (accumulate off) draws:
@@ -69,8 +69,15 @@ const VIDEO_DENOISER := "dlssrr"
 # The value 3 is the still route's day value (PT_SPP_DAY), kept under the 8 s TDR watchdog for
 # one such draw at 4K. Corrected 2026-10-06: it was documented as a per-sub-frame multiplier.
 const VIDEO_OIDN_SPP := 3
-# Target 4 = 4 samples per pixel (owner, 2026-10-06; a sub-frame is one sample, so the target IS
-# the sample count). The 7 s urbanvideotest1 job measured 1512 s at target 2 and 4150 s at target
+# Target 24 = 24 samples per pixel: production's value (owner). At 6 the delivered video showed
+# noise flicker in motion; 24 reduced it, and job 210 (7 s) took 10,490 s. With the 2026-10-08
+# fixture and culling changes, on job 210 keyframes 204-215 at 4K (flicker = frame-to-frame change
+# on flat pixels, 8-bit levels, mean / p90):
+#   24 spp: 41.4 s per delivered frame, flicker 0.57 / 1.21
+#   16 spp: 29.5 s per delivered frame, flicker 0.59 / 1.36
+#   before those changes, 24 spp: 28.4 s, flicker 0.52 / 1.13
+# History: target 4 (owner, 2026-10-06; a sub-frame is one sample, so the target IS the sample
+# count). The 7 s urbanvideotest1 job measured 1512 s at target 2 and 4150 s at target
 # 8 against VIDEO_RENDER_TIMEOUT_SECONDS 3600: each sub-frame is ~1.02 s of GPU at 4K, 99% of it
 # the path tracer; target 4 measured 2380 s and leaves room for slightly longer clips. Against a
 # 256-sample reference of keyframe 210, on lossless frames, 4 samples per pixel is closer than
@@ -78,7 +85,7 @@ const VIDEO_OIDN_SPP := 3
 # door, spokes, plant and pictures; DLSS-RR is closer on fine text (the AC label is legible at 8
 # samples: RMSE 2.62 vs DLSS-RR 2.50) and level on flat walls (0.43 vs 0.48). In the delivered
 # MJPEG movie the whole-frame error is level with DLSS-RR (4.75 vs 4.64).
-const VIDEO_OIDN_ACCUM_TARGET := 4
+const VIDEO_OIDN_ACCUM_TARGET := 24
 const VIDEO_OIDN_CLAMP_INDIRECT := 10.0 # Cycles' sample_clamp_indirect; fireflies are what OIDN smears into blotches
 var _video_denoiser := ""
 var _flicker_test := false
@@ -298,8 +305,8 @@ const GLB_WATER_REPAIR_METALLIC = false
 # so the authored values are simply what renders. This gate exists only because
 # we substitute values at all, and it is scoped to never substitute them when
 # that would be visible.
-const GLB_CONVERT_MAX_TINT = 0.90   # min RGB channel must be at least this (1.0 = white)
-const GLB_CONVERT_MAX_ALPHA = 0.35  # effective coverage must be below this
+const GLB_CONVERT_MAX_TINT = 0.90 # min RGB channel must be at least this (1.0 = white)
+const GLB_CONVERT_MAX_ALPHA = 0.35 # effective coverage must be below this
 # Coarse grid used to read the authored texture. 16x16 = 256 taps regardless of
 # map size; these are 4096x4096, so reading every texel would be 16M taps per
 # material for a number two decimal places wide.
@@ -2951,8 +2958,8 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			if not all_holes.has(hole_id):
 				all_holes[hole_id] = _floor_plan_root_data["holes"][hole_id]
 				print("[WARN] Hole '", hole_id, "' sourced from root-level fallback — "
-					+ "layer-level copy was absent (optimizer may have culled the parent wall). "
-					+ "Altitude/position may be stale; check scene_optimizer.py logs.")
+					+"layer-level copy was absent (optimizer may have culled the parent wall). "
+					+"Altitude/position may be stale; check scene_optimizer.py logs.")
 
 	var areas = {}
 	if layer_data.has("areas"):
