@@ -19,7 +19,19 @@ var _emission_scan_lines = []
 #   - All floor-plan coordinates use the resolved scene unit scale (legacy cm, 2.0.0 mm)
 
 const ENABLE_DUPLICATION = true
-const LOW_TEXTURE_QUALITY = false
+# 2048 cap on every texture (load_image_texture, _compress_glb_node_textures). Uncapped,
+# every map loads at full size, uncompressed: the culled job-210 scene held 9.5 GB of
+# textures and committed 16.0 GB of the 16 GB card before a frame was traced, and 20
+# more items spilled 3.8 GB to system memory, where the trace ran 13-30x slower. Capped:
+# 12.9 GB, the 41-item scene in 694 s instead of 4849 s, and 6% less fine detail (mean
+# |Laplacian| of a 4K frame; leather grain slightly softer at 2x zoom). Full-resolution
+# BC7 keeps the detail and fits too, but cvtt spends ~8 s per 4K map: 20-45 min a job
+# until compressed maps are cached per asset.
+const LOW_TEXTURE_QUALITY = true
+# Emissive fixture geometry IS the light, as in image_glb_creation.gd: a fixture whose
+# bulb surface is emissive is lit by that surface through emissive-mesh NEE and gets no
+# co-located analytic light (_add_light_fixture_effect). See the skip there.
+const USE_EMISSIVE_MESH_LIGHTS = true
 
 var _tracked_assets = []
 var _window_sunlight_data = [] # Collected during hole building, used to place window sunlights
@@ -1483,6 +1495,10 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	#   PT_DENOISER_NONE = 0
 	#   PT_DENOISER_DLSS_RAY_RECONSTRUCTION = 1
 	env.set_pathtracing_enabled(true)
+	# Emissive-mesh NEE, as the still route sets it: without it an emissive bulb is found
+	# only by BSDF rays that happen to hit it, which is noise, not light.
+	ProjectSettings.set_setting(
+			"rendering/pathtracer/emissive_mesh_lights", USE_EMISSIVE_MESH_LIGHTS)
 	env.set_pathtracing_max_bounces(6) # 6 bounces — DLSS RR denoises so fewer bounces suffice
 	if _video_phase_a():
 		# Phase A per delivered frame (spec 2026-10-01-video-oidn-design.md): a mirror of the still
@@ -4749,6 +4765,23 @@ func _add_light_fixture_effect(node: Node3D, item: Dictionary, local_aabb: AABB,
 
 	var emissive_surface_found = _apply_light_fixture_emission(node, light_color, emission_energy)
 
+	# ONE authority per fixture, ported from image_glb_creation.gd. With emissive-mesh NEE
+	# on, an emissive bulb is sampled directly and shadowed by its own fixture, so it needs
+	# no analytic twin. The twin was shadowless (no shadow rays for shadow_enabled=false,
+	# render_raytracing.cpp) and on job 210 carried ~92% of the light the daylight probe saw
+	# at keyframe 210 (exposure 0.925 with it, 11.5 without): the evenly lit, flat look of
+	# the delivered video against the window-lit still. Fixtures with no emissive surface
+	# keep the analytic light. Not skipped on the day + light_meta branch, whose clamped
+	# 0.36-1.10 emission the still route calls cosmetic: there the analytic pool stays.
+	var day_emission_is_cosmetic = day_render and skip_normalization
+	if USE_EMISSIVE_MESH_LIGHTS and emissive_surface_found and not day_emission_is_cosmetic:
+		print("[Emission] Fixture '%s' lit by emissive MESH; analytic light skipped." % [
+				str(item.get("name", item.get("id", "Light")))])
+		return
+	if emissive_surface_found and day_emission_is_cosmetic:
+		print("[Emission] Fixture '%s' keeping analytic light (day emission is cosmetic at %s); light_energy=%s" % [
+				str(item.get("name", item.get("id", "Light"))), emission_energy, light_energy])
+
 	# Tree-safe world position (see image_glb_creation.gd): node.to_global() fails when the
 	# builder root isn't in the tree yet, dumping lights at the origin. node is a direct child
 	# of the root, so its local transform already maps emitter_local into the root frame.
@@ -5566,9 +5599,14 @@ func load_image_texture(path):
 		return ImageTexture.create_from_image(img)
 	return null
 
-func _compress_glb_node_textures(root: Node, max_dim: int) -> void:
+# p_done maps a source texture's instance id to the texture that replaces it, so each map
+# is resized once per GLB. glTF materials share one map between slots (metallic and
+# roughness, often AO, read the same metallicRoughness texture): resized per slot, every
+# shared map became two or three separate capped copies. Keyed by id, not by the texture,
+# so the full-size original is not kept alive by the table.
+func _compress_glb_node_textures(root: Node, max_dim: int, p_done: Dictionary = {}) -> void:
 	for child in root.get_children():
-		_compress_glb_node_textures(child, max_dim)
+		_compress_glb_node_textures(child, max_dim, p_done)
 	if not (root is MeshInstance3D):
 		return
 	var mi := root as MeshInstance3D
@@ -5583,16 +5621,24 @@ func _compress_glb_node_textures(root: Node, max_dim: int) -> void:
 			var tex = mat.get(slot)
 			if not (tex is ImageTexture):
 				continue
+			var key: int = tex.get_instance_id()
+			if p_done.has(key):
+				mat.set(slot, p_done[key])
+				continue
 			var img: Image = (tex as ImageTexture).get_image()
 			if img == null:
 				continue
 			if img.get_width() <= max_dim and img.get_height() <= max_dim:
+				p_done[key] = tex
 				continue
 			var new_w := mini(img.get_width(), max_dim)
 			var new_h := mini(img.get_height(), max_dim)
 			img.resize(new_w, new_h, Image.INTERPOLATE_LANCZOS)
 			img.generate_mipmaps()
-			mat.set(slot, ImageTexture.create_from_image(img))
+			var capped := ImageTexture.create_from_image(img)
+			p_done[key] = capped
+			p_done[capped.get_instance_id()] = capped
+			mat.set(slot, capped)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
