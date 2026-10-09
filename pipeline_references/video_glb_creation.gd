@@ -4185,10 +4185,14 @@ func _is_light_fixture_item(item: Dictionary) -> bool:
 			model_hint = str(urls["glb_Url"]).to_lower()
 
 	var full_desc = item_type + " " + item_name + " " + mounting_type + " " + model_hint
+	# No "wallmount": it names a mounting, not a light. Matched against the GLB file
+	# name it made "WallMountedAirConditioner_HP_high.glb" a lamp with an analytic
+	# light. Across 107 saved payloads it was the only keyword behind that AC, and
+	# no real fixture depended on it ("Wall Mount Light" matches "light").
 	var light_keywords = [
 		"light", "lamp", "pendant", "pendent", "chandelier",
 		"lantern", "sconce", "ceilinglamp", "ceiling_light",
-		"wallmount", "streetlamp", "lighting fixture"
+		"streetlamp", "lighting fixture"
 	]
 	for kw in light_keywords:
 		if kw in full_desc:
