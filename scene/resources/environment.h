@@ -235,12 +235,13 @@ private:
 	// 0.0 = disabled (opt-in). Blender's comparable default is 10.0 for indirect;
 	// we default off so existing realtime/video output (one-shot path) is unchanged.
 	float pathtracing_clamp_indirect = 0.0f;
-	// Adaptive sampling: once a pixel's relative standard error (tracked via a
-	// per-pixel Welford running mean/variance) falls below this threshold, that
-	// pixel stops accumulating new samples and the budget goes elsewhere.
-	// 0.0 = disabled (sample every pixel every frame). Mirrors Cycles adaptive
-	// sampling (intern/cycles/kernel/film/adaptive_sampling.h).
-	float pathtracing_noise_threshold = 0.01f;
+	// Adaptive sampling with Cycles' test and Cycles' meaning of the threshold
+	// (intern/cycles/kernel/film/adaptive_sampling.h; scene_raytracing_raygen.glsl).
+	// 0.0 = disabled (sample every pixel every frame). Defaults to off, not to
+	// Cycles' 0.01: the previous relative-error test never converged at 0.01, so
+	// every Environment that left it unset has rendered with adaptive sampling
+	// in effect off, and the routes opt in explicitly.
+	float pathtracing_noise_threshold = 0.0f;
 	void _update_pathtracing();
 
 	// Glow

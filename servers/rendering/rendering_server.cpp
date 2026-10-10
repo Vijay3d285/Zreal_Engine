@@ -3878,6 +3878,12 @@ void RenderingServer::init() {
 	// leaves it 0 for video and DLSS-RR. A project setting rather than an
 	// Environment property because Environment.pathtracing_params[16] is full.
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/guiding_probability", PROPERTY_HINT_RANGE, "0.0,0.9,0.05"), 0.0);
+	// Adaptive sampling (Phase A accumulation, Environment.pathtracing_noise_threshold > 0):
+	// samples every pixel takes before its first convergence check. 0 = Cycles' automatic
+	// value for the threshold, ceil(16 / threshold^0.3) (64 at Cycles' default 0.01). Checks
+	// then run every 16 samples, as in Cycles, so a pixel stops at the first multiple of 16
+	// above this. A project setting because Environment.pathtracing_params[16] is full.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/adaptive_min_samples", PROPERTY_HINT_RANGE, "0,4096,1"), 0);
 	// Transmission / rough glass (roadmap E1). Defaults to true, unlike C1's
 	// emissive_mesh_lights: the feature is already data-gated (transmission
 	// defaults to 0.0 and no pre-Phase-D content can set it), so an untouched

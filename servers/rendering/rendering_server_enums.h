@@ -808,10 +808,11 @@ enum PathtracingParamIndex {
 	// bounce. This is the one that kills fireflies; indirect specular paths are
 	// where the outliers come from. 0.0 = disabled.
 	PT_PARAM_CLAMP_INDIRECT = 10,
-	// PT_PARAM_NOISE_THRESHOLD: per-pixel relative-error target. Once a pixel's
-	// estimated error falls below this, sampling stops for that pixel and the
-	// budget goes elsewhere. 0.0 = disabled (sample every pixel every frame).
-	// Mirrors Cycles adaptive sampling (intern/cycles/kernel/film/adaptive_sampling.h).
+	// PT_PARAM_NOISE_THRESHOLD: adaptive sampling threshold with Cycles' meaning (its
+	// "Noise Threshold", default 0.01): a pixel stops sampling once its error against a
+	// half-sample buffer, normalised by sqrt(intensity), is under it. Accumulate route
+	// only. 0.0 = disabled (sample every pixel every frame). Ported from
+	// intern/cycles/kernel/film/adaptive_sampling.h; see scene_raytracing_raygen.glsl.
 	PT_PARAM_NOISE_THRESHOLD = 11,
 	// PT_PARAM_MAX_DIFFUSE_BOUNCE: maximum number of diffuse reflection bounces a
 	// path may take before it terminates, independent of the total bounce limit.

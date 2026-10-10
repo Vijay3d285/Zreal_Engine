@@ -49,7 +49,7 @@
 // Phase A: persistent accumulation buffers for still-image convergence.
 #define RB_TEX_RAYTRACING_ACCUM SNAME("rt_accum")       // running-average radiance (R32G32B32A32_SFLOAT)
 #define RB_TEX_RAYTRACING_ACCUM_N SNAME("rt_accum_n") // sample count per pixel (R32_SFLOAT)
-#define RB_TEX_RAYTRACING_VARIANCE SNAME("rt_variance") // Welford (mean_luma, M2) per pixel (R32G32_SFLOAT)
+#define RB_TEX_RAYTRACING_VARIANCE SNAME("rt_variance") // adaptive sampling: Cycles' half buffer .rgb + state .w (R32G32B32A32_SFLOAT)
 // OIDN guides accumulated like the colour (spec 2026-09-16-oidn-accumulated-guides):
 // running-average primary albedo and world normal, one sample per frame at the
 // pixel filter's jitter -- Cycles' denoising_albedo / denoising_normal passes.

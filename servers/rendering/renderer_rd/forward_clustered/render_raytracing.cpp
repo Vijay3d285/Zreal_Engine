@@ -4365,6 +4365,23 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// fixed per-pixel pattern (bias, real detail) from sample noise; used for
 		// the Gap #30 follow-up (roadmap 11.26). Production never sets it.
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame + zr_seed_offset());
+		// Adaptive sampling, Cycles' test (scene_raytracing_raygen.glsl). RT_PARAM_NOISE_THRESHOLD
+		// is Cycles' user threshold. The error is measured at the tonemap exposure, as Cycles
+		// measures it at film exposure; the check schedule runs on the accumulate frame itself,
+		// so a ZR_SEED_OFFSET render checks on the same draws; and the minimum sample count is
+		// the project setting, or Cycles' automatic one: ceil(16 / threshold^0.3), at least 4
+		// (intern/cycles/scene/integrator.cpp).
+		{
+			const float threshold = rt_ubo.params[SceneShaderRaytracing::RT_PARAM_NOISE_THRESHOLD];
+			int min_samples = (int)GLOBAL_GET("rendering/pathtracer/adaptive_min_samples");
+			if (min_samples <= 0 && threshold > 0.0f) {
+				min_samples = (int)Math::ceil(16.0f / Math::pow(threshold, 0.3f));
+			}
+			const bool has_env = p_render_data && p_render_data->environment.is_valid();
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ADAPTIVE_EXPOSURE] = has_env ? RendererEnvironmentStorage::get_singleton()->environment_get_exposure(p_render_data->environment) : 1.0f;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ADAPTIVE_SAMPLE] = float(p_state->accum_frame);
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ADAPTIVE_MIN_SAMPLES] = float(MAX(4, min_samples));
+		}
 		// Gap #32 path guiding. Inert unless accumulating: the parameters are
 		// written as 0, guide_enabled() in the shader is then false, and no
 		// buffer is created or copied. The grid is the TLAS AABB at 1/64 of its

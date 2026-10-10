@@ -44,11 +44,20 @@ layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 // (binding 30) is declared in raytracing_common_inc.glsl: the hit and miss
 // shaders read it too, for the OIDN guide accumulators.
 layout(set = 0, binding = 29, rgba32f) uniform image2D rt_accum;
-// Adaptive sampling (Task 6): Welford (running mean luminance, M2) per pixel.
+// Adaptive sampling: Cycles' half buffer A in .rgb, state bits in .w (see main()).
 // Bound at 33, not 31 -- binding 31 is IES_BUFFER_BINDING (ies_lookup_inc.glsl)
 // and 32 is the motion-transforms SSBO (declared further down in this file); both
 // already occupy the scene raytracing set. See render_raytracing.cpp update_uniform_set.
-layout(set = 0, binding = 33, rg32f) uniform image2D rt_variance;
+layout(set = 0, binding = 33, rgba32f) uniform image2D rt_variance;
+
+// rt_variance.w state bits.
+const uint RT_ADAPTIVE_CONVERGED = 1u; // passed its last convergence check
+const uint RT_ADAPTIVE_ACTIVE = 2u; // sampling decision cached on the last non-check draw
+
+bool rt_adaptive_converged_at(ivec2 p_pixel, ivec2 p_size) {
+	ivec2 p = clamp(p_pixel, ivec2(0), p_size - 1);
+	return (uint(imageLoad(rt_variance, p).w) & RT_ADAPTIVE_CONVERGED) != 0u;
+}
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
 
@@ -404,21 +413,52 @@ void main() {
 
 		float n = max(imageLoad(rt_accum_n, ivec2(pixel)).x, 0.0);
 		vec3 prev = imageLoad(rt_accum, ivec2(pixel)).rgb;
-		vec2 var_state = imageLoad(rt_variance, ivec2(pixel)).xy;
 
-		// Adaptive sampling: once a pixel's relative standard error drops below
-		// the threshold, stop spending samples on it. Needs a minimum sample
-		// count first, otherwise early noise luck freezes a pixel prematurely.
-		const float MIN_ADAPTIVE_SAMPLES = 16.0;
+		// Adaptive sampling, ported from Cycles: the test in
+		// intern/cycles/kernel/film/adaptive_sampling.h, the half buffer in
+		// light_passes.h (film_write_adaptive_buffer) and the schedule in
+		// integrator/adaptive_sampling.cpp. rt_variance.rgb is the half buffer A:
+		// the class-A samples only, each x2, so it estimates the same sum as I
+		// from half the samples and |I - A| measures the noise. A check runs
+		// after sample s when s > min_samples and (s & 15) == 15. A converged
+		// pixel takes no samples; after each check Cycles' filter_x / filter_y
+		// reopen the neighbours of every unconverged pixel, done here by testing
+		// the 3x3 neighbourhood. Flags are written only on check draws and the
+		// neighbourhood is read only on the other draws (a check draw reuses the
+		// decision cached on the draw before), so no invocation reads a flag
+		// another is writing in the same dispatch and the render stays
+		// reproducible. Off (no rt_variance traffic at all) when the threshold is 0.
 		float noise_threshold = get_rt_param(RT_PARAM_NOISE_THRESHOLD);
-		if (noise_threshold > 0.0 && n >= MIN_ADAPTIVE_SAMPLES) {
-			float mean_luma = var_state.x;
-			float m2 = var_state.y;
-			// Standard error of the mean, relative to the mean itself.
-			float variance = m2 / max(n - 1.0, 1.0);
-			float std_err = sqrt(variance / n);
-			if (std_err < noise_threshold * max(mean_luma, 1e-4)) {
+		bool adaptive = noise_threshold > 0.0;
+		vec4 aux = vec4(0.0);
+		bool check_draw = false;
+		if (adaptive) {
+			aux = imageLoad(rt_variance, ivec2(pixel));
+			uint state = uint(aux.w);
+			uint s = uint(get_rt_param(RT_PARAM_ADAPTIVE_SAMPLE));
+			check_draw = s > uint(get_rt_param(RT_PARAM_ADAPTIVE_MIN_SAMPLES)) && (s & 15u) == 15u;
+			bool do_sample;
+			if (check_draw) {
+				do_sample = (state & RT_ADAPTIVE_ACTIVE) != 0u;
+			} else {
+				do_sample = (state & RT_ADAPTIVE_CONVERGED) == 0u;
+				if (!do_sample) {
+					ivec2 size = imageSize(rt_variance);
+					for (int dy = -1; dy <= 1 && !do_sample; dy++) {
+						for (int dx = -1; dx <= 1; dx++) {
+							if (!rt_adaptive_converged_at(ivec2(pixel) + ivec2(dx, dy), size)) {
+								do_sample = true;
+								break;
+							}
+						}
+					}
+				}
+				state = (state & RT_ADAPTIVE_CONVERGED) | (do_sample ? RT_ADAPTIVE_ACTIVE : 0u);
+				aux.w = float(state);
+			}
+			if (!do_sample) {
 				// Converged: republish the running average and take no sample.
+				imageStore(rt_variance, ivec2(pixel), aux);
 				imageStore(image, ivec2(pixel), vec4(prev, 1.0));
 				return;
 			}
@@ -442,15 +482,32 @@ void main() {
 		float w = 1.0 / (n + 1.0);
 		vec3 running = mix(prev, sample_rad, w);
 
-		// Welford online variance on sample luminance.
-		float luma = dot(sample_rad, vec3(0.2126, 0.7152, 0.0722));
-		float delta = luma - var_state.x;
-		float new_mean = var_state.x + delta * w;
-		float new_m2 = var_state.y + delta * (luma - new_mean);
+		if (adaptive) {
+			// Class A by the sequence index actually traced (Cycles' sample_is_class_A,
+			// kernel/sample/pattern.h): a stratified half of the Sobol points.
+			if ((bitCount(accum_frame & 0xaaaaaaaau) & 1) != 0) {
+				aux.rgb += sample_rad * 2.0;
+			}
+			if (check_draw) {
+				// Cycles' error: |I - A| over R+G+B at film exposure per sample, over
+				// sqrt(intensity) (intensity itself above 1), against threshold * 5,
+				// the factor Cycles applies to the user value (scene/integrator.cpp).
+				float n_new = n + 1.0;
+				vec3 sum_i = running * n_new;
+				float scale = get_rt_param(RT_PARAM_ADAPTIVE_EXPOSURE) / n_new;
+				vec3 d = abs(sum_i - aux.rgb);
+				float error_difference = (d.r + d.g + d.b) * scale;
+				float intensity = (sum_i.r + sum_i.g + sum_i.b) * scale;
+				float error_normalize = intensity < 1.0 ? sqrt(intensity) : intensity;
+				bool converged = error_difference / (0.0001 + error_normalize) < noise_threshold * 5.0;
+				uint state = uint(aux.w) & RT_ADAPTIVE_ACTIVE;
+				aux.w = float(state | (converged ? RT_ADAPTIVE_CONVERGED : 0u));
+			}
+			imageStore(rt_variance, ivec2(pixel), aux);
+		}
 
 		imageStore(rt_accum, ivec2(pixel), vec4(running, 1.0));
 		imageStore(rt_accum_n, ivec2(pixel), vec4(n + 1.0));
-		imageStore(rt_variance, ivec2(pixel), vec4(new_mean, new_m2, 0.0, 0.0));
 		imageStore(image, ivec2(pixel), vec4(running, 1.0));
 	} else {
 		// One-shot path: trace `samples_per_pixel` samples this launch and

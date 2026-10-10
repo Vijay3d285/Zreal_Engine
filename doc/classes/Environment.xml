@@ -244,8 +244,8 @@
 			Maximum number of glossy/specular-lobe bounces a path is allowed before it is terminated, counted separately from diffuse bounces. The path terminates as soon as either lobe's cap is reached, so the practical maximum path length is [code]pathtracing_max_diffuse_bounce + pathtracing_max_glossy_bounce - 1[/code], regardless of [member pathtracing_max_bounces].
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
-		<member name="pathtracing_noise_threshold" type="float" setter="set_pathtracing_noise_threshold" getter="get_pathtracing_noise_threshold" default="0.01">
-			Per-pixel relative-error target for adaptive sampling; once a pixel's estimated error falls below it, sampling stops for that pixel. [code]0.0[/code] disables adaptive sampling.
+		<member name="pathtracing_noise_threshold" type="float" setter="set_pathtracing_noise_threshold" getter="get_pathtracing_noise_threshold" default="0.0">
+			Adaptive sampling threshold, with the meaning of Cycles' Noise Threshold (Cycles defaults to [code]0.01[/code]): a pixel stops sampling once its noise, measured against a buffer of half its samples and normalized by the square root of its brightness at the tonemap exposure, falls below it. Checks run every 16 samples after the project setting [code]rendering/pathtracer/adaptive_min_samples[/code] (0 = Cycles' automatic minimum). [code]0.0[/code] disables adaptive sampling.
 			[b]Note:[/b] Only has an effect when [member pathtracing_accumulate] is [code]true[/code].
 		</member>
 		<member name="pathtracing_oidn_denoise" type="bool" setter="set_pathtracing_oidn_denoise" getter="is_pathtracing_oidn_denoise" default="false">

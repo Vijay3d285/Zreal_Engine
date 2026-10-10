@@ -217,6 +217,10 @@ public:
 	static constexpr int RT_PARAM_VOLUME_SIGMA_T = 16;
 	static constexpr int RT_PARAM_VOLUME_G = 17;
 	static constexpr int RT_PARAM_PORTAL_COUNT = 18; // live light portals (raytracing_portal_inc.glsl)
+	// Cycles adaptive sampling in Phase A (scene_raytracing_raygen.glsl), in the spare .w slots.
+	static constexpr int RT_PARAM_ADAPTIVE_EXPOSURE = 19; // tonemap exposure, for the error test
+	static constexpr int RT_PARAM_ADAPTIVE_SAMPLE = 23; // accumulate frame without ZR_SEED_OFFSET: the schedule
+	static constexpr int RT_PARAM_ADAPTIVE_MIN_SAMPLES = 27; // samples before the first check
 	static constexpr int RT_PARAM_VOLUME_ALBEDO_R = 20;
 	static constexpr int RT_PARAM_VOLUME_EMISSION_R = 24;
 	static constexpr int RT_PARAM_VOLUME_BOX_MIN_X = 28;

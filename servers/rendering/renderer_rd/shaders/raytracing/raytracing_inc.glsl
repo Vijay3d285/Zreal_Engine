@@ -26,7 +26,7 @@
 // they are not read by GLSL, so do not reuse them here.
 #define RT_PARAM_CLAMP_DIRECT 9 // rt_params[2].y - Max direct contribution (0 = off)
 #define RT_PARAM_CLAMP_INDIRECT 10 // rt_params[2].z - Max indirect contribution (0 = off)
-#define RT_PARAM_NOISE_THRESHOLD 11 // rt_params[2].w - Adaptive sampling relative-error target (0 = off)
+#define RT_PARAM_NOISE_THRESHOLD 11 // rt_params[2].w - Adaptive sampling threshold, Cycles' meaning (0 = off)
 #define RT_PARAM_MAX_DIFFUSE_BOUNCE 12 // rt_params[3].x - Diffuse bounce cap (0 = use MAX_BOUNCES)
 #define RT_PARAM_MAX_GLOSSY_BOUNCE 13 // rt_params[3].y - Glossy bounce cap (0 = use MAX_BOUNCES)
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
@@ -36,8 +36,12 @@
 #define RT_PARAM_VOLUME_SIGMA_T 16 // rt_params[4].x - extinction per metre (Environment.volumetric_fog_density)
 #define RT_PARAM_VOLUME_G 17 // rt_params[4].y - Henyey-Greenstein anisotropy
 #define RT_PARAM_PORTAL_COUNT 18 // rt_params[4].z - live light portals (raytracing_portal_inc.glsl)
+// Adaptive sampling (Cycles' test, Phase A; scene_raytracing_raygen.glsl) takes the spare .w slots.
+#define RT_PARAM_ADAPTIVE_EXPOSURE 19 // rt_params[4].w - tonemap exposure; Cycles scales its error by film exposure
 #define RT_PARAM_VOLUME_ALBEDO_R 20 // rt_params[5].xyz - single-scattering albedo
+#define RT_PARAM_ADAPTIVE_SAMPLE 23 // rt_params[5].w - accumulate frame WITHOUT ZR_SEED_OFFSET: the check schedule
 #define RT_PARAM_VOLUME_EMISSION_R 24 // rt_params[6].xyz - emission per metre, already x energy x density
+#define RT_PARAM_ADAPTIVE_MIN_SAMPLES 27 // rt_params[6].w - samples before the first convergence check
 #define RT_PARAM_VOLUME_BOX_MIN_X 28 // rt_params[7].xyz - world-space box (the scene's AABB, padded 1 cm)
 #define RT_PARAM_VOLUME_BOX_MAX_X 32 // rt_params[8].xyz
 #define RT_PARAM_GUIDE_PROB 35 // rt_params[8].w - path-guiding mixture probability (0 = off)

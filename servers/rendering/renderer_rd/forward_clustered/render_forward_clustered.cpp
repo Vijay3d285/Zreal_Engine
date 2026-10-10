@@ -146,7 +146,7 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::rt_ensure_texture
 		render_buffers->create_texture(
 				RB_SCOPE_FORWARD_CLUSTERED,
 				RB_TEX_RAYTRACING_VARIANCE,
-				RD::DATA_FORMAT_R32G32_SFLOAT,
+				RD::DATA_FORMAT_R32G32B32A32_SFLOAT, // Cycles' adaptive half buffer (rgb) + state bits (w)
 				usage_bits_oidn, // CAN_COPY_TO_BIT: cleared alongside the accumulator on reset.
 				RD::TEXTURE_SAMPLES_1);
 	}
