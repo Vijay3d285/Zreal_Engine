@@ -3884,6 +3884,15 @@ void RenderingServer::init() {
 	// then run every 16 samples, as in Cycles, so a pixel stops at the first multiple of 16
 	// above this. A project setting because Environment.pathtracing_params[16] is full.
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/adaptive_min_samples", PROPERTY_HINT_RANGE, "0,4096,1"), 0);
+	// Temporal reuse (spec 2026-10-10-video-temporal-reuse-design.md): each delivered frame of the
+	// accumulate route is blended with the previous frames before OIDN. The cap is how many
+	// samples the history may count for; 0 = off (byte-identical to no reuse). The video route
+	// sets 48. The gamma is the width of the 3x3 neighbourhood clamp in standard deviations.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/temporal_history_samples", PROPERTY_HINT_RANGE, "0,1024,1"), 0);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/temporal_clamp_gamma", PROPERTY_HINT_RANGE, "0.25,4.0,0.05"), 1.0);
+	// Debug: the blend writes an accept/reject mask instead of the image (green accepted, yellow
+	// off-screen or no history, red depth/miss mismatch, blue normal).
+	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/temporal_debug"), false);
 	// Transmission / rough glass (roadmap E1). Defaults to true, unlike C1's
 	// emissive_mesh_lights: the feature is already data-gated (transmission
 	// defaults to 0.0 and no pre-Phase-D content can set it), so an untouched

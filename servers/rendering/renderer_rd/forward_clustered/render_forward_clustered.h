@@ -36,6 +36,7 @@
 #include "servers/rendering/renderer_rd/effects/dlss.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #include "servers/rendering/renderer_rd/effects/local_highlight.h"
+#include "servers/rendering/renderer_rd/effects/pt_temporal.h"
 #include "servers/rendering/renderer_rd/effects/motion_vectors_store.h"
 #include "servers/rendering/renderer_rd/effects/ss_effects.h"
 #include "servers/rendering/renderer_rd/effects/taa.h"
@@ -840,6 +841,7 @@ private:
 #endif
 	RendererRD::MotionVectorsStore *motion_vectors_store = nullptr;
 	RendererRD::LocalHighlight *local_highlight = nullptr;
+	RendererRD::PTTemporal *pt_temporal = nullptr;
 
 	/* GPU-Driven Indirect Rendering */
 

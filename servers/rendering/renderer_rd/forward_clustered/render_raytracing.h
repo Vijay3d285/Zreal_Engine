@@ -39,6 +39,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/effects/pt_temporal_state.h"
 #include "servers/rendering/renderer_rd/storage_rd/emissive_lights.h"
 #include "servers/rendering/renderer_rd/storage_rd/env_cdf.h"
 #include "servers/rendering/renderer_rd/storage_rd/ies_manager.h"
@@ -511,6 +512,10 @@ struct RTViewportState {
 	// (copy_output_texture, the OIDN re-blit -- render_forward_clustered.cpp) and on the same
 	// events that clear oidn_denoise_done (accumulator reset), so a new view is never skipped.
 	bool relief_applied_to_current = false;
+
+	// Temporal reuse (spec 2026-10-10-video-temporal-reuse-design.md): history bookkeeping. Kept
+	// apart from the accumulator fields above, whose reset runs every video frame.
+	PTTemporalState temporal;
 
 	// E3: the packed rt_flags this frame's TLAS was actually built against --
 	// `p_rt_flags | scene_mask`, where scene_mask is the OR of every material's
