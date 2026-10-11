@@ -11,8 +11,9 @@
 
 namespace RendererRD {
 
-// Temporal reuse for the path tracer's accumulate route (spec
-// docs/superpowers/specs/2026-10-10-video-temporal-reuse-design.md). Owns the blend pass and
+// Temporal stabilisation of the path tracer's denoised frames (spec
+// docs/superpowers/specs/2026-10-10-video-temporal-reuse-design.md, amendment 2026-10-11: after
+// OIDN). Owns the blend pass and
 // two ping-pong history sets on the render buffers (scope "pt_temporal"). The caller keeps the
 // frame-to-frame state in RTViewportState::temporal (PTTemporalState) and passes read_index.
 class PTTemporal {
@@ -30,7 +31,8 @@ class PTTemporal {
 		uint32_t debug_mask;
 		float depth_tolerance;
 		float normal_min_dot;
-		float pad[2];
+		float albedo_tolerance;
+		float pad;
 	};
 	static_assert(sizeof(Params) == 256, "PTTemporal::Params must match the std140 block in pt_temporal.glsl");
 
@@ -43,16 +45,17 @@ class PTTemporal {
 
 public:
 	struct Inputs {
-		RID current_color; // rt_accum, RGBA32F
+		RID current_color; // the denoised RT colour (RB_TEX_RAYTRACING), RGBA16F
 		RID current_depth; // rt_depth, R32F
 		RID current_normal; // rt_accum_normal, RGBA16F
+		RID current_albedo; // rt_accum_albedo, RGBA16F (guides defer through glass and mirror-like reflections)
 		Projection curr_vp; // depth-corrected, as render_raytracing.cpp builds curr_vp_unjittered
 		Projection prev_vp;
 		Vector3 curr_cam_pos;
 		uint32_t read_index = 0;
 		bool history_valid = false;
 		float exposure = 1.0f;
-		float clamp_gamma = 1.0f;
+		float clamp_gamma = 1.25f;
 		float current_samples = 1.0f;
 		float history_cap = 0.0f;
 		bool debug_mask = false;
@@ -61,8 +64,9 @@ public:
 	PTTemporal();
 	~PTTemporal();
 
-	// Blends into history set 1 - read_index and returns its colour texture (RGBA32F, alpha 1),
-	// which the OIDN step reads in place of rt_accum. Invalid RID: nothing was dispatched.
+	// Blends into history set 1 - read_index and returns the texture to show (RGBA16F, the format
+	// of the RT colour it is copied into): the blend, or the debug mask when debug_mask is set (the
+	// history holds the blend either way). Invalid RID: nothing was dispatched.
 	RID process(Ref<RenderSceneBuffersRD> p_render_buffers, const Inputs &p_in);
 };
 

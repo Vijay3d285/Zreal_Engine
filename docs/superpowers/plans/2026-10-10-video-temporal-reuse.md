@@ -1,5 +1,9 @@
 # Video Temporal Reuse Implementation Plan
 
+> **Status 2026-10-11: closed by the owner after Task 4** (no gain at the same render time; the pass
+> ships off). Tasks 4 Step 2 onward and Task 5 were not executed. Outcome and numbers: the spec's
+> "Outcome" section.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Blend each delivered video frame's 24-sample accumulation with the previous frames' (reprojected, rejected, clamped) before OIDN, so edges and fine detail stop flickering without adding render time.

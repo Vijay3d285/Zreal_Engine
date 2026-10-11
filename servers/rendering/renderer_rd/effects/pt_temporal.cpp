@@ -12,10 +12,11 @@
 namespace RendererRD {
 
 static const StringName &_hist_name(int p_kind, uint32_t p_index) {
-	static const StringName names[3][2] = {
+	static const StringName names[4][2] = {
 		{ StringName("hist_color_0"), StringName("hist_color_1") },
 		{ StringName("hist_depth_0"), StringName("hist_depth_1") },
 		{ StringName("hist_normal_0"), StringName("hist_normal_1") },
+		{ StringName("hist_albedo_0"), StringName("hist_albedo_1") },
 	};
 	return names[p_kind][p_index & 1u];
 }
@@ -36,13 +37,16 @@ PTTemporal::~PTTemporal() {
 
 void PTTemporal::_ensure_history(Ref<RenderSceneBuffersRD> p_render_buffers, const Size2i &p_size) {
 	const uint32_t usage = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT;
-	const RD::DataFormat formats[3] = { RD::DATA_FORMAT_R32G32B32A32_SFLOAT, RD::DATA_FORMAT_R32_SFLOAT, RD::DATA_FORMAT_R16G16B16A16_SFLOAT };
-	for (int kind = 0; kind < 3; kind++) {
+	const RD::DataFormat formats[4] = { RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RD::DATA_FORMAT_R32_SFLOAT, RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RD::DATA_FORMAT_R16G16B16A16_SFLOAT };
+	for (int kind = 0; kind < 4; kind++) {
 		for (uint32_t i = 0; i < 2; i++) {
 			if (!p_render_buffers->has_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(kind, i))) {
 				p_render_buffers->create_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(kind, i), formats[kind], usage, RD::TEXTURE_SAMPLES_1, p_size);
 			}
 		}
+	}
+	if (!p_render_buffers->has_texture(RB_SCOPE_PT_TEMPORAL, SNAME("debug_mask"))) {
+		p_render_buffers->create_texture(RB_SCOPE_PT_TEMPORAL, SNAME("debug_mask"), RD::DATA_FORMAT_R16G16B16A16_SFLOAT, usage, RD::TEXTURE_SAMPLES_1, p_size);
 	}
 }
 
@@ -50,7 +54,7 @@ RID PTTemporal::process(Ref<RenderSceneBuffersRD> p_render_buffers, const Inputs
 	ERR_FAIL_COND_V(p_render_buffers.is_null(), RID());
 	ERR_FAIL_COND_V(!(p_in.history_cap > 0.0f), RID()); // caller gates on the cap.
 	RD *rd = RD::get_singleton();
-	ERR_FAIL_COND_V(!rd->texture_is_valid(p_in.current_color) || !rd->texture_is_valid(p_in.current_depth) || !rd->texture_is_valid(p_in.current_normal), RID());
+	ERR_FAIL_COND_V(!rd->texture_is_valid(p_in.current_color) || !rd->texture_is_valid(p_in.current_depth) || !rd->texture_is_valid(p_in.current_normal) || !rd->texture_is_valid(p_in.current_albedo), RID());
 
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
 	ERR_FAIL_NULL_V(material_storage, RID());
@@ -79,6 +83,7 @@ RID PTTemporal::process(Ref<RenderSceneBuffersRD> p_render_buffers, const Inputs
 	params.debug_mask = p_in.debug_mask ? 1u : 0u;
 	params.depth_tolerance = 0.02f;
 	params.normal_min_dot = 0.9f;
+	params.albedo_tolerance = 0.05f;
 	rd->buffer_update(params_buffer, 0, sizeof(Params), &params);
 
 	RID linear = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
@@ -86,6 +91,7 @@ RID PTTemporal::process(Ref<RenderSceneBuffersRD> p_render_buffers, const Inputs
 	RID hist_color = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(0, r));
 	RID hist_depth = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(1, r));
 	RID hist_normal = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(2, r));
+	RID hist_albedo = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(3, r));
 	RID out_color = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(0, w));
 	RID out_depth = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(1, w));
 	RID out_normal = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(2, w));
@@ -102,15 +108,20 @@ RID PTTemporal::process(Ref<RenderSceneBuffersRD> p_render_buffers, const Inputs
 	RD::Uniform u7(RD::UNIFORM_TYPE_IMAGE, 7, out_depth);
 	RD::Uniform u8(RD::UNIFORM_TYPE_IMAGE, 8, out_normal);
 	RD::Uniform u9(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 9, params_buffer);
+	RD::Uniform u10(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 10, Vector<RID>({ nearest, hist_albedo }));
+	RD::Uniform u11(RD::UNIFORM_TYPE_IMAGE, 11, p_in.current_albedo);
+	RD::Uniform u12(RD::UNIFORM_TYPE_IMAGE, 12, p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, _hist_name(3, w)));
+	RID debug_mask = p_render_buffers->get_texture(RB_SCOPE_PT_TEMPORAL, SNAME("debug_mask"));
+	RD::Uniform u13(RD::UNIFORM_TYPE_IMAGE, 13, debug_mask);
 
 	rd->draw_command_begin_label("PT Temporal Reuse");
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	rd->compute_list_bind_compute_pipeline(compute_list, pipeline);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(sh, 0, u0, u1, u2, u3, u4, u5, u6, u7, u8, u9), 0);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(sh, 0, u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13), 0);
 	rd->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
 	rd->compute_list_end();
 	rd->draw_command_end_label();
-	return out_color;
+	return p_in.debug_mask ? debug_mask : out_color;
 }
 
 } // namespace RendererRD

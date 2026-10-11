@@ -19,12 +19,6 @@ struct PTTemporalState {
 	uint32_t frames_denoised = 0; // frames blended since the reuse was switched on
 	Projection prev_vp; // previous delivered frame's view-projection (depth-corrected)
 
-	// Accumulate-route Sobol offset: frame k traces points k*target .. k*target+target-1, so
-	// its pixel-filter jitter lands in new places and edges converge across frames.
-	static uint32_t sample_offset(uint32_t p_frames_denoised, uint32_t p_target, int p_cap) {
-		return p_cap > 0 ? p_frames_denoised * p_target : 0u;
-	}
-
 	// Once per delivered frame, before the blend. False on the first frame, after a size
 	// change, and after invalidate().
 	bool begin_frame(const Size2i &p_size) {

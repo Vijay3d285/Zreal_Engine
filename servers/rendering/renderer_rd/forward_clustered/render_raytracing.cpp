@@ -4364,13 +4364,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// correlation of the two renders' high-pass residuals then separates a
 		// fixed per-pixel pattern (bias, real detail) from sample noise; used for
 		// the Gap #30 follow-up (roadmap 11.26). Production never sets it.
-		// Temporal reuse: each delivered frame continues the Sobol sequence (frame k traces points
-		// k*target..k*target+target-1) so its pixel-filter jitter lands in new places and edges
-		// converge across frames. 0 while the reuse is off: byte-identical to before.
-		const uint32_t temporal_offset = PTTemporalState::sample_offset(p_state->temporal.frames_denoised,
-				(uint32_t)MAX(0.0f, rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_TARGET]),
-				(int)GLOBAL_GET("rendering/pathtracer/temporal_history_samples"));
-		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame + zr_seed_offset() + temporal_offset);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_ACCUM_FRAMES] = float(p_state->accum_frame + zr_seed_offset());
 		// Adaptive sampling, Cycles' test (scene_raytracing_raygen.glsl). RT_PARAM_NOISE_THRESHOLD
 		// is Cycles' user threshold. The error is measured at the tonemap exposure, as Cycles
 		// measures it at film exposure; the check schedule runs on the accumulate frame itself,

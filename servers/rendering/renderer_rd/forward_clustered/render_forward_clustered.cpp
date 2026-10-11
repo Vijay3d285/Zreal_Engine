@@ -1992,7 +1992,7 @@ static void _oidn_write_pfm(const String &p_dir, const String &p_name, const flo
 static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBufferDataForwardClustered *p_rb_data,
 		Ref<RenderSceneBuffersRD> p_rb,
 		RendererSceneRenderImplementation::RTViewportState *p_rt_state,
-		bool p_oidn_active, uint32_t p_accum_target, RID p_color_source) {
+		bool p_oidn_active, uint32_t p_accum_target) {
 	using RTViewportState = RendererSceneRenderImplementation::RTViewportState;
 	ERR_FAIL_NULL(p_rb_data);
 	ERR_FAIL_NULL(p_rt_state);
@@ -2043,8 +2043,7 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 	// independently; the AOV layout is per-view in each RB scope texture.
 	for (uint32_t v = 0; v < view_count; v++) {
 		// --- accumulator: R32G32B32A32_SFLOAT scene-linear radiance (16 bytes/pixel) ---
-		// Temporal reuse hands over its blend (RGBA32F, alpha 1, same layout); else rt_accum.
-		const RID accum_rid = p_color_source.is_valid() ? p_color_source : p_rb_data->rt_get_accum_texture();
+		const RID accum_rid = p_rb_data->rt_get_accum_texture();
 		if (!RD::get_singleton()->texture_is_valid(accum_rid)) {
 			WARN_PRINT_ONCE("OIDN final-denoise: accumulator texture invalid, skipping.");
 			return;
@@ -3300,57 +3299,62 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		// sets oidn_denoise_done=true once it actually denoises + uploads to the RT color image).
 		const bool was_done = rt_state && rt_state->oidn_denoise_done;
 		RD::get_singleton()->draw_command_begin_label("RT OIDN Final Denoise");
-		// Temporal reuse (spec 2026-10-10-video-temporal-reuse-design.md). Same gate as the
-		// helper's own fire test, so it runs exactly once per delivered frame, and only where OIDN
-		// fires (never on the daylight probe's raw-accumulator viewport).
-		RID temporal_color;
-		const int temporal_cap = (int)GLOBAL_GET("rendering/pathtracer/temporal_history_samples");
-		if (rt_state && temporal_cap <= 0) {
-			rt_state->temporal.invalidate();
-		} else if (rt_state && pt_temporal && !rt_state->oidn_denoise_done && rt_state->accum_enabled &&
-				rt_state->accum_frame >= rt_accum_target && rb_data->rt_has_depth_texture() &&
-				rb_data->rt_has_accum_normal_texture() && p_render_data->scene_data) {
-			Projection correction;
-			correction.set_depth_correction(true);
-			const Projection curr_vp = (correction * p_render_data->scene_data->cam_projection) *
-					Projection(p_render_data->scene_data->cam_transform.affine_inverse());
-			const bool history_valid = rt_state->temporal.begin_frame(rb->get_internal_size());
-			RendererRD::PTTemporal::Inputs in;
-			in.current_color = rb_data->rt_get_accum_texture();
-			in.current_depth = rb_data->rt_get_depth_texture();
-			in.current_normal = rb_data->rt_get_accum_normal_texture();
-			in.curr_vp = curr_vp;
-			in.prev_vp = rt_state->temporal.prev_vp;
-			in.curr_cam_pos = p_render_data->scene_data->cam_transform.origin;
-			in.read_index = rt_state->temporal.read_index;
-			in.history_valid = history_valid;
-			in.exposure = p_render_data->environment.is_valid() ? environment_get_exposure(p_render_data->environment) : 1.0f;
-			in.clamp_gamma = (float)GLOBAL_GET("rendering/pathtracer/temporal_clamp_gamma");
-			in.current_samples = float(rt_accum_target);
-			in.history_cap = float(temporal_cap);
-			in.debug_mask = (bool)GLOBAL_GET("rendering/pathtracer/temporal_debug");
-			temporal_color = pt_temporal->process(rb, in);
-			if (temporal_color.is_valid()) {
-				static int s_temporal_logs = 0;
-				if (s_temporal_logs < 8) {
-					s_temporal_logs++;
-					print_line(vformat("[PT-TEMPORAL] fire %d: %dx%d history=%d read=%d cap=%d gamma=%s",
-							(int)rt_state->temporal.frames_denoised, rb->get_internal_size().width, rb->get_internal_size().height,
-							(int)history_valid, (int)rt_state->temporal.read_index, temporal_cap, String::num(in.clamp_gamma, 2)));
-				}
-				rt_state->temporal.end_frame(curr_vp);
-			} else {
-				rt_state->temporal.invalidate(); // nothing dispatched: no history to build on.
-			}
-		}
-		_oidn_final_denoise_accumulator(rb_data.ptr(), rb, rt_state, rt_oidn_active, rt_accum_target, temporal_color);
+		_oidn_final_denoise_accumulator(rb_data.ptr(), rb, rt_state, rt_oidn_active, rt_accum_target);
 		RD::get_singleton()->draw_command_end_label();
 		// The helper wrote the denoised color into the RT color image (RB_TEX_RAYTRACING), NOT
 		// internal_texture (internal_texture isn't updatable — texture_update is a no-op on it).
 		// Now re-blit the denoised RT color -> internal_texture using the same render-pass copy
 		// copy_output_texture uses, so tonemap + the Phase A blit + the captured PNG see the
 		// clean denoised image instead of the raw pre-denoise running average.
+		const int temporal_cap = (int)GLOBAL_GET("rendering/pathtracer/temporal_history_samples");
+		if (rt_state && temporal_cap <= 0) {
+			rt_state->temporal.invalidate();
+		}
 		if (rt_state && !was_done && rt_state->oidn_denoise_done) {
+			// Temporal stabilisation (spec 2026-10-10-video-temporal-reuse-design.md, amendment
+			// 2026-10-11): blend the freshly denoised RT colour with the previous stabilised frame
+			// before it is shown. Runs once per delivered frame (this transition), only where OIDN
+			// fired -- never on the daylight probe's raw-accumulator viewport -- and not at all at
+			// cap 0, which leaves this path byte-identical.
+			if (temporal_cap > 0 && pt_temporal && rb_data->rt_has_depth_texture() && rb_data->rt_has_accum_normal_texture() &&
+					rb_data->rt_has_accum_albedo_texture() && p_render_data->scene_data) {
+				Projection correction;
+				correction.set_depth_correction(true);
+				const Projection curr_vp = (correction * p_render_data->scene_data->cam_projection) *
+						Projection(p_render_data->scene_data->cam_transform.affine_inverse());
+				const Size2i internal_size = rb->get_internal_size();
+				const bool history_valid = rt_state->temporal.begin_frame(internal_size);
+				RendererRD::PTTemporal::Inputs in;
+				in.current_color = rb_data->rt_get_texture();
+				in.current_depth = rb_data->rt_get_depth_texture();
+				in.current_normal = rb_data->rt_get_accum_normal_texture();
+				in.current_albedo = rb_data->rt_get_accum_albedo_texture();
+				in.curr_vp = curr_vp;
+				in.prev_vp = rt_state->temporal.prev_vp;
+				in.curr_cam_pos = p_render_data->scene_data->cam_transform.origin;
+				in.read_index = rt_state->temporal.read_index;
+				in.history_valid = history_valid;
+				in.exposure = p_render_data->environment.is_valid() ? environment_get_exposure(p_render_data->environment) : 1.0f;
+				in.clamp_gamma = (float)GLOBAL_GET("rendering/pathtracer/temporal_clamp_gamma");
+				in.current_samples = float(rt_accum_target);
+				in.history_cap = float(temporal_cap);
+				in.debug_mask = (bool)GLOBAL_GET("rendering/pathtracer/temporal_debug");
+				const RID shown = pt_temporal->process(rb, in);
+				if (shown.is_valid()) {
+					RD::get_singleton()->texture_copy(shown, rb_data->rt_get_texture(), Vector3(), Vector3(),
+							Vector3(internal_size.width, internal_size.height, 1), 0, 0, 0, 0);
+					static int s_temporal_logs = 0;
+					if (s_temporal_logs < 8) {
+						s_temporal_logs++;
+						print_line(vformat("[PT-TEMPORAL] fire %d: %dx%d history=%d read=%d cap=%d gamma=%s",
+								(int)rt_state->temporal.frames_denoised, internal_size.width, internal_size.height,
+								(int)history_valid, (int)rt_state->temporal.read_index, temporal_cap, String::num(in.clamp_gamma, 2)));
+					}
+					rt_state->temporal.end_frame(curr_vp);
+				} else {
+					rt_state->temporal.invalidate(); // nothing dispatched: no history to build on.
+				}
+			}
 			RD::get_singleton()->draw_command_begin_label("RT OIDN Re-blit Denoised -> Internal");
 			raytracing->copy_output_texture(p_render_data);
 			RD::get_singleton()->draw_command_end_label();

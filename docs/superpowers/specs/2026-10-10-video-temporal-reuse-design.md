@@ -1,6 +1,8 @@
 # Video temporal reuse: blend each frame with the previous frames before OIDN
 
-**Date:** 2026-10-10. **Status:** design approved by the owner, not built. **Scope:** engine
+**Date:** 2026-10-10. **Status:** built and measured; CLOSED by the owner 2026-10-11 -- the pass
+stays in the engine switched off (setting 0, byte-identical), the video route does not turn it on. See
+"Outcome" at the end. **Scope:** engine
 (one new compute pass in the path tracer's OIDN final-denoise step, history textures, two
 project settings, a per-frame sample offset) and the video route (`video_glb_creation.gd`
 turns it on). Stills unchanged. **Evidence and raw numbers:**
@@ -175,3 +177,42 @@ temporally coherent, and advancing the pattern per frame plus resampling noisy h
 overall and <= 1.24 on edges (today 1.08 / 2.07: the same -33% / -40% as the original targets),
 error per frame <= today's 2.08, brightness bias per band within today's +/- 0.3 levels, and
 <= 43.5 s per delivered frame.
+
+## Outcome 2026-10-11 (owner): closed, keep 24 spp
+
+The post-OIDN pass was built as amended (19 doctest cases, mutation-checked) and measured on job 210,
+keyframes 204-215, 24 spp, against `ref128_ind`. Off (setting 0): static 5/5 and moving 12/12 frames
+byte-identical to the production binary, no `[PT-TEMPORAL]` lines, no shader errors. On (cap 48):
+
+| run | noise / edges | error | s/frame | fine detail (HF) |
+|---|---|---|---|---|
+| today (24 spp) | 1.08 / 2.07 | 2.08 | 41.4 | 1.163 |
+| reuse, gamma 1.25 | 1.08 / 2.18 | 2.34 | 41.3 | 1.046 (-10%) |
+| reuse, gamma 3 | 1.07 / 2.21 | 2.50 | -- | -- |
+| reuse, no clip | 1.10 / 2.33 | 2.94 | -- | 1.097 |
+| flat 48 spp | 0.93 / 1.78 | 1.79 | 77.2 | -- |
+| 128 spp | 0.80 / 1.51 | 1.55 | 197 | -- |
+
+- **The amended criterion 3 was unreachable.** Its targets (<= 0.72 / <= 1.24) were set as -33% / -40%
+  of today without measuring the instrument's floor; against an independent reference a 128-spp render
+  scores 0.80 / 1.51 (the reference's own noise plus 8-bit rounding). Measure a high-spp run against
+  the reference before setting any target on this instrument.
+- **What the reuse does by scale** (frame-to-frame change beyond the reference, mean levels, block size
+  1/2/4/8/16/64 px): today 1.075/0.894/0.716/0.550/0.402/0.182; reuse 1.082/0.858/0.659/0.476/0.319/
+  0.131; flat 48 0.933/0.765/0.605/0.460/0.333/0.145; 128 spp 0.804/0.647/0.502/0.374/0.266/0.109. It
+  calms the large scales (better than 48 spp at >= 16 px), but those carry <= 0.55 levels, about 0.5%
+  of mean luma, below visibility. The visible flicker is the 1-4 px shimmer on edges and fine texture,
+  where the reuse gives 0 / -4 / -8% and softens detail by ~10% (the variance clip on clean input pulls
+  history toward the 3x3 mean on 69-75% of pixels; with the clip open, background leaks across edges
+  because the depth-range test accepts both sides).
+- A low-frequency-only variant was simulated offline (`sim_lowfreq.py`): no useful gain, and by the
+  scale table it could at best match the reuse at >= 8 px while leaving 1-4 px unchanged. Not built.
+- Alignment was verified (tile phase correlation, reuse vs today: -0.007 px; TAA is off on the video
+  route; `rt_depth` is sample zero through the same depth-corrected projection), so the result is not
+  a reprojection bug.
+
+**Conclusion.** No method tried -- Cycles adaptive sampling, reuse before OIDN (three variants),
+reuse after OIDN -- removes the fine shimmer at the same render time. Within this pipeline the lever
+that works is more samples (48 spp: about -13% at every scale, +87% time). A multi-frame denoiser
+trained for animation (e.g. OptiX temporal) is the larger option, not pursued. Raw numbers:
+`.superpowers/sdd/2026-10-08-video-parity/results.md`.
