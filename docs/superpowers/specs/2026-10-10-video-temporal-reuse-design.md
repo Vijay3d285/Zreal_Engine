@@ -138,3 +138,40 @@ owner the trade-off before anything ships.
 - Overlap frames at chunk boundaries (main.py).
 - Blending the OIDN guides, motion of objects (the scenes are static), DLSS-RR.
 - Stills.
+
+## Amendment 2026-10-11 (owner): stabilise after OIDN, not before
+
+**Why.** The design above (blend before OIDN) was built and measured on job 210 (Task 4 of
+`docs/superpowers/plans/2026-10-10-video-temporal-reuse.md`; numbers in
+`.superpowers/sdd/2026-10-10-video-temporal-reuse/progress.md`). With a static camera it now
+delivers exactly the 48-sample result, but with the camera moving it lost to today's 24 spp on
+every measure, in three variants: noise change 1.36-2.10 vs 1.08, error vs an independent
+128-spp reference 2.69-3.18 vs 2.08. Causes found: (1) any clip or symmetric outlier test on
+24-spp radiance is biased by the skewed Monte Carlo noise (darkened dark areas by 1-1.5 levels
+and discarded the history); (2) today's fixed per-pixel sample pattern makes the 24-spp error
+temporally coherent, and advancing the pattern per frame plus resampling noisy history broke that
+(correlated noise that OIDN keeps). The owner chose to move the reuse after the denoiser.
+
+**Design.** Same pass, same history bookkeeping, moved:
+- Runs once per delivered frame right after OIDN has written the denoised colour into the RT
+  colour texture (`RB_TEX_RAYTRACING`, RGBA16F), before `copy_output_texture` shows it. Input:
+  the denoised frame, `rt_depth`, the accumulated normal and albedo guides. History: the previous
+  stabilised frame (RGBA16F) with its depth, normal (+ sample count) and albedo.
+- The sample pattern stays fixed (no per-frame Sobol offset): the coherence of today's error is
+  kept.
+- Rejections against the current 3x3 neighbourhood as built in Task 4: depth range (+/- 2%),
+  best-matching normal (dot >= 0.9), albedo-guide range (+/- 0.05), miss-to-miss. Then a
+  variance clip of the history to the current 3x3 in YCoCg of x/(1+x)-compressed exposure-scaled
+  colour, `rendering/pathtracer/temporal_clamp_gamma` (default 1.25): on denoised input the
+  neighbourhood is clean, which is the regime this clip is designed for.
+- Blend by sample count as before (cap 48 -> history weight up to 2/3); the result is copied
+  into the RT colour texture for display and kept as the next history.
+- The debug mask goes to its own texture (copied for display instead of the blend); the history
+  always holds the real blend.
+- Off (cap 0): the pass does not run, and nothing else changes: byte-identical.
+
+**Success criteria (replace criterion 3; 1, 2, 4, 5 stand).** Against the independent reference
+`ref128_ind` (128 spp, ZR_SEED_OFFSET=1000000), segment 204-215, 24 spp: noise change <= 0.72
+overall and <= 1.24 on edges (today 1.08 / 2.07: the same -33% / -40% as the original targets),
+error per frame <= today's 2.08, brightness bias per band within today's +/- 0.3 levels, and
+<= 43.5 s per delivered frame.
