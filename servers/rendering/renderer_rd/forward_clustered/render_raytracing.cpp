@@ -1547,6 +1547,12 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.normal_texture_idx = 0;
 	mat.orm_texture_idx = 0;
 	mat.emission_texture_idx = 0;
+	// The cache entry is reused across rebuilds and never zeroed, so this must be
+	// reset here or a material that loses its tint texture keeps a stale index.
+	mat.specular_tint_texture_idx = 0;
+	mat._pad_spec_tex[0] = 0;
+	mat._pad_spec_tex[1] = 0;
+	mat._pad_spec_tex[2] = 0;
 	mat.uv1_scale[0] = 1.0f;
 	mat.uv1_scale[1] = 1.0f;
 	mat.uv1_offset[0] = 0.0f;
@@ -1873,6 +1879,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.specular_tint[0] = c.r;
 		mat.specular_tint[1] = c.g;
 		mat.specular_tint[2] = c.b;
+	}
+
+	// specularColorTexture. glTF stores it sRGB-encoded, so request the sRGB view
+	// and let the sampler decode -- the same treatment as albedo and emission.
+	RID specular_tint_rd = get_material_texture("texture_specular_tint", true);
+	if (specular_tint_rd.is_valid()) {
+		mat.specular_tint_texture_idx = bindless_block->add_texture(specular_tint_rd);
 	}
 
 	Variant sheen_color_var = material_storage->material_get_param(p_material_rid, "sheen_color");

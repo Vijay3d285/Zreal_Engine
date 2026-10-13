@@ -1,0 +1,82 @@
+{
+	"asset": {
+		"version": "2.0",
+		"generator": "hand-authored for Godot specularColorTexture tests"
+	},
+	"extensionsUsed": [
+		"KHR_materials_specular"
+	],
+	"scene": 0,
+	"scenes": [
+		{
+			"nodes": []
+		}
+	],
+	"images": [
+		{
+			"uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGM8ISfHwMDAxAAGAA0EAQijE05aAAAAAElFTkSuQmCC",
+			"name": "base_color_red"
+		},
+		{
+			"uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGN0aDjAwMDAxAAGABGqAYSDRjw3AAAAAElFTkSuQmCC",
+			"name": "specular_color_blue"
+		}
+	],
+	"textures": [
+		{
+			"source": 0
+		},
+		{
+			"source": 1
+		}
+	],
+	"materials": [
+		{
+			"name": "SpecularColorTextured",
+			"pbrMetallicRoughness": {
+				"baseColorTexture": {
+					"index": 0
+				}
+			},
+			"extensions": {
+				"KHR_materials_specular": {
+					"specularFactor": 0.8,
+					"specularColorFactor": [
+						0.5,
+						0.25,
+						1.0
+					],
+					"specularColorTexture": {
+						"index": 1
+					}
+				}
+			}
+		},
+		{
+			"name": "SpecularColorMalformed",
+			"extensions": {
+				"KHR_materials_specular": {
+					"specularColorFactor": [
+						0.5,
+						0.25,
+						1.0
+					],
+					"specularColorTexture": {
+						"index": 0.5
+					}
+				}
+			}
+		},
+		{
+			"name": "SpecularFactorTextureStillDropped",
+			"extensions": {
+				"KHR_materials_specular": {
+					"specularFactor": 0.4,
+					"specularTexture": {
+						"index": 1
+					}
+				}
+			}
+		}
+	]
+}

@@ -118,7 +118,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 208 bytes)
+// MATERIAL DATA (matches C++ layout, 224 bytes)
 // ============================================================================
 #define RT_MAT_FLAG_BLEND 8u // Bit 3. MIRRORS RT_MAT_FLAG_BLEND in render_raytracing.h.
 #define RT_MAT_FLAG_ANYHIT_SKIP_ONLY 16u // Bit 4. MIRRORS render_raytracing.h (Gap #26).
@@ -163,6 +163,13 @@ struct MaterialData {
 	float clearcoat_ior; // E2d. Was _pad0.
 	vec3 clearcoat_tint; // E2d. std430 aligns this to offset 176.
 	float sss_scale; // E3. Was _pad0. Cycles subsurface_scale; <= 0 = thin-wall.
-	vec3 sss_radius; // E3. std430 aligns this to offset 192; struct is 208 bytes.
+	vec3 sss_radius; // E3. std430 aligns this to offset 192.
 	float sss_weight; // E3. Cycles subsurface_weight.
+	// specularColorTexture bindless index (offset 208); 0 = white default = none.
+	// Padded explicitly to 224 so the C++ twin's static_asserts and this layout
+	// state the same size rather than relying on implicit struct rounding.
+	uint specular_tint_texture_idx;
+	uint _pad_spec_tex0;
+	uint _pad_spec_tex1;
+	uint _pad_spec_tex2;
 };

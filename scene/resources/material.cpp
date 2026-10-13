@@ -585,6 +585,7 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->attenuation_color = "attenuation_color";
 	shader_names->specular_factor = "specular_factor";
 	shader_names->specular_tint = "specular_tint";
+	shader_names->texture_specular_tint = "texture_specular_tint";
 	shader_names->sheen_color = "sheen_color";
 	shader_names->sheen_roughness = "sheen_roughness";
 	shader_names->anisotropy_rotation = "anisotropy_rotation";
@@ -2380,6 +2381,19 @@ Color BaseMaterial3D::get_specular_tint() const {
 	return specular_tint;
 }
 
+void BaseMaterial3D::set_specular_tint_texture(const Ref<Texture2D> &p_texture) {
+	specular_tint_texture = p_texture;
+	// Same carrier as set_texture(): the RID goes into the parameter map, where
+	// render_raytracing.cpp looks it up by name. No _queue_shader_change() -- no
+	// forward+ uniform reads this, so the generated shader cannot depend on it.
+	Variant rid = p_texture.is_valid() ? Variant(p_texture->get_rid()) : Variant();
+	_material_set_param(shader_names->texture_specular_tint, rid);
+}
+
+Ref<Texture2D> BaseMaterial3D::get_specular_tint_texture() const {
+	return specular_tint_texture;
+}
+
 void BaseMaterial3D::set_sheen_color(const Color &p_sheen_color) {
 	sheen_color = p_sheen_color;
 	_material_set_param(shader_names->sheen_color, p_sheen_color);
@@ -3577,6 +3591,9 @@ void BaseMaterial3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_specular_tint", "specular_tint"), &BaseMaterial3D::set_specular_tint);
 	ClassDB::bind_method(D_METHOD("get_specular_tint"), &BaseMaterial3D::get_specular_tint);
 
+	ClassDB::bind_method(D_METHOD("set_specular_tint_texture", "texture"), &BaseMaterial3D::set_specular_tint_texture);
+	ClassDB::bind_method(D_METHOD("get_specular_tint_texture"), &BaseMaterial3D::get_specular_tint_texture);
+
 	ClassDB::bind_method(D_METHOD("set_sheen_color", "sheen_color"), &BaseMaterial3D::set_sheen_color);
 	ClassDB::bind_method(D_METHOD("get_sheen_color"), &BaseMaterial3D::get_sheen_color);
 
@@ -3910,6 +3927,7 @@ void BaseMaterial3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "attenuation_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_attenuation_color", "get_attenuation_color");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "specular_factor", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_specular_factor", "get_specular_factor");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "specular_tint", PROPERTY_HINT_COLOR_NO_ALPHA), "set_specular_tint", "get_specular_tint");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "specular_tint_texture", PROPERTY_HINT_RESOURCE_TYPE, Texture2D::get_class_static()), "set_specular_tint_texture", "get_specular_tint_texture");
 	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "sheen_color", PROPERTY_HINT_COLOR_NO_ALPHA), "set_sheen_color", "get_sheen_color");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "sheen_roughness", PROPERTY_HINT_RANGE, "0,1,0.01"), "set_sheen_roughness", "get_sheen_roughness");
 

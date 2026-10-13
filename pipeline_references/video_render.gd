@@ -195,6 +195,12 @@ func _setup_render(data, output_path, fallback_path):
 		
 	# Set up fill lights NOW, because the sun has just been oriented to the camera's true starting frame
 	setup_fixed_fill_lights()
+
+	# Exterior day: measure the exposure ONCE at the first camera pose, the
+	# way render.gd measures every exterior still. Runs before the warmup, so
+	# _process idles meanwhile (_warmup_frames is still 0, _rendering false).
+	if day_render and _ext_daylight:
+		await _video_exterior_probe()
 	
 	# Warmup: give Godot's renderer (shadow maps, ambient cache, GI) time to settle
 	# before the first frame is captured. 10 frames is safe even at 4K.
@@ -1238,6 +1244,7 @@ func setup_camera(data):
 
 	if cam_data.has("fov"): cam.fov = float(cam_data["fov"])
 	add_child(cam)
+	_attach_exterior_post_fx(cam)
 
 # ─────────────────────────────────────────────────────────────────
 # Fixed World-Space Room Lights
@@ -1248,6 +1255,14 @@ func setup_fixed_fill_lights():
 	# Safety: clear any lights from a previous call
 	for l in get_tree().get_nodes_in_group("fill_lights"):
 		l.queue_free()
+
+	# Exterior day: no room fill grid, exactly as the image path (render.gd
+	# skips setup_fixed_fill_lights on every day render). The fills are omni
+	# lights inside the rooms; on an exterior they only glow out of the
+	# windows and lift the facade above what the still shows.
+	if day_render and _ext_daylight:
+		_log_console("[VideoRender] Exterior day: fill grid skipped (matches image exterior).")
+		return
 
 	var placed = 0
 	var lighting_scale = _resolve_illumination_scale(_render_data)
@@ -1776,3 +1791,112 @@ func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 		print("Thumbnail saved to: ", thumb_path)
 	else:
 		print("Warning: Failed to save thumbnail. Error code: ", err)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Exterior day video = image exterior lighting
+# ─────────────────────────────────────────────────────────────────
+## Plausible range for a measured exterior exposure. The image probe gave
+## 2.28 - 4.55 on the exterior jobs measured (2026-10-06); a readback that
+## lands far outside this is a broken readback, not a scene.
+const EXTERIOR_PROBE_MIN := 1.0
+const EXTERIOR_PROBE_MAX := 10.0
+## Frames given to the path tracer to build its scene before the probe.
+const EXTERIOR_PROBE_SETTLE := 4
+## Extra lead frames cut on top of the counted ones, so an off-by-one in the
+## count can never leave a probe frame in the video (the 20 warmup + 5 prime
+## frames that follow are all frame 0 held still, so cutting two is unseen).
+const EXTERIOR_PROBE_TRIM_MARGIN := 2
+
+## The same Daylight probe render.gd runs on an exterior still: accumulate
+## the first-pose frame, take the median of the occupied pixels (sky masked),
+## expose it to 0.18, then apply the exterior trim. Held for the whole
+## walkthrough, so nothing pumps. The probe frames are recorded by
+## MovieWriter, so their count is written next to the AVI and main.py cuts
+## them before encoding.
+func _video_exterior_probe() -> void:
+	var we: WorldEnvironment = null
+	for c in get_children():
+		if c is WorldEnvironment:
+			we = c
+			break
+	if we == null or we.environment == null:
+		_log_console("[Daylight] Video exterior probe: no WorldEnvironment; keeping the estimate.")
+		return
+	var env = we.environment # untyped: the pathtracing_* members are fork-only
+	var estimate: float = env.tonemap_exposure
+	var prev_denoiser = env.pathtracing_denoiser
+	var prev_accumulate: bool = env.pathtracing_accumulate
+	var t0 := Time.get_ticks_msec()
+	for _i in range(EXTERIOR_PROBE_SETTLE):
+		await get_tree().process_frame
+	# Raw accumulator, no denoiser, exposure 1.0 - the state render.gd probes in.
+	env.set_pathtracing_denoiser(0)
+	env.tonemap_exposure = 1.0
+	var pr: Dictionary = await Daylight.probe(self, env, get_viewport().get_viewport_rid())
+	# Back to the realtime DLSS-RR route the walkthrough renders with.
+	env.pathtracing_accumulate = prev_accumulate
+	env.set_pathtracing_denoiser(prev_denoiser)
+	for _i in range(Daylight.RESET_SETTLE_FRAMES):
+		await get_tree().process_frame
+	var samples: PackedFloat32Array = pr.get("samples", PackedFloat32Array())
+	if samples.is_empty():
+		env.tonemap_exposure = estimate
+		_log_console("[Daylight] Video exterior probe: accumulator readback empty; exposure stays at the estimate %.3f" % estimate)
+	else:
+		var st: Dictionary = Daylight.stats(samples)
+		var measured: float = float(st["exposure"])
+		if measured < EXTERIOR_PROBE_MIN or measured > EXTERIOR_PROBE_MAX:
+			env.tonemap_exposure = estimate
+			_log_console("[Daylight] Video exterior probe: median %.5f -> exposure %.3f is outside %.1f-%.1f; keeping the estimate %.3f" % [
+				st["median"], measured, EXTERIOR_PROBE_MIN, EXTERIOR_PROBE_MAX, estimate])
+		else:
+			env.tonemap_exposure = measured * _ext_exposure_scale
+			_log_console("[Daylight] Video exterior probe: median %.5f (occupied %.1f%%), exposure %.3f x trim %.2f = %.3f (estimate was %.3f) [%d ms, %dx%d]" % [
+				st["median"], 100.0 * st["occupied_fraction"], measured, _ext_exposure_scale,
+				env.tonemap_exposure, estimate, Time.get_ticks_msec() - t0, pr["width"], pr["height"]])
+	_write_lead_trim(Engine.get_frames_drawn() + EXTERIOR_PROBE_TRIM_MARGIN)
+
+## Tells main.py how many leading frames of the AVI are probe frames.
+func _write_lead_trim(frames: int) -> void:
+	var movie := Engine.get_write_movie_path()
+	if movie == "":
+		return
+	var path := movie
+	if not movie.is_absolute_path():
+		path = ProjectSettings.globalize_path("res://").path_join(movie)
+	var f := FileAccess.open(path + ".lead", FileAccess.WRITE)
+	if f == null:
+		_log_console("[Daylight] could not write lead-trim file %s.lead (probe frames stay in the video)" % path)
+		return
+	f.store_string(str(frames))
+	f.close()
+	_log_console("[Daylight] %d lead frame(s) (exposure probe) will be cut from the video." % frames)
+
+## The Day-Sun UnrealPostFX grade render.gd attaches to every day still,
+## with the same values. Exterior day only: interior walkthroughs keep the
+## look they had.
+func _attach_exterior_post_fx(cam: Camera3D) -> void:
+	if not (USE_POST_FX and day_render and _ext_daylight):
+		return
+	if not ClassDB.class_exists("Compositor"):
+		_log_console("  [PostFX] Compositor class unavailable - exterior grade skipped.")
+		return
+	var post_fx_script = load("res://compositor_effect.gd")
+	if post_fx_script == null:
+		_log_console("  [PostFX] compositor_effect.gd not found - exterior grade skipped.")
+		return
+	var comp := Compositor.new()
+	var post_fx = post_fx_script.new()
+	post_fx.tonemap_mode = 1 # AgX
+	post_fx.exposure = 1.05
+	post_fx.contrast = 1.12
+	post_fx.saturation = 1.08
+	post_fx.lift = Color(0.02, 0.01, -0.01)
+	post_fx.gain = Color(1.10, 1.02, 0.88)
+	post_fx.gamma_grade = Color(1.02, 0.99, 0.96)
+	post_fx.vignette_strength = 0.28
+	post_fx.chromatic_aberration = 0.0003
+	comp.compositor_effects = [post_fx]
+	cam.compositor = comp
+	_log_console("  [PostFX] Exterior day: Day-Sun grade attached (same values as image).")

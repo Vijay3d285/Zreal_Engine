@@ -3120,10 +3120,15 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 			}
 		}
 
-		// glTF material extensions carried for the path tracer. Factors only;
-		// per-parameter extension textures are dropped with a warning below.
+		// glTF material extensions carried for the path tracer. Factors, plus
+		// specularColorTexture; every other per-parameter extension texture is
+		// dropped with a warning below.
 		// A malformed extension costs its parameter, never the model: these
 		// blocks skip and warn where core glTF fields ERR_FAIL.
+		//
+		// Declared outside the block: the UV-set check needs primary_texture_coord,
+		// which the core-texture code below this block decides.
+		int specular_color_tex_coord = 0;
 		{
 			Vector<String> dropped_textures;
 
@@ -3253,7 +3258,37 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 					material->set_specular_tint(c);
 				}
 				note_dropped_texture(ext, "specularTexture");
-				note_dropped_texture(ext, "specularColorTexture");
+
+				// Imported, not dropped. Neither of the material-data spec's reasons for
+				// dropping extension textures applies to this one: it is plain sRGB RGB
+				// that multiplies specularColorFactor (no channel-packing convention to
+				// invent), and resolveDielectricF0 already consumes the tint.
+				if (ext.has("specularColorTexture")) {
+					bool imported = false;
+					const Variant tex_info_var = ext["specularColorTexture"];
+					if (tex_info_var.get_type() == Variant::DICTIONARY) {
+						const Dictionary tex_info = tex_info_var;
+						// JSON numbers can arrive as INT or FLOAT; accept a FLOAT only if it
+						// is a whole number, so 0.5 is rejected rather than truncated to 0.
+						const Variant index_var = tex_info.get("index", Variant());
+						const bool index_is_number = index_var.get_type() == Variant::INT || index_var.get_type() == Variant::FLOAT;
+						const double index_d = index_is_number ? double(index_var) : -1.0;
+						if (index_is_number && index_d >= 0.0 && index_d == Math::floor(index_d)) {
+							const Ref<Texture2D> tex = _get_texture(p_state, GLTFTextureIndex(index_d), TEXTURE_TYPE_GENERIC);
+							if (tex.is_valid()) {
+								material->set_specular_tint_texture(tex);
+								imported = true;
+								const Variant coord_var = tex_info.get("texCoord", 0);
+								if (coord_var.get_type() == Variant::INT || coord_var.get_type() == Variant::FLOAT) {
+									specular_color_tex_coord = int(coord_var);
+								}
+							}
+						}
+					}
+					if (!imported) {
+						WARN_PRINT(vformat("glTF material '%s': ignoring malformed 'specularColorTexture'.", material->get_name()));
+					}
+				}
 			}
 
 			if (material_extensions.has("KHR_materials_clearcoat")) {
@@ -3542,6 +3577,17 @@ Error GLTFDocument::_parse_materials(Ref<GLTFState> p_state) {
 						WARN_PRINT("glTF: File uses different UV maps for emission, occlusion, and primary textures (baseColor/normal/etc). Godot does not support this, it only supports up to two UV maps. Using occlusion texture's UV map only and ignoring emission texture's UV map.");
 					}
 				}
+			}
+		}
+
+		// specularColorTexture is sampled on UV1 like every other path-traced texture,
+		// so it has to share the primary UV set. Checked here, once every core texture
+		// has had its say in primary_texture_coord.
+		if (material->get_specular_tint_texture().is_valid()) {
+			if (primary_texture_coord == -1) {
+				primary_texture_coord = specular_color_tex_coord;
+			} else if (specular_color_tex_coord != primary_texture_coord) {
+				WARN_PRINT("glTF: File uses different UV maps for specular color and base color textures. Godot does not support this. Using base color texture's UV map only and ignoring specular color texture's UV map.");
 			}
 		}
 

@@ -137,6 +137,20 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
 	return sample_bindless_texture(tex_idx, uv);
 }
 
+/// glTF KHR_materials_specular: specularColorFactor * specularColorTexture.rgb.
+/// THE single composition of the specular tint. Shading (raygen HG0) and every
+/// debug mode that reads the tint call this, never `mat.specular_tint` directly,
+/// so a gate reading a vis mode measures the tint that actually shades.
+/// The texture is bound through its sRGB view, so .rgb is already linear.
+/// Index 0 is BindlessBlock's permanent white default -- "no texture" -- so an
+/// untextured material skips the fetch and returns the factor unchanged.
+vec3 resolve_specular_tint(MaterialData p_mat, vec2 p_uv) {
+	if (p_mat.specular_tint_texture_idx == 0u) {
+		return p_mat.specular_tint;
+	}
+	return p_mat.specular_tint * sample_material_texture(p_mat.specular_tint_texture_idx, p_uv, p_mat.flags).rgb;
+}
+
 /// Apply tangent-space normal map to geometry normal.
 vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_depth) {
 	vec3 mapped = h.tangent * tangent_space_normal.x + h.bitangent * tangent_space_normal.y + h.geometry_normal * tangent_space_normal.z;
@@ -566,7 +580,7 @@ void debug_visualize(
 	} else if (vis_mode == 27) {
 		ps.radiance = dbg_material.attenuation_color;
 	} else if (vis_mode == 28) {
-		ps.radiance = dbg_material.specular_tint;
+		ps.radiance = resolve_specular_tint(dbg_material, uv);
 	} else if (vis_mode == 29) {
 		ps.radiance = dbg_material.sheen_color;
 	} else if (vis_mode == 43) {
@@ -610,7 +624,7 @@ void debug_visualize(
 		vec3 dbg_f0;
 		float dbg_eta;
 		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
-				dbg_material.specular_tint, dbg_f0, dbg_eta);
+				resolve_specular_tint(dbg_material, uv), dbg_f0, dbg_eta);
 		ps.radiance = (vis_mode == 30) ? dbg_f0 : vec3(dbg_eta);
 	} else if (vis_mode == 32) {
 		// Fix round 2, detector 1: pdf parity -- RETIRED as a two-function
@@ -657,7 +671,7 @@ void debug_visualize(
 		vec3 dbg_f0_32;
 		float dbg_eta_32;
 		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
-				dbg_material.specular_tint, dbg_f0_32, dbg_eta_32);
+				resolve_specular_tint(dbg_material, uv), dbg_f0_32, dbg_eta_32);
 		dbg_mat.dielectricF0 = dbg_f0_32;
 		dbg_mat.emissive = vec3(0.0);
 		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
@@ -756,7 +770,7 @@ void debug_visualize(
 		vec3 dbg_f0_33;
 		float dbg_eta_33;
 		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
-				dbg_material.specular_tint, dbg_f0_33, dbg_eta_33);
+				resolve_specular_tint(dbg_material, uv), dbg_f0_33, dbg_eta_33);
 		dbg_mat.dielectricF0 = dbg_f0_33;
 		dbg_mat.emissive = vec3(0.0);
 		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
@@ -926,7 +940,7 @@ void debug_visualize(
 		vec3 dbg_f0_35;
 		float dbg_eta_35;
 		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
-				dbg_material.specular_tint, dbg_f0_35, dbg_eta_35);
+				resolve_specular_tint(dbg_material, uv), dbg_f0_35, dbg_eta_35);
 		dbg_mat.dielectricF0 = dbg_f0_35;
 		dbg_mat.emissive = vec3(0.0);
 		dbg_mat.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;
@@ -1201,7 +1215,7 @@ void debug_visualize(
 		vec3 dbg_f0_40;
 		float dbg_eta_40;
 		resolveDielectricF0(dbg_material.ior, specular, dbg_material.specular_factor,
-				dbg_material.specular_tint, dbg_f0_40, dbg_eta_40);
+				resolve_specular_tint(dbg_material, uv), dbg_f0_40, dbg_eta_40);
 		dbg_mat40.dielectricF0 = dbg_f0_40;
 		dbg_mat40.emissive = vec3(0.0);
 		dbg_mat40.transmissivness = RT_GET_TRANSMISSION_ENABLED() ? dbg_material.transmission : 0.0;

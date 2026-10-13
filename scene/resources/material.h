@@ -483,6 +483,7 @@ private:
 		StringName attenuation_color;
 		StringName specular_factor;
 		StringName specular_tint;
+		StringName texture_specular_tint;
 		StringName sheen_color;
 		StringName sheen_roughness;
 		StringName anisotropy_rotation;
@@ -575,6 +576,11 @@ private:
 	Color attenuation_color = Color(1, 1, 1);
 	float specular_factor = 1.0f;
 	Color specular_tint = Color(1, 1, 1);
+	// glTF KHR_materials_specular specularColorTexture. Multiplies specular_tint
+	// per texel in the RT path. Kept out of TextureParam on purpose: that enum
+	// drives forward+ shader generation, and the forward+ renderer ignores the
+	// tint altogether.
+	Ref<Texture2D> specular_tint_texture;
 	Color sheen_color = Color(0, 0, 0);
 	float sheen_roughness = 0.0f;
 	float anisotropy_rotation = 0.0f; // Radians.
@@ -741,6 +747,9 @@ public:
 
 	void set_specular_tint(const Color &p_specular_tint);
 	Color get_specular_tint() const;
+
+	void set_specular_tint_texture(const Ref<Texture2D> &p_texture);
+	Ref<Texture2D> get_specular_tint_texture() const;
 
 	void set_sheen_color(const Color &p_sheen_color);
 	Color get_sheen_color() const;

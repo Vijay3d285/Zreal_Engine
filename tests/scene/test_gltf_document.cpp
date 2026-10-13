@@ -332,6 +332,66 @@ TEST_CASE("[SceneTree][GLTFDocument] Unsupported extension textures are dropped,
 	}
 }
 
+TEST_CASE("[SceneTree][GLTFDocument] specularColorTexture is imported onto specular_tint_texture") {
+	register_gltf_extension();
+
+	Ref<GLTFDocument> gltf_document;
+	gltf_document.instantiate();
+	Ref<GLTFState> gltf_state;
+	gltf_state.instantiate();
+
+	const Error err = gltf_document->append_from_file(
+			TestUtils::get_data_path("models/material_specular_color_texture.gltf"), gltf_state);
+	REQUIRE(err == OK);
+
+	const Vector<Ref<Material>> &materials = gltf_state->get_materials();
+	REQUIRE(materials.size() == 3);
+
+	// The fixture's two images are different colours, so these identities tell
+	// the base colour texture and the tint texture apart.
+	const Vector<Ref<Texture2D>> &images = gltf_state->get_images();
+	REQUIRE(images.size() == 2);
+	const Ref<Texture2D> base_color_image = images[0];
+	const Ref<Texture2D> specular_color_image = images[1];
+	REQUIRE(base_color_image.is_valid());
+	REQUIRE(specular_color_image.is_valid());
+
+	SUBCASE("The tint texture lands in its own slot and the factor is kept") {
+		Ref<StandardMaterial3D> mat = materials[0];
+		REQUIRE(mat.is_valid());
+
+		// Identity, not is_valid(): an importer that put the base colour image in
+		// the tint slot would pass a validity check.
+		CHECK(mat->get_specular_tint_texture() == specular_color_image);
+		CHECK(mat->get_texture(BaseMaterial3D::TEXTURE_ALBEDO) == base_color_image);
+
+		// glTF composes tint = specularColorFactor * texture, so the factor must
+		// still arrive alongside the texture (linear in glTF, sRGB in Godot).
+		CHECK(mat->get_specular_tint().is_equal_approx(Color(0.5f, 0.25f, 1.0f).linear_to_srgb()));
+		CHECK(mat->get_specular_factor() == doctest::Approx(0.8f));
+	}
+
+	SUBCASE("A fractional index is rejected, not truncated to texture 0") {
+		Ref<StandardMaterial3D> mat = materials[1];
+		REQUIRE(mat.is_valid());
+
+		// Truncating 0.5 to 0 would silently import the base colour image.
+		CHECK(mat->get_specular_tint_texture().is_null());
+		CHECK(mat->get_specular_tint().is_equal_approx(Color(0.5f, 0.25f, 1.0f).linear_to_srgb()));
+	}
+
+	SUBCASE("specularTexture is still dropped, and not misrouted to the tint slot") {
+		Ref<StandardMaterial3D> mat = materials[2];
+		REQUIRE(mat.is_valid());
+
+		CHECK(mat->get_specular_factor() == doctest::Approx(0.4f));
+		CHECK(mat->get_specular_tint_texture().is_null());
+		for (int i = 0; i < BaseMaterial3D::TEXTURE_MAX; i++) {
+			CHECK(mat->get_texture((BaseMaterial3D::TextureParam)i).is_null());
+		}
+	}
+}
+
 TEST_CASE("[SceneTree][GLTFDocument] Import glTF material extension edge cases") {
 	register_gltf_extension();
 

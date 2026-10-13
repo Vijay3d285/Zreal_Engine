@@ -972,7 +972,7 @@ void main() {
 	m.thickness = mat.thickness;
 	// Cycles' Volume Absorption coefficient, svm/closure.h:1236-1241.
 	m.attenuation = (vec3(1.0) - mat.attenuation_color) * mat.attenuation_density;
-	m.specular_tint = mat.specular_tint;
+	m.specular_tint = resolve_specular_tint(mat, uv);
 	m.specular_factor = mat.specular_factor;
 	// Transparent BSDF closure. Keyed on the material FLAG (glTF alphaMode BLEND
 	// -> ShaderData::rt_uses_alpha_blending), never on `m.alpha < 1.0`: an

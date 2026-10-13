@@ -405,6 +405,9 @@
 		<member name="specular_tint" type="Color" setter="set_specular_tint" getter="get_specular_tint" default="Color(1, 1, 1, 1)">
 			The tint applied to the specular (dielectric F0) reflection, imported from the glTF [code]KHR_materials_specular[/code] extension. Used by the path tracer only; the Forward+ renderer ignores this property.
 		</member>
+		<member name="specular_tint_texture" type="Texture2D" setter="set_specular_tint_texture" getter="get_specular_tint_texture">
+			Per-texel multiplier for [member specular_tint], imported from the glTF [code]KHR_materials_specular[/code] extension's [code]specularColorTexture[/code]. Its RGB channels are read as sRGB and sampled on UV1. Used by the path tracer only; the Forward+ renderer ignores this property.
+		</member>
 		<member name="stencil_color" type="Color" setter="set_stencil_effect_color" getter="get_stencil_effect_color" default="Color(0, 0, 0, 1)" experimental="May be affected by future rendering pipeline changes.">
 			The primary color of the stencil effect.
 		</member>

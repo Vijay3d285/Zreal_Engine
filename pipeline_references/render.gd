@@ -669,6 +669,13 @@ func _daylight_probe_and_expose(p_env: Environment) -> void:
 				fill.queue_free()
 			else:
 				fill.queue_free()
+	# Exterior light levels: a small trim after the probe so exteriors sit a
+	# little under the mid-grey target (softer, early-morning feel).
+	if typeof(_render_data) == TYPE_DICTIONARY and typeof(_render_data.get("exterior_light", null)) == TYPE_DICTIONARY:
+		var trim: float = clamp(float(_render_data["exterior_light"].get("exposure_scale", 1.0)), 0.3, 1.5)
+		if abs(trim - 1.0) > 0.001:
+			print("[Daylight] exterior exposure trim x%.2f: %.3f -> %.3f" % [trim, exposure, exposure * trim])
+			exposure *= trim
 	p_env.tonemap_exposure = exposure
 	# Local highlight relief (spec 2026-09-28): decided from the SAME probe
 	# samples, so this costs no extra render. At strength 0 the engine does not

@@ -108,7 +108,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 208 bytes).
+// Must match GLSL MaterialData (std430, 224 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -155,8 +155,16 @@ struct alignas(16) RT_MaterialData {
 	float sss_scale;
 	float sss_radius[3];
 	float sss_weight;
+	// glTF KHR_materials_specular specularColorTexture: bindless index of a
+	// per-texel multiplier on specular_tint. 0 is BindlessBlock's permanent white
+	// default and means "no texture" (the shader skips the fetch). No pad slot was
+	// left, so the struct grows 208 -> 224: one uint at 208, then padding up to the
+	// 16-byte struct alignment std430 imposes (the vec3 members set it).
+	uint32_t specular_tint_texture_idx;
+	uint32_t _pad_spec_tex[3];
 };
-static_assert(sizeof(RT_MaterialData) == 208, "RT_MaterialData must be 208 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 224, "RT_MaterialData must be 224 bytes for std430");
+static_assert(offsetof(RT_MaterialData, specular_tint_texture_idx) == 208, "specular_tint_texture_idx must follow sss_weight");
 static_assert(offsetof(RT_MaterialData, sss_scale) == 188, "sss_scale must occupy the old _pad0 slot");
 static_assert(offsetof(RT_MaterialData, sss_radius) == 192, "sss_radius must be 16-byte aligned for std430 vec3");
 static_assert(offsetof(RT_MaterialData, sss_weight) == 204, "sss_weight must follow sss_radius");

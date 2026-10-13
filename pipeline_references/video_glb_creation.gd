@@ -1,4 +1,4 @@
-extends Node3D
+﻿extends Node3D
 # Daylight design (spec 2026-09-19). Preloaded, not a global class name: the
 # live pipeline runs without an editor import, so no class cache exists there.
 # video_render.gd extends this script and inherits the constant.
@@ -324,6 +324,11 @@ var _frozen_lighting_profile = "day"
 var _frozen_camera_pose = null
 var _scene_built = false # TRUE after first full build — prevents light/asset accumulation
 var _dir_light = null
+# Exterior daylight parity with image_glb_creation.gd (see _apply_exterior_sun
+# and the sky block in setup_lighting). Daylight const is declared at the top.
+var _exterior_sun_applied: bool = false
+var _ext_daylight: bool = false
+var _ext_exposure_scale: float = 1.0
 var _directional_light_authoring_locked = false
 var _lighting_color_mood: String = "day"
 var _lighting_illumination_scale: float = 1.0
@@ -342,6 +347,9 @@ var _floor_plan_root_data: Dictionary = {}
 # against ALL of them, not just the first frame — see _collect_camera_path_samples.
 var _camera_path_samples: Array = []
 var structure_builder
+# Builds layer["cadShapes"] (editor CAD tools: push/pull, revolve, sweep, blend,
+# voids) - the same builder the image path uses.
+var cad_shape_builder
 
 func _accumulate_plan_bounds(raw_vertex, bounds: Array) -> bool:
 	if typeof(raw_vertex) != TYPE_DICTIONARY:
@@ -356,31 +364,33 @@ func _accumulate_plan_bounds(raw_vertex, bounds: Array) -> bool:
 	bounds[3] = max(bounds[3], vy)
 	return true
 
+# Version-2 floor plans are millimetre plans with radian rotations and no
+# plan rotation. The editor writes the version as "2.0.0" OR "2.0" (seen on
+# elevation jobs, 2026-10-05); a plan that only says unit "mm" is the same.
+# scene_optimizer.py already treated unit "mm" as millimetres - Godot read
+# "2.0" as a legacy centimetre plan and built the whole scene 10x too big with
+# rotations in degrees, so custom-shape elevations landed far off camera.
+func _is_v2_plan(data, geom_data = {}) -> bool:
+	for src in [geom_data, data]:
+		if typeof(src) != TYPE_DICTIONARY:
+			continue
+		var v := str(src.get("version", "")).strip_edges()
+		if v.begins_with("2"):
+			return true
+		if str(src.get("unit", "")).strip_edges().to_lower() == "mm":
+			return true
+	return false
+
 func _resolve_scene_unit_scale(data: Dictionary, geom_data = {}) -> float:
-	var version := ""
-	if typeof(geom_data) == TYPE_DICTIONARY and geom_data.has("version"):
-		version = str(geom_data.get("version", "")).strip_edges()
-	elif typeof(data) == TYPE_DICTIONARY and data.has("version"):
-		version = str(data.get("version", "")).strip_edges()
-	if version == "2.0.0":
+	if _is_v2_plan(data, geom_data):
 		return 0.001
 	return 0.01
 
 func _resolve_scene_rotation_is_radians(data: Dictionary, geom_data = {}) -> bool:
-	var version := ""
-	if typeof(geom_data) == TYPE_DICTIONARY and geom_data.has("version"):
-		version = str(geom_data.get("version", "")).strip_edges()
-	elif typeof(data) == TYPE_DICTIONARY and data.has("version"):
-		version = str(data.get("version", "")).strip_edges()
-	return version == "2.0.0"
+	return _is_v2_plan(data, geom_data)
 
 func _resolve_scene_plan_rotation_radians(data: Dictionary, geom_data = {}) -> float:
-	var version := ""
-	if typeof(geom_data) == TYPE_DICTIONARY and geom_data.has("version"):
-		version = str(geom_data.get("version", "")).strip_edges()
-	elif typeof(data) == TYPE_DICTIONARY and data.has("version"):
-		version = str(data.get("version", "")).strip_edges()
-	if version == "2.0.0":
+	if _is_v2_plan(data, geom_data):
 		return 0.0
 	var angle_deg := 0.0
 	if typeof(geom_data) == TYPE_DICTIONARY and geom_data.has("directionangle"):
@@ -660,7 +670,9 @@ func _get_color_mood_light_color(role: String) -> Color:
 # building 3D walls/floors, building custom stairs/shapes, and loading furniture.
 # ==============================================================================
 func build_scene(data):
-	structure_builder = preload("res://structure.gd").new(self)
+	structure_builder = preload("res://shapes/structure.gd").new(self)
+	if cad_shape_builder == null:
+		cad_shape_builder = preload("res://shapes/cad_shape.gd").new(self)
 	# ── First frame: resolve and lock lighting profile + camera pose ──────────
 	if not _lighting_locked:
 		lighting_profile = _resolve_lighting_profile(data)
@@ -746,6 +758,7 @@ func build_scene(data):
 	_window_sunlight_data.clear()
 	_door_hole_data.clear()
 	build_architecture(geom_data, cam_pose.get("position", Vector3.ZERO), show_all_floors)
+	_build_exterior_decorator_ground(geom_data)
 	build_structures(geom_data)
 	load_assets(geom_data)
 	
@@ -1219,6 +1232,10 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		var exr_image = Image.new()
 		var load_err = exr_image.load(exr_path)
 		if load_err == OK:
+			# Exterior walkthroughs: same camera-based sun as the image path
+			# (scene_exterior_sun.py) - the HDRI's sun disc is clipped and the
+			# panorama rolled so its sun matches the DirectionalLight3D.
+			_apply_exterior_sun(data, exr_image, cam_pose)
 			exr_image.generate_mipmaps()
 			var sky_tex = ImageTexture.create_from_image(exr_image)
 			var panorama_mat = PanoramaSkyMaterial.new()
@@ -1242,6 +1259,7 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		print("[VideoGLB] Warning: EXR sky file not found: ", exr_path)
 
 	if not sky_material_set:
+		_apply_exterior_sun(data, null, cam_pose)
 		var sky_mat = ProceduralSkyMaterial.new()
 		sky_mat.sky_top_color = lighting["sky_top_color"]
 		sky_mat.sky_horizon_color = lighting["sky_horizon_color"]
@@ -1342,6 +1360,17 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 		env.tonemap_exposure *= _auto_exposure_scale
 		print("[AUTO-LIGHTING] exposure trim: %.3f x %.3f = %.3f" % [
 				_expo_before, _auto_exposure_scale, env.tonemap_exposure])
+
+	# Exterior day with the normalised sky above: the image path exposes each
+	# still with the daylight probe (median -> 0.18) and then trims it by
+	# EXTERIOR_EXPOSURE_SCALE. A walkthrough cannot probe frame by frame (the
+	# exposure would pump), so it uses the probe's typical result for these
+	# exteriors and the same trim. Replaces the interior chain above outright,
+	# exactly as the probe does on a still.
+	if _ext_daylight:
+		env.tonemap_exposure = EXTERIOR_VIDEO_PROBE_EXPOSURE * _ext_exposure_scale
+		print("[Daylight] Video exterior exposure: %.2f (typical image probe) x trim %.2f = %.3f" % [
+			EXTERIOR_VIDEO_PROBE_EXPOSURE, _ext_exposure_scale, env.tonemap_exposure])
 
 	# ── SDFGI ─────────────────────────────────────────────────────────────────
 	# DAY: SDFGI ON at artifact-safe low settings.
@@ -2543,6 +2572,13 @@ func build_architecture(data, cam_pos = null, show_all_floors_override = null):
 			var layer = layer_map[layer_id]
 			if typeof(layer) != TYPE_DICTIONARY:
 				continue
+			# CAD shapes have no baked mesh in the JSON - cad_shape.gd rebuilds
+			# them from profiles + operations, at the altitude this layer's walls
+			# use. A layer can carry CAD shapes without any walls, so this runs
+			# before the walls check, exactly as in image_glb_creation.gd.
+			if layer.has("cadShapes") and cad_shape_builder != null:
+				cad_shape_builder.build_layer_cad_shapes(self, layer["cadShapes"],
+					_get_render_layer_altitude(layer, show_all_floors), str(layer_id))
 			var layer_flat = _arrays_to_dicts(layer)
 			if not layer_flat.has("lines") or not layer_flat.has("vertices"):
 				continue
@@ -2551,7 +2587,13 @@ func build_architecture(data, cam_pos = null, show_all_floors_override = null):
 				"  Vertices: ", layer_flat["vertices"].size(),
 				"  Holes: ", layer_flat.get("holes", {}).size(),
 				"  Areas: ", layer_flat.get("areas", {}).size())
-			_build_layer_geometry(layer_flat, _get_render_layer_altitude(layer, show_all_floors), show_all_floors, cam_pos, render_mode)
+			# Per-layer render mode, as image: the optimizer marks each layer
+			# INTERIOR / EXTERIOR; the top-level value is only the fallback.
+			var layer_render_mode = str(layer.get("render_mode", render_mode))
+			if layer_render_mode == "SKIPPED":
+				layer_render_mode = render_mode
+			_build_layer_geometry(layer_flat, _get_render_layer_altitude(layer, show_all_floors), show_all_floors, cam_pos, layer_render_mode)
+			_build_render_prisms(layer_flat, _get_render_layer_altitude(layer, show_all_floors))
 		return
 
 	if not layer_data.has("lines") or not layer_data.has("vertices"):
@@ -2642,6 +2684,14 @@ func _arrays_to_dicts(data: Dictionary) -> Dictionary:
 	elif typeof(raw_s) == TYPE_DICTIONARY:
 		out["structures"] = raw_s
 
+	# Every other layer key passes through unchanged. Only the six keys above
+	# were copied before, so externalAreas (the grass site area), render_prisms
+	# (scene_render_parity.py), cadShapes and force_uniform_ceiling_height never
+	# reached the builder in a walkthrough.
+	for k in data:
+		if not out.has(k):
+			out[k] = data[k]
+
 	return out
 
 # ─────────────────────────────────────────────────────────────────
@@ -2658,20 +2708,42 @@ func _get_wall_facing_direction(line: Dictionary, vertices: Dictionary, areas: D
 	var vB = vertices[v2_id]
 	var ax = float(vA["x"]); var ay = float(vA["y"])
 	var bx = float(vB["x"]); var by = float(vB["y"])
+	var a = _plan_point_2d(ax, ay)
+	var b = _plan_point_2d(bx, by)
+	ax = a.x
+	ay = a.y
+	bx = b.x
+	by = b.y
 
+	# Wall direction vector (2D)
 	var dir = Vector2(bx - ax, by - ay).normalized()
+
+	# Left (+Z local) and right (-Z local) perpendicular normals
 	var left_normal = Vector2(-dir.y, dir.x)
 	var right_normal = Vector2(dir.y, -dir.x)
-	var mid = Vector2((ax + bx) * 0.5, (ay + by) * 0.5)
-	var left_sample = mid + left_normal * 5.0
-	var right_sample = mid + right_normal * 5.0
 
+	# Wall midpoint
+	var mid = Vector2((ax + bx) * 0.5, (ay + by) * 0.5)
+
+	# Sample 5 cm to each side.
+	# Convert that physical distance back into source units so it stays correct
+	# for both cm-based legacy files and mm-based 2.0.0 files.
+	var sample_offset = 0.05 / max(_scene_unit_scale, 0.000001)
+	var left_sample = mid + left_normal * sample_offset
+	var right_sample = mid + right_normal * sample_offset
+
+	# â”€â”€ Check ALL areas containing both wall vertices â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	# For shared walls (between two rooms), different areas yield opposite
+	# results.  We use the lexicographically smallest area_id to guarantee
+	# a deterministic outcome regardless of dictionary iteration order
+	# (which changes after scene-optimizer culling).
 	var best_result = ""
 	var best_area_id = ""
 
 	# ── T-Junction fix: Geometry2D boundary-distance check ───────────────────
-	# Instead of requiring both endpoints to be named room corners, check whether
-	# each wall endpoint lies ON a boundary segment. Handles T-junction walls.
+	# Instead of requiring both endpoints to be named room corners, we check
+	# whether each wall endpoint lies ON a boundary segment of the area polygon.
+	# This correctly handles T-junction walls whose endpoints land mid-edge.
 	var snap_dist = 0.05 / max(_scene_unit_scale, 0.000001) # 5 cm in source units
 
 	for area_id in areas:
@@ -2680,12 +2752,13 @@ func _get_wall_facing_direction(line: Dictionary, vertices: Dictionary, areas: D
 			continue
 		var area_verts = area["vertices"]
 
+		# Build polygon from this area's vertices
 		var area_polygon: Array = []
 		for vid in area_verts:
 			var vs = str(vid)
 			if vertices.has(vs):
 				var v = vertices[vs]
-				area_polygon.append(Vector2(float(v["x"]), float(v["y"])))
+				area_polygon.append(_plan_point_2d(float(v["x"]), float(v["y"])))
 		if area_polygon.size() < 3:
 			continue
 
@@ -2716,14 +2789,18 @@ func _get_wall_facing_direction(line: Dictionary, vertices: Dictionary, areas: D
 		elif right_inside and not left_inside:
 			result = "inner-right"
 		else:
-			continue
+			continue # Both inside or neither â€” skip this area
 
-		# Deterministic: smallest area_id wins (handles shared walls between rooms)
+		# Deterministic: pick the area with smallest area_id
 		if best_result == "" or area_id < best_area_id:
 			best_result = result
 			best_area_id = area_id
 
-	return best_result
+	if best_result != "":
+		return best_result
+
+	# No area found â€” return empty (fallback to centroid in caller)
+	return ""
 
 # Ray-casting point-in-polygon (matches frontend isPointInPolygon)
 func _is_point_in_polygon(point: Vector2, polygon: Array) -> bool:
@@ -2762,36 +2839,49 @@ func _resolve_wall_face_material(line: Dictionary, face: String, wall_facing: St
 		var other_props = line[other_prop_key]
 		has_face_material = other_props.has("material") and typeof(other_props["material"]) == TYPE_DICTIONARY
 
-	# 1. asset_urls block
+	# 1. asset_urls block  (same data the frontend wallTextures come from)
 	if line.has("asset_urls") and typeof(line["asset_urls"]) == TYPE_DICTIONARY:
 		var au = line["asset_urls"]
 		if au.has(lookup_face) and typeof(au[lookup_face]) == TYPE_DICTIONARY:
 			var block = au[lookup_face]
+			# Build a unified mat_data dict that create_material() understands
 			var mat_data = {}
 
+			# Texture URL
 			if block.has("mapUrl") and block["mapUrl"] != null and str(block["mapUrl"]) != "":
 				mat_data["mapUrl"] = block["mapUrl"]
 			elif block.has("texture_urls") and typeof(block["texture_urls"]) == TYPE_ARRAY and block["texture_urls"].size() > 0:
 				mat_data["mapUrl"] = block["texture_urls"][0]
 
+			# Normal map
 			if block.has("normalUrl") and block["normalUrl"] != null and str(block["normalUrl"]) != "":
 				mat_data["normalUrl"] = block["normalUrl"]
 
+			# Roughness map
 			if block.has("roughnessUrl") and block["roughnessUrl"] != null and str(block["roughnessUrl"]) != "":
 				mat_data["roughnessUrl"] = block["roughnessUrl"]
 
+			# Fallback colour (used when texture is absent or as tint)
 			var fallback_color = block.get("fallback_color", "")
 			if fallback_color == null or str(fallback_color).strip_edges() == "":
 				fallback_color = ""
 			if fallback_color != "":
 				mat_data["color"] = str(fallback_color)
 
+			# Texture scale (maps to UV repeat in create_material)
 			if block.has("texture_scale_x") or block.has("texture_scale_y"):
-				var sx = float(block.get("texture_scale_x", 1.0))
-				var sy = float(block.get("texture_scale_y", 1.0))
-				mat_data["scale"] = [sx if sx > 0 else 1.0, sy if sy > 0 else 1.0]
-			elif block.has("repeat") and typeof(block["repeat"]) == TYPE_ARRAY:
-				mat_data["repeat"] = block["repeat"]
+				var sx = float(block.get("texture_scale_x", 0.0))
+				var sy = float(block.get("texture_scale_y", 0.0))
+				if sx > 0.0 and sy > 0.0:
+					mat_data["scale"] = [sx, sy]
+			var repeat_x = float(block.get("repeatX", 0.0))
+			var repeat_y = float(block.get("repeatY", 0.0))
+			if repeat_x > 0.0 or repeat_y > 0.0:
+				mat_data["repeatX"] = repeat_x
+				mat_data["repeatY"] = repeat_y
+			else:
+				if block.has("repeat") and typeof(block["repeat"]) == TYPE_ARRAY:
+					mat_data["repeat"] = block["repeat"]
 
 			if mat_data.size() > 0:
 				var has_texture = mat_data.has("mapUrl") or mat_data.has("normalUrl") or mat_data.has("roughnessUrl")
@@ -2805,7 +2895,7 @@ func _resolve_wall_face_material(line: Dictionary, face: String, wall_facing: St
 		if props.has("material") and typeof(props["material"]) == TYPE_DICTIONARY:
 			return props["material"]
 
-	# 3. Cross-fallback
+	# 3. Cross-fallback: if requesting "outer" and only "inner" exists, use inner (and vice-versa)
 	if line.has(other_prop_key) and typeof(line[other_prop_key]) == TYPE_DICTIONARY:
 		var props = line[other_prop_key]
 		if props.has("material") and typeof(props["material"]) == TYPE_DICTIONARY:
@@ -2847,12 +2937,13 @@ func build_structures(data):
 
 			var layer_flat = _arrays_to_dicts(layer)
 			if layer_flat.has("structures"):
-				_load_layer_structures(layer_flat["structures"], _get_render_layer_altitude(layer, show_all_floors), str(layer_id))
+				var layer_render_mode = str(layer.get("render_mode", data.get("render_mode", "INTERIOR"))).to_upper()
+				_load_layer_structures(layer_flat["structures"], _get_render_layer_altitude(layer, show_all_floors), str(layer_id), layer_render_mode)
 	
 	if layer_data.has("structures"):
-		_load_layer_structures(layer_data["structures"], 0.0, "root")
+		_load_layer_structures(layer_data["structures"], 0.0, "root", str(data.get("render_mode", "INTERIOR")).to_upper())
 
-func _load_layer_structures(structures, layer_altitude, layer_id := ""):
+func _load_layer_structures(structures, layer_altitude, layer_id := "", render_mode: String = "INTERIOR"):
 	for structure_id in structures:
 		var structure
 		if typeof(structures) == TYPE_DICTIONARY:
@@ -2863,9 +2954,9 @@ func _load_layer_structures(structures, layer_altitude, layer_id := ""):
 			continue
 		if structure.has("visible") and structure["visible"] == false:
 			continue
-		_build_structure_mesh(structure, layer_altitude, layer_id)
+		_build_structure_mesh(structure, layer_altitude, layer_id, render_mode)
 
-func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_id := "") -> void:
+func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_id := "", render_mode: String = "INTERIOR") -> void:
 	var structure_type = str(structure.get("structure_type", structure.get("type", ""))).to_lower()
 	if structure_type == "":
 		return
@@ -2875,9 +2966,13 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 		props = structure["properties"]
 
 	var scale_factor = _scene_unit_scale
-	var width = get_dimension_value(props.get("width", structure.get("width", 100))) * scale_factor
-	var depth = get_dimension_value(props.get("depth", structure.get("depth", 100))) * scale_factor
-	var height = get_dimension_value(props.get("height", structure.get("height", 100))) * scale_factor
+	# Editor (SceneBridge.structureToWire): a missing width / depth / height is
+	# 1000 mm, i.e. one metre - expressed here in plan units so it holds for
+	# any scene unit.
+	var default_dim = 1.0 / max(scale_factor, 0.000001)
+	var width = get_dimension_value(props.get("width", structure.get("width", default_dim))) * scale_factor
+	var depth = get_dimension_value(props.get("depth", structure.get("depth", default_dim))) * scale_factor
+	var height = get_dimension_value(props.get("height", structure.get("height", default_dim))) * scale_factor
 	var altitude = get_dimension_value(props.get("altitude", structure.get("altitude", 0))) * scale_factor
 
 	var root = Node3D.new()
@@ -2894,15 +2989,22 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 		rot = float(structure["rotation"])
 	elif props.has("rotation"):
 		rot = float(props["rotation"])
+	# The editor sets (rotationX, -rotation, rotationZ) on a three.js object,
+	# whose Euler order is XYZ. Godot's default is YXZ, which only agrees while
+	# X and Z are zero - a tilted beam came out turned the wrong way round.
+	root.rotation_order = EULER_ORDER_XYZ
 	root.rotation.y = _world_yaw_from_source_rotation(rot)
 	if structure.has("rotationX"):
 		root.rotation.x = float(structure["rotationX"])
 	if structure.has("rotationZ"):
 		root.rotation.z = float(structure["rotationZ"])
+	# Editor (StructureManager._placeGroup): flipX / flipZ mirror ONLY ramps,
+	# staircases and partition walls. Every other type ignores the flags.
+	var flippable = structure_type in ["ramp", "staircase", "partitionwall"]
 	root.scale = Vector3(
-		-1.0 if bool(structure.get("flipX", false)) else 1.0,
+		-1.0 if flippable and bool(structure.get("flipX", false)) else 1.0,
 		1.0,
-		-1.0 if bool(structure.get("flipZ", false)) else 1.0
+		-1.0 if flippable and bool(structure.get("flipZ", false)) else 1.0
 	)
 	add_child(root)
 
@@ -2910,12 +3012,12 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 	match structure_type:
 		"partitionwall":
 			structure_builder._add_partitionwall_structure(root, structure, width, depth, height, mat_data)
-		"squarecolumn", "flue", "beam":
+		"squarecolumn", "column", "flue", "beam":
 			structure_builder._add_box_structure(root, structure_type, width, depth, height, mat_data)
 		"circlecolumn":
 			structure_builder._add_cylinder_structure(root, width, depth, height, mat_data)
 		"ramp":
-			structure_builder._add_ramp_structure(root, width, depth, height, mat_data)
+			structure_builder._add_ramp_structure(root, structure, width, depth, height, mat_data)
 		"step":
 			structure_builder._add_step_structure(root, structure, width, depth, height, mat_data)
 		"falseceiling":
@@ -2923,7 +3025,7 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 		"staircase":
 			structure_builder._add_staircase_structure(root, structure, width, depth, height, mat_data)
 		"sunshade":
-			structure_builder._add_sunshade_structure(root, structure, width, depth, height, mat_data)
+			structure_builder._add_sunshade_structure(root, structure, width, depth, height, mat_data, render_mode)
 		"niche":
 			structure_builder._add_niche_structure(root, width, depth, height, mat_data)
 		"baywindowsill":
@@ -2932,19 +3034,27 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 			structure_builder._add_custom_shape_structure(root, structure, scale_factor)
 		"flooropening":
 			pass # handled by _add_floor_opening_cutters
+		"roof":
+			print("[Structure] roof structures are not built by the renderer yet; skipped ", str(structure.get("id", "")))
 		_:
-			structure_builder._add_box_structure(root, structure_type, width, depth, height, mat_data)
+			# The editor draws nothing for a structure type it does not know.
+			print("[Structure] unknown structure type '%s'; skipped %s" % [structure_type, str(structure.get("id", ""))])
 
 
 func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, cam_pos = null, render_mode: String = "INTERIOR"):
+	# Ported from image_glb_creation.gd (2026-10-06) so walkthroughs build the
+	# same geometry as stills. Video keeps two sections of its own: the
+	# door/window asset + light collection block (interior video lighting) and
+	# the ceiling visibility along the camera path (cam_pos).
 	var csg = CSGCombiner3D.new()
 	csg.use_collision = true
 	add_child(csg)
 
 	var lines = layer_data["lines"]
 	var vertices = layer_data["vertices"]
-	var scale_factor = _scene_unit_scale # source units → metres
+	var scale_factor = _scene_unit_scale # Convert source units → metres
 
+	# Helper map for hole definitions
 	var all_holes = {}
 	if layer_data.has("holes"):
 		all_holes = layer_data["holes"]
@@ -2961,15 +3071,20 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					+"layer-level copy was absent (optimizer may have culled the parent wall). "
 					+"Altitude/position may be stale; check scene_optimizer.py logs.")
 
+	# Areas dictionary — required by the facing-direction helper
 	var areas = {}
 	if layer_data.has("areas"):
 		areas = layer_data["areas"]
 
+	# Structures dictionary — used for floor openings and procedural meshes
 	var structures = {}
 	if layer_data.has("structures") and typeof(layer_data["structures"]) == TYPE_DICTIONARY:
 		structures = layer_data["structures"]
 
-	# ── Room centroid (fallback for walls with no named area) ──────────────────
+	# ——— Compute room centroid (used for inner_sign fallback only) —————————————
+	# The centroid approach is a legacy fallback kept for walls that belong to
+	# no named area. The primary facing-direction logic now uses per-area
+	# polygon tests via _get_wall_facing_direction(), matching the frontend.
 	var room_centroid = Vector3.ZERO
 	var centroid_count = 0
 	for area_id in areas:
@@ -2979,24 +3094,29 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			var vs = str(v_id)
 			if vertices.has(vs):
 				var v = vertices[vs]
-				room_centroid += Vector3(float(v["x"]), 0.0, float(v["y"])) * scale_factor
+				room_centroid += _plan_point_3d(float(v["x"]), float(v["y"]))
 				centroid_count += 1
 	if centroid_count > 0:
 		room_centroid /= centroid_count
 	var has_centroid = centroid_count > 0
 
-	print("[VideoGLB] Layer has ", lines.size(), " lines. Room centroid: ", room_centroid)
+	print("Layer has ", lines.size(), " lines. Room centroid: ", room_centroid)
 
-	# ── 1. Build Walls ─────────────────────────────────────────────────────────
+	# ——— 1. Build Walls ——————————————————————————————————————————————————————
 	for line_id in lines:
 		var line = lines[line_id]
-		if line.has("visible") and line["visible"] == false: continue
-		if not line.has("vertices") or line["vertices"].size() < 2: continue
+		var wall_visible = true
+		if line.has("visible"): wall_visible = bool(line["visible"])
+		elif line.has("isvisible"): wall_visible = bool(line["isvisible"])
+		elif line.has("isVisible"): wall_visible = bool(line["isVisible"])
+		if not wall_visible: continue
 
 		var wall_csg = CSGCombiner3D.new()
 		wall_csg.name = "WallCSG_" + str(line_id)
 		wall_csg.use_collision = true
 		add_child(wall_csg)
+		
+		if not line.has("vertices") or line["vertices"].size() < 2: continue
 
 		var v1_id = str(line["vertices"][0])
 		var v2_id = str(line["vertices"][1])
@@ -3025,21 +3145,33 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 		var left_normal_2d = Vector2(dir_2d.y, -dir_2d.x) # 90° CCW in frontend Y-down space
 		var right_normal_2d = Vector2(-dir_2d.y, dir_2d.x) # 90° CW
 
-		var align_offset_2d = Vector2.ZERO
+		# Frontend lOff / rOff (wallGeometry.ts): thickness on the +n side and
+		# the -n side of the vertex line, where n = right_normal_2d here.
+		# properties.lineOffset shifts the whole wall along n. Centre offset
+		# = n * (lOff - rOff) / 2. Without lineOffset this equals the old
+		# left/right/center behaviour exactly.
+		var line_offset_val = 0.0
+		if line.has("properties") and line["properties"].has("lineOffset"):
+			line_offset_val = get_dimension_value(line["properties"]["lineOffset"], 0.0)
+		var l_off = wall_thickness_val / 2.0
+		var r_off = wall_thickness_val / 2.0
 		if alignment == "left":
-			# Left edge on the line → bulk extrudes right → shift center rightward
-			align_offset_2d = right_normal_2d * (wall_thickness_val / 2.0)
+			l_off = wall_thickness_val
+			r_off = 0.0
 		elif alignment == "right":
-			# Right edge on the line → bulk extrudes left → shift center leftward
-			align_offset_2d = left_normal_2d * (wall_thickness_val / 2.0)
+			l_off = 0.0
+			r_off = wall_thickness_val
+		l_off += line_offset_val
+		r_off -= line_offset_val
+		var align_offset_2d = right_normal_2d * ((l_off - r_off) / 2.0)
 
-		var p1 = Vector3(v1_x + align_offset_2d.x, 0.0, v1_y + align_offset_2d.y) * scale_factor
-		var p2 = Vector3(v2_x + align_offset_2d.x, 0.0, v2_y + align_offset_2d.y) * scale_factor
+		var p1 = _plan_point_3d(v1_x + align_offset_2d.x, v1_y + align_offset_2d.y)
+		var p2 = _plan_point_3d(v2_x + align_offset_2d.x, v2_y + align_offset_2d.y)
 
 		var diff = p2 - p1
 		var length = diff.length()
 		var center = (p1 + p2) / 2.0
-		var height = 240.0 * scale_factor # default
+		var height = 240.0 * scale_factor # Default height
 
 		if line.has("properties") and line["properties"].has("height"):
 			var h_prop = line["properties"]["height"]
@@ -3056,12 +3188,9 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 		var wall_angle = - atan2(diff.z, diff.x)
 		var wall_pos = Vector3(center.x, layer_altitude, center.z)
 
-		# Keep a tiny seam gap so adjacent colored walls do not overlap.
-		# This avoids visible color/texture blending at wall joins while
-		# staying effectively invisible in the final render.
 		var wall_join_gap = 0.001
 		var corner_length = max(length - wall_join_gap, 0.05)
-
+		
 		# Generate dynamic polygon profile supporting peaked/sloped ceilings
 		var half_l = corner_length / 2.0
 		var poly_pts = PackedVector2Array()
@@ -3095,16 +3224,17 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 
 		var poly_span = Vector2(corner_length, max_h)
 
-		# ── Determine inner/outer facing (mirrors frontend exactly) ───────────
+		# ——— Determine inner/outer facing (mirrors frontend exactly) ———————————
 		var wall_facing = _get_wall_facing_direction(line, vertices, areas)
 
+		# ——— Fallback: centroid dot-product (legacy, area-free walls) ———————————
 		var inner_sign = 1.0 # +1 → +Z is inner, -1 → -Z is inner
 		if wall_facing == "inner-left":
 			inner_sign = 1.0
 		elif wall_facing == "inner-right":
 			inner_sign = -1.0
 		else:
-			# No area polygon found — fall back to centroid dot-product
+			# No area polygon found — fall back to centroid approach
 			var wall_basis = Basis(Vector3.UP, wall_angle)
 			var wall_normal_world = wall_basis * Vector3(0, 0, 1)
 			if has_centroid:
@@ -3114,13 +3244,21 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					inner_sign = -1.0
 			wall_facing = "inner-left" if inner_sign > 0 else "inner-right"
 
-		print("[VideoGLB] Wall ", line_id, " facing: ", wall_facing, " inner_sign: ", inner_sign)
+		print("Wall ", line_id, " facing: ", wall_facing, " inner_sign: ", inner_sign)
 
-		# ── Resolve inner/outer material data ─────────────────────────────────
+		# ——— Resolve inner/outer material data from the line ———————————————————
+		# Per-wall render mode. scene_optimizer_exterior.py flags walls that border
+		# an OPEN room (balcony / terrace) with exterior_dual_face=true: in an
+		# exterior shot both faces of such a wall are visible, so it must get the
+		# same per-face inner/outer panels as an interior shot instead of the
+		# outer material on both sides.
+		var wall_render_mode = render_mode
+		if render_mode != "INTERIOR" and bool(line.get("exterior_dual_face", false)):
+			wall_render_mode = "INTERIOR"
+			print("Wall ", line_id, " borders an open room - per-face materials in exterior render.")
 		var inner_mat_data = _resolve_wall_face_material(line, "inner", wall_facing)
 		var outer_mat_data = _resolve_wall_face_material(line, "outer", wall_facing)
 
-		# ── Build structural CSGPolygon3D wall ─────────────────────────────────────
 		var wall = CSGPolygon3D.new()
 		wall.polygon = poly_pts
 		wall.depth = wall_thickness
@@ -3141,37 +3279,51 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			inner_mat_for_wall = StandardMaterial3D.new()
 			inner_mat_for_wall.albedo_color = Color(0.82, 0.82, 0.82)
 
-		if render_mode == "INTERIOR":
-			# INTERIOR: camera is inside — structural wall uses inner material.
-			# Prevents outer brick/stone textures from bleeding through.
+		if wall_render_mode == "INTERIOR":
+			# INTERIOR: apply inner material on the structural wall.
+			# The camera is inside and mainly sees the inner face. This
+			# prevents outer textures (brick/stone) from bleeding through.
 			inner_mat_for_wall.cull_mode = BaseMaterial3D.CULL_DISABLED
 			inner_mat_for_wall = _apply_architecture_texture_scale(
 				inner_mat_for_wall,
 				inner_mat_data,
-				poly_span
+				Vector2(corner_length, height)
 			)
 			wall.material = inner_mat_for_wall
 		else:
-			# EXTERIOR: camera is outside — structural wall uses outer material.
+			# Exterior: show outer material from both sides
 			outer_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 			outer_mat = _apply_architecture_texture_scale(
 				outer_mat,
 				outer_mat_data,
-				poly_span
+				Vector2(corner_length, height)
 			)
 			wall.material = outer_mat
 
 		wall_csg.add_child(wall)
 
-		# ── Dual overlay panels (INTERIOR mode only) ───────────────────────────
+		# â”€â”€ Dual overlay panels (INTERIOR mode only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+		#
+		# To correctly render both inner and outer textures on their
+		# respective faces (matching the frontend's per-face material
+		# assignment), we create two thin overlay panels:
+		#   1. Inner panel â€” on the room-facing side, with inner material
+		#   2. Outer panel â€” on the exterior-facing side, with outer material
+		#
+		# Each panel is 3 mm thick, placed flush with the structural wall
+		# surface, using CULL_BACK (only the outward-facing side renders).
+		# This ensures the camera sees the correct texture regardless of
+		# which side of the wall it is viewing.
+		#
+		# EXTERIOR render: skip â€” structural wall alone is sufficient.
 		var inner_csg: CSGCombiner3D = null
 		var outer_csg: CSGCombiner3D = null
 
-		if render_mode == "INTERIOR":
-			var face_t = 0.003 # 3 mm — clears Z-fighting at close range
+		if wall_render_mode == "INTERIOR":
+			var face_t = 0.003 # 3 mm â€” clears Z-fighting at close range
 			var wall_basis = Basis(Vector3.UP, wall_angle)
 
-			# Inner overlay panel (room-facing side)
+			# â”€â”€ Inner overlay panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 			if inner_mat_data != null:
 				var inner_offset = wall_thickness / 2.0 + face_t / 2.0
 				var inner_world = wall_pos + wall_basis * Vector3(0, 0, inner_offset * inner_sign)
@@ -3197,9 +3349,14 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 				inner_box.material = inner_mat
 				inner_csg.add_child(inner_box)
 
-			# Outer overlay panel (exterior-facing side)
+			# â”€â”€ Outer overlay panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+			# Placed on the opposite side from the inner panel.
+			# This ensures walls viewed from adjacent rooms or the exterior
+			# show the correct outer texture instead of the inner material
+			# that is now on the structural wall.
 			if outer_mat_data != null:
 				var outer_offset = wall_thickness / 2.0 + face_t / 2.0
+				# Outer side is opposite to inner_sign
 				var outer_world = wall_pos + wall_basis * Vector3(0, 0, outer_offset * (-inner_sign))
 
 				outer_csg = CSGCombiner3D.new()
@@ -3222,7 +3379,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 				outer_box.material = outer_panel_mat
 				outer_csg.add_child(outer_box)
 
-		# ── Holes (Doors / Windows) ────────────────────────────────────────────
+		# â”€â”€ Build Holes (Doors / Windows) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 		if line.has("holes"):
 			for hole_id in line["holes"]:
 				var hid = str(hole_id)
@@ -3237,20 +3394,33 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					var props = hole["properties"]
 					if props.has("width"): h_width = get_dimension_value(props["width"]) * scale_factor
 					if props.has("height"): h_height = get_dimension_value(props["height"]) * scale_factor
-					if props.has("altitude"): h_alt = get_dimension_value(props["altitude"]) * scale_factor
+					# FIX (Defect 2 – floating window): properties.altitude is the
+					# edited value written by the frontend; the top-level altitude
+					# field may be stale.  Always prefer properties.altitude and
+					# log when the two values disagree so staleness is detectable.
+					if props.has("altitude"):
+						var props_alt = get_dimension_value(props["altitude"]) * scale_factor
+						if abs(props_alt - h_alt) > 0.001:
+							print("[WARN] Hole '", hid, "': top-level altitude=", h_alt,
+								" differs from properties.altitude=", props_alt,
+								" — using properties value (top-level may be stale).")
+						h_alt = props_alt
 
+				# Ported from 4k_ai_godot_engine_staging pipeline (correct behaviour):
+				# Read raw_offset unconditionally — offset=0.0 is a valid position
+				# meaning "start of wall" and must NOT fall back to 0.5 (midpoint).
+				# The old has_offset gate was silently mis-placing any window whose
+				# offset happened to be 0.0 by snapping it to wall centre instead.
 				var offset_ratio = 0.5
-				var raw_offset = 0.0
-				if hole.has("offset"):
-					raw_offset = float(hole["offset"])
-				elif hole.has("properties") and hole["properties"].has("offset"):
+				var raw_offset = float(hole.get("offset", 0.0))
+				if hole.has("properties") and hole["properties"].has("offset"):
 					raw_offset = float(hole["properties"]["offset"])
 				if raw_offset > 1.0:
-					if length > 0.0001:
-						# Convert absolute source units to metres, then to a wall ratio.
-						offset_ratio = clamp((raw_offset * scale_factor) / length, 0.0, 1.0)
+					var wall_len = p1.distance_to(p2)
+					if wall_len > 0.0001:
+						offset_ratio = clamp((raw_offset * scale_factor) / wall_len, 0.0, 1.0)
 					else:
-						offset_ratio = raw_offset
+						offset_ratio = 0.5 # degenerate wall — default to midpoint
 				else:
 					offset_ratio = raw_offset
 
@@ -3258,18 +3428,18 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 				var h_center_pos = hole_pos_xz
 				h_center_pos.y = layer_altitude + h_alt + h_height / 2.0
 
-				if h_width < 0.01 or h_height < 0.01:
-					continue
+				if h_width < 0.01 or h_height < 0.01: continue
 
-				# 1. Cut through structural wall
+				# 1. Cut through the structural wall
 				var hole_csg = CSGBox3D.new()
 				hole_csg.operation = CSGBox3D.OPERATION_SUBTRACTION
 				hole_csg.size = Vector3(h_width, h_height, wall_thickness + 0.2)
 				hole_csg.position = h_center_pos
 				hole_csg.rotation.y = wall_angle
 				wall_csg.add_child(hole_csg)
+				print("Added hole cutter at: ", h_center_pos)
 
-				# 2a. Cut through inner overlay panel
+				# 2. Cut through the inner face panel
 				if inner_csg != null:
 					var inner_hole = CSGBox3D.new()
 					inner_hole.operation = CSGBox3D.OPERATION_SUBTRACTION
@@ -3279,7 +3449,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					inner_hole.position = local_pos
 					inner_csg.add_child(inner_hole)
 
-				# 2b. Cut through outer overlay panel
+				# 2b. Cut through the outer face panel
 				if outer_csg != null:
 					var outer_hole = CSGBox3D.new()
 					outer_hole.operation = CSGBox3D.OPERATION_SUBTRACTION
@@ -3289,16 +3459,29 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					outer_hole.position = local_pos_o
 					outer_csg.add_child(outer_hole)
 
-				# 3. Exterior black blocker
+				# 3. Exterior backdrop (if flagged by scene_optimizer_exterior.py)
+				# Only windows, open archways and glazed doors are flagged; solid doors
+				# are not. The panel is exactly the opening size and sits just inside
+				# the wall face FARTHEST from the camera, so the frame, glass and reveal
+				# stay visible in front of it. Colour comes from exterior_backdrop_color
+				# (soft charcoal) instead of flat black.
 				if hole.get("is_exterior_black", false):
+					var backdrop_normal = Basis(Vector3.UP, wall_angle) * Vector3(0, 0, 1)
+					var to_cam = _backdrop_camera_position(cam_pos) - h_center_pos
+					to_cam.y = 0.0
+					var away_sign = -1.0 if to_cam.dot(backdrop_normal) > 0.0 else 1.0
+					var backdrop_depth = max(wall_thickness * 0.5 - 0.01, 0.0)
 					var blocker = CSGBox3D.new()
-					blocker.size = Vector3(h_width + 0.02, h_height + 0.02, 0.01)
-					blocker.position = h_center_pos
+					blocker.size = Vector3(h_width, h_height, 0.01)
+					blocker.position = h_center_pos + backdrop_normal * (away_sign * backdrop_depth)
 					blocker.rotation.y = wall_angle
-					var black_mat = StandardMaterial3D.new()
-					black_mat.albedo_color = Color.BLACK
-					blocker.material = black_mat
+					var backdrop_mat = StandardMaterial3D.new()
+					var backdrop_hex = str(hole.get("exterior_backdrop_color", "#16191d"))
+					backdrop_mat.albedo_color = Color(backdrop_hex) if backdrop_hex.is_valid_html_color() else Color(0.086, 0.098, 0.114)
+					backdrop_mat.roughness = 0.9
+					blocker.material = backdrop_mat
 					add_child(blocker)
+					print("Added exterior backdrop behind opening: ", hid, " colour ", backdrop_hex)
 
 				# Determine hole type before asset loading so is_window_for_sun is in scope
 				# throughout the asset block (window glass must stop casting shadows below).
@@ -3443,7 +3626,9 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					print("[VideoGLB] Collected non-window opening (", hole_type_sun, ") for door fill light: ", hole_name_sun)
 
 		# ── 6. Add Wall Shapes (CustomShapes) ──────────────────────────────────
-		# Build hole rects in wall-local 2D: X=along-wall from p1, Y=height from floor.
+		# Build a list of hole rectangles in wall-local 2D space so that we can
+		# clip them out of every custom shape before rendering.
+		# Wall-local X = distance along wall from p1 (metres), Y = height from floor.
 		var wall_local_hole_rects: Array = []
 		if line.has("holes"):
 			for hole_id in line["holes"]:
@@ -3457,36 +3642,28 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					var props = hole["properties"]
 					if props.has("width"): hw = get_dimension_value(props["width"]) * scale_factor
 					if props.has("height"): hh = get_dimension_value(props["height"]) * scale_factor
-					# FIX (Defect 2 – floating window): properties.altitude is the
-					# edited value written by the frontend; the top-level altitude
-					# field may be stale.  Always prefer properties.altitude and
-					# log when the two values disagree so staleness is detectable.
-					if props.has("altitude"):
-						var props_alt = get_dimension_value(props["altitude"]) * scale_factor
-						if abs(props_alt - ha) > 0.001:
-							print("[WARN] Hole '", hid, "': top-level altitude=", ha,
-								" differs from properties.altitude=", props_alt,
-								" — using properties value (top-level may be stale).")
-						ha = props_alt
+					if props.has("altitude"): ha = get_dimension_value(props["altitude"]) * scale_factor
 				if hw < 0.01 or hh < 0.01: continue
-				var off_ratio = 0.5
-				var raw_off = float(hole.get("offset", 0.0))
-				if hole.has("properties") and hole["properties"].has("offset"):
+				var raw_off = 0.0
+				if hole.has("offset"): raw_off = float(hole["offset"])
+				elif hole.has("properties") and hole["properties"].has("offset"):
 					raw_off = float(hole["properties"]["offset"])
+				var off_ratio = raw_off
 				if raw_off > 1.0:
 					var wl = p1.distance_to(p2)
 					if wl > 0.0001:
 						off_ratio = clamp((raw_off * scale_factor) / wl, 0.0, 1.0)
-					else:
-						off_ratio = 0.5
-				else:
-					off_ratio = raw_off
-				var h_cx_along = off_ratio * length
+				var h_cx_along = off_ratio * length # centre x along wall
+				var h_left = h_cx_along - hw * 0.5
+				var h_right = h_cx_along + hw * 0.5
+				var h_bot = ha # from floor
+				var h_top = ha + hh
+				# Store as a PackedVector2Array rectangle (CCW)
 				var hole_rect = PackedVector2Array()
-				hole_rect.append(Vector2(h_cx_along - hw * 0.5, ha))
-				hole_rect.append(Vector2(h_cx_along + hw * 0.5, ha))
-				hole_rect.append(Vector2(h_cx_along + hw * 0.5, ha + hh))
-				hole_rect.append(Vector2(h_cx_along - hw * 0.5, ha + hh))
+				hole_rect.append(Vector2(h_left, h_bot))
+				hole_rect.append(Vector2(h_right, h_bot))
+				hole_rect.append(Vector2(h_right, h_top))
+				hole_rect.append(Vector2(h_left, h_top))
 				wall_local_hole_rects.append(hole_rect)
 
 		var faces_to_check = []
@@ -3504,6 +3681,26 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 			
 			for shape_idx in range(shapes_arr.size()):
 				var shape = shapes_arr[shape_idx]
+
+				if str(shape.get("structure_type", "")).to_lower() == "custom_shape":
+					var ctx = {
+						"surface_type": "wall",
+						"face": "inner" if side_sign > 0 else "outer",
+						"p1": p1,
+						"p2": p2,
+						"height": height,
+						"hole_rects": wall_local_hole_rects,
+						"shape_index": shape_idx,
+						"scale_factor": scale_factor,
+						"wall_thickness": wall_thickness
+					}
+					structure_builder.custom_shape_gen.build_surface_custom_shape(
+						inner_csg if side_sign > 0 else outer_csg,
+						shape,
+						ctx
+					)
+					continue
+
 				if not shape.has("points") or typeof(shape["points"]) != TYPE_ARRAY or shape["points"].size() < 3:
 					continue
 					
@@ -3534,13 +3731,16 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					shape_poly_pts.reverse()
 
 				# ── Clip hole areas out of this shape ─────────────────────────────
+				# Geometry2D.clip_polygons(subject, clip) = subject MINUS clip.
+				# We iteratively subtract every hole rectangle from the shape polygon.
+				# The result may be zero, one, or several disjoint polygons — emit each.
 				var clipped_fragments: Array = [shape_poly_pts]
 				for hole_rect in wall_local_hole_rects:
 					var next_fragments: Array = []
 					for frag in clipped_fragments:
 						var remaining = Geometry2D.clip_polygons(frag, hole_rect)
 						if remaining.is_empty():
-							pass
+							pass # entirely inside the hole — discard
 						else:
 							for r in remaining:
 								if r.size() >= 3:
@@ -3550,7 +3750,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 						break
 
 				if clipped_fragments.is_empty():
-					print("[VideoGLB] customShape fully clipped by holes — skipped")
+					print("customShape fully clipped by holes — skipped")
 					continue
 
 				# ── Step 1: Detect createOpening flag ─────────────────────────────
@@ -3562,6 +3762,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					else:
 						is_opening = (str(val).to_lower() == "true")
 
+				# Prepare material once per original shape
 				var shape_poly_span = Vector2(max_x - min_x, max_y - min_y)
 				var s_basis = Basis(Vector3.UP, wall_angle)
 				var local_z = s_basis * Vector3(0, 0, 1)
@@ -3583,13 +3784,17 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					
 					if shape.has("material") and not is_opening:
 						var smat = create_material(shape["material"], "wall")
-						smat = _apply_architecture_texture_scale(smat, shape["material"], shape_poly_span)
+						# CSGPolygon3D normalises UVs to THIS fragment's bounding box
+						# (a shape cut by an opening is several fragments), so the
+						# scale has to come from the fragment, not the whole shape.
+						var frag_min = Vector2(INF, INF)
+						var frag_max = Vector2(-INF, -INF)
+						for fp_pt in frag_poly:
+							frag_min = frag_min.min(fp_pt)
+							frag_max = frag_max.max(fp_pt)
+						var frag_span = frag_max - frag_min if frag_poly.size() >= 3 else shape_poly_span
+						smat = _apply_custom_shape_texture_scale(smat, shape["material"], frag_span)
 						poly.material = smat
-					else:
-						if not is_opening:
-							var smat = StandardMaterial3D.new()
-							smat.albedo_color = Color(1, 1, 1)
-							poly.material = smat
 					
 					# ── Step 3: Position — opening centres on wall; surface shape sits on face ──
 					var s_pos = p1
@@ -3636,9 +3841,9 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 					
 					frag_idx += 1
 
-				print("[VideoGLB] Added custom shape on wall ", line_id, " side ", side_sign, " is_opening=", is_opening, " fragments=", frag_idx)
+				print("Added customShape: ", shape.get("shapeKind", "polygon"), " is_opening=", is_opening, " side=", side_sign, " fragments=", frag_idx)
 
-	# ── 2. Build Floors and Ceilings from Areas ────────────────────────────────
+	# â”€â”€ 2. Build Floors and Ceilings from Areas â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 	# max_wall_height: include ALL walls (visible and invisible) so invisible
 	# structural dividers contribute correctly to the layer's ceiling height.
 	var max_wall_height = 0.0
@@ -3661,74 +3866,44 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 	if max_wall_height < 0.1:
 		max_wall_height = 280.0 * scale_factor
 
-	# ── External Areas ──────────────────────────────────────────────────────────
+	var force_uniform_ceiling_height = false
+	if layer_data.has("force_uniform_ceiling_height"):
+		force_uniform_ceiling_height = bool(layer_data["force_uniform_ceiling_height"])
+	var global_ceil_height = max_wall_height
+
 	if layer_data.has("externalAreas") and typeof(layer_data["externalAreas"]) == TYPE_DICTIONARY:
-		print("[VideoGLB] Building Floors for ", layer_data["externalAreas"].size(), " external areas.")
+		print("Building Floors for ", layer_data["externalAreas"].size(), " external areas.")
 		for area_id in layer_data["externalAreas"]:
-			var area = layer_data["externalAreas"][area_id]
-			if typeof(area) != TYPE_DICTIONARY or not area.has("vertices") or area["vertices"].size() < 3:
+			var ext_area = layer_data["externalAreas"][area_id]
+			if typeof(ext_area) != TYPE_DICTIONARY:
 				continue
-			var polygon = PackedVector2Array()
-			for v_id in area["vertices"]:
-				var vs = str(v_id)
-				if vertices.has(vs):
-					polygon.append(Vector2(float(vertices[vs]["x"]) * scale_factor, float(vertices[vs]["y"]) * scale_factor))
-			if polygon.size() < 3: continue
-			
-			var signed_area = 0.0
-			for pi in range(polygon.size()):
-				var pa = polygon[pi]; var pb = polygon[(pi + 1) % polygon.size()]
-				signed_area += (pa.x * pb.y - pb.x * pa.y)
-			signed_area *= 0.5
-			if signed_area < 0: polygon.reverse()
-			
-			var floor_depth = 0.1
-			if area.has("properties") and typeof(area["properties"]) == TYPE_DICTIONARY and area["properties"].has("thickness"):
-				var t = float(area["properties"]["thickness"]) * scale_factor
-				if t > 0.001: floor_depth = t
-				
-			var floor_poly = CSGPolygon3D.new()
-			floor_poly.polygon = polygon
-			floor_poly.mode = CSGPolygon3D.MODE_DEPTH
-			floor_poly.depth = floor_depth
-			floor_poly.rotation.x = PI / 2
-			# Push external areas below the main floor by their full depth + a margin to avoid Z-fighting
-			floor_poly.position.y = layer_altitude - floor_depth - 0.01
-			
-			var floor_span = _get_polygon_world_span(polygon)
-			if area.has("material") and typeof(area["material"]) == TYPE_DICTIONARY:
-				var f_mat = create_material(area["material"], "floor")
-				f_mat = _apply_architecture_texture_scale(f_mat, area["material"], floor_span)
-				floor_poly.material = f_mat
-			else:
-				var floor_mat = StandardMaterial3D.new()
-				floor_mat.albedo_color = Color(0.3, 0.6, 0.3)
-				floor_poly.material = floor_mat
-				
-			var floor_csg = CSGCombiner3D.new()
-			floor_csg.name = "ExternalAreaCSG_" + str(area_id)
-			floor_csg.use_collision = true
-			add_child(floor_csg)
-			floor_csg.add_child(floor_poly)
+			_build_external_area_floor(str(area_id), ext_area, vertices, layer_altitude, scale_factor)
 
 	if layer_data.has("areas"):
-		print("[VideoGLB] Building Floors/Ceilings for ", layer_data["areas"].size(), " areas.")
+		print("Building Floors/Ceilings for ", layer_data["areas"].size(), " areas.")
 		for area_id in layer_data["areas"]:
 			var area = layer_data["areas"][area_id]
-			if not area.has("vertices") or area["vertices"].size() < 3:
-				continue
+			if not area.has("vertices") or area["vertices"].size() < 3: continue
 
 			var polygon = PackedVector2Array()
-			for v_id in area["vertices"]:
-				var vs = str(v_id)
-				if vertices.has(vs):
-					var v = vertices[vs]
-					polygon.append(Vector2(float(v["x"]) * scale_factor, float(v["y"]) * scale_factor))
+			# Frontend draws floor + ceiling on area.geometry.innerPolygon.
+			# scene_render_parity.py validates it and passes render_floor_polygon.
+			var floor_src = area.get("render_floor_polygon", null)
+			if typeof(floor_src) == TYPE_ARRAY and floor_src.size() >= 3:
+				for fp_pt in floor_src:
+					var fp_p = _plan_point_2d(float(fp_pt["x"]), float(fp_pt["y"]))
+					polygon.append(fp_p * scale_factor)
+			else:
+				for v_id in area["vertices"]:
+					var vs = str(v_id)
+					if vertices.has(vs):
+						var v = vertices[vs]
+						var p = _plan_point_2d(float(v["x"]), float(v["y"]))
+						polygon.append(p * scale_factor)
 
-			if polygon.size() < 3:
-				continue
+			if polygon.size() < 3: continue
 
-			# Enforce CCW winding (required by CSGPolygon3D)
+			# Enforce CCW winding
 			var signed_area = 0.0
 			for pi in range(polygon.size()):
 				var pa = polygon[pi]
@@ -3739,56 +3914,117 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 				polygon.reverse()
 
 			var uv_polygon = polygon.duplicate()
-			# Expand polygon outward to fill wall-thickness gaps at edges
 			# polygon = _expand_polygon_outward(polygon, max_wall_thickness / 2.0)
 
-			# ── Floor ──────────────────────────────────────────────────────────
-			var floor_depth = 0.1
-			if area.has("floor_properties") and typeof(area["floor_properties"]) == TYPE_DICTIONARY:
-				var fp2 = area["floor_properties"]
-				if fp2.has("thickness"):
-					var t = float(fp2["thickness"]) * scale_factor
+			# â”€â”€ 1. Floor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+			var floor_props = area.get("floor_properties", {})
+			var floor_is_visible = true
+			if floor_props.has("visible"):
+				floor_is_visible = bool(floor_props["visible"])
+			elif floor_props.has("isvisible"):
+				floor_is_visible = bool(floor_props["isvisible"])
+			elif floor_props.has("isVisible"):
+				floor_is_visible = bool(floor_props["isVisible"])
+
+			print("[VISIBILITY] Area: ", area_id, " | Floor visible: ", floor_is_visible, " (Found property: ", floor_props.has("isvisible") or floor_props.has("isVisible"), ")")
+
+			if floor_is_visible:
+				var floor_depth = 0.1
+				if floor_props.has("thickness"):
+					var t = float(floor_props["thickness"]) * scale_factor
 					if t > 0.001: floor_depth = t
 
-			var floor_poly = CSGPolygon3D.new()
-			floor_poly.polygon = polygon
-			floor_poly.mode = CSGPolygon3D.MODE_DEPTH
-			floor_poly.depth = floor_depth
-			floor_poly.rotation.x = PI / 2
-			floor_poly.position.y = layer_altitude
-			# Use the expanded polygon span because CSGPolygon3D normalises
-			# its UVs to [0,1] over the expanded bounding box, not the
-			# original one.  Measuring from the smaller original polygon
-			# caused every tile to appear ~3-4 % oversized.
-			var floor_span = _get_polygon_world_span(polygon)
+				var floor_poly = CSGPolygon3D.new()
+				floor_poly.polygon = polygon
+				floor_poly.mode = CSGPolygon3D.MODE_DEPTH
+				floor_poly.depth = floor_depth
+				floor_poly.rotation.x = PI / 2
+				floor_poly.position.y = layer_altitude
+				var floor_span = _get_polygon_world_span(uv_polygon)
 
-			if area.has("floor_properties") and typeof(area["floor_properties"]) == TYPE_DICTIONARY and area["floor_properties"].has("material"):
-				var f_mat = create_material(area["floor_properties"]["material"], "floor")
-				f_mat = _apply_architecture_texture_scale(
-					f_mat,
-					area["floor_properties"]["material"],
-					floor_span
-				)
-				floor_poly.material = f_mat
-			else:
-				var floor_mat = StandardMaterial3D.new()
-				floor_mat.albedo_color = Color(0.8, 0.8, 0.8)
-				floor_poly.material = floor_mat
+				# Check if paving is enabled
+				var has_paving = false
+				var pav_cfg = {}
+				if floor_props.has("paving") and typeof(floor_props["paving"]) == TYPE_DICTIONARY:
+					pav_cfg = floor_props["paving"]
+					var pav_pattern = str(pav_cfg.get("pattern", "none")).strip_edges().to_lower()
+					if pav_pattern != "none" and pav_pattern != "":
+						has_paving = true
 
-			var floor_csg = CSGCombiner3D.new()
-			floor_csg.name = "FloorCSG_" + str(area_id)
-			floor_csg.use_collision = true
-			add_child(floor_csg)
+				if has_paving:
+					# Generate grout color for floor_poly
+					var grout_color: Color = Color(0.0, 0.0, 0.0) # default black grout
+					var gap_color_mode = str(pav_cfg.get("gapColorMode", "none")).strip_edges().to_lower()
+					var has_gap_color = pav_cfg.has("gapColor") and str(pav_cfg.get("gapColor", "")).strip_edges() != ""
+					var pav_material_data = floor_props.get("material", {})
+					if has_gap_color:
+						var raw_color_str = str(pav_cfg["gapColor"]).strip_edges()
+						if raw_color_str.is_valid_html_color():
+							grout_color = Color(raw_color_str)
+					elif gap_color_mode == "material":
+						if pav_material_data.has("color") and str(pav_material_data["color"]).strip_edges() != "":
+							var mat_col = Color(str(pav_material_data["color"]))
+							grout_color = mat_col.lightened(0.55)
 
-			structure_builder._add_floor_opening_cutters(floor_csg, structures, str(area_id), layer_altitude, floor_depth, scale_factor)
-			floor_csg.add_child(floor_poly)
+					var grout_mat = StandardMaterial3D.new()
+					grout_mat.albedo_color = grout_color
+					grout_mat.roughness = 0.90
+					grout_mat.metallic = 0.0
+					floor_poly.material = grout_mat
+					print("[Paving] Setting base floor_poly material to grout color: ", grout_color)
+				else:
+					if floor_props.has("material"):
+						var f_mat = create_material(floor_props["material"], "floor")
+						f_mat = _apply_architecture_texture_scale(
+							f_mat,
+							floor_props["material"],
+							floor_span,
+							false  # editor parity: no density boost on floors
+						)
+						floor_poly.material = f_mat
+						print("[FloorUV] Base floor ", area_id, " uv1_scale=", f_mat.uv1_scale, " span=", floor_span)
+						print("Floor Material Optimized: ", floor_props["material"].get("mapUrl", "default"))
+					else:
+						var floor_mat = StandardMaterial3D.new()
+						floor_mat.albedo_color = Color(0.8, 0.8, 0.8)
+						# Apply default optimizer logic to fallback floor with context
+						floor_poly.material = floor_mat
 
-			# ── Paving Pattern Overlay ─────────────────────────────────────────
-			# When the frontend has set floor_properties.paving (pattern != 'none')
-			# we generate per-tile CSGPolygon3D slabs clipped to the room polygon,
-			# sitting 2 mm above the base floor slab so they always win z-fighting.
-			if area.has("floor_properties") and typeof(area["floor_properties"]) == TYPE_DICTIONARY:
-				var floor_props = area["floor_properties"]
+				var floor_csg = CSGCombiner3D.new()
+				floor_csg.name = "FloorCSG_" + str(area_id)
+				floor_csg.use_collision = true
+				add_child(floor_csg)
+
+				floor_csg.add_child(floor_poly)
+				structure_builder._add_floor_opening_cutters(floor_csg, structures, str(area_id), layer_altitude, floor_depth, scale_factor)
+
+				# ── Pre-collect custom shape polygons for paving exclusion ────────
+				# When both paving AND custom shapes exist, paving tiles must be
+				# clipped around the custom shape footprints so the shapes are
+				# clearly visible on top.
+				var floor_exclusion_polys: Array = []
+				if floor_props.has("customShapes") and typeof(floor_props["customShapes"]) == TYPE_ARRAY:
+					for cs in floor_props["customShapes"]:
+						if not cs.has("points") or typeof(cs["points"]) != TYPE_ARRAY or cs["points"].size() < 3:
+							continue
+						var ex_pts = PackedVector2Array()
+						for pt in cs["points"]:
+							var p = _plan_point_2d(float(pt.get("x", 0)), float(pt.get("y", 0)))
+							ex_pts.append(p * scale_factor)
+						# Ensure CCW winding for Geometry2D clipping
+						var ex_sa = 0.0
+						for epi in range(ex_pts.size()):
+							var epa = ex_pts[epi]
+							var epb = ex_pts[(epi + 1) % ex_pts.size()]
+							ex_sa += (epa.x * epb.y - epb.x * epa.y)
+						if ex_sa < 0: ex_pts.reverse()
+						floor_exclusion_polys.append(ex_pts)
+
+				# ── Paving Pattern Overlay ─────────────────────────────────────────
+				# When the frontend has set floor_properties.paving (pattern != 'none')
+				# we generate per-tile CSGPolygon3D slabs clipped to the room polygon,
+				# sitting 2 mm above the base floor slab so they always win z-fighting.
+				# pav_root is parented to floor_csg so it stays with the floor node.
 				if floor_props.has("paving") and typeof(floor_props["paving"]) == TYPE_DICTIONARY:
 					var pav = floor_props["paving"]
 					var pav_pattern = str(pav.get("pattern", "none")).strip_edges().to_lower()
@@ -3801,200 +4037,230 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 							uv_polygon,
 							layer_altitude,
 							floor_span,
-							pav_material_data
+							pav_material_data,
+							floor_csg,
+							floor_exclusion_polys
 						)
-						print("[Paving] Applied pattern '", pav_pattern, "' to area ", area_id)
+						print("[Paving] Applied pattern '", pav_pattern, "' to area ", area_id, " (exclusions: ", floor_exclusion_polys.size(), ")")
 
-			if area.has("floor_properties") and typeof(area["floor_properties"]) == TYPE_DICTIONARY and area["floor_properties"].has("customShapes"):
-				for shape_idx in range(area["floor_properties"]["customShapes"].size()):
-					var shape = area["floor_properties"]["customShapes"][shape_idx]
-					if not shape.has("points") or typeof(shape["points"]) != TYPE_ARRAY or shape["points"].size() < 3: continue
-					var shape_pts = PackedVector2Array()
-					var min_x = 999999.0; var max_x = -999999.0
-					var min_y = 999999.0; var max_y = -999999.0
-					for pt in shape["points"]:
-						var p = _plan_point_2d(float(pt.get("x", 0)), float(pt.get("y", 0)))
-						var scaled_p = p * scale_factor
-						shape_pts.append(scaled_p)
-						if scaled_p.x < min_x: min_x = scaled_p.x
-						if scaled_p.x > max_x: max_x = scaled_p.x
-						if scaled_p.y < min_y: min_y = scaled_p.y
-						if scaled_p.y > max_y: max_y = scaled_p.y
-					var shape_signed_area = 0.0
-					for pi in range(shape_pts.size()):
-						var pa = shape_pts[pi]
-						var pb = shape_pts[(pi + 1) % shape_pts.size()]
-						shape_signed_area += (pa.x * pb.y - pb.x * pa.y)
-					if shape_signed_area < 0: shape_pts.reverse()
-					var s_poly = CSGPolygon3D.new()
-					s_poly.polygon = shape_pts
-					s_poly.mode = CSGPolygon3D.MODE_DEPTH
-					var shape_depth = 0.010
-					if shape.has("thickness"):
-						shape_depth = get_dimension_value(shape["thickness"], 10.0) * scale_factor
-					s_poly.depth = shape_depth
-					s_poly.rotation.x = PI / 2
-					# Floor slab extrudes UPWARD to layer_altitude + floor_depth (paving tiles
-					# to +0.022); the old "+0.005" buried the shape inside the slab.
-					var cs_floor_top = layer_altitude + floor_depth
-					var cs_pav = area["floor_properties"].get("paving", {})
-					if typeof(cs_pav) == TYPE_DICTIONARY:
-						var cs_pat = str(cs_pav.get("pattern", "none")).strip_edges().to_lower()
-						if cs_pat != "none" and cs_pat != "":
+				# ── Floor Custom Shapes ─────────────────────────────────────────────
+				# IMPORTANT: Custom shapes are added as STANDALONE CSGCombiner3D nodes
+				# directly to the scene root — NOT inside floor_csg.
+				# Putting them inside floor_csg caused CSG boolean operations to carve
+				# black holes/pits into the floor.  As standalone nodes they are rendered
+				# as independent geometry with zero CSG interaction with the floor slab.
+				#
+				# Y position:  layer_altitude + 0.025 (25 mm above floor base)
+				#              This clears the paving tile top face (at +2 mm) by 23 mm,
+				#              guaranteeing the shape is always visible on top.
+				if floor_props.has("customShapes"):
+					for shape_idx in range(floor_props["customShapes"].size()):
+						var shape = floor_props["customShapes"][shape_idx]
+						if not shape.has("points") or typeof(shape["points"]) != TYPE_ARRAY or shape["points"].size() < 3: continue
+						var shape_pts = PackedVector2Array()
+						var min_x = 999999.0; var max_x = -999999.0
+						var min_y = 999999.0; var max_y = -999999.0
+						for pt in shape["points"]:
+							var p = _plan_point_2d(float(pt.get("x", 0)), float(pt.get("y", 0)))
+							var scaled_p = p * scale_factor
+							shape_pts.append(scaled_p)
+							if scaled_p.x < min_x: min_x = scaled_p.x
+							if scaled_p.x > max_x: max_x = scaled_p.x
+							if scaled_p.y < min_y: min_y = scaled_p.y
+							if scaled_p.y > max_y: max_y = scaled_p.y
+						# Enforce CCW winding so the top face normal points up
+						var shape_signed_area = 0.0
+						for pi in range(shape_pts.size()):
+							var pa = shape_pts[pi]
+							var pb = shape_pts[(pi + 1) % shape_pts.size()]
+							shape_signed_area += (pa.x * pb.y - pb.x * pa.y)
+						if shape_signed_area < 0: shape_pts.reverse()
+
+						# Standalone wrapper — no CSG interaction with floor/paving
+						var shape_root = CSGCombiner3D.new()
+						shape_root.name = "FloorCustomShape_%s_%d" % [str(area_id), shape_idx]
+						add_child(shape_root)
+
+						var s_poly = CSGPolygon3D.new()
+						s_poly.polygon = shape_pts
+						s_poly.mode = CSGPolygon3D.MODE_DEPTH
+						var shape_depth = 0.010
+						if shape.has("thickness"):
+							shape_depth = get_dimension_value(shape["thickness"], 10.0) * scale_factor
+						s_poly.depth = shape_depth
+						s_poly.rotation.x = PI / 2
+						# CSGPolygon3D with rotation.x = PI/2 extrudes UPWARD from position.y,
+						# so the floor slab spans [layer_altitude, layer_altitude + floor_depth]
+						# (and paving tiles reach layer_altitude + 0.002 + 0.02). The old
+						# "+0.005" put a 10 mm rug at 5-15 mm, i.e. buried inside a 20 mm slab.
+						# Seat the shape on the actual walkable top instead.
+						var cs_floor_top = layer_altitude + floor_depth
+						if has_paving:
 							cs_floor_top = max(cs_floor_top, layer_altitude + 0.002 + 0.02)
-					s_poly.position.y = cs_floor_top + 0.001 + 0.001 * shape_idx
-					if shape.has("material"):
-						var smat = create_material(shape["material"], "floor")
-						var span = Vector2(max_x - min_x, max_y - min_y)
-						smat = _apply_architecture_texture_scale(smat, shape["material"], span)
-						s_poly.material = smat
-					add_child(s_poly)
-
-			# ── Ceiling ────────────────────────────────────────────────────────
-			var ceil_height = max_wall_height
-
-			if area.has("properties") and typeof(area["properties"]) == TYPE_DICTIONARY:
-				var h_prop = area["properties"].get("height", null)
-				if h_prop != null:
-					var h_val = 0.0
-					if typeof(h_prop) == TYPE_DICTIONARY and h_prop.has("length"):
-						h_val = float(h_prop["length"]) * scale_factor
-					elif typeof(h_prop) == TYPE_INT or typeof(h_prop) == TYPE_FLOAT:
-						h_val = float(h_prop) * scale_factor
-					if h_val >= 1.5:
-						# 1.5 m safety threshold: ignore sub-1.5 m values (curbs, outdoor
-						# half-walls, or typos like 300 mm) to prevent ceiling collapse.
-						ceil_height = min(h_val, max_wall_height)
-
-			if ceil_height == max_wall_height and area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY:
-				var cp = area["ceiling_properties"]
-				if cp.has("height"):
-					var ch_val = 0.0
-					if typeof(cp["height"]) == TYPE_DICTIONARY and cp["height"].has("length"):
-						ch_val = float(cp["height"]["length"]) * scale_factor
-					elif typeof(cp["height"]) == TYPE_INT or typeof(cp["height"]) == TYPE_FLOAT:
-						ch_val = float(cp["height"]) * scale_factor
-					elif typeof(cp["height"]) == TYPE_STRING and cp["height"].is_valid_float():
-						ch_val = float(cp["height"]) * scale_factor
-					if ch_val >= 1.5:
-						# 1.5 m safety threshold
-						ceil_height = min(ch_val, max_wall_height)
-
-			if ceil_height < 0.1:
-				ceil_height = max_wall_height
-
-			var ceil_depth = 0.1
-			if area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY:
-				var cp = area["ceiling_properties"]
-				if cp.has("thickness"):
-					var t = float(cp["thickness"]) * scale_factor
-					if t > 0.001: ceil_depth = t
-			if ceil_depth < 0.05:
-				ceil_depth = 0.05
-
-			var ceil_poly = CSGPolygon3D.new()
-			ceil_poly.polygon = polygon
-			ceil_poly.mode = CSGPolygon3D.MODE_DEPTH
-			ceil_poly.depth = ceil_depth
-			ceil_poly.rotation.x = PI / 2
-			ceil_poly.position.y = layer_altitude + ceil_height - ceil_depth
-			# Match floor: use expanded polygon span for UV accuracy.
-			var ceil_span = _get_polygon_world_span(polygon)
-
-			if area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY and area["ceiling_properties"].has("material"):
-				var c_mat = create_material(area["ceiling_properties"]["material"], "ceiling")
-				c_mat = _apply_architecture_texture_scale(
-					c_mat,
-					area["ceiling_properties"]["material"],
-					ceil_span
-				)
-				ceil_poly.material = c_mat
+						s_poly.position.y = cs_floor_top + 0.001 + 0.001 * shape_idx
+						if shape.has("material"):
+							var smat = create_material(shape["material"], "floor")
+							var span = Vector2(max_x - min_x, max_y - min_y)
+							smat = _apply_custom_shape_texture_scale(smat, shape["material"], span)
+							# CSGPolygon3D cap UVs are normalised 0..1 across the polygon's
+							# bounding box (not world metres), so repeats = span / tile size.
+							# _apply_custom_shape_texture_scale uses 1 / tile, which stretched
+							# one texture tile over (tile / span) of the shape -> over-scaled.
+							var cs_tile_u = float(shape["material"].get("repeatX", 0.0))
+							var cs_tile_v = float(shape["material"].get("repeatY", 0.0))
+							if cs_tile_u > 0.0 and cs_tile_v > 0.0:
+								# CSGPolygon3D cap UVs are packed into [0, 0.5] in UV space.
+								# To get `span / tile` repeats, we must multiply by 2.0.
+								smat.uv1_scale = Vector3(
+									(span.x * 2.0) / max(cs_tile_u * _scene_unit_scale, 0.000001),
+									(span.y * 2.0) / max(cs_tile_v * _scene_unit_scale, 0.000001),
+									1.0)
+								print("[CustomShape] Floor shape ", shape_idx, " uv1_scale=", smat.uv1_scale, " span=", span)
+							smat.cull_mode = BaseMaterial3D.CULL_BACK
+							s_poly.material = smat
+						shape_root.add_child(s_poly)
+						print("[CustomShape] Floor shape ", shape_idx, " standalone at y=", s_poly.position.y, " (area=", area_id, ")")
+			# â”€â”€ 2. Ceiling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+			var ceiling_props = area.get("ceiling_properties", {})
+			# Ceiling visibility rules:
+			#   showAllFloors=true  â†’ ceiling visible by default, hidden ONLY if isvisible=false
+			#   showAllFloors=false â†’ ceiling hidden by default (removed), kept ONLY if isvisible=true
+			var has_visibility_prop = ceiling_props.has("visible") or ceiling_props.has("isvisible") or ceiling_props.has("isVisible")
+			var ceil_is_visible: bool
+			if has_visibility_prop:
+				if ceiling_props.has("visible"): ceil_is_visible = bool(ceiling_props["visible"])
+				elif ceiling_props.has("isvisible"): ceil_is_visible = bool(ceiling_props["isvisible"])
+				else: ceil_is_visible = bool(ceiling_props["isVisible"])
 			else:
-				var ceil_mat = StandardMaterial3D.new()
-				ceil_mat.albedo_color = Color(0.95, 0.95, 0.95)
-				ceil_poly.material = ceil_mat
-
-			# Ceiling visibility gate
-			var has_visibility_prop = false
-			var ceil_is_visible = true
-			
-			if area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY:
-				var cp = area["ceiling_properties"]
-				has_visibility_prop = cp.has("visible") or cp.has("isvisible") or cp.has("isVisible")
-				if has_visibility_prop:
-					if cp.has("visible"): ceil_is_visible = bool(cp["visible"])
-					elif cp.has("isvisible"): ceil_is_visible = bool(cp["isvisible"])
-					else: ceil_is_visible = bool(cp["isVisible"])
-			
-			if not has_visibility_prop:
 				ceil_is_visible = show_all_floors
-			
-			print("[VideoGLB] Ceiling visible: ", ceil_is_visible, " | showAllFloors: ", show_all_floors, " | has_prop: ", has_visibility_prop)
 
-			var is_visible = ceil_is_visible
-			
-			# EXTRA EXCEPTION: Hide ceiling if camera is ABOVE it (e.g. for top-down renders)
-			# ONLY apply if we don't have an explicit visibility property.
-			if is_visible and cam_pos != null and not has_visibility_prop:
+			print("[VISIBILITY] Area: ", area_id, " | Ceiling visible: ", ceil_is_visible, " | showAllFloors: ", show_all_floors, " | has_prop: ", has_visibility_prop)
+
+			if ceil_is_visible or (not show_all_floors and cam_pos != null and not has_visibility_prop):
+				# Resolve ceiling elevation
+				var ceil_height = global_ceil_height
+				if not force_uniform_ceiling_height:
+					ceil_height = max_wall_height
+					if area.has("properties") and area["properties"].has("height"):
+						var h_prop = area["properties"]["height"]
+						var ch = 0.0
+						if typeof(h_prop) == TYPE_DICTIONARY and h_prop.has("length"):
+							ch = float(h_prop["length"]) * scale_factor
+						else:
+							ch = float(h_prop) * scale_factor
+						# Frontend parity (AreaManager): the ceiling top sits at the ROOM's
+						# own height, not the tallest wall on the layer. The old 1.5 m
+						# threshold + wall cap put a 0.61 m plinth room's ceiling at the
+						# 1.22 m compound-wall height, inside the floor above.
+						if ch > 0.05: ceil_height = ch
+					elif ceiling_props.has("height"):
+						var ch = float(ceiling_props["height"]) * scale_factor
+						# 1.5 m safety threshold
+						if ch >= 1.5: ceil_height = min(ch, max_wall_height)
+
 				var ceiling_world_y = layer_altitude + ceil_height
-				if cam_pos.y > (ceiling_world_y + 0.1): # Tiny margin
-					is_visible = false
-					print("[VideoGLB] Hiding Ceiling automatically: Camera height (", cam_pos.y, ") is above ceiling Y (", ceiling_world_y, ")")
-			
-			# Portal-based fallback for show_all_floors=false
-			# Only fallback if we don't have an explicit property.
-			if not is_visible and not show_all_floors and cam_pos != null and not has_visibility_prop:
-				if _camera_requires_ceiling(cam_pos, layer_altitude, ceil_height, polygon):
-					is_visible = true
 
-			if not is_visible:
-				continue
+				# Video ceiling rules (camera path): hide a ceiling the camera is above,
+				# and with showAllFloors=false bring back one the walkthrough needs.
+				# Only when the area has no explicit visibility property.
+				if ceil_is_visible and cam_pos != null and not has_visibility_prop:
+					if cam_pos.y > (ceiling_world_y + 0.1):
+						ceil_is_visible = false
+						print("[VideoGLB] Hiding Ceiling automatically: Camera height (", cam_pos.y, ") is above ceiling Y (", ceiling_world_y, ")")
+				if not ceil_is_visible and not show_all_floors and cam_pos != null and not has_visibility_prop:
+					if _camera_requires_ceiling(cam_pos, layer_altitude, ceil_height, polygon):
+						ceil_is_visible = true
 
-			var ceil_csg = CSGCombiner3D.new()
-			ceil_csg.name = "CeilingCSG_" + str(area_id)
-			ceil_csg.use_collision = true
-			add_child(ceil_csg)
-			ceil_csg.add_child(ceil_poly)
-			
-			if area.has("ceiling_properties") and typeof(area["ceiling_properties"]) == TYPE_DICTIONARY and area["ceiling_properties"].has("customShapes"):
-				for shape_idx in range(area["ceiling_properties"]["customShapes"].size()):
-					var shape = area["ceiling_properties"]["customShapes"][shape_idx]
-					if not shape.has("points") or typeof(shape["points"]) != TYPE_ARRAY or shape["points"].size() < 3: continue
-					var shape_pts = PackedVector2Array()
-					var min_x = 999999.0; var max_x = -999999.0
-					var min_y = 999999.0; var max_y = -999999.0
-					for pt in shape["points"]:
-						var p = _plan_point_2d(float(pt.get("x", 0)), float(pt.get("y", 0)))
-						var scaled_p = p * scale_factor
-						shape_pts.append(scaled_p)
-						if scaled_p.x < min_x: min_x = scaled_p.x
-						if scaled_p.x > max_x: max_x = scaled_p.x
-						if scaled_p.y < min_y: min_y = scaled_p.y
-						if scaled_p.y > max_y: max_y = scaled_p.y
-					var shape_signed_area = 0.0
-					for pi in range(shape_pts.size()):
-						var pa = shape_pts[pi]
-						var pb = shape_pts[(pi + 1) % shape_pts.size()]
-						shape_signed_area += (pa.x * pb.y - pb.x * pa.y)
-					if shape_signed_area > 0: shape_pts.reverse()
-					var s_poly = CSGPolygon3D.new()
-					s_poly.polygon = shape_pts
-					s_poly.mode = CSGPolygon3D.MODE_DEPTH
-					var shape_depth = 0.005
-					if shape.has("thickness"):
-						shape_depth = get_dimension_value(shape["thickness"], 5.0) * scale_factor
-					# Extend depth by 10mm to ensure it connects to the ceiling
-					s_poly.depth = shape_depth + 0.010
-					s_poly.rotation.x = PI / 2
-					# Top of the shape anchors to bottom of the ceiling, dropping down by shape_depth
-					s_poly.position.y = (layer_altitude + ceil_height - ceil_depth) - shape_depth - 0.001 * shape_idx
-					if shape.has("material"):
-						var smat = create_material(shape["material"], "ceiling")
-						var span = Vector2(max_x - min_x, max_y - min_y)
-						smat = _apply_architecture_texture_scale(smat, shape["material"], span)
-						s_poly.material = smat
-					add_child(s_poly)
-			print("[VideoGLB] Floor/Ceiling area: ", area_id, " ceil_h=", ceil_height, " floor_depth=", floor_depth)
+				if ceil_is_visible:
+					var ceil_depth = 0.1
+					if ceiling_props.has("thickness"):
+						var t = float(ceiling_props["thickness"]) * scale_factor
+						if t > 0.001: ceil_depth = t
+					if ceil_depth < 0.05:
+						ceil_depth = 0.05
+
+					var ceil_poly = CSGPolygon3D.new()
+					ceil_poly.polygon = polygon
+					ceil_poly.mode = CSGPolygon3D.MODE_DEPTH
+					ceil_poly.depth = ceil_depth
+					ceil_poly.rotation.x = PI / 2
+					ceil_poly.position.y = ceiling_world_y - ceil_depth
+					var ceil_span = _get_polygon_world_span(uv_polygon)
+
+					if ceiling_props.has("material"):
+						var c_mat = create_material(ceiling_props["material"], "ceiling")
+						c_mat = _apply_architecture_texture_scale(
+							c_mat,
+							ceiling_props["material"],
+							ceil_span
+						)
+						ceil_poly.material = c_mat
+					else:
+						var ceil_mat = StandardMaterial3D.new()
+						ceil_mat.albedo_color = Color(0.82, 0.82, 0.82)
+						# Optimize fallback ceiling
+						ceil_poly.material = ceil_mat
+
+					var ceil_csg = CSGCombiner3D.new()
+					ceil_csg.name = "CeilingCSG_" + str(area_id)
+					ceil_csg.use_collision = true
+					add_child(ceil_csg)
+					ceil_csg.add_child(ceil_poly)
+					
+					# ── Ceiling Custom Shapes ───────────────────────────────────────────
+					# Each shape is a flat panel that hangs BELOW the base ceiling slab.
+					# Position rule:
+					#   Top face  = ceiling_world_y - ceil_depth - shape_depth - (1mm * idx)
+					#   Bottom face (visible from room) = top - shape_depth
+					# Subtracting shape_depth ensures the shape is fully BELOW the slab
+					# bottom and not z-fighting with or embedded inside it.
+					# Shapes are parented to ceil_csg (not bare add_child).
+					# Texture scale uses _apply_custom_shape_texture_scale (no density boost).
+					if ceiling_props.has("customShapes"):
+						for shape_idx in range(ceiling_props["customShapes"].size()):
+							var shape = ceiling_props["customShapes"][shape_idx]
+							if not shape.has("points") or typeof(shape["points"]) != TYPE_ARRAY or shape["points"].size() < 3: continue
+							var shape_pts = PackedVector2Array()
+							var min_x = 999999.0; var max_x = -999999.0
+							var min_y = 999999.0; var max_y = -999999.0
+							for pt in shape["points"]:
+								var p = _plan_point_2d(float(pt.get("x", 0)), float(pt.get("y", 0)))
+								var scaled_p = p * scale_factor
+								shape_pts.append(scaled_p)
+								if scaled_p.x < min_x: min_x = scaled_p.x
+								if scaled_p.x > max_x: max_x = scaled_p.x
+								if scaled_p.y < min_y: min_y = scaled_p.y
+								if scaled_p.y > max_y: max_y = scaled_p.y
+							var shape_signed_area = 0.0
+							for pi in range(shape_pts.size()):
+								var pa = shape_pts[pi]
+								var pb = shape_pts[(pi + 1) % shape_pts.size()]
+								shape_signed_area += (pa.x * pb.y - pb.x * pa.y)
+							if shape_signed_area > 0: shape_pts.reverse()
+							var s_poly = CSGPolygon3D.new()
+							s_poly.polygon = shape_pts
+							s_poly.mode = CSGPolygon3D.MODE_DEPTH
+							var shape_depth = 0.005
+							if shape.has("thickness"):
+								shape_depth = get_dimension_value(shape["thickness"], 5.0) * scale_factor
+							# Extend depth to ensure it penetrates the ceiling base by 10mm
+							s_poly.depth = shape_depth + 0.010
+							s_poly.rotation.x = PI / 2
+							# Base ceiling bottom face is at (ceiling_world_y - ceil_depth).
+							# We want the shape to stick out below the ceiling by exactly `shape_depth`.
+							# Since rotation.x = PI/2 means the polygon extrudes UPWARDS (+Y), 
+							# position.y is the BOTTOM of the shape.
+							s_poly.position.y = (ceiling_world_y - ceil_depth) - shape_depth - 0.001 * shape_idx
+							if shape.has("material"):
+								var smat = create_material(shape["material"], "ceiling")
+								var span = Vector2(max_x - min_x, max_y - min_y)
+								# Use custom-shape scale (no density boost) so tile fills the shape correctly
+								smat = _apply_custom_shape_texture_scale(smat, shape["material"], span)
+								s_poly.material = smat
+							# Parent to ceil_csg so shape lives in the correct CSG combiner
+							ceil_csg.add_child(s_poly)
+
+					print("[INFO] Created ceiling for area: ", area_id, " at Y=", ceiling_world_y)
 
 # ─────────────────────────────────────────────────────────────────
 # Polygon helpers (ported from image_glb_creation.gd)
@@ -4048,53 +4314,14 @@ func _get_polygon_world_span(polygon: PackedVector2Array) -> Vector2:
 
 	return Vector2(max(0.001, max_x - min_x), max(0.001, max_y - min_y))
 
-func _apply_architecture_texture_scale(mat: StandardMaterial3D, mat_data: Dictionary, surface_size: Vector2) -> StandardMaterial3D:
+func _apply_architecture_texture_scale(mat: StandardMaterial3D, mat_data, surface_size: Vector2, apply_density_boost: bool = true) -> StandardMaterial3D:
+	# mat_data is untyped on purpose: walls with no authored face material
+	# (e.g. compound / plinth walls with empty outer_properties) pass null.
+	# A typed Dictionary parameter turned that into a SCRIPT ERROR that
+	# aborted the whole layer build (walls, floors, external areas).
 	if mat == null or typeof(mat_data) != TYPE_DICTIONARY:
 		return mat
-
-	var width = max(surface_size.x, 0.001)
-	var height = max(surface_size.y, 0.001)
-	var scale_u = 1.0
-	var scale_v = 1.0
-
-	var tile_u = 0.0
-	var tile_v = 0.0
-	if mat_data.has("repeatX"):
-		tile_u = float(mat_data.get("repeatX", 0.0))
-	elif mat_data.has("texture_scale_x"):
-		tile_u = float(mat_data.get("texture_scale_x", 0.0))
-	if mat_data.has("repeatY"):
-		tile_v = float(mat_data.get("repeatY", 0.0))
-	elif mat_data.has("texture_scale_y"):
-		tile_v = float(mat_data.get("texture_scale_y", 0.0))
-
-	var has_physical_repeat = false
-	if tile_u > 0.0 and tile_v > 0.0:
-		scale_u = width / max(tile_u * _scene_unit_scale, 0.000001)
-		scale_v = height / max(tile_v * _scene_unit_scale, 0.000001)
-		has_physical_repeat = true
-	if has_physical_repeat:
-		# Apply density boost - multiplying UV scale makes tiles appear smaller.
-		# Multiply by 2.0 to account for CSGPolygon3D packing caps into 0..0.5 UV space.
-		mat.uv1_scale = Vector3(scale_u * FLOOR_CEIL_TEXTURE_DENSITY_BOOST * 2.0,
-								scale_v * FLOOR_CEIL_TEXTURE_DENSITY_BOOST * 2.0, 1.0)
-		return mat
-
-	if mat_data.has("repeat"):
-		var r = mat_data["repeat"]
-		if typeof(r) == TYPE_ARRAY and r.size() >= 2:
-			var repeat_u = float(r[0])
-			var repeat_v = float(r[1])
-			if repeat_u > 0.0:
-				scale_u = repeat_u * width / 2.4
-			if repeat_v > 0.0:
-				scale_v = repeat_v * height / 2.4
-			if repeat_u > 0.0 or repeat_v > 0.0:
-				# Apply density boost to legacy repeat path too.
-				mat.uv1_scale = Vector3(scale_u * FLOOR_CEIL_TEXTURE_DENSITY_BOOST,
-									scale_v * FLOOR_CEIL_TEXTURE_DENSITY_BOOST, 1.0)
-				return mat
-
+	mat.uv1_scale = _editor_csg_uv_scale(mat_data, surface_size)
 	return mat
 
 # ─────────────────────────────────────────────────────────────────
@@ -5053,13 +5280,19 @@ func _load_layer_items(items, layer_altitude, layer_id = "root"):
 						applied_flips.append("Z")
 					if not applied_flips.is_empty():
 						print("[VideoGLB] Applied flip(s) on axis/axes ", applied_flips, " for asset: ", item.get("name", "Unknown"))
-					var bounds_y_min = aabb.position.y * final_scale.y
-					node.position.y = pz - bounds_y_min
+					# Editor tilt (rotationX / rotationZ), same as image_glb_creation.gd:
+					# three.js XYZ Euler about the item's bottom-centre.
+					var tilt_x: float = float(item.get("rotationX", 0.0)) if item.get("rotationX", null) != null else 0.0
+					var tilt_z: float = float(item.get("rotationZ", 0.0)) if item.get("rotationZ", null) != null else 0.0
+					if abs(tilt_x) > 0.000001 or abs(tilt_z) > 0.000001:
+						var yaw: float = node.rotation.y
+						node.rotation_order = EULER_ORDER_XYZ
+						node.rotation = Vector3(tilt_x, yaw, tilt_z)
+						print("[VideoGLB] Item tilt applied: %s rotationX=%.4f rotationZ=%.4f" % [item.get("name", "Unknown"), tilt_x, tilt_z])
 
-					var local_center = Vector3(aabb.position.x + aabb.size.x / 2.0, 0.0, aabb.position.z + aabb.size.z / 2.0)
-					var world_offset = node.transform.basis * local_center
-					node.position.x = px - world_offset.x
-					node.position.z = py - world_offset.z
+					var local_pivot = Vector3(aabb.position.x + aabb.size.x / 2.0, aabb.position.y, aabb.position.z + aabb.size.z / 2.0)
+					var world_offset = node.transform.basis * local_pivot
+					node.position = Vector3(px - world_offset.x, pz - world_offset.y, py - world_offset.z)
 
 					# Track exterior assets for sunlight optimization
 					var item_name_l = str(item.get("name", "")).to_lower()
@@ -6008,6 +6241,18 @@ func _build_custom_lights(geom_data: Dictionary) -> void:
 			base_color = _kelvin_to_rgb(color_temp_k)
 		else:
 			base_color = Color(light_data.get("color", "#ffffff"))
+		# Day render: added lights are mixed 55% toward white, as in
+		# image_glb_creation.gd (job d2f30cfb: raw 4000K turned every white wall
+		# orange whenever these lights outweighed the windows). Night keeps the
+		# full Kelvin colour.
+		if day_render:
+			var tint_peak: float = max(base_color.r, max(base_color.g, base_color.b))
+			if tint_peak > 0.001:
+				var day_tint_mix := 0.55
+				base_color = Color(
+					lerp(1.0, base_color.r / tint_peak, day_tint_mix),
+					lerp(1.0, base_color.g / tint_peak, day_tint_mix),
+					lerp(1.0, base_color.b / tint_peak, day_tint_mix))
 		var energy_mult = 1.0
 		if light_data.has("intensityMultiplier"):
 			energy_mult = float(light_data["intensityMultiplier"])
@@ -6291,7 +6536,9 @@ func _build_paving_overlay(
 		uv_polygon: PackedVector2Array,
 		layer_altitude: float,
 		floor_span: Vector2,
-		material_data: Dictionary
+		material_data: Dictionary,
+		parent_node: Node3D = null,
+		exclusion_polygons: Array = []
 ) -> void:
 	# -- Tile dimensions (match frontend AreaMaterialConfig) ---
 	# repeatX / repeatY on material = tile WIDTH/HEIGHT in mm.
@@ -6341,8 +6588,8 @@ func _build_paving_overlay(
 	var gap_real = (gap_mode == "real" and gap_mm > 0.1)
 	# Effective shrink in metres:
 	#   real  → half the grout joint on each side of the tile
-	#   false → fixed 1 mm visual seam (matches frontend stroke width ~= 1 px at 1 mm/px)
-	var shrink_m: float = 0.001
+	#   false → fixed 3 mm visual seam (matches frontend stroke width ~= 1 px at 1 mm/px, enhanced for visibility)
+	var shrink_m: float = 0.003
 	if gap_real:
 		shrink_m = clamp(gap_mm * _scene_unit_scale * 0.5, 0.0005, 0.05)
 
@@ -6350,13 +6597,15 @@ func _build_paving_overlay(
 	# Priority 1: gapColor present in JSON → always use it (gapColorMode may be absent)
 	# Priority 2: gapColorMode == 'custom' with gapColor
 	# Priority 3: gapColorMode == 'material' → lighten the floor material colour
-	# Priority 4: off-white default
-	var grout_color: Color = Color(0.92, 0.90, 0.88) # off-white default
+	# Priority 4: black default (if no color is specified)
+	var grout_color: Color = Color(0.0, 0.0, 0.0) # default black grout
 	var gap_color_mode = str(pav_cfg.get("gapColorMode", "none")).strip_edges().to_lower()
 	var has_gap_color = pav_cfg.has("gapColor") and str(pav_cfg.get("gapColor", "")).strip_edges() != ""
 	if has_gap_color:
 		# gapColor set explicitly → use it directly (covers both custom and legacy JSON)
-		grout_color = Color(str(pav_cfg["gapColor"]))
+		var raw_color_str = str(pav_cfg["gapColor"]).strip_edges()
+		if raw_color_str.is_valid_html_color():
+			grout_color = Color(raw_color_str)
 	elif gap_color_mode == "material":
 		# Use a lightened version of the floor material colour as cement grout
 		if material_data.has("color") and str(material_data["color"]).strip_edges() != "":
@@ -6370,9 +6619,9 @@ func _build_paving_overlay(
 		tile_mat.albedo_color = Color(0.85, 0.82, 0.78)
 	else:
 		tile_mat = create_material(material_data, "floor")
-		# Apply texture scale so texture fills individual tiles (not the whole room)
-		var per_tile_span = Vector2(tile_w, tile_h)
-		tile_mat = _apply_architecture_texture_scale(tile_mat, material_data, per_tile_span)
+		# One image per tile, as the editor's paving texture draws it. A whole
+		# tile's CSG cap spans 0..0.5 of UV space, so 2.0 shows the image once.
+		tile_mat.uv1_scale = Vector3(2.0, 2.0, 1.0)
 	# Ensure winding/shading is correct for the tile top face
 	var per_tile_mat: StandardMaterial3D = tile_mat.duplicate()
 	per_tile_mat.cull_mode = BaseMaterial3D.CULL_BACK
@@ -6386,23 +6635,28 @@ func _build_paving_overlay(
 	grout_mat.metallic = 0.0
 
 	# ── Parent node ────────────────────────────────────────────────────────────
-	var pav_root = Node3D.new()
+	var pav_root = CSGCombiner3D.new()
 	pav_root.name = "PavingOverlay_" + area_id
-	add_child(pav_root)
+	# Parent pav_root to floor_csg when provided so tiles live under the floor node.
+	if parent_node != null:
+		parent_node.add_child(pav_root)
+	else:
+		add_child(pav_root)
 
 	var tile_y = layer_altitude + 0.002 # 2 mm above base floor slab
-	var tile_depth = 0.004 # 4 mm ceramic / plank thickness
+	var tile_depth = 0.02 # 20 mm ceramic / plank thickness for solid CSG intersection
 
-	# ── Grout slab — placed FIRST so tiles render on top ───────────────────────
-	var grout_slab = CSGPolygon3D.new()
-	grout_slab.name = "PavGrout_" + area_id
-	grout_slab.polygon = uv_polygon
-	grout_slab.mode = CSGPolygon3D.MODE_DEPTH
-	grout_slab.depth = tile_depth
-	grout_slab.rotation.x = PI / 2
-	grout_slab.position.y = tile_y - 0.001 # 1 mm below tile surfaces → shows in seams
-	grout_slab.material = grout_mat
-	pav_root.add_child(grout_slab)
+	# ── Grout slab — bypassed since floor_poly now serves as the grout layer
+	# (Prevents precision discards and Z-fighting issues)
+	# var grout_slab = CSGPolygon3D.new()
+	# grout_slab.name      = "PavGrout_" + area_id
+	# grout_slab.polygon   = uv_polygon
+	# grout_slab.mode      = CSGPolygon3D.MODE_DEPTH
+	# grout_slab.depth     = tile_depth
+	# grout_slab.rotation.x = PI / 2
+	# grout_slab.position.y = tile_y - 0.001
+	# grout_slab.material  = grout_mat
+	# pav_root.add_child(grout_slab)
 
 	# ── Emit tile slabs ─────────────────────────────────────────────────────────
 	var tile_idx = 0
@@ -6418,6 +6672,27 @@ func _build_paving_overlay(
 		var clipped = Geometry2D.intersect_polygons(tile_pts, uv_polygon)
 		if clipped.is_empty():
 			continue
+
+		# ── Subtract custom-shape exclusion polygons from each tile ──────
+		# This carves holes in the paving grid so custom shapes placed on
+		# top are fully visible without z-fighting or material overlap.
+		if not exclusion_polygons.is_empty():
+			var after_exclusion: Array = []
+			for cp in clipped:
+				var remaining: Array = [cp]
+				for ex_poly in exclusion_polygons:
+					var next_remaining: Array = []
+					for rem_poly in remaining:
+						var diff = Geometry2D.clip_polygons(rem_poly, ex_poly)
+						for d in diff:
+							if d.size() >= 3:
+								next_remaining.append(d)
+					remaining = next_remaining
+				for r in remaining:
+					after_exclusion.append(r)
+			clipped = after_exclusion
+			if clipped.is_empty():
+				continue
 
 		for clip_poly in clipped:
 			if clip_poly.size() < 3:
@@ -6445,7 +6720,28 @@ func _build_paving_overlay(
 			tp.depth = tile_depth
 			tp.rotation.x = PI / 2
 			tp.position.y = tile_y
-			tp.material = per_tile_mat
+			# Editor paving draws the material image once inside every tile.
+			# The CSG cap UV spans this polygon's bounding box, so a tile cut
+			# at the room edge needs its scale reduced in proportion, or the
+			# whole image is squeezed into the partial tile.
+			var full_min = Vector2(INF, INF)
+			var full_max = Vector2(-INF, -INF)
+			for fp2 in tile_pts:
+				full_min = full_min.min(fp2)
+				full_max = full_max.max(fp2)
+			var part_min = Vector2(INF, INF)
+			var part_max = Vector2(-INF, -INF)
+			for pp2 in render_poly:
+				part_min = part_min.min(pp2)
+				part_max = part_max.max(pp2)
+			var full_span = (full_max - full_min).max(Vector2(0.000001, 0.000001))
+			var frac = (part_max - part_min) / full_span
+			if abs(frac.x - 1.0) > 0.02 or abs(frac.y - 1.0) > 0.02:
+				var part_mat: StandardMaterial3D = per_tile_mat.duplicate()
+				part_mat.uv1_scale = Vector3(2.0 * frac.x, 2.0 * frac.y, 1.0)
+				tp.material = part_mat
+			else:
+				tp.material = per_tile_mat
 			pav_root.add_child(tp)
 			tile_idx += 1
 
@@ -6664,3 +6960,450 @@ func _kelvin_to_rgb(kelvin: float) -> Color:
 		clamp(g / 255.0, 0.0, 1.0),
 		clamp(b / 255.0, 0.0, 1.0)
 	)
+
+
+# ==============================================================================
+# EXTERIOR PARITY WITH THE IMAGE PATH (ported from image_glb_creation.gd)
+# ==============================================================================
+# Typical daylight-probe exposure of an exterior still once the HDRI sun is
+# clipped and the sky normalised (jobs 3099d8b7 3.28, 094542f4 2.28, bee4990e
+# 4.55). Video cannot probe per frame, so it uses this, times the same
+# EXTERIOR_EXPOSURE_SCALE trim the stills get.
+const EXTERIOR_VIDEO_PROBE_EXPOSURE := 3.3
+const EXTERIOR_SUN_PEAK_RATIO := 3.0   # HDRI peak / upper-sky mean needed to call it "a clear sun"
+# The HDRI's own sun disc is clipped on exterior day renders: the
+# DirectionalLight3D IS the sun (see image_glb_creation.gd for the measurement).
+const EXTERIOR_SUN_CLIP_SKY_MULT := 20.0
+const EXTERIOR_SUN_CLIP_DEG := 8.0
+
+# Camera-based exterior sun (data["exterior_sun"], scene_exterior_sun.py). The
+# walkthrough's frozen first-frame camera stands in for the still's camera,
+# the same camera main.py planned with.
+func _apply_exterior_sun(data, exr_image, cam_pose) -> void:
+	if _exterior_sun_applied or _dir_light == null or not day_render:
+		return
+	if typeof(data) != TYPE_DICTIONARY or typeof(data.get("exterior_sun", null)) != TYPE_DICTIONARY:
+		return
+	if typeof(cam_pose) != TYPE_DICTIONARY:
+		return
+	_exterior_sun_applied = true
+	var plan: Dictionary = data["exterior_sun"]
+	var cam_pos: Vector3 = cam_pose.get("position", Vector3.ZERO)
+	var cam_tgt: Vector3 = cam_pose.get("target", cam_pos + Vector3(0, 0, -1))
+	var fwd: Vector3 = cam_tgt - cam_pos
+	fwd.y = 0.0
+	if fwd.length() < 0.001:
+		fwd = Vector3(0, 0, -1)
+	fwd = fwd.normalized()
+	var right: Vector3 = fwd.cross(Vector3.UP).normalized()
+	var off := deg_to_rad(clamp(float(plan.get("azimuth_offset_deg", 40.0)), 0.0, 90.0))
+	var side_sign := -1.0 if str(plan.get("side", "left")) == "left" else 1.0
+	var s_h: Vector3 = (-fwd * cos(off) + right * side_sign * sin(off)).normalized()
+	var elev_deg := float(plan.get("elevation_deg", 38.0))
+	var src := "plan elevation (no HDRI)"
+	if exr_image != null and bool(plan.get("match_hdri", true)):
+		var found := _find_hdri_sun(exr_image)
+		if bool(found.get("ok", false)):
+			var rng = plan.get("elevation_range", [5.0, 70.0])
+			var e_lo := float(rng[0]) if typeof(rng) == TYPE_ARRAY and rng.size() > 1 else 5.0
+			var e_hi := float(rng[1]) if typeof(rng) == TYPE_ARRAY and rng.size() > 1 else 70.0
+			elev_deg = clamp(float(found["elevation_deg"]), e_lo, e_hi)
+			var u_want := atan2(s_h.x, -s_h.z) / TAU
+			if u_want < 0.0:
+				u_want += 1.0
+			var w: int = exr_image.get_width()
+			_clip_hdri_sun(exr_image, found)
+			var shift_px := int(round((u_want - float(found["u"])) * w))
+			_roll_image_x(exr_image, shift_px)
+			src = "HDRI sun (found at u=%.3f, elevation %.1f deg, peak/sky %.1f; used %.1f deg); panorama rolled %d px (%.1f deg)" % [
+				float(found["u"]), float(found["elevation_deg"]), float(found["ratio"]), elev_deg,
+				shift_px, float(shift_px) / float(w) * 360.0]
+		else:
+			src = "plan elevation - the HDRI has no clear sun (peak/sky %.1f < %.1f); panorama not rotated" % [
+				float(found.get("ratio", 0.0)), EXTERIOR_SUN_PEAK_RATIO]
+	var e := deg_to_rad(elev_deg)
+	var d := Vector3(s_h.x * cos(e), sin(e), s_h.z * cos(e))
+	_dir_light.position = cam_tgt + d * 50.0
+	_dir_light.look_at(cam_tgt, Vector3.UP)
+	_directional_light_authoring_locked = true
+	print("[ExtSun] video: source=%s side=%s offset=%.1f deg -> sun direction (to sun) %s, elevation %.1f deg; %s" % [
+		str(plan.get("source", "?")), str(plan.get("side", "?")), rad_to_deg(off), str(d), elev_deg, src])
+
+func _find_hdri_sun(img: Image) -> Dictionary:
+	if img == null or img.is_empty():
+		return {"ok": false}
+	var small := img.duplicate() as Image
+	if small.is_compressed():
+		small.decompress()
+	small.clear_mipmaps()
+	var sw := 512
+	var sh := 256
+	small.resize(sw, sh, Image.INTERPOLATE_BILINEAR)
+	var peak := 0.0
+	var total := 0.0
+	var n := 0
+	var lum := PackedFloat32Array()
+	lum.resize(sw * (sh / 2))
+	for y in range(sh / 2):          # upper hemisphere only
+		for x in range(sw):
+			var c := small.get_pixel(x, y)
+			var l := 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+			lum[y * sw + x] = l
+			total += l
+			n += 1
+			if l > peak:
+				peak = l
+	var mean: float = total / float(max(n, 1))
+	var ratio: float = peak / max(mean, 1e-6)
+	if ratio < EXTERIOR_SUN_PEAK_RATIO:
+		return {"ok": false, "ratio": ratio}
+	var sorted_lum := lum.duplicate()
+	sorted_lum.sort()
+	var sky_median: float = sorted_lum[sorted_lum.size() / 2]
+	# Weighted centroid of the brightest pixels (circular mean across the seam).
+	var cs := 0.0
+	var sn := 0.0
+	var ys := 0.0
+	var wsum := 0.0
+	for y in range(sh / 2):
+		for x in range(sw):
+			var l := lum[y * sw + x]
+			if l >= peak * 0.9:
+				var a := (float(x) + 0.5) / float(sw) * TAU
+				cs += cos(a) * l
+				sn += sin(a) * l
+				ys += (float(y) + 0.5) * l
+				wsum += l
+	var a_mean := atan2(sn, cs)
+	if a_mean < 0.0:
+		a_mean += TAU
+	var v := (ys / wsum) / float(sh)
+	return {"ok": true, "u": a_mean / TAU, "v": v, "elevation_deg": 90.0 - v * 180.0, "ratio": ratio,
+			"sky_median": sky_median}
+
+func _clip_hdri_sun(img: Image, found: Dictionary) -> void:
+	var med := float(found.get("sky_median", 0.0))
+	if med <= 1e-6:
+		print("[ExtSun] HDRI sun disc not clipped (no sky median)")
+		return
+	if img.is_compressed():
+		img.decompress()
+	img.clear_mipmaps()
+	var w := img.get_width()
+	var h := img.get_height()
+	var cap := med * EXTERIOR_SUN_CLIP_SKY_MULT
+	var cx := int(float(found["u"]) * w)
+	var cy := int(float(found["v"]) * h)
+	var rx := int(ceil(EXTERIOR_SUN_CLIP_DEG / 360.0 * w))
+	var ry := int(ceil(EXTERIOR_SUN_CLIP_DEG / 180.0 * h))
+	var clipped := 0
+	var peak := 0.0
+	for y in range(max(0, cy - ry), min(h / 2, cy + ry + 1)):
+		for dx in range(-rx, rx + 1):
+			var x := ((cx + dx) % w + w) % w
+			var c := img.get_pixel(x, y)
+			var l := 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
+			if l > cap:
+				peak = max(peak, l)
+				var k := cap / l
+				img.set_pixel(x, y, Color(c.r * k, c.g * k, c.b * k, c.a))
+				clipped += 1
+	print("[ExtSun] HDRI sun disc clipped: %d px within %.0f deg of the sun scaled to %.1fx the median sky (%.3f; peak was %.1f) - the DirectionalLight3D is the only sun" % [
+		clipped, EXTERIOR_SUN_CLIP_DEG, EXTERIOR_SUN_CLIP_SKY_MULT, cap, peak])
+
+func _roll_image_x(img: Image, shift_px: int) -> void:
+	var w := img.get_width()
+	var h := img.get_height()
+	var k := ((shift_px % w) + w) % w
+	if k == 0:
+		return
+	if img.is_compressed():
+		img.decompress()
+	img.clear_mipmaps()
+	# Row by row, so a large HDR is never duplicated whole.
+	for y in range(h):
+		var row := img.get_region(Rect2i(0, y, w, 1))
+		img.blit_rect(row, Rect2i(0, 0, w - k, 1), Vector2i(k, y))
+		img.blit_rect(row, Rect2i(w - k, 0, k, 1), Vector2i(0, y))
+
+# Extended ground under the exterior decorators (floor_plan_data.
+# exterior_decorators.ground, scene_exterior_decorators.py) - same slab as the
+# image path, tiled the same way (2 x span / tile, the editor's CSG UV rule).
+func _build_exterior_decorator_ground(data) -> void:
+	if typeof(data) != TYPE_DICTIONARY or not data.has("exterior_decorators"):
+		return
+	var dec = data["exterior_decorators"]
+	if typeof(dec) != TYPE_DICTIONARY or typeof(dec.get("ground", null)) != TYPE_DICTIONARY:
+		return
+	var g = dec["ground"]
+	var pts = g.get("polygon", [])
+	if typeof(pts) != TYPE_ARRAY or pts.size() < 3:
+		print("[Decor] Ground polygon missing or too small - skipped.")
+		return
+	var polygon = PackedVector2Array()
+	for p in pts:
+		if typeof(p) != TYPE_DICTIONARY:
+			continue
+		var pp = _plan_point_2d(float(p.get("x", 0.0)), float(p.get("y", 0.0)))
+		polygon.append(pp * _scene_unit_scale)
+	if polygon.size() < 3:
+		return
+	var signed_area = 0.0
+	for pi in range(polygon.size()):
+		var pa = polygon[pi]
+		var pb = polygon[(pi + 1) % polygon.size()]
+		signed_area += (pa.x * pb.y - pb.x * pa.y)
+	if signed_area < 0:
+		polygon.reverse()
+	var layer_alt = 0.0
+	var lid = str(dec.get("layer_id", ""))
+	if data.has("layers") and typeof(data["layers"]) == TYPE_DICTIONARY and data["layers"].has(lid):
+		var layer = data["layers"][lid]
+		if typeof(layer) == TYPE_DICTIONARY and layer.has("altitude"):
+			var alt_val = layer["altitude"]
+			if typeof(alt_val) == TYPE_DICTIONARY and alt_val.has("length"):
+				layer_alt = float(alt_val["length"]) * _scene_unit_scale
+			else:
+				layer_alt = float(alt_val) * _scene_unit_scale
+	var top_below = float(g.get("top_below_m", 0.02))
+	var thick = max(float(g.get("thickness_m", 0.05)), 0.005)
+	var poly = CSGPolygon3D.new()
+	poly.polygon = polygon
+	poly.mode = CSGPolygon3D.MODE_DEPTH
+	poly.depth = thick
+	poly.rotation.x = PI / 2
+	poly.position.y = layer_alt - top_below - thick
+	var mat_data = g.get("material", {})
+	if typeof(mat_data) != TYPE_DICTIONARY or mat_data.is_empty():
+		mat_data = {"color": "#6f8f3a", "roughness": 0.9}
+	var mat = create_material(mat_data, "floor")
+	if mat is BaseMaterial3D:
+		var span: Vector2 = _get_polygon_world_span(polygon)
+		var tx: float = float(mat_data.get("repeatX", 0.0)) if mat_data.get("repeatX", null) != null else 0.0
+		var ty: float = float(mat_data.get("repeatY", 0.0)) if mat_data.get("repeatY", null) != null else 0.0
+		var tile_u: float = (tx if tx > 0.0 else 1000.0) * _scene_unit_scale
+		var tile_v: float = (ty if ty > 0.0 else 1000.0) * _scene_unit_scale
+		mat.uv1_triplanar = false
+		mat.uv1_scale = Vector3(2.0 * max(span.x, 0.001) / max(tile_u, 0.000001), 2.0 * max(span.y, 0.001) / max(tile_v, 0.000001), 1.0)
+	poly.material = mat
+	var comb = CSGCombiner3D.new()
+	comb.name = "ExteriorDecoratorGround"
+	comb.use_collision = true
+	add_child(comb)
+	comb.add_child(poly)
+	var summary = dec.get("summary", {})
+	print("[Decor] Video ground slab: %d points, top at %.3f m, material %s; lawn tiles %s, trees %s" % [
+		polygon.size(), layer_alt - top_below, str(mat_data),
+		str(summary.get("lawn_tiles", "?")), str(summary.get("trees", "?"))])
+
+# ==============================================================================
+# GEOMETRY PARITY WITH image_glb_creation.gd (ported 2026-10-06)
+# ==============================================================================
+# Texture scale (editor parity), external-area floors, render prisms
+# (scene_render_parity.py) and the exterior backdrop camera. Same code as the
+# image builder so a walkthrough and a still of one plan build the same scene.
+
+func _plan_point_3d(x: float, y: float, world_y: float = 0.0) -> Vector3:
+	var point = _plan_point_2d(x, y)
+	return Vector3(point.x * _scene_unit_scale, world_y, point.y * _scene_unit_scale)
+
+func _build_external_area_floor(area_id: String, area: Dictionary, vertices: Dictionary, layer_altitude: float, scale_factor: float) -> void:
+	if not area.has("vertices") or area["vertices"].size() < 3:
+		return
+
+	var polygon = PackedVector2Array()
+	for v_id in area["vertices"]:
+		var vs = str(v_id)
+		if vertices.has(vs):
+			var v = vertices[vs]
+			var p = _plan_point_2d(float(v["x"]), float(v["y"]))
+			polygon.append(p * scale_factor)
+
+	if polygon.size() < 3:
+		return
+
+	var signed_area = 0.0
+	for pi in range(polygon.size()):
+		var pa = polygon[pi]
+		var pb = polygon[(pi + 1) % polygon.size()]
+		signed_area += (pa.x * pb.y - pb.x * pa.y)
+	signed_area *= 0.5
+	if signed_area < 0:
+		polygon.reverse()
+
+	var uv_polygon = polygon.duplicate()
+	var floor_props: Dictionary = {}
+	if area.has("floor_properties") and typeof(area["floor_properties"]) == TYPE_DICTIONARY:
+		floor_props = area["floor_properties"]
+
+	var floor_is_visible = true
+	if area.has("visible"):
+		floor_is_visible = bool(area["visible"])
+	elif typeof(floor_props) == TYPE_DICTIONARY and floor_props.has("visible"):
+		floor_is_visible = bool(floor_props["visible"])
+	elif typeof(floor_props) == TYPE_DICTIONARY and floor_props.has("isvisible"):
+		floor_is_visible = bool(floor_props["isvisible"])
+	elif typeof(floor_props) == TYPE_DICTIONARY and floor_props.has("isVisible"):
+		floor_is_visible = bool(floor_props["isVisible"])
+
+	print("[VISIBILITY] External Area: ", area_id, " | Floor visible: ", floor_is_visible)
+
+	if not floor_is_visible:
+		return
+
+	var floor_depth = 0.1
+	if area.has("properties") and typeof(area["properties"]) == TYPE_DICTIONARY and area["properties"].has("thickness"):
+		var t = get_dimension_value(area["properties"]["thickness"], 20.0) * scale_factor
+		if t > 0.001:
+			floor_depth = t
+	elif floor_props.has("thickness"):
+		var t2 = get_dimension_value(floor_props["thickness"], 20.0) * scale_factor
+		if t2 > 0.001:
+			floor_depth = t2
+
+	var floor_poly = CSGPolygon3D.new()
+	floor_poly.polygon = polygon
+	floor_poly.mode = CSGPolygon3D.MODE_DEPTH
+	floor_poly.depth = floor_depth
+	floor_poly.rotation.x = PI / 2
+	# Push external areas below the main floor by their full depth + a margin to avoid Z-fighting and ensure they don't cover interior floors.
+	floor_poly.position.y = layer_altitude - floor_depth - 0.01
+	var floor_span = _get_polygon_world_span(uv_polygon)
+
+	var floor_material_data = _resolve_area_floor_material_data(area, floor_props)
+	if not floor_material_data.is_empty():
+		var f_mat = create_material(floor_material_data, "floor")
+		f_mat = _apply_architecture_texture_scale(f_mat, floor_material_data, floor_span, false)
+		floor_poly.material = f_mat
+		print("External Area Material Optimized: ", floor_material_data.get("mapUrl", "default"))
+	else:
+		var floor_mat = StandardMaterial3D.new()
+		floor_mat.albedo_color = Color(0.3, 0.6, 0.3)
+		floor_poly.material = floor_mat
+
+	var floor_csg = CSGCombiner3D.new()
+	floor_csg.name = "ExternalAreaCSG_" + str(area_id)
+	floor_csg.use_collision = true
+	add_child(floor_csg)
+	floor_csg.add_child(floor_poly)
+
+func _resolve_area_floor_material_data(area: Dictionary, floor_props: Dictionary = {}) -> Dictionary:
+	var resolved: Dictionary = {}
+
+	if typeof(floor_props) == TYPE_DICTIONARY and floor_props.has("material") and typeof(floor_props["material"]) == TYPE_DICTIONARY:
+		resolved = floor_props["material"].duplicate(true)
+	elif area.has("material") and typeof(area["material"]) == TYPE_DICTIONARY:
+		resolved = area["material"].duplicate(true)
+
+	if area.has("material") and typeof(area["material"]) == TYPE_DICTIONARY:
+		for key in area["material"]:
+			if not resolved.has(key):
+				resolved[key] = area["material"][key]
+
+	if area.has("properties") and typeof(area["properties"]) == TYPE_DICTIONARY:
+		var props = area["properties"]
+		if props.has("material") and typeof(props["material"]) == TYPE_DICTIONARY:
+			for key in props["material"]:
+				if not resolved.has(key):
+					resolved[key] = props["material"][key]
+
+		if (not resolved.has("mapUrl") or str(resolved.get("mapUrl", "")).strip_edges() == ""):
+			var texture_url := ""
+			if typeof(floor_props) == TYPE_DICTIONARY and floor_props.has("texture"):
+				texture_url = str(floor_props.get("texture", "")).strip_edges()
+			if texture_url == "" and props.has("texture"):
+				texture_url = str(props.get("texture", "")).strip_edges()
+			if texture_url != "" and texture_url.to_lower() != "none":
+				resolved["mapUrl"] = texture_url
+
+	return resolved
+
+func _editor_csg_uv_scale(mat_data, surface_size: Vector2) -> Vector3:
+	var width = max(surface_size.x, 0.001)
+	var height = max(surface_size.y, 0.001)
+	var tile_u = _editor_tile_size_m(mat_data, "repeatX", "texture_scale_x")
+	var tile_v = _editor_tile_size_m(mat_data, "repeatY", "texture_scale_y")
+	return Vector3(2.0 * width / tile_u, 2.0 * height / tile_v, 1.0)
+
+func _editor_tile_size_m(mat_data, key: String, legacy_key: String) -> float:
+	var tile = 0.0
+	if mat_data.has(key) and mat_data[key] != null:
+		tile = float(mat_data[key])
+	elif mat_data.has(legacy_key) and mat_data[legacy_key] != null:
+		tile = float(mat_data[legacy_key])
+	if tile <= 0.0:
+		# Editor default: `repeatX || 1000` -> one tile per metre.
+		return 1.0
+	return max(tile * _scene_unit_scale, 0.000001)
+
+func _apply_custom_shape_texture_scale(mat: StandardMaterial3D, mat_data, surface_size: Vector2) -> StandardMaterial3D:
+	if mat == null or typeof(mat_data) != TYPE_DICTIONARY:
+		return mat
+	mat.uv1_scale = _editor_csg_uv_scale(mat_data, surface_size)
+	return mat
+
+func _build_render_prisms(layer_data, layer_altitude) -> void:
+	# Extra geometry produced by scene_render_parity.py so the render matches
+	# the frontend editor: mitred wall-corner fillers, door bottom fillers
+	# (bottomfiller) and visible slabs. Each prism is a plan polygon (source
+	# units) extruded from "bottom" to "top" (source units above the layer).
+	if typeof(layer_data) != TYPE_DICTIONARY or not layer_data.has("render_prisms"):
+		return
+	var prisms = layer_data["render_prisms"]
+	if typeof(prisms) != TYPE_ARRAY:
+		return
+	var built = 0
+	for prism in prisms:
+		if typeof(prism) != TYPE_DICTIONARY:
+			continue
+		var pts = prism.get("polygon", [])
+		if typeof(pts) != TYPE_ARRAY or pts.size() < 3:
+			continue
+		var polygon = PackedVector2Array()
+		for pt in pts:
+			if typeof(pt) == TYPE_ARRAY and pt.size() >= 2:
+				var pp = _plan_point_2d(float(pt[0]), float(pt[1]))
+				polygon.append(pp * _scene_unit_scale)
+		if polygon.size() < 3:
+			continue
+		var signed_area = 0.0
+		for pi in range(polygon.size()):
+			var pa = polygon[pi]
+			var pb = polygon[(pi + 1) % polygon.size()]
+			signed_area += (pa.x * pb.y - pb.x * pa.y)
+		if signed_area < 0:
+			polygon.reverse()
+		var bottom_m = float(prism.get("bottom", 0.0)) * _scene_unit_scale
+		var top_m = float(prism.get("top", 0.0)) * _scene_unit_scale
+		if top_m - bottom_m < 0.0005:
+			continue
+		var shape = CSGPolygon3D.new()
+		shape.name = "Parity_" + str(prism.get("kind", "prism")) + "_" + str(built)
+		shape.polygon = polygon
+		shape.mode = CSGPolygon3D.MODE_DEPTH
+		shape.depth = top_m - bottom_m
+		shape.rotation.x = PI / 2
+		shape.position.y = layer_altitude + bottom_m
+		var mat_data = prism.get("material", null)
+		var mat
+		if typeof(mat_data) == TYPE_DICTIONARY:
+			mat = create_material(mat_data, "wall")
+			mat = _apply_architecture_texture_scale(mat, mat_data, _get_polygon_world_span(polygon))
+		else:
+			mat = StandardMaterial3D.new()
+			mat.albedo_color = Color(0.82, 0.82, 0.82)
+		mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		shape.material = mat
+		add_child(shape)
+		built += 1
+	if built > 0:
+		print("[Parity] Built ", built, " render prisms (corner fillers / door fillers / slabs)")
+
+## Camera position the exterior backdrop is placed against (the panel goes on
+## the wall face farthest from it). A walkthrough uses its first pose.
+func _backdrop_camera_position(cam_pos) -> Vector3:
+	if cam_pos != null and typeof(cam_pos) == TYPE_VECTOR3:
+		return cam_pos
+	if typeof(_frozen_camera_pose) == TYPE_DICTIONARY and _frozen_camera_pose.has("position"):
+		return _frozen_camera_pose["position"]
+	return Vector3.ZERO
