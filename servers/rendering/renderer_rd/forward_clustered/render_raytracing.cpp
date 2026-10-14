@@ -4250,11 +4250,11 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	// Binding 6: Raytracing params + unjittered VP matrices.
 	{
 		struct {
-			float params[40]; // F2: 16 -> 40 (vec4 rt_params[10] in the shader)
+			float params[44]; // F2: 16 -> 40; DoF: 44 (vec4 rt_params[11] in the shader)
 			float prev_vp_unjittered[16];
 			float curr_vp_unjittered[16];
 		} rt_ubo = {};
-		static_assert(sizeof(rt_ubo) == 72 * sizeof(float));
+		static_assert(sizeof(rt_ubo) == 76 * sizeof(float));
 
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			const float *env_params = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_params_ptr(p_render_data->environment);
@@ -4425,6 +4425,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_GUIDE_ORIGIN_X + 2] = guide_origin.z;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_GUIDE_CELL] = guide_cell;
 		}
+		// Thin-lens depth of field (spec 2026-10-13-pt-depth-of-field-design.md). Set per still by
+		// render.gd after the daylight probe; 0 keeps the pinhole camera (byte-identical).
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DOF_APERTURE] = MAX(0.0f, (float)GLOBAL_GET("rendering/pathtracer/dof_aperture_radius"));
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DOF_FOCUS] = MAX(0.05f, (float)GLOBAL_GET("rendering/pathtracer/dof_focus_distance"));
 		p_state->accum_enabled = accum_enabled;
 		// accum_frame is incremented post-trace in the dispatch site
 		// (render_forward_clustered.cpp) so it only advances after a real launch.

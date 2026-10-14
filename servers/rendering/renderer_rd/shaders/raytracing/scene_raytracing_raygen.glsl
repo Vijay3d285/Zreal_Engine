@@ -382,7 +382,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 /// Build the primary camera ray for `p_pixel` offset by `p_jitter` (in pixels).
 /// Passing vec2(0.5) reproduces the original pixel-centre ray exactly.
-void camera_ray(uvec2 p_pixel, vec2 p_jitter, out vec3 r_origin, out vec3 r_dir) {
+void camera_ray(uvec2 p_pixel, vec2 p_jitter, uint p_sample, out vec3 r_origin, out vec3 r_dir) {
 	const vec2 pixel_center = vec2(p_pixel) + p_jitter;
 	const vec2 in_uv = pixel_center / vec2(gl_LaunchSizeEXT.xy);
 	const vec2 d = in_uv * 2.0 - 1.0;
@@ -393,6 +393,22 @@ void camera_ray(uvec2 p_pixel, vec2 p_jitter, out vec3 r_origin, out vec3 r_dir)
 			vec4(0.0, 0.0, 0.0, 1.0)));
 
 	vec4 target = scene_data_block.data.inv_projection_matrix * vec4(d.x, d.y, 1.0, 1.0);
+	// Thin lens (Cycles camera_sample_perspective): aim every aperture point at
+	// the point where the pinhole ray meets the focal plane z = -focus. Sample 0
+	// stays a pinhole ray so the primary-ray depth/G-buffer writes stay aligned.
+	// Mirrored in tests/servers/rendering/test_pt_dof.cpp.
+	const float aperture = get_rt_param(RT_PARAM_DOF_APERTURE);
+	if (aperture > 0.0 && p_sample != 0u) {
+		const vec3 dir_view = normalize(target.xyz);
+		const vec3 focal = dir_view * (get_rt_param(RT_PARAM_DOF_FOCUS) / -dir_view.z);
+		const vec3 origin_view = vec3(aperture * rt_concentric_disk(camera_lens_u(p_pixel, p_sample)), 0.0);
+		r_origin = (inv_view * vec4(origin_view, 1.0)).xyz;
+		r_dir = (inv_view * vec4(normalize(focal - origin_view), 0.0)).xyz;
+		return;
+	}
+	// The pinhole ray, verbatim from before the lens: off is byte-identical only if
+	// these two lines compile exactly as they did (sharing a merged origin/direction
+	// with the lens path changed the GPU compiler's rounding: 21% of pixels moved).
 	r_origin = (inv_view * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
 	r_dir = (inv_view * vec4(normalize(target.xyz), 0.0)).xyz;
 }
@@ -468,7 +484,7 @@ void main() {
 		// accumulator averages the same camera ray forever and never
 		// anti-aliases, however many frames are driven.
 		vec3 origin, direction;
-		camera_ray(pixel, camera_filter_jitter(pixel, accum_frame), origin, direction);
+		camera_ray(pixel, camera_filter_jitter(pixel, accum_frame), accum_frame, origin, direction);
 
 		// accum_frame alone: contiguous, resets with the accumulator (unlike
 		// frame_index, which is a session-lifetime dispatch counter and never
@@ -528,7 +544,7 @@ void main() {
 		[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
 			bool sz = (sample_idx == 0u);
 			vec3 origin, direction;
-			camera_ray(pixel, camera_filter_jitter(pixel, sample_idx), origin, direction);
+			camera_ray(pixel, camera_filter_jitter(pixel, sample_idx), sample_idx, origin, direction);
 			// frame_index is the session-lifetime dispatch counter (never resets in
 			// this mode either), so successive realtime frames do not replay the
 			// same points. See rng_pack()'s saturation caveat in raytracing_inc.glsl

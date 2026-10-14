@@ -47,6 +47,8 @@
 #define RT_PARAM_GUIDE_PROB 35 // rt_params[8].w - path-guiding mixture probability (0 = off)
 #define RT_PARAM_GUIDE_ORIGIN_X 36 // rt_params[9].xyz - guide grid origin (the TLAS AABB min)
 #define RT_PARAM_GUIDE_CELL 39 // rt_params[9].w - guide voxel edge in metres (0 = off)
+#define RT_PARAM_DOF_APERTURE 40 // rt_params[10].x - thin-lens aperture radius, metres (0 = pinhole, off)
+#define RT_PARAM_DOF_FOCUS 41 // rt_params[10].y - focal plane distance along the view axis, metres
 
 // ============================================================================
 // PATHTRACING PAYLOAD (48 bytes nominal, fp32 radiance/throughput)
@@ -452,6 +454,7 @@ const uint RT_SAMPLER_SEED = 0x5f356495u;
 // from an earlier layout, not evidence of a two-slot-per-2D-draw convention.
 #define RT_PRNG_BOUNCE_NUM 16u
 #define RT_PRNG_FILTER 0u // 2D, init block only: sub-pixel reconstruction filter.
+#define RT_PRNG_LENS 1u // 2D, init block only: point on the thin-lens aperture (Cycles PRNG_LENS_TIME).
 #define RT_PRNG_SURFACE_BSDF 0u // 2D: BSDF direction sample.
 #define RT_PRNG_LIGHT 2u // 2D: position on the selected light.
 #define RT_PRNG_LOBE 4u // 1D: diffuse-vs-specular lobe choice.
@@ -635,6 +638,35 @@ vec2 camera_filter_jitter(uvec2 p_pixel, uint p_sample) {
 	r.offset = 0u;
 	vec2 u = rng_2d(r, RT_PRNG_FILTER);
 	return vec2(0.5) + vec2(bh_filter_1d(u.x), bh_filter_1d(u.y));
+}
+
+/// Shirley-Chiu concentric map of the unit square onto the unit disc (uniform
+/// density, low distortion). Mirrored in tests/servers/rendering/test_pt_dof.cpp.
+vec2 rt_concentric_disk(vec2 p_u) {
+	vec2 o = 2.0 * p_u - 1.0;
+	if (o.x == 0.0 && o.y == 0.0) {
+		return vec2(0.0);
+	}
+	float r;
+	float theta;
+	if (abs(o.x) > abs(o.y)) {
+		r = o.x;
+		theta = (PI * 0.25) * (o.y / o.x);
+	} else {
+		r = o.y;
+		theta = (PI * 0.5) - (PI * 0.25) * (o.x / o.y);
+	}
+	return r * vec2(cos(theta), sin(theta));
+}
+
+/// Aperture sample for accumulation/loop sample `p_sample`: init block,
+/// dimension RT_PRNG_LENS, the same scheme as camera_filter_jitter().
+vec2 camera_lens_u(uvec2 p_pixel, uint p_sample) {
+	RNGState r;
+	r.pixel = rng_pixel_seed(p_pixel);
+	r.sample_index = p_sample;
+	r.offset = 0u;
+	return rng_2d(r, RT_PRNG_LENS);
 }
 
 // ============================================================================

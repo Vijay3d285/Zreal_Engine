@@ -3894,6 +3894,11 @@ void RenderingServer::init() {
 	// Debug: the pass shows an accept/reject mask instead of the image (green accepted, yellow
 	// off-screen or no history, red depth, blue normal, magenta albedo guide, cyan clipped).
 	GLOBAL_DEF(PropertyInfo(Variant::BOOL, "rendering/pathtracer/temporal_debug"), false);
+	// Thin-lens depth of field (spec 2026-10-13-pt-depth-of-field-design.md): aperture radius in
+	// metres (0 = pinhole, off) and the focal plane's distance along the view axis. render.gd sets
+	// both on day stills from the daylight probe's depth; nothing else does.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/dof_aperture_radius", PROPERTY_HINT_RANGE, "0,0.05,0.0001,or_greater"), 0.0);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/dof_focus_distance", PROPERTY_HINT_RANGE, "0.05,100,0.01,or_greater"), 3.0);
 	// Transmission / rough glass (roadmap E1). Defaults to true, unlike C1's
 	// emissive_mesh_lights: the feature is already data-gated (transmission
 	// defaults to 0.0 and no pre-Phase-D content can set it), so an untouched

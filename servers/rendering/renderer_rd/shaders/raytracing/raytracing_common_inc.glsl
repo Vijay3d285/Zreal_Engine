@@ -123,7 +123,7 @@ global_shader_uniforms;
 #ifndef RT_STAGE_ANY_HIT
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
-	vec4 rt_params[10]; // F2: 4 -> 10; indices 16+ are the volume block (raytracing_inc.glsl)
+	vec4 rt_params[11]; // F2: 4 -> 10; DoF: 11 (slots 40-41). indices 16+ are the volume block (raytracing_inc.glsl)
 	mat4 prev_vp_unjittered;
 	mat4 curr_vp_unjittered;
 };
