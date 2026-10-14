@@ -74,8 +74,9 @@ sits about 10 m from the camera, beyond the far wall of a 6.8 m room.
   - convert each depth to metres along the ray: unproject `(ndc_x, ndc_y, depth)` through the
     inverse of the camera's depth-corrected projection and take the length;
   - focus distance = the **median**, clamped to **[0.5, 25] m**;
-  - if fewer than **10%** of the sampled pixels hit geometry (e.g. a shot straight out of a
-    window), depth of field stays **off** for that still and the log says why.
+  - if fewer than **10%** of the sampled pixels hit geometry (open sky only: window glass is
+    a primary hit, see the amendment), depth of field stays **off** for that still and the log
+    says why.
 - **Strength:** aperture radius = focal length / (2 x f-number), as Blender computes it; the focal
   length comes from the camera's vertical field of view on a full-frame 24 mm-high sensor:
   `f = 12 mm / tan(fov / 2)` (45 degrees -> 29.0 mm). The f-number is one constant,
@@ -152,3 +153,16 @@ probe); later renders are back to normal.
 **Owner's pick:** f/8 (`DOF_F_STOP := 8.0`; 29.0 mm at 45 degrees -> aperture radius 1.81 mm). On
 job 209 autofocus lands on the window wall, so everything from about 2.25 m back stays sharp and
 the near bench and rug soften slightly.
+
+**Window glass (final review, owner's ruling 2026-10-14: focus on the glass).** `rt_depth` records
+the first surface a primary ray commits to, and a window pane (alpha-blend or transmissive) is that
+surface, so a still aimed through a window focuses on the pane, not the view outside, and the
+under-10% fallback fires only for open sky. At f/8 the outside softens only when the pane is closer
+than about 3.5 m (about 4 px at 4K for a pane 2.5 m away); job 209's pane at 6.45 m is unaffected.
+The owner chose this over measuring the first non-glass surface (an extra engine read-back).
+
+**Shipping order.** `render.gd` calls the depth read-back by name, guarded by
+`RenderingServer.has_method()`: a direct call does not parse on a binary older than this feature
+(verified: "Static function viewport_get_pathtracing_depth_image() not found"), which would break
+every still. With the guard the scripts can ship first; on an old binary stills log
+`[DoF] off: this engine binary has no depth read-back` and render without depth of field.

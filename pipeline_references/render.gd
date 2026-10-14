@@ -703,10 +703,14 @@ func _dof_autofocus(p_vp: RID) -> void:
 	var cam := get_node_or_null("MainCamera") as Camera3D
 	var radius := 0.0
 	var focus := 3.0
-	if cam == null or Dof.DOF_F_STOP <= 0.0:
-		print("[DoF] off: %s" % ("no MainCamera" if cam == null else "DOF_F_STOP is 0"))
+	# Called by name, not directly: an engine binary older than the depth read-back
+	# (2026-10-13) rejects a direct call at PARSE time, which would break every still,
+	# so these scripts can ship before the binary and simply render without DoF.
+	var has_depth_api := RenderingServer.has_method("viewport_get_pathtracing_depth_image")
+	if cam == null or Dof.DOF_F_STOP <= 0.0 or not has_depth_api:
+		print("[DoF] off: %s" % ("no MainCamera" if cam == null else ("DOF_F_STOP is 0" if Dof.DOF_F_STOP <= 0.0 else "this engine binary has no depth read-back (pre 2026-10-13)")))
 	else:
-		var depth: Image = RenderingServer.viewport_get_pathtracing_depth_image(p_vp)
+		var depth: Image = RenderingServer.call("viewport_get_pathtracing_depth_image", p_vp)
 		var inv := (Projection.create_depth_correction(true) * cam.get_camera_projection()).inverse()
 		var m := Dof.measure_focus(depth, inv)
 		if m["ok"]:
