@@ -1264,6 +1264,18 @@ func setup_fixed_fill_lights():
 		_log_console("[VideoRender] Exterior day: fill grid skipped (matches image exterior).")
 		return
 
+	# Interior day: no fill grid either, as stills since the daylight design (spec 2026-09-19:
+	# "setup_fixed_fill_lights() is no longer called on day"). This changes no pixel: the grid
+	# SpotLights below were never added to the scene (their add_child is commented out) and
+	# the floor fill is already skipped on day, yet the log claimed "placed N grid fill
+	# lights" and 49 unused light nodes were created per video. Verified 2026-10-14: job 216
+	# keyframe 210 and keyframes 204-215, every frame byte-identical with and without this
+	# return. Day light comes from the sun, the sky through the portals, the fixtures and the
+	# daylight probe (exposure + its one measured fallback fill).
+	if day_render:
+		_log_console("[VideoRender] Day render: fill grid skipped (daylight design, as stills).")
+		return
+
 	var placed = 0
 	var lighting_scale = _resolve_illumination_scale(_render_data)
 	var mood_fill_color = _get_color_mood_light_color("fill")
@@ -1771,8 +1783,8 @@ func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 	# Create a copy to avoid mutating the original image
 	var thumb = source_image.duplicate()
 	
-	# Resize to max 480px on the longest side, preserving aspect ratio
-	var max_dim = 480
+	# Resize to max 3840px on the longest side, preserving aspect ratio
+	var max_dim = 3840
 	var w = thumb.get_width()
 	var h = thumb.get_height()
 	if w > max_dim or h > max_dim:
@@ -1785,8 +1797,8 @@ func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 			var new_w = int(float(w) * float(max_dim) / float(h))
 			thumb.resize(max(new_w, 1), new_h, Image.INTERPOLATE_LANCZOS)
 	
-	# Save as WebP with lossy compression (quality 0.75 = 75%)
-	var err = thumb.save_webp(thumb_path, true, 0.75)
+	# Save as WebP with lossy compression (quality 0.90 = 90%)
+	var err = thumb.save_webp(thumb_path, true, 0.90)
 	if err == OK:
 		print("Thumbnail saved to: ", thumb_path)
 	else:
