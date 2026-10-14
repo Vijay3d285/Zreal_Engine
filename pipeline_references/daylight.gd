@@ -24,7 +24,7 @@ extends RefCounted
 ## Direct-normal over diffuse-horizontal irradiance for a 10 AM clear sky:
 ## ~90 klux direct vs ~18 klux diffuse. The one look-defining constant.
 const SUN_TO_SKY := 5.0
-const SUN_ENERGY := SUN_TO_SKY / PI  # DirectionalLight3D.light_energy: energy E is irradiance pi*E in the tracer
+const SUN_ENERGY := SUN_TO_SKY / PI # DirectionalLight3D.light_energy: energy E is irradiance pi*E in the tracer
 ## Photographic mid-grey: the occupied frame's median after exposure.
 const TARGET_MEDIAN := 0.18
 ## Darkest occupied quarter must reach this after exposure, or a fill is added.
@@ -71,7 +71,7 @@ const RESET_SETTLE_FRAMES := 3
 ## jamb and the side-table lamp. The C++ default of
 ## rendering/pathtracer/highlight_relief_knee (rendering_server.cpp) must equal
 ## this, so the decision and the operator agree even if render.gd never runs.
-const RELIEF_KNEE := 3.0
+const RELIEF_KNEE := 2.0
 ## Below this fraction of samples past the knee, do nothing at all: the pass is
 ## not dispatched and the render is byte-identical to a build without this
 ## feature. Job 201 measured 4.17% of the FRAME clipped, and its sun patch is

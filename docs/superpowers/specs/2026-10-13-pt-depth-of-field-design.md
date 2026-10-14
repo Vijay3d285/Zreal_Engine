@@ -118,3 +118,35 @@ sits about 10 m from the camera, beyond the far wall of a 6.8 m room.
 
 Video depth of field; night stills; aperture blades / bokeh shape; per-job JSON control; focus on a
 named object; DoF in the daylight probe itself.
+
+## Amendment and results 2026-10-13 (implementation, `docs/superpowers/plans/2026-10-13-pt-depth-of-field.md`)
+
+**Rulings made in implementation:**
+- **`RT_PRNG_LENS = 1u`, not `2u`:** in this sampler a 2D draw occupies one slot, so the init
+  block's next free slot after the filter is 1 -- Cycles' `PRNG_LENS_TIME` position.
+- **The focus distance is axial** (`-z` in camera space), the same plane the lens focuses on, not
+  the length along each ray.
+- **The pinhole ray keeps its pre-lens code verbatim** after an early-return lens branch. A
+  version that merged the lens and pinhole origin/direction changed the GPU compiler's rounding
+  of every pinhole ray (20.8% of pixels moved by up to 64 levels, mean 0.1; probe exposure
+  24.909 -> 24.890), which "off is exact" forbids.
+
+**Measured on job 209** (4K, 256 spp + OIDN, production scripts, relief knee 2.0):
+
+| check | result |
+|---|---|
+| baseline repeatability (two renders) | byte-identical |
+| engine off (radius 0) / script off (`DOF_F_STOP := 0.0`) | byte-identical to the baseline |
+| exposure and relief with DoF on | unchanged (24.909, strength 0.837) |
+| centre pixel (window wall, 6.33-6.45 m by the floor plan) | 6.45 m |
+| focus (median of 32,215 central pixels, 99% hit) | 6.27 m |
+| 1 cm aperture at 6.4 m (lens smoke test) | foreground detail -87%, window wall -7% |
+| render time, warm shader cache | 500 s (baseline 498-504 s) |
+| shader compile errors | 0 |
+
+The first render after a new binary pays a one-off ray-tracing pipeline compile (+13-15 s in the
+probe); later renders are back to normal.
+
+**Owner's pick:** f/8 (`DOF_F_STOP := 8.0`; 29.0 mm at 45 degrees -> aperture radius 1.81 mm). On
+job 209 autofocus lands on the window wall, so everything from about 2.25 m back stays sharp and
+the near bench and rug soften slightly.
