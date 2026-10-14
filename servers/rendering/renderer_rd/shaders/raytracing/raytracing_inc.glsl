@@ -669,6 +669,38 @@ vec2 camera_lens_u(uvec2 p_pixel, uint p_sample) {
 	return rng_2d(r, RT_PRNG_LENS);
 }
 
+// Filter Glossy (spec 2026-10-14-pt-filter-glossy-design.md; Cycles surface_shader.h:195,
+// shade_surface.h:612). Each path keeps the smallest BSDF pdf it has sampled; once
+// fg * min_pdf < 1 its glossy lobes get an alpha floor of sqrt(1 - fg * min_pdf) * 0.5. The
+// minimum rides in 5 bits as a log-scale code: 0 = none yet; c in 1..31 decodes to
+// 2^(4 - (c-1)/3), 16 down to 2^-6, rounded so the stored pdf is never smaller than the true
+// one (the blur never stronger than Cycles'). Mirrored in test_pt_filter_glossy.cpp.
+float g_glossy_alpha_floor = 0.0; // set by shade_and_bounce at a blurred hit; read by ggxAnisoAlphas
+
+uint rt_glossy_min_encode(float p_pdf) {
+	if (!(p_pdf > 0.0) || p_pdf >= 16.0) {
+		return 0u;
+	}
+	return uint(min(31.0, floor(3.0 * (4.0 - log2(p_pdf))) + 1.0));
+}
+
+float rt_glossy_min_decode(uint p_code) {
+	return exp2(4.0 - float(p_code - 1u) / 3.0);
+}
+
+uint rt_glossy_min_update(uint p_code, float p_pdf) {
+	return max(p_code, rt_glossy_min_encode(p_pdf));
+}
+
+// p_fg = 1 / the filter_glossy setting, 0 = off. Returns 0.0 for no blur.
+float rt_glossy_alpha_floor(uint p_code, float p_fg) {
+	if (p_code == 0u || !(p_fg > 0.0)) {
+		return 0.0;
+	}
+	float blur_pdf = p_fg * rt_glossy_min_decode(p_code);
+	return blur_pdf < 1.0 ? sqrt(1.0 - blur_pdf) * 0.5 : 0.0;
+}
+
 // ============================================================================
 // FIREFLY CLAMPING
 // ============================================================================
