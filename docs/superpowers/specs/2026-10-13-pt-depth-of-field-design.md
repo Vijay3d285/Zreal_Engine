@@ -137,6 +137,8 @@ named object; DoF in the daylight probe itself.
 |---|---|
 | baseline repeatability (two renders) | byte-identical |
 | engine off (radius 0) / script off (`DOF_F_STOP := 0.0`) | byte-identical to the baseline |
+| night still (job 209 as night, SPP-2 pipeline), pre-DoF vs new binary | byte-identical (pre-DoF repeats byte-for-byte) |
+| video, job 210 keyframe 210 static (5 frames), pre-DoF vs new binary | 26/26 frames byte-identical (pre-DoF repeats 26/26) |
 | exposure and relief with DoF on | unchanged (24.909, strength 0.837) |
 | centre pixel (window wall, 6.33-6.45 m by the floor plan) | 6.45 m |
 | focus (median of 32,215 central pixels, 99% hit) | 6.27 m |
