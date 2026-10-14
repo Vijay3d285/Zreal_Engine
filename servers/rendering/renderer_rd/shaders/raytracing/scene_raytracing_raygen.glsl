@@ -176,6 +176,7 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	// accumulate variant; the one-shot pipelines (DLSS-RR, realtime) compile without it.
 	ps.feat_throughput = vec3(1.0);
 	ps.feat_pending = p_is_sample_zero && get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5;
+	ps.glossy_min_code = 0u; // Filter Glossy: no blurry bounce yet (Cycles' min_ray_pdf = FLT_MAX)
 #endif
 
 	vec3 ray_origin = p_origin;

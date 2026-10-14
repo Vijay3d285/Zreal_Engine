@@ -3900,6 +3900,10 @@ void RenderingServer::init() {
 	// both on day stills from the daylight probe's depth; nothing else does.
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/dof_aperture_radius", PROPERTY_HINT_RANGE, "0,0.05,0.0001,or_greater"), 0.0);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/dof_focus_distance", PROPERTY_HINT_RANGE, "0.05,100,0.01,or_greater"), 3.0);
+	// Filter Glossy (spec 2026-10-14-pt-filter-glossy-design.md): Blender's setting and default
+	// (1.0): after a blurry bounce, glossy lobes get an alpha floor, so sharp reflections seen
+	// through bounce light stop producing speckles. 0 = off. Accumulate (still / video) route.
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/filter_glossy", PROPERTY_HINT_RANGE, "0,10,0.01"), 1.0);
 	// Transmission / rough glass (roadmap E1). Defaults to true, unlike C1's
 	// emissive_mesh_lights: the feature is already data-gated (transmission
 	// defaults to 0.0 and no pre-Phase-D content can set it), so an untouched

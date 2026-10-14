@@ -4429,6 +4429,12 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// render.gd after the daylight probe; 0 keeps the pinhole camera (byte-identical).
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DOF_APERTURE] = MAX(0.0f, (float)GLOBAL_GET("rendering/pathtracer/dof_aperture_radius"));
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DOF_FOCUS] = MAX(0.05f, (float)GLOBAL_GET("rendering/pathtracer/dof_focus_distance"));
+		// Filter Glossy (spec 2026-10-14-pt-filter-glossy-design.md): Cycles stores 1 / the UI value
+		// (scene/integrator.cpp:269); 0 = off.
+		{
+			const float filter_glossy = (float)GLOBAL_GET("rendering/pathtracer/filter_glossy");
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_FILTER_GLOSSY] = filter_glossy > 0.0f ? 1.0f / filter_glossy : 0.0f;
+		}
 		p_state->accum_enabled = accum_enabled;
 		// accum_frame is incremented post-trace in the dispatch site
 		// (render_forward_clustered.cpp) so it only advances after a real launch.

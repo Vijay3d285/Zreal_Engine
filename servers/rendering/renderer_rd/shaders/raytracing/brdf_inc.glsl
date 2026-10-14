@@ -1985,7 +1985,9 @@ bool ggxAnisoAlphas(float alpha, MaterialProperties material, float3 N,
 	// Cycles saturates unconditionally. alpha is roughness^2 and roughness is
 	// [0,1], so the isotropic clamp is a no-op today; it is applied anyway to
 	// match Cycles exactly rather than depend on that invariant holding forever.
-	outAx = clamp(alpha, 0.0f, 1.0f);
+	// Filter Glossy: g_glossy_alpha_floor is 0.0 except at a blurred hit, where it is Cycles'
+	// bsdf_blur floor on both axes (spec 2026-10-14-pt-filter-glossy-design.md).
+	outAx = max(clamp(alpha, 0.0f, 1.0f), g_glossy_alpha_floor);
 	outAy = outAx;
 	outPhi = 0.0f;
 
@@ -1995,8 +1997,8 @@ bool ggxAnisoAlphas(float alpha, MaterialProperties material, float3 N,
 		float3 Tlocal = rotatePoint(qToZ, material.tangent / tangentLen);
 		if (dot(Tlocal.xy, Tlocal.xy) > 1e-12f) {
 			float aspect = anisoAspect(material.anisotropy);
-			outAx = clamp(alpha / aspect, 0.0f, 1.0f);
-			outAy = clamp(alpha * aspect, 0.0f, 1.0f);
+			outAx = max(clamp(alpha / aspect, 0.0f, 1.0f), g_glossy_alpha_floor);
+			outAy = max(clamp(alpha * aspect, 0.0f, 1.0f), g_glossy_alpha_floor);
 			outPhi = atan(Tlocal.y, Tlocal.x) + material.anisotropyRotation;
 			return true;
 		}

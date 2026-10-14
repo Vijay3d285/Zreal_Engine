@@ -49,6 +49,7 @@
 #define RT_PARAM_GUIDE_CELL 39 // rt_params[9].w - guide voxel edge in metres (0 = off)
 #define RT_PARAM_DOF_APERTURE 40 // rt_params[10].x - thin-lens aperture radius, metres (0 = pinhole, off)
 #define RT_PARAM_DOF_FOCUS 41 // rt_params[10].y - focal plane distance along the view axis, metres
+#define RT_PARAM_FILTER_GLOSSY 42 // rt_params[10].z - 1 / the Filter Glossy setting (0 = off)
 
 // ============================================================================
 // PATHTRACING PAYLOAD (48 bytes nominal, fp32 radiance/throughput)
@@ -99,7 +100,8 @@ struct PathPayload {
 	// RT_OIDN_FEATURES (the accumulate / Phase A pipeline only: sample-count field 0 in
 	// the RT flags word, see scene_shader_raytracing.cpp) turns that word into a plain
 	// uint, sss_bits: bit 0 sss_exit, bit 1 guide_record, bit 2 feat_pending (OIDN
-	// guides), bits 8-15 / 16-23 / 24-31 the OIDN feature throughput r / g / b as unorm8
+	// guides), bits 3-7 the Filter Glossy minimum-pdf code (spec 2026-10-14), bits
+	// 8-15 / 16-23 / 24-31 the OIDN feature throughput r / g / b as unorm8
 	// (spec 2026-10-04-oidn-guide-feature-passthrough-design.md; Cycles'
 	// denoising_feature_throughput, a product of albedos in [0, 1], quantised exactly as
 	// packUnorm4x8 does, so 1.0 round-trips). Same 16 bytes, so the payload stays 92:
@@ -210,6 +212,7 @@ struct PathState {
 #ifdef RT_OIDN_FEATURES
 	vec3 feat_throughput; // OIDN guide: product of the specular albedos deferred through
 	bool feat_pending; // OIDN guide: this sample has not written its guide yet
+	uint glossy_min_code; // Filter Glossy: running minimum pdf code, 0..31 (bits 3-7 of sss_bits)
 #endif
 };
 
@@ -227,12 +230,13 @@ PathState path_unpack(PathPayload p) {
 	s.skip_prim = p.skip_prim;
 #ifdef RT_OIDN_FEATURES
 	s.sss_restart = p.sss_restart;
-	// sss_bits: bit 0 sss_exit, bit 1 guide_record, bit 2 feat_pending, bits 8-31 the
-	// OIDN feature throughput as three unorm8 (see PathPayload).
+	// sss_bits: bit 0 sss_exit, bit 1 guide_record, bit 2 feat_pending, bits 3-7 the Filter
+	// Glossy minimum-pdf code, bits 8-31 the OIDN feature throughput as three unorm8 (see PathPayload).
 	s.sss_exit = (p.sss_bits & 1u) != 0u;
 	s.guide_record = (p.sss_bits & 2u) != 0u;
 	s.feat_pending = (p.sss_bits & 4u) != 0u;
 	s.feat_throughput = unpackUnorm4x8(p.sss_bits >> 8u).rgb;
+	s.glossy_min_code = (p.sss_bits >> 3u) & 31u;
 #else
 	s.sss_restart = p.sss_restart.xyz;
 	// sss_restart.w carries two bits as a small integer: 1 = sss_exit, 2 = guide_record.
@@ -260,7 +264,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	// packUnorm4x8(vec4(t.rgb, 0)) puts r, g, b in bits 0-23; << 8 moves them to 8-31 and
 	// drops the empty w byte. Same quantisation as the old dedicated word.
 	p.sss_bits = (s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u) | (s.feat_pending ? 4u : 0u) |
-			(packUnorm4x8(vec4(s.feat_throughput, 0.0)) << 8u);
+			((s.glossy_min_code & 31u) << 3u) | (packUnorm4x8(vec4(s.feat_throughput, 0.0)) << 8u);
 #else
 	p.sss_restart = vec4(s.sss_restart, float((s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u)));
 #endif

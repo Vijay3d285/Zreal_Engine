@@ -1866,6 +1866,22 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.sssScale = 0.0;
 #endif
 
+#ifdef RT_OIDN_FEATURES
+	// Filter Glossy (spec 2026-10-14-pt-filter-glossy-design.md; Cycles surface_shader.h:195):
+	// after a blurry bounce, every glossy lobe gets Cycles' alpha floor before NEE and the next
+	// bounce, so a sharp reflection reached through bounce light cannot be a speckle. The
+	// camera's own hit has code 0 and never blurs. Our alpha is roughness^2.
+	{
+		const float glossy_floor = rt_glossy_alpha_floor(ps.glossy_min_code, get_rt_param(RT_PARAM_FILTER_GLOSSY));
+		if (glossy_floor > 0.0) {
+			const float r_floor = sqrt(glossy_floor);
+			brdf_mat.roughness = max(brdf_mat.roughness, r_floor);
+			brdf_mat.coatRoughness = max(brdf_mat.coatRoughness, r_floor);
+			g_glossy_alpha_floor = glossy_floor;
+		}
+	}
+#endif
+
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
 	// Fix round 1, I2: the transmission weight used to be applied to THIS
 	// local via a separate `*=` below, but this local's only consumer is
@@ -2756,6 +2772,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	} else {
 		float bsdf_pdf = combinedPdf(N, next_dir, V, brdf_mat);
 		ps.mis_ray_pdf = (bsdf_pdf > 0.0) ? bsdf_pdf : RT_MIS_PDF_NONE;
+#ifdef RT_OIDN_FEATURES
+		if (get_rt_param(RT_PARAM_FILTER_GLOSSY) > 0.0) {
+			// Cycles: min_ray_pdf = fminf(unguided_bsdf_pdf, min_ray_pdf) (shade_surface.h:612).
+			// combinedPdf's diffuse term reads g_guide, so take the material's own pdf without it.
+			float unguided_pdf = bsdf_pdf;
+			if (g_guide.is_active) {
+				const GuideState guide_saved = g_guide;
+				g_guide.is_active = false;
+				unguided_pdf = combinedPdf(N, next_dir, V, brdf_mat);
+				g_guide = guide_saved;
+			}
+			ps.glossy_min_code = rt_glossy_min_update(ps.glossy_min_code, unguided_pdf);
+		}
+#endif
 	}
 	// Light portals: the sky pdf the miss stage weighs this ray against is
 	// evaluated from the same point the env NEE above used (h.hit_pos).
