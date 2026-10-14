@@ -150,10 +150,18 @@ const H2_TOL := 0.01
 # forced-dispatch diagnostic on the SMALLER first fixture read 0.1537. Neither
 # is a measurement of this fixture at this band; both are kept so the number's
 # provenance is not lost.
+#
+# 2026-10-14: the bar is now 0.05. At the owner's knee 2.0 this fixture read
+# 0.3930 at 1-8 px on the bilinear-upsample shader (FAIL at 0.25), and
+# production showed what that halo is: job 211's coffee-table rim went from 143
+# to 35 levels, a dark boxy band around every sun patch (0.6% of the frame).
+# The shader now upsamples the gain map edge-aware (local_highlight.glsl), so a
+# pixel darker than the patch keeps its own gain; the ring beside the patch
+# should barely move. 0.05 leaves room for the patch's own soft edge.
 # The band H3 gates, in px below the patch's near edge -- where the halo is.
 const H3_RING_NEAR_PX := 1
 const H3_RING_FAR_PX := 8
-const H3_MAX_DARKENING := 0.25
+const H3_MAX_DARKENING := 0.05
 
 # Frame size and patch size. The blur footprint is a fixed number of PIXELS
 # (see BLUR_PX), so what decides whether the fixture exercises the operator is

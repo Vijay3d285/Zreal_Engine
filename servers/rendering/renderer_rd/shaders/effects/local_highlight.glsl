@@ -33,6 +33,10 @@ float luminance(vec3 c) {
 	return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
+// Range of the edge-aware upsample, in stops of luminance: cells more than ~2 stops
+// away from a pixel's own brightness barely count toward its gain.
+const float RELIEF_RANGE_SIGMA_STOPS = 1.0;
+
 void main() {
 	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
 
@@ -60,12 +64,33 @@ void main() {
 	if (any(greaterThanEqual(pos, params.src_size))) {
 		return;
 	}
-	// The blurred luminance is read with a bilinear sampler at the pixel's own
-	// normalised position, so the 1/16 map is smoothly upsampled -- no blocky
-	// gain field. THE DIVISOR MUST STAY SMOOTH: that is what preserves the
-	// patch's own texture while moving the patch as a whole down the curve.
-	vec2 uv = (vec2(pos) + 0.5) / vec2(params.src_size);
-	float lb = textureLod(source_luma, uv, 0.0).r * params.exposure;
+	// The 1/16 map is upsampled EDGE-AWARE (joint bilateral): the 4x4 nearest
+	// cells, each weighted by a tent of radius 2 cells and by how close its log
+	// luminance is to this pixel's own. A plain bilinear read gave every pixel
+	// within ~32 px of a sun patch the patch's gain, so the darker objects beside
+	// it went dark too (2026-10-14: job 211's coffee-table rim, 143 -> 35 levels).
+	// Inside a patch all cells are alike, so the divisor stays smooth there --
+	// THE DIVISOR MUST STAY SMOOTH: that is what preserves the patch's own
+	// texture while moving the patch as a whole down the curve.
+	// Mirrored in tests/servers/rendering/test_pt_relief.cpp.
+	vec4 c = imageLoad(dest_color, pos);
+	vec2 t = (vec2(pos) + 0.5) / vec2(params.src_size) * vec2(params.dst_size) - 0.5;
+	ivec2 base = ivec2(floor(t)) - 1;
+	float own_log = log2(max(luminance(c.rgb), 1e-6));
+	float acc = 0.0;
+	float wsum = 0.0;
+	for (int y = 0; y < 4; y++) {
+		for (int x = 0; x < 4; x++) {
+			ivec2 cell = base + ivec2(x, y);
+			vec2 ws2 = max(vec2(0.0), 1.0 - abs(vec2(cell) - t) * 0.5);
+			float l = texelFetch(source_luma, clamp(cell, ivec2(0), params.dst_size - 1), 0).r;
+			float dl = log2(max(l, 1e-6)) - own_log;
+			float w = ws2.x * ws2.y * (exp(-0.5 * dl * dl / (RELIEF_RANGE_SIGMA_STOPS * RELIEF_RANGE_SIGMA_STOPS)) + 1e-6);
+			acc += w * l;
+			wsum += w;
+		}
+	}
+	float lb = acc / max(wsum, 1e-12) * params.exposure;
 	float excess = max(0.0, lb / params.knee - 1.0);
 	float gain = 1.0 / (1.0 + params.strength * excess);
 
@@ -73,7 +98,6 @@ void main() {
 		imageStore(dest_color, pos, vec4(vec3(gain), 1.0));
 		return;
 	}
-	vec4 c = imageLoad(dest_color, pos);
 	imageStore(dest_color, pos, vec4(c.rgb * gain, c.a));
 #endif
 }
