@@ -970,6 +970,7 @@ public:
 	/* PATH TRACER ACCUMULATOR READBACK */
 
 	virtual Ref<Image> get_pathtracing_accum_image(Ref<RenderSceneBuffers> p_render_buffers) override;
+	virtual Ref<Image> get_pathtracing_depth_image(Ref<RenderSceneBuffers> p_render_buffers) override;
 
 	/* GEOMETRY INSTANCE */
 

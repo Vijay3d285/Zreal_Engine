@@ -345,6 +345,7 @@ public:
 	// no accumulation has run). Blocking readback: call only after a frame has
 	// been drawn.
 	virtual Ref<Image> get_pathtracing_accum_image(Ref<RenderSceneBuffers> p_render_buffers) { return Ref<Image>(); }
+	virtual Ref<Image> get_pathtracing_depth_image(Ref<RenderSceneBuffers> p_render_buffers) { return Ref<Image>(); }
 
 	virtual void screen_space_roughness_limiter_set_active(bool p_enable, float p_amount, float p_limit) = 0;
 	virtual bool screen_space_roughness_limiter_is_active() const = 0;

@@ -1418,6 +1418,7 @@ public:
 	PASS0R(Ref<RenderSceneBuffers>, render_buffers_create)
 	PASS1(gi_set_use_half_resolution, bool)
 	PASS1R(Ref<Image>, get_pathtracing_accum_image, Ref<RenderSceneBuffers>)
+	PASS1R(Ref<Image>, get_pathtracing_depth_image, Ref<RenderSceneBuffers>)
 
 	/* Misc */
 	PASS1(set_debug_draw_mode, RSE::ViewportDebugDraw)

@@ -1,5 +1,8 @@
 extends "res://image_glb_creation.gd"
 
+# Thin-lens depth of field (spec 2026-10-13). Preloaded, not a class_name: no class cache in production.
+const Dof = preload("res://dof.gd")
+
 # render.gd
 # Main entry point for rendering. Handles arguments, camera, and rendering output.
 var use_threejs = true
@@ -688,7 +691,35 @@ func _daylight_probe_and_expose(p_env: Environment) -> void:
 	print("[Relief] clipped %.2f%% of probe samples past knee %.1f -> strength %.3f (%s)" % [
 			100.0 * relief["clipped_fraction"], Daylight.RELIEF_KNEE, relief["strength"],
 			"ON" if relief["needed"] else "off"])
+	# Depth of field (spec 2026-10-13): focus from the depth this probe just rendered (no
+	# lens yet), so exposure, fill and relief above are decided exactly as before.
+	_dof_autofocus(vp)
 	await Daylight.reset_accumulator(self, p_env)
+
+
+## Centre-weighted autofocus from the probe's primary-hit depth (spec 2026-10-13).
+## Always writes both settings: a still where it cannot focus keeps the pinhole.
+func _dof_autofocus(p_vp: RID) -> void:
+	var cam := get_node_or_null("MainCamera") as Camera3D
+	var radius := 0.0
+	var focus := 3.0
+	if cam == null or Dof.DOF_F_STOP <= 0.0:
+		print("[DoF] off: %s" % ("no MainCamera" if cam == null else "DOF_F_STOP is 0"))
+	else:
+		var depth: Image = RenderingServer.viewport_get_pathtracing_depth_image(p_vp)
+		var inv := (Projection.create_depth_correction(true) * cam.get_camera_projection()).inverse()
+		var m := Dof.measure_focus(depth, inv)
+		if m["ok"]:
+			radius = Dof.aperture_radius_m(cam.fov, Dof.DOF_F_STOP)
+			focus = m["distance"]
+			print("[DoF] focus %.2f m (median of %d central pixels, %d%% hit; centre pixel %.2f m), f/%.1f at %.1f mm -> aperture radius %.2f mm" % [
+					focus, m["hits"], int(round(100.0 * m["hit_fraction"])), m["centre_distance"],
+					Dof.DOF_F_STOP, Dof.focal_length_mm(cam.fov), radius * 1000.0])
+		else:
+			print("[DoF] off: only %d%% of central pixels hit geometry (need %d%%)" % [
+					int(round(100.0 * m["hit_fraction"])), int(round(100.0 * Dof.MIN_HIT_FRACTION))])
+	ProjectSettings.set_setting("rendering/pathtracer/dof_aperture_radius", radius)
+	ProjectSettings.set_setting("rendering/pathtracer/dof_focus_distance", focus)
 
 
 ## The fallback fill: centroid of the camera's room (or the lighting bounds'
@@ -1381,7 +1412,7 @@ func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 	if source_image == null or source_image.is_empty(): return
 	var thumb_path = output_path.get_base_dir().path_join(output_path.get_file().get_basename() + "_thumb.webp")
 	var thumb: Image = source_image.duplicate() as Image
-	var max_dim = 480
+	var max_dim = 3840
 	var w = thumb.get_width(); var h = thumb.get_height()
 	if w > max_dim or h > max_dim:
 		if w >= h: thumb.resize(max_dim, int(float(h) * max_dim / w), Image.INTERPOLATE_LANCZOS)
@@ -1389,11 +1420,11 @@ func _save_thumbnail_webp(source_image: Image, output_path: String) -> void:
 	# Downsample BEFORE the colour conversion. The still path hands us a LINEAR RGBH
 	# readback, which Image.resize() handles natively (only RGB565/RGBA4444/RGBE9995
 	# need converting first), so the Lanczos filter runs in linear light — which is
-	# where averaging is actually correct — and the sRGB encode then runs on 480px
+	# where averaging is actually correct — and the sRGB encode then runs on 3840px
 	# instead of on 8.3 M. save_webp needs 8-bit anyway, and feeding it the linear
 	# buffer directly would come out badly darkened. No-op on the 8-bit video path.
 	thumb = _linear_image_to_srgb8(thumb)
-	thumb.save_webp(thumb_path, true, 0.75)
+	thumb.save_webp(thumb_path, true, 0.90)
 
 func _wait_frames(count: int) -> void:
 	for i in range(count): await get_tree().process_frame
