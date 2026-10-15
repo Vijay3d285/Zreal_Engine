@@ -201,3 +201,63 @@ probe re-meters the PNG):
   planned.
 - **Max-channel versus channel-sum clamping**, at every site.
 - **Fog in-scatter**, which is not routed through `clamp_contribution`.
+
+## Results 2026-10-15
+
+Measured in the main checkout, with session 2 Active for every run. Ledger:
+`.superpowers/sdd/2026-10-14-pt-sky-miss-clamp/progress.md`; runs, `measure.txt` and crops:
+`.superpowers/sdd/2026-10-14-sky-miss-clamp/` (both git-ignored).
+
+**Gate** (`pipeline_references/tests/pt_sky_clamp_gate.gd`, ratio of crop means, clamps 0/10 over 0/0):
+
+| Binary | S1 | S3 | F1 | S2 | Result |
+|---|---|---|---|---|---|
+| pre-change | 1.000000 | 1.000000 | 1.000001 | 1.000000 | FAIL (S2) |
+| fault, `== 0u` | 1.000000 | 0.010000 | 0.234869 | 0.010000 | FAIL (S3, F1) |
+| this rule, `<= 1u` | 1.000000 | 1.000000 | 1.000001 | 0.049615 | PASS |
+
+The S1 guard (sky over limit) read 100 on all three.
+
+**Job 209**, luminance of the raw `oidn_color.pfm` at 4K:
+
+| Run | Binary | Env | > 50 | > 200 | Mean | Box-4 median | Exposure | PNG luma | Time |
+|---|---|---|---|---|---|---|---|---|---|
+| R1 | pre-change | production, 256 | 18 | 0 | 0.04309 | 0.00868 | 24.437 | 117.68 | 507 s |
+| R2 | pre-change | production, 256 | 18 | 0 | 0.04309 | 0.00868 | 24.437 | 117.68 | 501 s |
+| R3 | new | production, 256 | 15 | 0 | 0.04270 | 0.00867 | 24.433 | 117.59 | 537 s |
+| R4 | pre-change | clamp 0, 64 | 34 | 2 | 0.04324 | 0.00876 | 24.452 | 117.81 | 262 s |
+| R5 | new | clamp 0, 64 | 34 | 2 | 0.04324 | 0.00876 | 24.452 | 117.81 | 265 s |
+| R6 (diagnostic) | pre-change source, this build's config | clamp 0, 64 | byte-identical to R4 | | | | 24.452 | | 322 s |
+
+R1 and R2 are byte-identical, raw dump and PNG, so the run-to-run spread is 0. R3's extra time
+is mostly in the daylight probe (69 s against 55 s), which was the new binary's first job.
+
+**Verdict**, by the rules fixed in section 4:
+- **V1 FAIL.** R4 and R5 differ in 9164 pixels (0.110%). Each differs by at most 1.19e-7 raw (3e-7
+  relative, 1 ULP), the luminance sum is unchanged, and 615 PNG pixels differ by 1 level. R6,
+  the pre-change shader built with this change's `d3d12=no` config, is byte-identical to R4, so
+  the build config is not the cause. The new expression's code shape changes float rounding at
+  0/0, although `clamp_contribution` returns its argument there; the most likely mechanism is
+  multiply-add contraction. So section 1's invariant ("byte-identical to the pre-change binary"
+  at 0/0) does not hold. DLSS-RR video and the gates, all at 0/0, will drift by 1 ULP on about
+  0.1% of pixels. Per the rule, work stopped here and the owner decides.
+- **V2 split.** Above 50: 18 -> 15, a drop of 3 against a spread of 0, so PASS. Above 200: 0 -> 0,
+  FAIL as written, because R1 had no pixel above 200 to remove (the shipped Filter Glossy build
+  had 1). Job 209's remaining bright spikes are not sky reached by a bounce ray: R1's ten
+  brightest pixels (192, 184, 104, ...) are unchanged in R3. Gate S2 proves the mechanism.
+- **V3 PASS.** Mean -0.90%, box-4 median -0.03%.
+- **V4 PASS.** The three window panes' raw crop means are unchanged (+0.00%), and the PNG crops look
+  the same (`crops/all_windows_R1_vs_R3.png`). No sun disc is in view.
+
+**What the clamp removed.** No pixel rose. 244 pixels dropped by more than 1 raw, and 390 by
+more than 0.1. They are isolated speckles, such as (2239, 605) 60.44 -> 0.06: single sky samples
+of about 1.5e4 reached at total >= 2. They are spread over the room and densest on the right-hand
+sofa. Their sum is the -0.90% in the mean.
+
+**Not measured.**
+- OIDN video jobs. Their windows are an alpha closure, so sky reached through a pane from a
+  bounce vertex is now clamped there too.
+- The DLSS-RR one-shot variant. Per V1, it is not byte-identical at 0/0 either.
+
+**Build note.** The pre-change binary had been built with D3D12. This change was built with the
+instructed `d3d12=no` (176 MB against 186 MB), and R6 shows that this does not change rendering.
