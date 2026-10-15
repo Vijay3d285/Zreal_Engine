@@ -109,6 +109,9 @@ func _resolve_video_denoiser() -> String:
 	# one-shot one, so with it on the probe would meter light the frames never render (~2% darker).
 	if mode == "dlssrr":
 		ProjectSettings.set_setting("rendering/pathtracer/filter_glossy", 0.0)
+		# Blue-noise sampling (spec 2026-10-15-pt-blue-noise-sampling-design.md) is the same case:
+		# accumulate variant only, so the classic pattern keeps the probe byte-identical.
+		ProjectSettings.set_setting("rendering/pathtracer/sampling_pattern", 0)
 	# T4 test hook: force an accumulator reset every delivered frame, so a static camera yields
 	# independent renders of identical content. Phase A modes only; production never sets it.
 	_flicker_test = mode != "dlssrr" and OS.get_environment("ZR_VIDEO_FLICKER_TEST") == "1"
