@@ -1307,17 +1307,20 @@ func setup_lighting(data, geom_data = {}):
 	#
 	# Optional tuning env vars (offline route only):
 	#   ZR_PT_ACCUM_TARGET   accumulation frames        (default 256)
-	#   ZR_PT_CLAMP_INDIRECT firefly clamp, 0 = off     (default 0; Blender's is 10)
+	#   ZR_PT_CLAMP_INDIRECT firefly clamp, 0 = off     (default 10; Blender's is 10)
 	#   ZR_PT_NOISE_THRESH   adaptive sampling, 0 = off (default 0 for a pure reference)
 	#   ZR_PT_FINAL          "oidn" | "dlssrr" | "none" (default "oidn")
 	#
-	# KNOWN OPEN ITEM if CLAMP_INDIRECT is enabled: it only clamps the environment-NEE
-	# half of a sky hit (raytracing_closest_hit_common_inc.glsl clamp_contribution on the
-	# env_sample() contribution); the BSDF/miss half that reaches the sky is added raw
-	# (scene_raytracing_raygen.glsl sky_contribution). The two MIS strategies then
-	# estimate different integrands, so the sky darkens where the env-NEE weight is high
-	# while BSDF-sampled sun fireflies pass through unclamped. This is inert at the
-	# default (clamp is 0 = off); it is not intended behaviour, just not yet fixed.
+	# CLAMP_INDIRECT AND THE SKY (spec 2026-10-14-pt-sky-miss-clamp-design.md). Both MIS halves
+	# of a sky hit are clamped. The environment-NEE half takes its vertex's limit
+	# (raytracing_closest_hit_common_inc.glsl clamp_limit); the BSDF half, added in the miss
+	# stage (scene_raytracing_raygen.glsl sky_clamp), takes Cycles' film_write_background rule,
+	# bounce - 1: the camera ray and the first surface's bounce ray are direct (clamp_direct,
+	# 0 here, so unclamped), later bounces indirect. Before this the miss half was added raw,
+	# and single-pixel sky spikes through glass passed clamp_indirect untouched.
+	# One asymmetry remains: an alpha pass-through counts as a bounce in our counter, so sky
+	# reached through an alpha pane from a first-bounce vertex takes the indirect limit where
+	# Cycles keeps it direct. Fixing that needs a payload bit; not planned.
 	var phase_a_offline := PHASE_A_OFFLINE_STILL or OS.get_environment("ZR_PHASE_A") == "1"
 
 	if phase_a_offline:
