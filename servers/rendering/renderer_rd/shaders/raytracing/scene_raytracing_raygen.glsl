@@ -765,7 +765,21 @@ void main() {
 	const float sky_clamp = (get_total_bounces(ps.packed_bounces_flags) <= 1u)
 			? get_rt_param(RT_PARAM_CLAMP_DIRECT)
 			: get_rt_param(RT_PARAM_CLAMP_INDIRECT);
-	vec3 sky_contribution = clamp_contribution(ps.throughput * sky_color * mis_w, sky_clamp);
+	// The clamp is clamp_contribution's (max channel scaled down to the limit), applied as a
+	// factor on mis_w instead of to the finished product, so the multiply that feeds
+	// ps.radiance stays the one it was before the clamp existed: sky_scale is exactly 1.0 at
+	// clamps 0/0 and the result is bit-for-bit the old one. Routing the product through
+	// clamp_contribution -- unconditionally, or inside an if on the limit -- moved 0.11% of
+	// job 209's pixels by 1 ULP at 0/0 (GPU code shape, not value; spec Results).
+	float sky_scale = 1.0;
+	if (sky_clamp > 0.0) {
+		const vec3 sky_unclamped = ps.throughput * sky_color * mis_w;
+		const float sky_max = max(sky_unclamped.r, max(sky_unclamped.g, sky_unclamped.b));
+		if (sky_max > sky_clamp) {
+			sky_scale = sky_clamp / sky_max;
+		}
+	}
+	vec3 sky_contribution = ps.throughput * sky_color * (mis_w * sky_scale);
 
 #ifdef RT_DEBUG_ENABLED
 	{
