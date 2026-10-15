@@ -84,6 +84,8 @@ if (glossy_min_code > 0 && fg > 0):        // fg = 1 / setting, 0 when the setti
 
 - Our GGX uses `alpha = roughness * roughness` (`brdf_inc.glsl:2054`); Cycles floors alpha, so the
   roughness floor is `sqrt(alpha_floor)`. Transmission shares `roughness`.
+  **Amended after measurement (see Results):** materials with transmission are NOT blurred --
+  unlike Cycles, which blurs refraction and glass closures too.
 - Anisotropy: `ggxAnisoAlphas` (`brdf_inc.glsl:1983`) is the only place ax/ay are derived; it
   clamps both to the module-level `g_glossy_alpha_floor` (the existing `g_guide` pattern), which is
   0.0 except at a blurred hit.
@@ -130,3 +132,58 @@ To turn it off in production: `rendering/pathtracer/filter_glossy=0.0` under `[r
 
 Blue-noise sampling (the next spec); Filter Glossy on the one-shot / DLSS-RR route; volumes;
 MNEE (we have none).
+
+## Results 2026-10-14
+
+Measured on the production scripts: job 209 still (256 spp, `clamp_indirect` 10) and job 216
+keyframes 204-215 (24 spp), each with Filter Glossy off (`filter_glossy=0.0`) and on, with the raw
+OIDN input dumped (`ZR_OIDN_DUMP`).
+
+**Off is exact.** The job 209 still with `filter_glossy=0.0` is byte-identical to the pre-change
+binary, and again after the fix below.
+
+**As first built, on blurred glass, and that added light instead of removing grain.**
+- The final PNG's mean moved only +0.06%, but only because the daylight probe re-metered
+  (exposure 24.909 -> 22.199). The PNG check in Testing item 3 cannot fail on a probe-exposed day
+  render; bias is judged on the raw OIDN input instead.
+- The raw input was +4.87% mean and +12% median (4x4 box averages).
+- An unclamped pair showed +12.4%, so this was not recovered clamp energy. With the sun's energy
+  zeroed it was +18% median and +32% mean, so it was not a sun caustic either.
+- Each "on" render also had the same single-pixel spikes of 100-215 raw (one sample ~5e4) that
+  `clamp_indirect` never touched: 64 pixels above 50, against 19 with off.
+
+**The cause is glass.** A temporary per-lobe mask, sun off at 64 spp:
+- blurring only transmissive materials reproduced all of it (+30.3% mean, +11.5% median, spikes 1 -> 9);
+- blurring everything except them gave -1.0% / +0.7% / 1 -> 1;
+- coat, metals and the guide pdf had no effect.
+
+All three windows in job 209 are `cast_shadow` OFF (Gap #30), so window light depends on the
+sampler. A blurred pane sends bounce rays to the HDR sky at MIS weight 1 (transmissive lobe ->
+`RT_MIS_PDF_NONE`), into the miss path, which adds the sky without a clamp. Production glass is
+also optically clear on purpose (`_apply_glb_transmissive_glass`, roughness 0). So Filter Glossy
+skips any material with `transmissivness > 0`.
+
+**The new gate** is `pipeline_references/tests/filter_glossy/fg_energy_gate.py`. On the raw dumps it
+requires mean and box-4 median within 2% and no more than 2 extra pixels above 200. It is RED on
+dd87243e38 (+29.55% / +12.18% / 1 -> 10) and GREEN on the fix (-1.03% / +0.68% / 1 -> 1).
+
+**Shipped behaviour, measured off -> on:**
+
+| | Raw speckles | Raw mean | Raw median | Pixels > 50 | Exposure | PNG luma | Time |
+|---|---|---|---|---|---|---|---|
+| Job 209 still | 14694 -> 9608 (-35%) | +0.25% | +0.75% | 19 -> 18 | 24.909 -> 24.437 | 118.24 -> 117.68 | 503 -> 498 s |
+| Job 216 video, last frame | 83998 -> 75870 (-10%) | +0.16% | | | | 115.83 -> 115.59 | 871 -> 847 s |
+
+- On the still, the TV seen directly is unchanged (crop mean 65.8 both). The window crop is 2
+  levels darker, which is the exposure change.
+- The video's mean frame-to-frame change is 6.735 -> 6.719 levels; camera motion dominates it.
+- The video was unchanged by the glass fix (33/33 frames byte-identical before and after): the
+  video pipeline turns windows into an alpha closure, not transmissive glass.
+- Video speckles are measured on the last frame only, because `ZR_OIDN_DUMP` keeps fixed file
+  names (plan ruling).
+
+**Owner's decision (2026-10-14): ship on at 1.0.**
+
+Found on the way, out of scope here: the miss path adds the sky reached by a bounce ray without
+`clamp_indirect`, while Cycles clamps background hits (`film_write_background` ->
+`film_clamp_light`). It is filed as its own task.
