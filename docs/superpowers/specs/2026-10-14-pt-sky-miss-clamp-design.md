@@ -329,3 +329,40 @@ spikes. Nothing that reaches the sky after two or more bounces exceeds 10 here.
     `ZR_PT_CLAMP_INDIRECT` default (10).
 - **Both scripts parse** under the new binary (`--check-only`, on a copy without `.godot`, exit 0).
   The same check on a deliberately broken copy exits 1.
+
+## Amendment 2026-10-15 (2): clamps 0/0 byte-identical again, `39cc5512d3`
+
+**Asked by the owner after the ship above:** try a form that keeps the old sky expression
+unchanged when both clamps are 0, and show it is byte-identical. Production still runs the
+shipped `ad5497576` (the drift build). Nothing under `C:\Zlendo2026` changed here, so shipping
+this form is a new decision for the owner.
+
+**Two forms tried**, each checked by a clamp-off render of job 209 (64 spp) against R4:
+- **An `if (sky_clamp > 0.0)` around the same `clamp_contribution` call (R5a): it still drifts.**
+  R5a is byte-identical to R5, not R4: the compiler turns the branch into the same code. This is
+  the "uniform branch" the first amendment listed as not attempted.
+- **The clamp as a factor on `mis_w` (R5b, committed as `39cc5512d3`): exact.** The factor is
+  `clamp_contribution`'s, `limit / max channel` when that channel exceeds the limit, computed only
+  when the limit is on. It multiplies `mis_w`, so the product that feeds `ps.radiance` is the
+  pre-clamp multiply, and `sky_scale` is exactly 1.0 when the clamp is off. A re-run of the
+  pre-change binary (R4c) is byte-identical to R4 (same machine state, session 2 Active).
+  R5b is byte-identical to both, in the raw dump and the PNG.
+
+**So section 1's first invariant holds again for this form.** With clamps 0/0 the output is
+byte-identical to the pre-change binary. That covers DLSS-RR video and every gate. A later
+"off is exact" A/B can use a pre-change baseline, unless it is compared against the shipped
+`ad5497576`, which has the drift.
+
+**Production settings on this form (R3b; same V1-V4 rules, R3b in place of R3, R4c/R5b in place
+of R4/R5):**
+- V1 PASS.
+- V2: above 50, 18 -> 15 (PASS); above 200, 0 -> 0 (FAIL as written; nothing to drop).
+- V3 PASS: mean -0.90%, box-4 median -0.03%.
+- V4 PASS: window raw means +0.00%. Window PNG pixels move by at most 2 levels, from the probe's
+  exposure (24.437 -> 24.433).
+
+Against R1, only 942 raw pixels differ (the committed rule's R3 had 8611). They are the same 390
+speckles (244 by more than 1 raw), and no pixel rose. Against the shipped rule's R3, the
+differences are 1-ULP only (at most 1.2e-7, none above 0.1). The clamp itself is unchanged.
+
+`pt_sky_clamp_gate` PASS on this form: S1 1.000000, S3 0.999999, F1 0.999999, S2 0.049615.
