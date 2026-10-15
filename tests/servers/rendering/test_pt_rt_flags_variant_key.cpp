@@ -32,6 +32,7 @@
 
 TEST_FORCE_LINK(test_pt_rt_flags_variant_key)
 
+#include "core/config/project_settings.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 
 namespace TestPTRtFlagsVariantKey {
@@ -46,6 +47,11 @@ namespace TestPTRtFlagsVariantKey {
 // one-shot pipeline (a performance and identity regression), and an accumulate word with a
 // non-zero field would leave OIDN stills and video without their guides, a plausible-looking
 // but wrong render. Nothing else in the suite would fail.
+//
+// Blue-noise sampling (spec 2026-10-15-pt-blue-noise-sampling-design.md) added a second
+// accumulate key: the flag word has no free bit, so the field's top value,
+// RT_SAMPLE_COUNT_BLUE_NOISE (127), means accumulate + blue noise and also injects
+// `#define RT_BLUE_NOISE`; one-shot counts therefore stop at 126.
 
 using RendererSceneRenderImplementation::SceneShaderRaytracing;
 
@@ -70,19 +76,48 @@ static uint32_t flags_for(const EnvParams &p_params) {
 	return SceneShaderRaytracing::compute_rt_flags(p_params.p, false, false);
 }
 
-TEST_CASE("[PathTracer][VariantKey] the accumulate flag packs sample-count field 0") {
+static const uint32_t BLUE_KEY = SceneShaderRaytracing::RT_SAMPLE_COUNT_BLUE_NOISE;
+
+// Either accumulate key: 0 (classic pattern) or BLUE_KEY (blue noise).
+static bool is_accumulate_key(uint32_t p_field) {
+	return p_field == 0u || p_field == BLUE_KEY;
+}
+
+// rendering/pathtracer/sampling_pattern for the scope of one test, restored afterwards.
+struct SamplingPatternScope {
+	Variant saved;
+	explicit SamplingPatternScope(int p_pattern) {
+		saved = ProjectSettings::get_singleton()->get_setting("rendering/pathtracer/sampling_pattern", 1);
+		ProjectSettings::get_singleton()->set_setting("rendering/pathtracer/sampling_pattern", p_pattern);
+	}
+	~SamplingPatternScope() {
+		ProjectSettings::get_singleton()->set_setting("rendering/pathtracer/sampling_pattern", saved);
+	}
+};
+
+TEST_CASE("[PathTracer][VariantKey] the accumulate flag packs field 0 with the classic pattern") {
 	// Whatever the one-shot sample count says, accumulate wins: the field is the variant key.
+	SamplingPatternScope classic(0);
 	for (float spp : { 0.0f, 1.0f, 3.0f, 4.0f, 127.0f, 128.0f, 1000.0f }) {
 		const EnvParams params(1.0f, spp);
 		CHECK(sample_count_field(flags_for(params)) == 0u);
 	}
 }
 
+TEST_CASE("[PathTracer][VariantKey] the accumulate flag packs RT_SAMPLE_COUNT_BLUE_NOISE with blue noise") {
+	SamplingPatternScope blue(1);
+	for (float spp : { 0.0f, 1.0f, 3.0f, 4.0f, 127.0f, 128.0f, 1000.0f }) {
+		const EnvParams params(1.0f, spp);
+		CHECK(sample_count_field(flags_for(params)) == BLUE_KEY);
+	}
+}
+
 TEST_CASE("[PathTracer][VariantKey] one-shot packs a sample-count field of at least 1") {
 	// 0 and 1 both mean one sample; 4 and 6 pass through unchanged (6 is the DLSS-RR video
 	// job's samples-per-pixel: its one-shot raygen loop traces exactly that many samples);
-	// 127 is the field's top; 128 and 1000 must CLAMP to 127 (a masked 128 would read as 0 --
-	// the accumulate key -- and silently switch variants).
+	// 126 is the one-shot top, one below the blue-noise accumulate key; 127, 128 and 1000 must
+	// CLAMP to 126 (a masked 128 would read as 0 and 127 as BLUE_KEY -- both accumulate keys --
+	// and silently switch variants).
 	struct Case {
 		float spp;
 		uint32_t expected_field;
@@ -92,14 +127,16 @@ TEST_CASE("[PathTracer][VariantKey] one-shot packs a sample-count field of at le
 		{ 1.0f, 1u },
 		{ 4.0f, 4u },
 		{ 6.0f, 6u },
-		{ 127.0f, 127u },
-		{ 128.0f, 127u },
-		{ 1000.0f, 127u },
+		{ 126.0f, 126u },
+		{ 127.0f, 126u },
+		{ 128.0f, 126u },
+		{ 1000.0f, 126u },
 	};
 	for (const Case &c : cases) {
 		const EnvParams params(0.0f, c.spp);
 		const uint32_t field = sample_count_field(flags_for(params));
 		CHECK(field >= 1u);
+		CHECK(!is_accumulate_key(field));
 		CHECK(field == c.expected_field);
 	}
 }
@@ -115,8 +152,12 @@ TEST_CASE("[PathTracer][VariantKey] the accumulate flag test is strictly greater
 	CHECK(sample_count_field(flags_for(EnvParams(0.0f, 4.0f))) >= 1u);
 	CHECK(sample_count_field(flags_for(EnvParams(0.4999f, 4.0f))) >= 1u);
 	CHECK(sample_count_field(flags_for(EnvParams(0.5f, 4.0f))) >= 1u);
-	CHECK(sample_count_field(flags_for(EnvParams(0.5001f, 4.0f))) == 0u);
-	CHECK(sample_count_field(flags_for(EnvParams(1.0f, 4.0f))) == 0u);
+	for (int pattern = 0; pattern < 2; pattern++) {
+		SamplingPatternScope scope(pattern);
+		CHECK(!is_accumulate_key(sample_count_field(flags_for(EnvParams(0.5f, 4.0f)))));
+		CHECK(is_accumulate_key(sample_count_field(flags_for(EnvParams(0.5001f, 4.0f)))));
+		CHECK(is_accumulate_key(sample_count_field(flags_for(EnvParams(1.0f, 4.0f)))));
+	}
 }
 
 TEST_CASE("[PathTracer][VariantKey] the accumulate and one-shot words differ only in the sample-count field") {
