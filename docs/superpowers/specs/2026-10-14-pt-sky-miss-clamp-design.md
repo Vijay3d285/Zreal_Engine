@@ -282,3 +282,50 @@ section changes what is accepted, not what was measured.
   Any later "off is exact" A/B must use a post-change binary as its baseline, not one built before
   `5e92275328`.
 - **Not attempted:** a uniform branch around the clamp to restore the old code shape at 0/0.
+
+## OIDN video results 2026-10-15, and the ship
+
+**Why measured:** the owner asked for it before shipping. "Not measured" above listed OIDN video:
+there, windows are an alpha closure, so sky reached through a pane from a bounce is clamped too.
+
+**Setup.** Job 216 keyframes 204-215 (`.superpowers/sdd/2026-10-14-video-fill-grid/seg204.json`:
+12 frames, 4K, day, OIDN, 24 spp, `clamp_indirect` 10), production scripts copied, session 2
+Active for every run, `tasklist` empty before each. `ZR_OIDN_DUMP` keeps fixed file names, so a
+watcher copied every frame's `oidn_color.pfm` as it landed: 12 raw dumps per run. Runner and
+comparison script: the session scratchpad's `v216/run_video.sh` and `v216/compare_video.py`.
+
+| Run | Binary | Raw dumps | Frames | Exposure | Time |
+|---|---|---|---|---|---|
+| before | `pre_skyclamp` (dd87243e3) | 12 | 33 | 12.068 | 819 s |
+| after | `skyclamp` (ad5497576) | 12 | 33 | 12.068 | 889 s |
+| repeat | `pre_skyclamp` | 12 | 33 | 12.068 | 814 s |
+
+**Results.**
+- **The repeat is byte-identical** to "before", in all 12 raw dumps and all 33 PNG frames. The
+  floor is 0.
+- **Raw OIDN input, before -> after.** The mean is identical in all 12 keyframes (0.113149 to
+  0.122758). Pixels above 50 and above 200 are unchanged (for example frame 9: 2363 and 97 in both).
+  No pixel moved by more than 0.1 in either direction, and the largest relative change in any frame
+  is 4.5e-7. **No sample was clamped.**
+- **Delivered frames.** Means are identical. At most 15,617 pixels in a frame (0.19%) differ, by 1
+  level at most. That is the accepted code-shape drift (amendment above), not the clamp.
+- **Time.** "after" is +70 s. Its daylight probe took 40.8 s against 8.0 s, which is consistent with
+  shader compilation on the binary's first video job; the frames themselves are not slower.
+
+**Reading.** In video, windows are alpha panes, not transmissive glass. So no bounce ray reaches
+the bright sky at MIS weight 1 through a refracting pane, which is the path behind the still's
+spikes. Nothing that reaches the sky after two or more bounces exceeds 10 here.
+
+**Shipped 2026-10-15, owner's decision.**
+- `C:\Zlendo2026\ZlenderRender_stage_copy\godot\bin\godot.windows.editor.x86_64{,.console}.exe`
+  were build `5df125252` and are now `ad5497576`; a byte comparison against `bin/*.skyclamp.exe`
+  passed. The previous pair is kept beside them as `*.pre_skyclamp*.exe` for rollback.
+- **This also ships, for the first time:** the highlight-relief edge-aware upsample (`f45a4e6bad`)
+  and Filter Glossy with its glass skip (`c9a615a085`, `dd87243e38`, `027c4188e4`).
+- **Scripts in the live `godot_project`:**
+  - `video_glb_creation.gd` gained the DLSS-RR `filter_glossy = 0.0` block from `b5637d0c94`.
+    Without it, a DLSS-RR video's probe would meter about 2% more light than its frames render.
+  - `image_glb_creation.gd` gained the rewritten KNOWN OPEN ITEM comment and the corrected
+    `ZR_PT_CLAMP_INDIRECT` default (10).
+- **Both scripts parse** under the new binary (`--check-only`, on a copy without `.godot`, exit 0).
+  The same check on a deliberately broken copy exits 1.
