@@ -31,7 +31,9 @@ extends "res://tests/pt_validation.gd"
 ##   pre-change binary   S1 1.000000  S3 1.000000  F1 1.000001  S2 1.000000  -> FAIL (S2)
 ##   fault, == 0u        S1 1.000000  S3 0.010000  F1 0.234869  S2 0.010000  -> FAIL (S3, F1)
 ##   this rule, <= 1u    S1 1.000000  S3 1.000000  F1 1.000001  S2 0.049615  -> PASS
-## The S1 guard read 100 (sky 1000 / limit 10) on all three. Under the fault even S2's total-1
+##   rule as a factor    S1 1.000000  S3 0.999999  F1 0.999999  S2 0.049615  -> PASS
+##     on mis_w (39cc5512d3, 2026-10-15; clamps 0/0 byte-identical to the pre-change binary)
+## The S1 guard read 100 (sky 1000 / limit 10) on all four. Under the fault even S2's total-1
 ## front reflection is clamped, hence 0.010 there against 0.050 under the rule.
 
 const SKY := 1000.0
