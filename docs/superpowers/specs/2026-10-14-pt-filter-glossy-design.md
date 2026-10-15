@@ -184,6 +184,20 @@ dd87243e38 (+29.55% / +12.18% / 1 -> 10) and GREEN on the fix (-1.03% / +0.68% /
 
 **Owner's decision (2026-10-14): ship on at 1.0.**
 
+**Where it is turned off (final review).**
+- **DLSS-RR video jobs.** Their daylight probes run the accumulate variant while their frames run the
+  one-shot variant, which has no Filter Glossy. With it on, the probe metered about 2% more light
+  than the frames render (the still's exposure moved 24.909 -> 24.437). So
+  `video_glb_creation.gd` sets `filter_glossy` to 0.0 when it resolves `dlssrr`, which is
+  byte-identical to before. The invariant comment in `scene_shader_raytracing.cpp` names this
+  exception. Production video uses OIDN by default and keeps Filter Glossy on.
+- **The path-tracer gates.** Every `pt_validation.gd` gate pins `filter_glossy` to 0.0 on entering
+  the tree, so their baselines, all measured without it, still hold. Filter Glossy has its own gate.
+
+`pipeline_references/tests/filter_glossy_unit.gd` checks both. Run it from a copy of
+`pipeline_references` without `.godot/`, because the repo's class cache has a duplicate
+`CustomShapeGenerator`.
+
 Found on the way, out of scope here: the miss path adds the sky reached by a bounce ray without
 `clamp_indirect`, while Cycles clamps background hits (`film_write_background` ->
 `film_clamp_light`). It is filed as its own task.

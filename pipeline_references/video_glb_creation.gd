@@ -104,6 +104,11 @@ func _resolve_video_denoiser() -> String:
 		print("[VideoDenoiser] unknown mode '%s'; using dlssrr" % mode)
 		mode = "dlssrr"
 	_video_denoiser = mode
+	# Filter Glossy (spec 2026-10-14-pt-filter-glossy-design.md) exists only in the accumulate
+	# shader variant. A DLSS-RR job's daylight probes run that variant while its frames run the
+	# one-shot one, so with it on the probe would meter light the frames never render (~2% darker).
+	if mode == "dlssrr":
+		ProjectSettings.set_setting("rendering/pathtracer/filter_glossy", 0.0)
 	# T4 test hook: force an accumulator reset every delivered frame, so a static camera yields
 	# independent renders of identical content. Phase A modes only; production never sets it.
 	_flicker_test = mode != "dlssrr" and OS.get_environment("ZR_VIDEO_FLICKER_TEST") == "1"

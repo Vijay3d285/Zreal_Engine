@@ -803,6 +803,10 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	// exposure, hence the invariant: code under RT_OIDN_FEATURES must NEVER touch radiance
 	// or the RNG, or DLSS-RR video exposure changes (and with it every DLSS-RR frame). It
 	// may only carry guide state through the payload and write the guide buffers.
+	// The one deliberate exception is Filter Glossy (spec 2026-10-14-pt-filter-glossy-design.md),
+	// which changes radiance here by design; video_glb_creation.gd sets filter_glossy to 0.0 for
+	// DLSS-RR jobs, which is byte-identical to the variant without it, so the invariant still
+	// holds for them.
 	if (((p_rt_flags >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK) == 0u) {
 		inject_define(sources, "#define RT_OIDN_FEATURES\n");
 	}

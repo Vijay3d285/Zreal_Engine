@@ -14,6 +14,15 @@ class_name PTValidation
 ## server definitely observes the transition (see _render_accum).
 const RESET_SETTLE_FRAMES := 3
 
+
+## Every gate's baseline was measured without Filter Glossy, a deliberate bias with its own
+## gate (tests/filter_glossy/fg_energy_gate.py; spec 2026-10-14-pt-filter-glossy-design.md),
+## so the gates pin it off. A notification, not _ready, so no gate has to call super().
+func _notification(p_what: int) -> void:
+	if p_what == NOTIFICATION_ENTER_TREE:
+		ProjectSettings.set_setting("rendering/pathtracer/filter_glossy", 0.0)
+
+
 ## Root-mean-square error between two same-size linear images (RGB only).
 static func rmse(p_a: Image, p_b: Image) -> float:
 	assert(p_a.get_size() == p_b.get_size(), "rmse: size mismatch")
