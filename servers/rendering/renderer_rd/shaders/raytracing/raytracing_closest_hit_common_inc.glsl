@@ -1871,9 +1871,13 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// after a blurry bounce, every glossy lobe gets Cycles' alpha floor before NEE and the next
 	// bounce, so a sharp reflection reached through bounce light cannot be a speckle. The
 	// camera's own hit has code 0 and never blurs. Our alpha is roughness^2.
+	// Transmissive materials are NOT blurred, unlike Cycles' bsdf_blur: window panes are
+	// cast_shadow OFF (Gap #30), so light through them is sampler-dependent, and a rough pane
+	// added +12% median raw light plus unclamped sky spikes on job 209 (gate fg_energy_gate,
+	// 2026-10-14); production glass is optically clear on purpose (GlassFix).
 	{
 		const float glossy_floor = rt_glossy_alpha_floor(ps.glossy_min_code, get_rt_param(RT_PARAM_FILTER_GLOSSY));
-		if (glossy_floor > 0.0) {
+		if (glossy_floor > 0.0 && brdf_mat.transmissivness <= 0.0) {
 			const float r_floor = sqrt(glossy_floor);
 			brdf_mat.roughness = max(brdf_mat.roughness, r_floor);
 			brdf_mat.coatRoughness = max(brdf_mat.coatRoughness, r_floor);
