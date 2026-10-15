@@ -366,3 +366,14 @@ speckles (244 by more than 1 raw), and no pixel rose. Against the shipped rule's
 differences are 1-ULP only (at most 1.2e-7, none above 0.1). The clamp itself is unchanged.
 
 `pt_sky_clamp_gate` PASS on this form: S1 1.000000, S3 0.999999, F1 0.999999, S2 0.049615.
+
+**Shipped 2026-10-15 (2), owner's decision: the exact form replaces `ad5497576`.**
+- `C:\Zlendo2026\ZlenderRender_stage_copy\godotin\godot.windows.editor.x86_64{,.console}.exe`
+  are now the `39cc5512d3` build. A byte comparison against `bin/*.skyclamp_exact*.exe` passed:
+  exe md5 `53275225...`, console md5 `d4913e5e...`. `--version` reports `a30dea919`, the HEAD
+  when it was built; the shader source it was built from was committed right after as `39cc5512d3`.
+- The `ad5497576` pair is kept beside it for rollback as `*.skyclamp_ad5497576{,.console}.exe`. It
+  is byte-identical to `bin/*.skyclamp*.exe` and still launches. The older `*.pre_skyclamp*.exe`
+  pair (`5df125252`) is untouched.
+- No Godot process was running from `C:\Zlendo2026` during the swap. No script changed: the live
+  `image_glb_creation.gd` comment (`sky_clamp` in the miss stage) still describes this form.
