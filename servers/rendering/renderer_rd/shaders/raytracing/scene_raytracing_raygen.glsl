@@ -749,7 +749,23 @@ void main() {
 		mis_w = (e_pdf > 0.0) ? power_heuristic(ps.mis_ray_pdf, e_pdf) : 1.0;
 	}
 #endif // RT_ENV_NEE_ENABLED
-	vec3 sky_contribution = ps.throughput * sky_color * mis_w;
+	// Firefly clamp on the sky, with Cycles' rule: film_write_background clamps the
+	// background with film_clamp_light(bounce - 1) (kernel/film/light_passes.h:638), i.e.
+	// by the vertex that CAST this ray -- the same class as that vertex's own NEE clamp
+	// (shade_and_bounce's clamp_limit), so both MIS halves of a sky hit share one limit.
+	// total_bounces already counts the bounce that produced this ray, so the camera ray (0)
+	// and the first surface's bounce ray (1) are direct; later bounces are indirect.
+	// Deviation: our total_bounces also counts transparent (alpha) pass-throughs, which
+	// Cycles keeps in transparent_bounce, so a pass-through between the casting vertex and
+	// the sky moves the hit to the indirect limit where Cycles keeps it direct. Exact parity
+	// needs a payload bit we do not have (PathPayload's sss_restart note in raytracing_inc.glsl).
+	// The emissive-hit clamp (raytracing_closest_hit_common_inc.glsl, clamp_limit) still
+	// uses total_bounces == 0 -- the same off-by-one, a filed follow-up.
+	// Spec: docs/superpowers/specs/2026-10-14-pt-sky-miss-clamp-design.md.
+	const float sky_clamp = (get_total_bounces(ps.packed_bounces_flags) <= 1u)
+			? get_rt_param(RT_PARAM_CLAMP_DIRECT)
+			: get_rt_param(RT_PARAM_CLAMP_INDIRECT);
+	vec3 sky_contribution = clamp_contribution(ps.throughput * sky_color * mis_w, sky_clamp);
 
 #ifdef RT_DEBUG_ENABLED
 	{
