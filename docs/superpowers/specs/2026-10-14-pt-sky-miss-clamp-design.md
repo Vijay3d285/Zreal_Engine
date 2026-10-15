@@ -100,6 +100,8 @@ Replace the unclamped assignment at line 752:
     output is byte-identical to the pre-change binary. This covers DLSS-RR video and every gate,
     all of which default the clamps to 0 (`environment.h:234,237`).
   - With production's 0/10, every miss at total 0 or 1 is byte-identical.
+  - **Superseded by the 2026-10-15 amendment (end of this spec):** measured, both hold only to
+    within 1 ULP, not byte for byte; the owner accepted that.
 - No payload, C++ or script change. A full SCons build regenerates the `.glsl.gen.h`.
 
 ### 2. Comment: `pipeline_references/image_glb_creation.gd` KNOWN OPEN ITEM
@@ -261,3 +263,22 @@ sofa. Their sum is the -0.90% in the mean.
 
 **Build note.** The pre-change binary had been built with D3D12. This change was built with the
 instructed `d3d12=no` (176 MB against 186 MB), and R6 shows that this does not change rendering.
+
+## Amendment 2026-10-15, approved by the owner: the clamps-0/0 drift is accepted
+
+**Owner's decision (2026-10-15):** accept the 1-ULP drift at clamps 0/0. Record it here as an
+amendment. V1 stays FAIL in the record above, because the rule fixed in section 4 was not met; this
+section changes what is accepted, not what was measured.
+
+- **What replaces section 1's first invariant.** At clamps 0/0 the output is no longer
+  byte-identical to the pre-change binary, but it is equal within 1 ULP. On job 209 that is 0.110%
+  of pixels, at most 1.19e-7 raw, with the luminance sum unchanged and 615 PNG pixels off by one
+  level. The second invariant (production 0/10, misses at total 0 or 1) was not measured
+  separately; read it the same way, as equal within the same rounding.
+- **Why it is accepted.** R6 rules out the build configuration, so the cause is how the new
+  expression compiles. Restoring exactness would mean restructuring the shader in the hope that
+  the compiler fuses it as before. That is not guaranteed, and it costs a build and a render.
+- **Where it shows.** DLSS-RR video and every path-tracer gate run at 0/0. They inherit the drift.
+  Any later "off is exact" A/B must use a post-change binary as its baseline, not one built before
+  `5e92275328`.
+- **Not attempted:** a uniform branch around the clamp to restore the old code shape at 0/0.
