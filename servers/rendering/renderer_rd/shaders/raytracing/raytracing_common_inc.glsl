@@ -123,7 +123,7 @@ global_shader_uniforms;
 #ifndef RT_STAGE_ANY_HIT
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
-	vec4 rt_params[11]; // F2: 4 -> 10; DoF: 11 (slots 40-41). indices 16+ are the volume block (raytracing_inc.glsl)
+	vec4 rt_params[11]; // F2: 4 -> 10; DoF: 11 (slots 40-41); 42 Filter Glossy. indices 16+ are the volume block (raytracing_inc.glsl)
 	mat4 prev_vp_unjittered;
 	mat4 curr_vp_unjittered;
 };
@@ -131,6 +131,15 @@ layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 float get_rt_param(uint idx) {
 	return rt_params[idx >> 2u][idx & 3u];
 }
+
+#ifdef RT_BLUE_NOISE
+/// Blue noise for this invocation (spec 2026-10-15-pt-blue-noise-sampling-design.md): Cycles
+/// BLUE_NOISE_PURE with N = the accumulation target. Only the accumulate + blue-noise variant
+/// compiles this; called first in the raygen and closest-hit main().
+void rt_init_blue_noise() {
+	g_rt_blue_noise_length = max(1u, uint(get_rt_param(RT_PARAM_ACCUM_TARGET)));
+}
+#endif
 
 /// Project a world-space point to UV through an unjittered VP.
 vec2 project_uv(vec3 world_pos, mat4 vp) {

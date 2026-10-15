@@ -123,6 +123,12 @@ public:
 	// pre-feature shader source. MUST match raytracing_common_inc.glsl.
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 20;
 	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0x7F; // 7 bits since F2; bit 27 is RT_FLAG_VOLUME_ENABLED
+	// Blue-noise sampling (spec 2026-10-15-pt-blue-noise-sampling-design.md): the flag word has no
+	// free bit, so the sample-count field's top value means "accumulate + blue noise". It compiles
+	// the RT_OIDN_FEATURES variant plus `#define RT_BLUE_NOISE` (_ensure_variant_compile_context);
+	// one-shot sample counts are capped one below it. A compile-time variant, not a runtime branch:
+	// the branch moved 6.9% of classic pixels by float rounding, and classic must stay byte-identical.
+	constexpr static uint32_t RT_SAMPLE_COUNT_BLUE_NOISE = RT_SAMPLE_COUNT_MASK;
 
 	constexpr static uint32_t RT_MAX_BOUNCES_SHIFT = 28;
 	constexpr static uint32_t RT_MAX_BOUNCES_MASK = 0xF;

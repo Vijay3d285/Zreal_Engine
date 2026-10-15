@@ -22,8 +22,10 @@
 #define RT_PARAM_ACCUM_FLAG 4 // rt_params[1].x - 1.0 = accumulate across frames, 0.0 = one-shot
 #define RT_PARAM_ACCUM_FRAMES 5 // rt_params[1].y - 0-based accumulation frame index (driver-injected)
 // Indices 6-8 are taken by PT_PARAM_OIDN_FLAG, PT_PARAM_ACCUM_TARGET, and
-// PT_PARAM_DLSS_RR_FINAL_FLAG (defined C++-side in rendering_server_enums.h);
-// they are not read by GLSL, so do not reuse them here.
+// PT_PARAM_DLSS_RR_FINAL_FLAG (defined C++-side in rendering_server_enums.h); do not
+// reuse them here. Only 7 is read by GLSL: the blue-noise sequence length N (spec
+// 2026-10-15-pt-blue-noise-sampling-design.md).
+#define RT_PARAM_ACCUM_TARGET 7 // rt_params[1].w - accumulation target (samples per pixel on the accumulate route)
 #define RT_PARAM_CLAMP_DIRECT 9 // rt_params[2].y - Max direct contribution (0 = off)
 #define RT_PARAM_CLAMP_INDIRECT 10 // rt_params[2].z - Max indirect contribution (0 = off)
 #define RT_PARAM_NOISE_THRESHOLD 11 // rt_params[2].w - Adaptive sampling threshold, Cycles' meaning (0 = off)
@@ -483,9 +485,24 @@ struct RNGState {
 	uint offset;
 };
 
+#ifdef RT_BLUE_NOISE
+/// Blue-noise sequence length N for this invocation (spec 2026-10-15-pt-blue-noise-sampling-design.md).
+/// RT_BLUE_NOISE is a compile-time variant (sample-count field RT_SAMPLE_COUNT_BLUE_NOISE, injected by
+/// scene_shader_raytracing.cpp), so the classic variant's source is unchanged: a runtime branch here
+/// moved 6.9% of classic pixels by float rounding. rt_params is declared after this file
+/// (raytracing_common_inc.glsl), so rt_init_blue_noise() sets N at the top of the raygen and
+/// closest-hit main().
+uint g_rt_blue_noise_length = 1u;
+#endif
+
 /// Per-pixel scramble seed (Cycles `path_rng_pixel_init`, pattern.h:143).
 uint rng_pixel_seed(uvec2 p_pixel) {
+#ifdef RT_BLUE_NOISE
+	// Cycles path_rng_pixel_init (pattern.h:156): this pixel's offset along one shared sequence.
+	return sb_nested_uniform_scramble_base4(sb_morton2d(p_pixel.x, p_pixel.y), RT_SAMPLER_SEED);
+#else
 	return sb_hash_iqnt2d(p_pixel.x, p_pixel.y) ^ RT_SAMPLER_SEED;
+#endif
 }
 
 /// Start a path. Block 0 is reserved for the camera/init decisions (the pixel
@@ -508,6 +525,10 @@ RNGState rng_next_bounce(RNGState p_rng) {
 
 /// 1D draw from dimension `p_dim` of the current block. Does not mutate state.
 float rng_1d(RNGState p_rng, uint p_dim) {
+#ifdef RT_BLUE_NOISE
+	// Cycles BLUE_NOISE_PURE (pattern.h:42-47, :79-80): one sequence, seed 0, this pixel's section.
+	return sobol_burley_sample_1D(p_rng.sample_index + p_rng.pixel * g_rt_blue_noise_length, p_rng.offset + p_dim, 0u, 0xffffffffu);
+#else
 	// 0xffffffff = maximum sequence length. Cycles derives a shorter mask from the
 	// sample count purely to shorten this loop. The mask does change the values --
 	// `index &= mask` truncates the shuffled index, so a different Sobol point is
@@ -515,11 +536,16 @@ float rng_1d(RNGState p_rng, uint p_dim) {
 	// "first 2^k samples hit every stratum/cell exactly once", which passes at both
 	// a block_mask(k) and at 0xffffffffu).
 	return sobol_burley_sample_1D(p_rng.sample_index, p_rng.offset + p_dim, p_rng.pixel, 0xffffffffu);
+#endif
 }
 
 /// 2D draw from dimension set `p_dim` of the current block. Does not mutate state.
 vec2 rng_2d(RNGState p_rng, uint p_dim) {
+#ifdef RT_BLUE_NOISE
+	return sobol_burley_sample_2D(p_rng.sample_index + p_rng.pixel * g_rt_blue_noise_length, p_rng.offset + p_dim, 0u, 0xffffffffu);
+#else
 	return sobol_burley_sample_2D(p_rng.sample_index, p_rng.offset + p_dim, p_rng.pixel, 0xffffffffu);
+#endif
 }
 
 /// Seed for a PCG side stream that is decorrelated from every Sobol dimension.

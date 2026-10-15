@@ -661,7 +661,8 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		if (p_env_params[RT_PARAM_VIS_MODE] != 0.0f) {
 			flags |= RT_FLAG_DEBUG_VIS_ENABLED;
 		}
-		sample_count = MAX(1u, (uint32_t)p_env_params[RT_PARAM_SAMPLE_COUNT]);
+		// One-shot counts stop one below RT_SAMPLE_COUNT_BLUE_NOISE, which is a variant key.
+		sample_count = MIN(MAX(1u, (uint32_t)p_env_params[RT_PARAM_SAMPLE_COUNT]), RT_SAMPLE_COUNT_BLUE_NOISE - 1u);
 		// Accumulate (Phase A) packs sample count 0: that raygen branch never reads the
 		// count, and 0 is the variant key for the OIDN guide-feature code
 		// (`#define RT_OIDN_FEATURES`, injected by _ensure_variant_compile_context). One-shot
@@ -669,7 +670,9 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		// (`get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5`, scene_raytracing_raygen.glsl), so
 		// the variant key and the shader branch agree on every value, 0.5 included.
 		if (p_env_params[RT_PARAM_ACCUM_FLAG] > 0.5f) {
-			sample_count = 0;
+			// Blue-noise sampling (spec 2026-10-15-pt-blue-noise-sampling-design.md) is a variant of
+			// the accumulate route, keyed by the field's top value (scene_shader_raytracing.h).
+			sample_count = (int)GLOBAL_GET("rendering/pathtracer/sampling_pattern") == 1 ? RT_SAMPLE_COUNT_BLUE_NOISE : 0;
 		}
 		// Cycles' shipped default total is 12 (blender/addon/properties.py); 8 was
 		// clipping requests the pipeline already makes. This is a specialization
@@ -807,8 +810,13 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	// which changes radiance here by design; video_glb_creation.gd sets filter_glossy to 0.0 for
 	// DLSS-RR jobs, which is byte-identical to the variant without it, so the invariant still
 	// holds for them.
-	if (((p_rt_flags >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK) == 0u) {
+	const uint32_t sample_count_field = (p_rt_flags >> RT_SAMPLE_COUNT_SHIFT) & RT_SAMPLE_COUNT_MASK;
+	if (sample_count_field == 0u || sample_count_field == RT_SAMPLE_COUNT_BLUE_NOISE) {
 		inject_define(sources, "#define RT_OIDN_FEATURES\n");
+	}
+	// Accumulate + blue noise (RT_SAMPLE_COUNT_BLUE_NOISE, see the header): Cycles BLUE_NOISE_PURE.
+	if (sample_count_field == RT_SAMPLE_COUNT_BLUE_NOISE) {
+		inject_define(sources, "#define RT_BLUE_NOISE\n");
 	}
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.

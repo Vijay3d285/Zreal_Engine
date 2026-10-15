@@ -3904,6 +3904,10 @@ void RenderingServer::init() {
 	// (1.0): after a blurry bounce, glossy lobes get an alpha floor, so sharp reflections seen
 	// through bounce light stop producing speckles. 0 = off. Accumulate (still / video) route.
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/filter_glossy", PROPERTY_HINT_RANGE, "0,10,0.01"), 1.0);
+	// Blue-noise sampling (spec 2026-10-15-pt-blue-noise-sampling-design.md): Cycles' default for
+	// final renders (BLUE_NOISE_PURE). Every pixel draws from one shared Sobol sequence at a
+	// Morton-curve offset, so its error lands as blue noise. Accumulate (still / video) route.
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/sampling_pattern", PROPERTY_HINT_ENUM, "Classic,Blue Noise"), 1);
 	// Transmission / rough glass (roadmap E1). Defaults to true, unlike C1's
 	// emissive_mesh_lights: the feature is already data-gated (transmission
 	// defaults to 0.0 and no pre-Phase-D content can set it), so an untouched

@@ -4250,7 +4250,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	// Binding 6: Raytracing params + unjittered VP matrices.
 	{
 		struct {
-			float params[44]; // F2: 16 -> 40; DoF: 44 (vec4 rt_params[11] in the shader)
+			float params[44]; // F2: 16 -> 40; DoF: 44 (vec4 rt_params[11] in the shader); 42 Filter Glossy
 			float prev_vp_unjittered[16];
 			float curr_vp_unjittered[16];
 		} rt_ubo = {};

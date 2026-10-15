@@ -415,6 +415,9 @@ void camera_ray(uvec2 p_pixel, vec2 p_jitter, uint p_sample, out vec3 r_origin, 
 }
 
 void main() {
+#ifdef RT_BLUE_NOISE
+	rt_init_blue_noise();
+#endif
 	uvec2 pixel = gl_LaunchIDEXT.xy;
 
 	// Sample count from specialization constant, frame index from uniform
@@ -882,6 +885,9 @@ layout(set = 0, binding = 8) uniform sampler radiance_sampler;
 // MAIN
 // ============================================================================
 void main() {
+#ifdef RT_BLUE_NOISE
+	rt_init_blue_noise();
+#endif
 	HitData h = compute_hit_data();
 	write_primary_hit_depth(h.hit_pos);
 	write_primary_hit_velocity(h.hit_pos);
