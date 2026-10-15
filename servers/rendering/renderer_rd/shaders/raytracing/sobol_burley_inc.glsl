@@ -140,3 +140,41 @@ vec2 sobol_burley_sample_2D(uint p_index, uint p_dimension_set, uint p_seed, uin
 			sb_sobol_burley(p_index, 0u, p_seed ^ 0xe0aaaf76u),
 			sb_sobol_burley(p_index, 1u, p_seed ^ 0x94964d4eu));
 }
+
+// ---------------------------------------------------------------------------
+// Blue-noise pixel offsets (spec 2026-10-15-pt-blue-noise-sampling-design.md), verbatim from
+// Cycles kernel/sample/util.h:44-77. Mirrored in tests/servers/rendering/test_pt_sobol.cpp.
+// ---------------------------------------------------------------------------
+
+/// Base-4 Owen scramble of a bit-reversed integer (Cycles `reversed_bit_owen_base4`).
+uint sb_pcg_owen_base4(uint p_n, uint p_seed) {
+	p_n ^= p_n * 0x3d20adeau;
+	p_n ^= (p_n >> 1u) & (p_n << 1u) & 0x55555555u;
+	p_n += p_seed;
+	p_n *= (p_seed >> 16u) | 1u;
+	p_n ^= (p_n >> 1u) & (p_n << 1u) & 0x55555555u;
+	p_n ^= p_n * 0x05526c56u;
+	p_n ^= p_n * 0x53a22864u;
+	return p_n;
+}
+
+/// Hierarchical base-4 shuffle: keeps every aligned 4^k block together (Cycles
+/// `nested_uniform_scramble_base4`), so a Morton-ordered 2x2 quad stays a quad.
+uint sb_nested_uniform_scramble_base4(uint p_i, uint p_seed) {
+	return bitfieldReverse(sb_pcg_owen_base4(bitfieldReverse(p_i), p_seed));
+}
+
+/// Spread the low 16 bits to the even positions (Cycles `expand_bits`).
+uint sb_expand_bits(uint p_x) {
+	p_x &= 0x0000ffffu;
+	p_x = (p_x ^ (p_x << 8u)) & 0x00ff00ffu;
+	p_x = (p_x ^ (p_x << 4u)) & 0x0f0f0f0fu;
+	p_x = (p_x ^ (p_x << 2u)) & 0x33333333u;
+	p_x = (p_x ^ (p_x << 1u)) & 0x55555555u;
+	return p_x;
+}
+
+/// Morton code: x in the odd bits, y in the even bits (Cycles `morton2d`).
+uint sb_morton2d(uint p_x, uint p_y) {
+	return (sb_expand_bits(p_x) << 1u) | sb_expand_bits(p_y);
+}

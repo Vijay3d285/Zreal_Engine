@@ -183,6 +183,131 @@ static uint32_t block_mask(int p_log2_count) {
 	return sb_bit_reverse((1u << p_log2_count) - 1u);
 }
 
+// Blue-noise mirrors (spec 2026-10-15-pt-blue-noise-sampling-design.md). Keep in lockstep with
+// sobol_burley_inc.glsl. Source of truth: Cycles kernel/sample/util.h:44-77.
+static uint32_t sb_pcg_owen_base4(uint32_t p_n, uint32_t p_seed) {
+	p_n ^= p_n * 0x3d20adeau;
+	p_n ^= (p_n >> 1) & (p_n << 1) & 0x55555555u;
+	p_n += p_seed;
+	p_n *= (p_seed >> 16) | 1u;
+	p_n ^= (p_n >> 1) & (p_n << 1) & 0x55555555u;
+	p_n ^= p_n * 0x05526c56u;
+	p_n ^= p_n * 0x53a22864u;
+	return p_n;
+}
+
+static uint32_t sb_nested_uniform_scramble_base4(uint32_t p_i, uint32_t p_seed) {
+	return sb_bit_reverse(sb_pcg_owen_base4(sb_bit_reverse(p_i), p_seed));
+}
+
+static uint32_t sb_expand_bits(uint32_t p_x) {
+	p_x &= 0x0000ffffu;
+	p_x = (p_x ^ (p_x << 8)) & 0x00ff00ffu;
+	p_x = (p_x ^ (p_x << 4)) & 0x0f0f0f0fu;
+	p_x = (p_x ^ (p_x << 2)) & 0x33333333u;
+	p_x = (p_x ^ (p_x << 1)) & 0x55555555u;
+	return p_x;
+}
+
+static uint32_t sb_morton2d(uint32_t p_x, uint32_t p_y) {
+	return (sb_expand_bits(p_x) << 1) | sb_expand_bits(p_y);
+}
+
+// Cycles util/hash.h hash_iqnt2d, as sobol_burley_inc.glsl sb_hash_iqnt2d: the classic
+// per-pixel seed the blue-noise pattern replaces.
+static uint32_t sb_hash_iqnt2d(uint32_t p_x, uint32_t p_y) {
+	const uint32_t qx = 1103515245u * ((p_x >> 1) ^ p_y);
+	const uint32_t qy = 1103515245u * ((p_y >> 1) ^ p_x);
+	return 1103515245u * (qx ^ (qy >> 3));
+}
+
+static const uint32_t BN_TILE = 64;
+static const uint32_t BN_SEED = 0x5f356495u; // RT_SAMPLER_SEED (raytracing_inc.glsl)
+static const uint32_t BN_DIM = 16u; // block 1, slot 0: the first shading draw (RT_PRNG_SURFACE_BSDF)
+
+// Per-pixel error of an N-sample estimate over a 64x64 tile (spec, Testing 2). p_blue: Cycles
+// BLUE_NOISE_PURE indexing (index = s + offset * N, seed 0); otherwise the classic per-pixel
+// seed. p_disc: the 2D disc indicator |v - (0.5, 0.5)| < 0.4; otherwise the 1D step u < 0.37.
+static void bn_error_map(uint32_t p_n, bool p_blue, bool p_disc, double *r_err) {
+	for (uint32_t y = 0; y < BN_TILE; y++) {
+		for (uint32_t x = 0; x < BN_TILE; x++) {
+			const uint32_t offset = sb_nested_uniform_scramble_base4(sb_morton2d(x, y), BN_SEED);
+			const uint32_t pixel_seed = sb_hash_iqnt2d(x, y) ^ BN_SEED;
+			double hits = 0.0;
+			for (uint32_t s = 0; s < p_n; s++) {
+				const uint32_t index = p_blue ? s + offset * p_n : s;
+				const uint32_t seed = p_blue ? 0u : pixel_seed;
+				if (p_disc) {
+					float u, v;
+					sobol_burley_sample_2D(index, BN_DIM, seed, 0xffffffffu, u, v);
+					hits += ((u - 0.5f) * (u - 0.5f) + (v - 0.5f) * (v - 0.5f) < 0.16f) ? 1.0 : 0.0;
+				} else {
+					hits += (sobol_burley_sample_1D(index, BN_DIM, seed, 0xffffffffu) < 0.37f) ? 1.0 : 0.0;
+				}
+			}
+			const double truth = p_disc ? Math::PI * 0.16 : 0.37;
+			r_err[y * BN_TILE + x] = hits / (double)p_n - truth;
+		}
+	}
+}
+
+// Integer DFT frequencies (u, v) with 1 <= u^2 + v^2 <= 64: the low-frequency ring, i.e. blotches.
+static int bn_ring_bins() {
+	int n = 0;
+	for (int v = -8; v <= 8; v++) {
+		for (int u = -8; u <= 8; u++) {
+			const int r2 = u * u + v * v;
+			n += (r2 >= 1 && r2 <= 64) ? 1 : 0;
+		}
+	}
+	return n;
+}
+
+// Share of the error map's power in the ring, DC excluded. Total non-DC power comes from Parseval:
+// sum |F|^2 = M * sum e^2 with M = 64 * 64, minus |F(0)|^2 = (sum e)^2.
+static double bn_low_share(const double *p_err) {
+	double sum = 0.0;
+	double sum2 = 0.0;
+	for (uint32_t i = 0; i < BN_TILE * BN_TILE; i++) {
+		sum += p_err[i];
+		sum2 += p_err[i] * p_err[i];
+	}
+	const double total = (double)(BN_TILE * BN_TILE) * sum2 - sum * sum;
+	if (total <= 1e-9) {
+		return 1.0; // a constant error map has no spatial spectrum at all: certainly not blue
+	}
+	double low = 0.0;
+	for (int v = -8; v <= 8; v++) {
+		for (int u = -8; u <= 8; u++) {
+			const int r2 = u * u + v * v;
+			if (r2 < 1 || r2 > 64) {
+				continue;
+			}
+			double re = 0.0;
+			double im = 0.0;
+			for (uint32_t y = 0; y < BN_TILE; y++) {
+				for (uint32_t x = 0; x < BN_TILE; x++) {
+					const double a = -2.0 * Math::PI * ((double)u * x + (double)v * y) / (double)BN_TILE;
+					re += p_err[y * BN_TILE + x] * Math::cos(a);
+					im += p_err[y * BN_TILE + x] * Math::sin(a);
+				}
+			}
+			low += re * re + im * im;
+		}
+	}
+	return low / total;
+}
+
+static double bn_ratio(uint32_t p_n, bool p_disc) {
+	static double blue[64 * 64];
+	static double classic[64 * 64];
+	bn_error_map(p_n, true, p_disc, blue);
+	bn_error_map(p_n, false, p_disc, classic);
+	const double r = bn_low_share(blue) / bn_low_share(classic);
+	MESSAGE("N=", p_n, (p_disc ? " disc" : " step"), " blue/classic low-frequency share ", r);
+	return r;
+}
+
 TEST_CASE("[PathTracer][Sobol] 1D samples stay in [0, 1)") {
 	const uint32_t seed = 0x1234abcdu;
 	for (uint32_t i = 0; i < 4096; i++) {
@@ -329,6 +454,90 @@ TEST_CASE("[PathTracer][Sobol] integrates a smooth 2D function far better than w
 
 	CHECK(sobol_err < 0.002);
 	CHECK(sobol_err < white_err);
+}
+
+TEST_CASE("[PathTracer][Sobol] morton2d puts x in the odd bits and y in the even bits") {
+	CHECK(sb_morton2d(0, 0) == 0u);
+	CHECK(sb_morton2d(1, 0) == 2u);
+	CHECK(sb_morton2d(0, 1) == 1u);
+	CHECK(sb_morton2d(3, 3) == 15u);
+	CHECK(sb_morton2d(65535, 65535) == 0xffffffffu);
+}
+
+TEST_CASE("[PathTracer][Sobol] base-4 nested scramble keeps 64x64 tiles and 2x2 quads together") {
+	const uint32_t seeds[2] = { BN_SEED, 0x12345678u };
+	for (uint32_t seed : seeds) {
+		static uint32_t v[64 * 64];
+		for (uint32_t y = 0; y < BN_TILE; y++) {
+			for (uint32_t x = 0; x < BN_TILE; x++) {
+				v[y * BN_TILE + x] = sb_nested_uniform_scramble_base4(sb_morton2d(x, y), seed);
+			}
+		}
+		static bool seen[4096];
+		for (uint32_t i = 0; i < 4096; i++) {
+			seen[i] = false;
+		}
+		bool high_ok = true;
+		for (uint32_t i = 0; i < 4096; i++) {
+			high_ok = high_ok && (v[i] >> 12) == (v[0] >> 12);
+			seen[v[i] & 4095u] = true;
+		}
+		int distinct = 0;
+		for (uint32_t i = 0; i < 4096; i++) {
+			distinct += seen[i] ? 1 : 0;
+		}
+		CHECK(high_ok);
+		CHECK(distinct == 4096);
+		bool quads_ok = true;
+		for (uint32_t y = 0; y < BN_TILE; y += 2) {
+			for (uint32_t x = 0; x < BN_TILE; x += 2) {
+				const uint32_t a = v[y * BN_TILE + x];
+				const uint32_t b = v[y * BN_TILE + x + 1];
+				const uint32_t c = v[(y + 1) * BN_TILE + x];
+				const uint32_t d = v[(y + 1) * BN_TILE + x + 1];
+				const bool same = (a >> 2) == (b >> 2) && (a >> 2) == (c >> 2) && (a >> 2) == (d >> 2);
+				const uint32_t lows = (1u << (a & 3u)) | (1u << (b & 3u)) | (1u << (c & 3u)) | (1u << (d & 3u));
+				quads_ok = quads_ok && same && lows == 15u;
+			}
+		}
+		CHECK(quads_ok);
+	}
+}
+
+TEST_CASE("[PathTracer][Sobol] two scramble seeds give different pixel offsets") {
+	int differ = 0;
+	for (uint32_t y = 0; y < BN_TILE; y++) {
+		for (uint32_t x = 0; x < BN_TILE; x++) {
+			const uint32_t m = sb_morton2d(x, y);
+			differ += sb_nested_uniform_scramble_base4(m, BN_SEED) != sb_nested_uniform_scramble_base4(m, 0x12345678u) ? 1 : 0;
+		}
+	}
+	CHECK(differ > 4000);
+}
+
+TEST_CASE("[PathTracer][Sobol] blue-noise indexing pushes N=16 error out of low frequencies") {
+	CHECK(bn_ratio(16, false) < 0.5);
+	CHECK(bn_ratio(16, true) < 0.5);
+}
+
+TEST_CASE("[PathTracer][Sobol] blue-noise indexing pushes N=24 error out of low frequencies") {
+	// 0.6, not the spec's 0.8: at 0.8 a row-major offset (0.63 / 0.72) would pass (plan ruling).
+	CHECK(bn_ratio(24, false) < 0.6);
+	CHECK(bn_ratio(24, true) < 0.6);
+}
+
+TEST_CASE("[PathTracer][Sobol] the classic per-pixel scramble leaves white-noise error") {
+	static double err[64 * 64];
+	const double white = (double)bn_ring_bins() / (64.0 * 64.0 - 1.0);
+	const uint32_t ns[2] = { 16, 24 };
+	for (uint32_t n : ns) {
+		for (int disc = 0; disc < 2; disc++) {
+			bn_error_map(n, false, disc == 1, err);
+			const double share = bn_low_share(err) / white;
+			CHECK(share > 0.7);
+			CHECK(share < 1.3);
+		}
+	}
 }
 
 } // namespace TestPTSobol
