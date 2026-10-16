@@ -112,6 +112,18 @@ TEST_CASE("[PathTracer][VariantKey] the accumulate flag packs RT_SAMPLE_COUNT_BL
 	}
 }
 
+TEST_CASE("[PathTracer][VariantKey] a DLSS-RR accumulate word stays classic with blue noise on") {
+	// DLSS-RR video's daylight probe runs the accumulate variant while its frames run the one-shot
+	// variant, which has no blue noise: the probe must meter the classic pattern (the RT_OIDN_FEATURES
+	// invariant in scene_shader_raytracing.cpp), whether or not the job's script pins the setting.
+	SamplingPatternScope blue(1);
+	EnvParams params(1.0f, 4.0f);
+	params.p[SceneShaderRaytracing::RT_PARAM_DENOISER] = float(RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION);
+	CHECK(sample_count_field(flags_for(params)) == 0u);
+	params.p[SceneShaderRaytracing::RT_PARAM_DENOISER] = float(RSE::PT_DENOISER_NONE);
+	CHECK(sample_count_field(flags_for(params)) == BLUE_KEY);
+}
+
 TEST_CASE("[PathTracer][VariantKey] one-shot packs a sample-count field of at least 1") {
 	// 0 and 1 both mean one sample; 4 and 6 pass through unchanged (6 is the DLSS-RR video
 	// job's samples-per-pixel: its one-shot raygen loop traces exactly that many samples);

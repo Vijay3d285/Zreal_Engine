@@ -671,8 +671,12 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(const float *p_env_params, bool
 		// the variant key and the shader branch agree on every value, 0.5 included.
 		if (p_env_params[RT_PARAM_ACCUM_FLAG] > 0.5f) {
 			// Blue-noise sampling (spec 2026-10-15-pt-blue-noise-sampling-design.md) is a variant of
-			// the accumulate route, keyed by the field's top value (scene_shader_raytracing.h).
-			sample_count = (int)GLOBAL_GET("rendering/pathtracer/sampling_pattern") == 1 ? RT_SAMPLE_COUNT_BLUE_NOISE : 0;
+			// the accumulate route, keyed by the field's top value (scene_shader_raytracing.h). Never
+			// with the DLSS-RR denoiser: that accumulate word is DLSS-RR video's daylight probe, whose
+			// frames run the one-shot variant (no blue noise), so the probe must meter the classic
+			// pattern whatever the job's script sets (the RT_OIDN_FEATURES invariant below).
+			const bool dlss_rr = (uint32_t)p_env_params[RT_PARAM_DENOISER] == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
+			sample_count = ((int)GLOBAL_GET("rendering/pathtracer/sampling_pattern") == 1 && !dlss_rr) ? RT_SAMPLE_COUNT_BLUE_NOISE : 0;
 		}
 		// Cycles' shipped default total is 12 (blender/addon/properties.py); 8 was
 		// clipping requests the pipeline already makes. This is a specialization
