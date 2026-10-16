@@ -82,6 +82,12 @@ uint sb_morton2d(uint p_x, uint p_y) { return (sb_expand_bits(p_x) << 1u) | sb_e
 
 ### 2. Indexing (`raytracing_inc.glsl`, accumulate variant only)
 
+> **Amended after implementation (see Results).** The runtime branch described below broke
+> off-exactness, so blue noise is a compile-time shader variant instead.
+> - Sample-count field value 127 (`RT_SAMPLE_COUNT_BLUE_NOISE`) injects `#define RT_BLUE_NOISE`.
+> - All blue code sits under `#ifdef RT_BLUE_NOISE` / `#else <original line>`.
+> - `rt_params` slot 43 is not used.
+
 - New defines: `RT_PARAM_ACCUM_TARGET 7` (the slot already exists; only a name is new) and
   `RT_PARAM_SAMPLING_PATTERN 43` (1 = blue noise, 0 = classic).
 - A helper `uint rt_blue_noise_length()`:
@@ -103,6 +109,10 @@ uint sb_morton2d(uint p_x, uint p_y) { return (sb_expand_bits(p_x) << 1u) | sb_e
   this never happens there. Cycles has the same constraint.
 
 ### 3. Control and placement
+
+> **Amended after implementation (see Results).** The setting is read in
+> `SceneShaderRaytracing::compute_rt_flags()` as part of the shader variant key, not passed in
+> slot 43, and one-shot sample counts cap at 126.
 
 - **Setting:** `GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracer/sampling_pattern",
   PROPERTY_HINT_ENUM, "Classic,Blue Noise"), 1)`, next to `filter_glossy` in
@@ -206,3 +216,56 @@ copies it or asks for it. To turn blue noise off in production, set
 - A per-frame (animated) seed for video.
 - Tabulated Sobol.
 - The unclamped miss-path sky (its own task).
+
+## Results 2026-10-15
+
+**Unit tests.** The C++ mirror of the blue/classic low-frequency share, 64x64 tile, dimension 16:
+
+| N | Step | Disc |
+|---|---|---|
+| 16 | 0.396 | 0.417 |
+| 24 | 0.381 | 0.508 |
+
+These are identical to the Python prototype. The N=24 threshold is 0.6, not 0.8 (plan ruling): at 0.8 a row-major offset (0.63 / 0.72) would pass. The classic pattern reads white (0.96-1.16x). The block, seed and Morton tests pass, and the suite is 1611/1611.
+
+**Off is exact, as a shader variant.**
+- **The runtime early-return branch failed.** With `sampling_pattern = 0` it moved 6.9% of raw pixels by float rounding (median 8e-7 relative, max 2.2%, mean 0.0); the GPU compiler rescheduled float code around the per-call branches (the DoF failure mode).
+- **Blue noise is now a compile-time variant.**
+  - The flag word is full, so sample-count field 127 means accumulate + blue noise and injects `RT_BLUE_NOISE`.
+  - One-shot sample counts cap at 126.
+  - `test_pt_rt_flags_variant_key.cpp` states the new contract.
+- **Result:** classic raw and OIDN output are byte-identical to the pre-change binary, and the classic PNG differs in 0 pixels.
+- **The PNG alone cannot carry an off check.** A same-binary rerun can differ in about 27 pixels by 1 level, introduced after OIDN, while the raw and OIDN dumps are deterministic. So off is judged on the raw dumps.
+
+**Brightness and time (job 209 still, 4K).**
+- Raw mean +0.07% and box-4 median -0.32% against a classic noise floor of 0.06% / 0.07%.
+- No spikes above 200.
+- Warm blue took 511 s against the mean of four classic runs, 505 s (497-510): +1.2%. Full HD: 207 s vs 206 s.
+- 0 `Error compiling` in every render.
+
+**Benefit, against independent references.**
+- **The plan's first references were biased toward classic.** Classic at 2048 / 1024 spp from index 0 reuses the classic candidate's own samples (error correlation +0.10). Against them, classic's raw total error read 12% low (0.03634 vs 0.04065).
+- **The references were re-rendered with `ZR_SEED_OFFSET=524288`** (correlation +0.015). Blue vs classic:
+
+| | Blotch, raw | Blotch, denoised | Total error, raw | Total error, denoised |
+|---|---|---|---|---|
+| Still, full HD, 256 spp | -3.8% | -3.6% | 0.0% | 0.0% |
+| Video, last frame, 24 spp | -2.9% | -5.6% | 0.0% | +0.1% |
+
+- Total error is unchanged and the low-frequency (blotchy) share drops, as blue noise should.
+- Video mean frame-to-frame change: 6.719 classic, 6.681 blue (-0.6%).
+- In the raw crops the grain is visibly finer; the denoised images look nearly the same.
+
+**The DLSS-RR one-shot variant** compiles (0 errors) and renders. The 1-keyframe DLSS-RR video job then hits `VK_ERROR_DEVICE_LOST` at DLSS priming or thumbnail capture. The 2026-10-08 production binary does the same, so this is pre-existing and filed as its own task.
+
+**Owner's decision (2026-10-15): ship on (default 1).**
+
+**Rulings (plan and execution):**
+- The N=24 threshold is 0.6.
+- The benefit metric's display is median-normalised.
+- The video reference is cut from `seg204.json`.
+- Blue noise is a variant, not a runtime branch; slot 43 is unused.
+- Off-exactness is judged on the raw dumps.
+- The variant-key tests were updated to the new contract.
+- Time is judged against four classic runs.
+- The references are independent (`ZR_SEED_OFFSET=524288`).
