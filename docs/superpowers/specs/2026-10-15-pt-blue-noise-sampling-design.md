@@ -269,3 +269,20 @@ These are identical to the Python prototype. The N=24 threshold is 0.6, not 0.8 
 - The variant-key tests were updated to the new contract.
 - Time is judged against four classic runs.
 - The references are independent (`ZR_SEED_OFFSET=524288`).
+
+**Delivered exposure (final review, 2026-10-15).** The pass/fail brightness check compared
+pre-exposure raw dumps, so it could not see the daylight probe choosing a different exposure.
+
+| Render | Classic exposure | Blue exposure | Change |
+|---|---|---|---|
+| 4K still | 24.433 | 24.102 | -1.36% |
+| Full-HD still | 23.776 | 23.557 | -0.92% |
+
+- Classic run on another seed: +0.21%.
+- Delivered still: about 1% darker.
+- Neither exposure is more accurate. The probe's own statistic on the converged 2048-spp full-HD
+  reference reads 0.00760; the 16-spp probes read classic -0.34% and blue +0.58%.
+- The integrator's brightness is unchanged (raw +0.07%).
+- **The owner accepts the ~1% exposure shift and keeps blue noise on (2026-10-15).**
+- DLSS-RR accumulate words never take the blue variant (engine guard in `compute_rt_flags`, final review).
+
