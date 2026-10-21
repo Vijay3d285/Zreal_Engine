@@ -2074,7 +2074,7 @@ func parse_vec3(d):
 # HDRI sun's own elevation is used, so the sky, its lighting and the
 # DirectionalLight3D shadows all agree. A pose the USER placed never reaches
 # here (Python leaves exterior_sun out).
-const EXTERIOR_SUN_PEAK_RATIO := 3.0   # HDRI peak / upper-sky mean needed to call it "a clear sun"
+const EXTERIOR_SUN_PEAK_RATIO := 3.0 # HDRI peak / upper-sky mean needed to call it "a clear sun"
 # The HDRI's own sun disc is clipped on exterior day renders: the
 # DirectionalLight3D IS the sun. Left in, the disc carried 77% of
 # testing_hdri.exr's irradiance, so after the "sky irradiance = 1" normalisation
@@ -2151,7 +2151,7 @@ func _find_hdri_sun(img: Image) -> Dictionary:
 	var n := 0
 	var lum := PackedFloat32Array()
 	lum.resize(sw * (sh / 2))
-	for y in range(sh / 2):          # upper hemisphere only
+	for y in range(sh / 2): # upper hemisphere only
 		for x in range(sw):
 			var c := small.get_pixel(x, y)
 			var l := 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b
@@ -3793,7 +3793,7 @@ func _wall_face_span(line_id, line: Dictionary, lines: Dictionary, vertices: Dic
 			if o_id == me["b_id"] or ov.distance_to(pb) < snap:
 				nb_b.append(entry)
 	var s0 = _face_corner_axial(pa, dir, face_n, half_t, nb_a)
-	var s1 = -_face_corner_axial(pb, -dir, face_n, half_t, nb_b)
+	var s1 = - _face_corner_axial(pb, -dir, face_n, half_t, nb_b)
 	var start_m = s0 * scale_factor
 	var end_m = length_m + s1 * scale_factor
 	if end_m - start_m < 0.001:
@@ -4510,9 +4510,9 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 									# (urbantest227: the room's only opening was an arched glass door).
 									if is_window_for_sun:
 										_disable_shadow_casting_recursive(asset_node)
-									elif _node_has_any_glass(asset_node):
-										_disable_glass_shadow_only(asset_node)
-										print("  [DoorGlass] glass panes: cast_shadow OFF (daylight passes)")
+									# elif _node_has_any_glass(asset_node):
+									# 	_disable_glass_shadow_only(asset_node)
+									# 	print("  [DoorGlass] glass panes: cast_shadow OFF (daylight passes)")
 									print("Loaded hole asset: ", model_path, " final scale: ", asset_node.scale, " (window glass: cast_shadow OFF)" if is_window_for_sun else " (shadows: handled by material)")
 									# Detect glass: enables shadow on glass-door fill SpotLights
 									if not is_window_for_sun:
@@ -4944,7 +4944,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 							f_mat,
 							floor_props["material"],
 							floor_span,
-							false  # editor parity: no density boost on floors
+							false # editor parity: no density boost on floors
 						)
 						floor_poly.material = f_mat
 						print("[FloorUV] Base floor ", area_id, " uv1_scale=", f_mat.uv1_scale, " span=", floor_span)
