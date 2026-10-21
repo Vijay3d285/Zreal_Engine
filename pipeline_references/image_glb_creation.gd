@@ -279,6 +279,7 @@ var _scene_plan_rotation_radians: float = 0.0
 var _scene_plan_pivot: Vector2 = Vector2.ZERO
 var _floor_plan_root_data: Dictionary = {}
 var structure_builder
+var roof_builder = null
 # Builds layer["cadShapes"] (editor CAD tools: push/pull, revolve, sweep, blend, voids).
 var cad_shape_builder
 var _lighting_color_mood: String = "day"
@@ -474,7 +475,19 @@ func _transform_plan_point_meters(point: Vector3) -> Vector3:
 # rendering pipeline in order: setting global scales, generating lighting, 
 # building 3D walls/floors, building custom stairs/shapes, and loading furniture.
 # ==============================================================================
+# USE_TEXTURES_ASSETS (.env, sent per job as "use_textures_assets"). False:
+# no GLB models (furniture, decor, door/window models) and no material
+# textures - walls, floors, ceilings, openings, structures, custom / CAD shapes
+# and paving are still built, in their plain material colours. The sky .exr is
+# kept (daylight needs it). Cuts VRAM to the architecture alone.
+var _use_textures_assets: bool = true
+
 func build_scene(data):
+	_use_textures_assets = true
+	if typeof(data) == TYPE_DICTIONARY and data.has("use_textures_assets"):
+		_use_textures_assets = bool(data["use_textures_assets"])
+	if not _use_textures_assets:
+		print("[Assets] USE_TEXTURES_ASSETS=False -> no GLB models and no textures; architecture only, plain colours.")
 	structure_builder = preload("res://shapes/structure.gd").new(self)
 	cad_shape_builder = preload("res://shapes/cad_shape.gd").new(self)
 	lighting_profile = _resolve_lighting_profile(data)
@@ -922,11 +935,7 @@ func setup_lighting(data, geom_data = {}):
 			env.ambient_light_energy = lighting["ambient_energy"] * _lighting_illumination_scale * _auto_ambient_boost
 
 	if env.tonemap_mode == Environment.TONE_MAPPER_AGX:
-		# AgX reads tonemap_agx_white, not tonemap_white -- Environment::_update_tonemap()
-		# (scene/resources/environment.cpp) forwards tonemap_agx_white to the renderer
-		# when tone_mapper == TONE_MAPPER_AGX; tonemap_white is inert in that branch and
-		# was silently discarding every profile's intended value (fixed 2026-09-28).
-		env.tonemap_agx_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
+		env.tonemap_white = lighting.get("tonemap_agx_white", lighting["tonemap_white"])
 		# Day: the probe owns the exposure (spec 2026-09-19); a multiplier after
 		# it would move the median off 0.18. Night keeps the profile's contrast
 		# and warm-mood terms.
@@ -1907,7 +1916,16 @@ func _autosmooth_converted_surfaces(m: MeshInstance3D, surface_ids: Array) -> Ar
 	var rebuilt := ArrayMesh.new()
 	rebuilt.resource_name = mesh.resource_name
 	var changed := false
-	for i in range(mesh.get_surface_count()):
+	# Custom vertex channels (CUSTOM0-3, e.g. a GLB's TEXCOORD_2+) only survive
+	# add_surface_from_arrays when their format bits are passed back as flags;
+	# without them every surface is rejected ("Invalid array format") and the
+	# model came out with NO geometry - job 669b7c90, the car (Car3_HP).
+	var custom_bits: int = 0
+	for c in range(4):
+		custom_bits |= Mesh.ARRAY_FORMAT_CUSTOM_MASK << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + c * Mesh.ARRAY_FORMAT_CUSTOM_BITS)
+	var keep_flags: int = custom_bits | Mesh.ARRAY_FLAG_USE_8_BONE_WEIGHTS
+	var src_count: int = mesh.get_surface_count()
+	for i in range(src_count):
 		var prim: int = mesh.surface_get_primitive_type(i)
 		var arrays: Array = mesh.surface_get_arrays(i)
 		if i in surface_ids and prim == Mesh.PRIMITIVE_TRIANGLES:
@@ -1916,11 +1934,20 @@ func _autosmooth_converted_surfaces(m: MeshInstance3D, surface_ids: Array) -> Ar
 				arrays = res["arrays"]
 				changed = true
 				report.append("%s (normals corrected up to %.1f deg)" % [mesh.surface_get_name(i), res["max_correction_deg"]])
-		rebuilt.add_surface_from_arrays(prim, arrays)
+		var before: int = rebuilt.get_surface_count()
+		rebuilt.add_surface_from_arrays(prim, arrays, [], {}, mesh.surface_get_format(i) & keep_flags)
+		if rebuilt.get_surface_count() != before + 1:
+			break # a surface was rejected: the copy is incomplete, keep the original below
 		rebuilt.surface_set_name(i, mesh.surface_get_name(i))
 		var src_mat = mesh.surface_get_material(i)
 		if src_mat != null:
 			rebuilt.surface_set_material(i, src_mat)
+	# Never swap in a mesh that lost surfaces: a model with authored normals is
+	# far better than a model with no geometry at all.
+	if changed and rebuilt.get_surface_count() != src_count:
+		print("  [GlassFix] auto-smooth skipped for %s: rebuilt %d of %d surfaces, original mesh kept" % [mesh.resource_name, rebuilt.get_surface_count(), src_count])
+		changed = false
+		report = []
 	if changed:
 		m.mesh = rebuilt
 	_autosmooth_mesh_cache[mid] = {"mesh": rebuilt if changed else null, "report": report}
@@ -3647,6 +3674,132 @@ func _resolve_camera_layer_id(data: Dictionary) -> String:
 # to metres), so source coordinates stay in the input's original plan units.
 #
 # Returns: "inner-left", "inner-right", or "" (unknown / no area found).
+# ── Wall face span (editor WallManager._buildShapeOverlays parity) ──────────
+# Wall custom shapes (baseboards, cladding strips) are stored in the Material
+# Editor's face space: x = mm along the FACE from the face's start corner. That
+# corner is the mitred joint with the neighbouring wall, not the wall's
+# centre-line vertex. The renderer measured x from the centre-line vertex, so a
+# baseboard drawn exactly corner-to-corner on a 228.6 mm wall was shifted by
+# half the thickness: it ran 114 mm into one adjacent wall and stopped 114 mm
+# short of the other corner (job 4608ef53).
+#
+# Returns [start_offset, face_length] in metres along the wall axis measured
+# from p1, for the face whose outward normal is `face_sign` x the wall's left
+# normal (+local Z of the wall basis, the side custom shapes use for side>0).
+func _wall_aligned_endpoints_2d(line: Dictionary, vertices: Dictionary):
+	if not line.has("vertices") or line["vertices"].size() < 2:
+		return null
+	var a_id = str(line["vertices"][0])
+	var b_id = str(line["vertices"][1])
+	if not vertices.has(a_id) or not vertices.has(b_id):
+		return null
+	var ax = float(vertices[a_id]["x"]); var ay = float(vertices[a_id]["y"])
+	var bx = float(vertices[b_id]["x"]); var by = float(vertices[b_id]["y"])
+	var t = 20.0
+	var props = line.get("properties", {})
+	if typeof(props) == TYPE_DICTIONARY and props.has("thickness"):
+		t = get_dimension_value(props["thickness"], 20.0)
+	var alignment = "center"
+	if typeof(props) == TYPE_DICTIONARY and props.has("alignment"):
+		alignment = str(props["alignment"]).to_lower().strip_edges()
+	var line_offset_val = 0.0
+	if typeof(props) == TYPE_DICTIONARY and props.has("lineOffset"):
+		line_offset_val = get_dimension_value(props["lineOffset"], 0.0)
+	var d = (Vector2(bx, by) - Vector2(ax, ay))
+	if d.length() < 0.000001:
+		return null
+	d = d.normalized()
+	var rn = Vector2(-d.y, d.x)
+	var l_off = t / 2.0
+	var r_off = t / 2.0
+	if alignment == "left":
+		l_off = t
+		r_off = 0.0
+	elif alignment == "right":
+		l_off = 0.0
+		r_off = t
+	l_off += line_offset_val
+	r_off -= line_offset_val
+	var off = rn * ((l_off - r_off) / 2.0)
+	var pa = _plan_point_2d(ax + off.x, ay + off.y)
+	var pb = _plan_point_2d(bx + off.x, by + off.y)
+	return {"a_id": a_id, "b_id": b_id, "a": pa, "b": pb, "t": t}
+
+func _line_intersection_2d(p: Vector2, d: Vector2, q: Vector2, e: Vector2):
+	var den = d.x * e.y - d.y * e.x
+	if abs(den) < 0.000001:
+		return null
+	var w = q - p
+	var s = (w.x * e.y - w.y * e.x) / den
+	return p + d * s
+
+# Axial position (source units, along `dir` from vertex point `v`) where this
+# wall's face line meets the neighbouring wall's face at that joint; 0 when the
+# end is free or the neighbour is collinear.
+func _face_corner_axial(v: Vector2, dir: Vector2, face_n: Vector2, half_t: float, neighbours: Array) -> float:
+	if neighbours.is_empty():
+		return 0.0
+	# The face on side face_n meets the neighbour that is angularly next when
+	# sweeping from `dir` towards face_n.
+	var best = null
+	var best_ang = INF
+	var sweep_sign = 1.0 if dir.cross(face_n) > 0.0 else -1.0
+	for nb in neighbours:
+		var nd: Vector2 = nb["dir"]
+		var ang = atan2(dir.cross(nd) * sweep_sign, dir.dot(nd))
+		if ang <= 0.0001:
+			ang += TAU
+		if ang < best_ang:
+			best_ang = ang
+			best = nb
+	if best == null:
+		return 0.0
+	var nd: Vector2 = best["dir"]
+	var nn = Vector2(-nd.y, nd.x)
+	# Neighbour face on the same side of the corner as our face.
+	var want_pos = face_n.dot(nd) > 0.0
+	var n_face = nn if ((nn.dot(dir) > 0.0) == want_pos) else -nn
+	var hit = _line_intersection_2d(v + face_n * half_t, dir, best["v"] + n_face * float(best["half_t"]), nd)
+	if hit == null:
+		return 0.0
+	return (hit - v).dot(dir)
+
+func _wall_face_span(line_id, line: Dictionary, lines: Dictionary, vertices: Dictionary, face_sign: float, length_m: float, scale_factor: float) -> Array:
+	var me = _wall_aligned_endpoints_2d(line, vertices)
+	if me == null:
+		return [0.0, length_m]
+	var pa: Vector2 = me["a"]
+	var pb: Vector2 = me["b"]
+	var dir = (pb - pa).normalized()
+	var face_n = Vector2(-dir.y, dir.x) * face_sign
+	var half_t = float(me["t"]) / 2.0
+	var nb_a = []
+	var nb_b = []
+	var snap = 0.005 / max(scale_factor, 0.000001)
+	for other_id in lines:
+		if str(other_id) == str(line_id):
+			continue
+		var o = _wall_aligned_endpoints_2d(lines[other_id], vertices)
+		if o == null:
+			continue
+		for end in ["a", "b"]:
+			var ov: Vector2 = o[end]
+			var o_far: Vector2 = o["b"] if end == "a" else o["a"]
+			var o_id = o["a_id"] if end == "a" else o["b_id"]
+			var odir = (o_far - ov).normalized()
+			var entry = {"v": ov, "dir": odir, "half_t": float(o["t"]) / 2.0}
+			if o_id == me["a_id"] or ov.distance_to(pa) < snap:
+				nb_a.append(entry)
+			if o_id == me["b_id"] or ov.distance_to(pb) < snap:
+				nb_b.append(entry)
+	var s0 = _face_corner_axial(pa, dir, face_n, half_t, nb_a)
+	var s1 = -_face_corner_axial(pb, -dir, face_n, half_t, nb_b)
+	var start_m = s0 * scale_factor
+	var end_m = length_m + s1 * scale_factor
+	if end_m - start_m < 0.001:
+		return [0.0, length_m]
+	return [start_m, end_m - start_m]
+
 func _get_wall_facing_direction(line: Dictionary, vertices: Dictionary, areas: Dictionary) -> String:
 	var v1_id = str(line["vertices"][0])
 	var v2_id = str(line["vertices"][1])
@@ -4278,7 +4431,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 				# Used to enable shadow_enabled on glass-door fill SpotLights.
 				var hole_has_glass := false
 				# 4. Instantiate door/window asset GLB
-				if hole.has("asset_urls"):
+				if _use_textures_assets and hole.has("asset_urls"):
 					var urls = hole["asset_urls"]
 					var model_path = ""
 					if urls.has("GLB_File_URL") and urls["GLB_File_URL"] != null:
@@ -4352,9 +4505,14 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 									# instance (RT_INSTANCE_MASK_NO_SHADOW): camera and bounce rays
 									# still see and refract through the pane, no shadow ray does. Frames
 									# and mullions keep their shadows (_is_glass_mesh decides per mesh).
-									# Doors are left alone: an opaque door should shadow.
+									# Doors keep their shadows -- an opaque door should shadow -- EXCEPT their
+									# glass panes (2026-10-21): a glass door passes sun and sky like a window
+									# (urbantest227: the room's only opening was an arched glass door).
 									if is_window_for_sun:
 										_disable_shadow_casting_recursive(asset_node)
+									elif _node_has_any_glass(asset_node):
+										_disable_glass_shadow_only(asset_node)
+										print("  [DoorGlass] glass panes: cast_shadow OFF (daylight passes)")
 									print("Loaded hole asset: ", model_path, " final scale: ", asset_node.scale, " (window glass: cast_shadow OFF)" if is_window_for_sun else " (shadows: handled by material)")
 									# Detect glass: enables shadow on glass-door fill SpotLights
 									if not is_window_for_sun:
@@ -4506,11 +4664,16 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 				var shape_poly_pts = PackedVector2Array()
 				var min_x = 999999.0; var max_x = -999999.0
 				var min_y = 999999.0; var max_y = -999999.0
-				
+				# Face-space x runs from the face's mitred start corner (editor
+				# parity); see _wall_face_span.
+				var face_span = _wall_face_span(line_id, line, lines, vertices, side_sign, length, scale_factor)
+				var face_start = float(face_span[0])
+				var face_len = float(face_span[1])
+
 				for pt in shape["points"]:
-					var px = float(pt.get("x", 0)) * scale_factor
+					var px = face_start + float(pt.get("x", 0)) * scale_factor
 					if side_sign < 0:
-						px = length - px
+						px = face_start + face_len - float(pt.get("x", 0)) * scale_factor
 					# Frontend Y=0 is ceiling, Y=height is floor. Godot Y=0 is floor.
 					var py = height - (float(pt.get("y", 0)) * scale_factor)
 					shape_poly_pts.append(Vector2(px, py))
@@ -4565,15 +4728,18 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 				var shape_poly_span = Vector2(max_x - min_x, max_y - min_y)
 				var s_basis = Basis(Vector3.UP, wall_angle)
 				var local_z = s_basis * Vector3(0, 0, 1)
-				var offset_amt = 0.001 * shape_idx
+				# Editor OVERLAY_OFFSET: 2 mm off the wall face (+1 mm per stacked shape).
+				var offset_amt = 0.002 + 0.001 * shape_idx
 
 				var frag_idx = 0
 				for frag_poly in clipped_fragments:
 					var poly = CSGPolygon3D.new()
 					poly.polygon = frag_poly
-					var shape_depth = 0.02
-					if shape.has("thickness"):
-						shape_depth = get_dimension_value(shape["thickness"], 20.0) * scale_factor
+					# Editor: shape.thickness (mm) when > 0, else 15 mm.
+					var shape_depth = 0.015
+					if shape.has("thickness") and shape["thickness"] != null:
+						var st = get_dimension_value(shape["thickness"], 0.0) * scale_factor
+						if st > 0.0: shape_depth = st
 					
 					# ── Step 2: Override depth + operation for openings ─────────
 					if is_opening:
@@ -4972,12 +5138,19 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 					print("[VISIBILITY] Hiding Ceiling automatically (showAllFloors=false): Camera height (", _camera_height_m, ") is above ceiling Y (", ceiling_world_y, ")")
 
 				if ceil_is_visible:
-					var ceil_depth = 0.1
-					if ceiling_props.has("thickness"):
-						var t = float(ceiling_props["thickness"]) * scale_factor
-						if t > 0.001: ceil_depth = t
-					if ceil_depth < 0.05:
-						ceil_depth = 0.05
+					# Editor parity (AreaManager.addArea / SceneBridge.areaToWire): the
+					# slab hangs DOWN from the room height by exactly
+					# ceiling_properties.thickness (200 mm when absent), so the ceiling
+					# underside sits at roomHeight - thickness. Items are placed against
+					# that underside: a 30 mm ceiling light at altitude 3316.8 under a
+					# 3352.8 room with a 6 mm ceiling touches it exactly. The old 50 mm
+					# minimum (and 100 mm default) pushed the underside 44 mm lower and
+					# buried every flush ceiling fixture inside the slab (job 280bd8fe).
+					var ceil_depth = 200.0 * scale_factor
+					if ceiling_props.has("thickness") and ceiling_props["thickness"] != null:
+						ceil_depth = float(ceiling_props["thickness"]) * scale_factor
+					# CSG needs a non-zero depth; 1 mm keeps a 0 mm ceiling a closed slab.
+					ceil_depth = max(ceil_depth, 0.001)
 
 					var ceil_poly = CSGPolygon3D.new()
 					ceil_poly.polygon = polygon
@@ -5270,7 +5443,17 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 		"baywindowsill":
 			structure_builder._add_baywindowsill_structure(root, width, depth, mat_data)
 		"roof":
-			print("[Structure] roof structures are not built by the renderer yet; skipped ", str(structure.get("id", "")))
+			# Native roof builder (shapes/roof.gd), written against the editor's
+			# roof code. Editor _placeGroup: a roof sits at the centre of its
+			# footprint, so the origin moves by the footprint offset.
+			if roof_builder == null:
+				roof_builder = preload("res://shapes/roof.gd").new(self)
+			var roof_off = roof_builder.roof_offset(structure)
+			var roof_xy = _plan_point_2d(float(structure.get("x", 0)) + roof_off[0], float(structure.get("y", 0)) + roof_off[1])
+			root.position.x = roof_xy.x * scale_factor
+			root.position.z = roof_xy.y * scale_factor
+			var nroof = roof_builder.build(root, structure)
+			print("[Structure] roof %s: %d mesh(es)" % [str(structure.get("id", "")), nroof])
 		"step":
 			structure_builder._add_step_structure(root, structure, width, depth, height, mat_data)
 		"falseceiling":
@@ -5293,6 +5476,9 @@ func _build_structure_mesh(structure: Dictionary, layer_altitude: float, layer_i
 # place them at exact coordinates inside the 3D rooms.
 # ==============================================================================
 func load_assets(data):
+	if not _use_textures_assets:
+		print("[Assets] Skipping all item models (USE_TEXTURES_ASSETS=False).")
+		return
 	if data.has("layers"):
 		var layers_dict = data["layers"]
 		var show_all_floors = data.get("showAllFloors", true)
@@ -5697,14 +5883,10 @@ func _is_light_fixture_item(item: Dictionary) -> bool:
 	var mounting_type = str(item.get("mounting_type", "")).to_lower()
 	var model_hint = _get_item_model_hint(item)
 	var full_desc = item_type + " " + item_name + " " + mounting_type + " " + model_hint
-	# No "wallmount": it names a mounting, not a light. Matched against the GLB file
-	# name it made "WallMountedAirConditioner_HP_high.glb" a lamp with an analytic
-	# light. Across 107 saved payloads it was the only keyword behind that AC, and
-	# no real fixture depended on it ("Wall Mount Light" matches "light").
 	var light_keywords = [
 		"light", "lamp", "pendant", "pendent", "chandelier",
 		"lantern", "sconce", "ceilinglamp", "ceiling_light",
-		"streetlamp", "lighting fixture"
+		"wallmount", "streetlamp", "lighting fixture"
 	]
 	for kw in light_keywords:
 		if kw in full_desc:
@@ -7191,6 +7373,13 @@ func _disable_ceiling_asset_sun_shadow(node: Node) -> void:
 	for child in node.get_children():
 		_disable_ceiling_asset_sun_shadow(child)
 
+# Glass doors: only the glass panes stop casting shadows; every other mesh keeps its setting.
+func _disable_glass_shadow_only(node: Node) -> void:
+	if node is MeshInstance3D and _is_glass_mesh(node as MeshInstance3D):
+		(node as MeshInstance3D).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	for child in node.get_children():
+		_disable_glass_shadow_only(child)
+
 func _disable_shadow_casting_recursive(node: Node) -> void:
 	if node is MeshInstance3D:
 		var mesh_inst := node as MeshInstance3D
@@ -7514,6 +7703,8 @@ func _resolve_local_texture(url: String) -> String:
 	return ""
 
 func load_texture_from_path(path):
+	if not _use_textures_assets:
+		return null # USE_TEXTURES_ASSETS=False: plain material colours
 	if path == "" or path == "null" or path == "None": return null
 	var norm_path = str(path).replace("\\", "/")
 	

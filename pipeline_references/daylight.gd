@@ -36,7 +36,10 @@ const PROBE_FRAMES := 16
 ## Statistics are taken at every PROBE_STEP-th pixel in x and y.
 const PROBE_STEP := 4
 const EXPOSURE_MIN := 0.05
-const EXPOSURE_MAX := 50.0
+## Raised from 50 (2026-10-21): a closed room lit only through one glass door (urbantest227)
+## needed 253 and rendered near-black at the old cap; normal rooms sit at 3-25, so they never
+## reach it. No fill light is involved -- the image is exposed from the scene's own light.
+const EXPOSURE_MAX := 256.0
 ## The fill may supply at most this share of the occupied median.
 const FILL_SHARE_CAP := 0.5
 const FILL_SCAN_START := 0.01
