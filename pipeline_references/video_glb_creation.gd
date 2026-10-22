@@ -86,8 +86,15 @@ const VIDEO_OIDN_SPP := 3
 # samples: RMSE 2.62 vs DLSS-RR 2.50) and level on flat walls (0.43 vs 0.48). In the delivered
 # MJPEG movie the whole-frame error is level with DLSS-RR (4.75 vs 4.64).
 const VIDEO_OIDN_ACCUM_TARGET := 24
+# Dark rooms (owner, 2026-10-22). With no scene fill lights a room lit only through a door
+# probes far darker (job 227's kitchen: exposure 256, clamped) and OIDN blotches its walls and
+# smears wood at 24 samples; 64 cleaned it. The probe sets _video_dark_room when the exposure it
+# chooses is above the old Daylight.EXPOSURE_MAX of 50. No past video job pooled above 21.7.
+const VIDEO_DARK_ROOM_EXPOSURE := 50.0
+const VIDEO_DARK_ROOM_ACCUM_TARGET := 64
 const VIDEO_OIDN_CLAMP_INDIRECT := 10.0 # Cycles' sample_clamp_indirect; fireflies are what OIDN smears into blotches
 var _video_denoiser := ""
+var _video_dark_room := false # set by video_render.gd's daylight probe
 var _flicker_test := false
 
 
@@ -124,7 +131,7 @@ func _video_phase_a() -> bool:
 
 
 func _video_accum_target() -> int:
-	var t := VIDEO_OIDN_ACCUM_TARGET
+	var t := VIDEO_DARK_ROOM_ACCUM_TARGET if _video_dark_room else VIDEO_OIDN_ACCUM_TARGET
 	var e := OS.get_environment("ZR_VIDEO_ACCUM_TARGET")
 	if e.is_valid_int():
 		t = maxi(1, e.to_int())
@@ -1574,67 +1581,11 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 	world_env.environment = env
 	add_child(world_env)
 
-	# ── Scene Fill Lights ──────────────────────────────────────────────────────
-	if lighting_profile == "day" or lighting_profile == "sunset":
-		var fill = OmniLight3D.new()
-		fill.name = "FillLight"
-		fill.position = Vector3(room_center.x, room_ceiling_y - 0.55, room_center.z)
-		fill.light_energy = lighting["fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
-		fill.omni_range = max(room_extent.x, room_extent.y) * 2.5 + 10.0
-		var mood_fill_color = _get_color_mood_light_color("fill")
-		fill.light_color = Color(
-			lighting["fill_color"].r * mood_fill_color.r,
-			lighting["fill_color"].g * mood_fill_color.g,
-			lighting["fill_color"].b * mood_fill_color.b
-		)
-		fill.light_specular = 0.0
-		fill.shadow_enabled = false
-		add_child(fill)
-
-		# Symmetric front/back fill avoids camera-direction brightness splits
-		var fill_offset = max(room_extent.x, room_extent.y) * 0.28
-		var fill_front = OmniLight3D.new()
-		fill_front.name = "FrontFillLight"
-		fill_front.position = Vector3(room_center.x, room_ceiling_y - 0.9, room_center.z) + cam_forward * fill_offset
-		fill_front.light_energy = lighting["front_back_fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
-		fill_front.omni_range = max(room_extent.x, room_extent.y) * 1.6 + 4.0
-		fill_front.light_color = Color(
-			lighting["front_back_fill_color"].r * mood_fill_color.r,
-			lighting["front_back_fill_color"].g * mood_fill_color.g,
-			lighting["front_back_fill_color"].b * mood_fill_color.b
-		)
-		fill_front.light_specular = 0.0
-		fill_front.shadow_enabled = false
-		add_child(fill_front)
-
-		var fill_back = OmniLight3D.new()
-		fill_back.name = "BackFillLight"
-		fill_back.position = Vector3(room_center.x, room_ceiling_y - 0.9, room_center.z) - cam_forward * fill_offset
-		fill_back.light_energy = lighting["front_back_fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
-		fill_back.omni_range = max(room_extent.x, room_extent.y) * 1.6 + 4.0
-		fill_back.light_color = Color(
-			lighting["front_back_fill_color"].r * mood_fill_color.r,
-			lighting["front_back_fill_color"].g * mood_fill_color.g,
-			lighting["front_back_fill_color"].b * mood_fill_color.b
-		)
-		fill_back.light_specular = 0.0
-		fill_back.shadow_enabled = false
-		add_child(fill_back)
-	else:
-		var fill = OmniLight3D.new()
-		fill.name = "FillLight"
-		fill.position = Vector3(room_center.x, room_ceiling_y - 0.55, room_center.z)
-		fill.light_energy = lighting["fill_energy"] * _lighting_illumination_scale * 0.1 * _auto_ambient_boost
-		fill.omni_range = max(room_extent.x, room_extent.y) * 2.2 + 7.0
-		var mood_fill_color = _get_color_mood_light_color("fill")
-		fill.light_color = Color(
-			lighting["fill_color"].r * mood_fill_color.r,
-			lighting["fill_color"].g * mood_fill_color.g,
-			lighting["fill_color"].b * mood_fill_color.b
-		)
-		fill.light_specular = 0.0
-		fill.shadow_enabled = false
-		add_child(fill)
+	# No scene fill lights, to match stills: the still route places no room fill
+	# (image_glb_creation.gd's _create_day_ambient_fill is never called). The shadowless omnis
+	# that stood here (three by day and sunset, one otherwise) were most of the light in a dark
+	# room: job 227's kitchen probed exposure 106 with them against the still's 252.
+	print("[VideoGLB] Scene fill lights: none (as stills).")
 
 	_lighting_setup_done = true
 	print("[VideoGLB] Photorealistic lighting setup complete. profile=", lighting_profile)

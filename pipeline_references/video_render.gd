@@ -673,6 +673,13 @@ func _run_daylight_probe() -> void:
 			ascending.size(), ascending.size() * (Daylight.RESET_SETTLE_FRAMES * 2 + Daylight.PROBE_FRAMES)])
 	_log_console("[Daylight] pre-roll frames recorded by MovieWriter before the sequence: warmup %d + probe %d + priming %d (production does NOT trim them: main.py converts the whole AVI, so they ship as the first frames of the video, or of each chunk of a chunked clip)" % [
 			20, iterations, 0 if _video_phase_a() else DLSS_PRIME_FRAMES])
+	if _video_phase_a() and exposure > VIDEO_DARK_ROOM_EXPOSURE:
+		# The sub-frame loops read _video_accum_target() per frame; the Environment's target (OIDN's
+		# trigger and blue noise's N) was set once in setup_lighting, so it is set again here.
+		_video_dark_room = true
+		env.set_pathtracing_accumulation_target(_video_accum_target())
+		_log_console("[Daylight] dark room: exposure %.1f > %.0f -> %d samples per delivered frame (normally %d)" % [
+				exposure, VIDEO_DARK_ROOM_EXPOSURE, _video_accum_target(), VIDEO_OIDN_ACCUM_TARGET])
 	_finish_daylight_probe()
 
 
