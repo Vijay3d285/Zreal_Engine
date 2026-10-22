@@ -17,6 +17,7 @@ const PtValidation = preload("res://tests/pt_validation.gd")
 
 const FILTER_GLOSSY := "rendering/pathtracer/filter_glossy"
 const SAMPLING_PATTERN := "rendering/pathtracer/sampling_pattern"
+const GATE_PATTERN_ENV := "ZR_GATE_SAMPLING_PATTERN"
 
 var _failures: Array[String] = []
 var _checks := 0
@@ -48,6 +49,7 @@ func _video_mode(p_mode: String) -> void:
 
 func _initialize() -> void:
 	print("[filter_glossy_unit]")
+	OS.unset_environment(GATE_PATTERN_ENV) # the default-gate checks must not inherit the shell's
 	_video_mode("dlssrr")
 	_check("dlssrr video turns Filter Glossy off", _setting(FILTER_GLOSSY), 0.0)
 	_check("dlssrr video uses the classic sampling pattern", _setting(SAMPLING_PATTERN), 0.0)
@@ -65,6 +67,16 @@ func _initialize() -> void:
 func _finish() -> void:
 	_check("a gate entering the tree pins Filter Glossy off", _setting(FILTER_GLOSSY), 0.0)
 	_check("a gate entering the tree pins the classic sampling pattern", _setting(SAMPLING_PATTERN), 0.0)
+
+	# ZR_GATE_SAMPLING_PATTERN=1 runs a gate on blue noise; Filter Glossy stays pinned off.
+	# root is in the tree now, so ENTER_TREE fires inside add_child.
+	_set_both_on()
+	OS.set_environment(GATE_PATTERN_ENV, "1")
+	root.add_child(PtValidation.new())
+	OS.unset_environment(GATE_PATTERN_ENV)
+	_check("ZR_GATE_SAMPLING_PATTERN=1 runs a gate on blue noise", _setting(SAMPLING_PATTERN), 1.0)
+	_check("ZR_GATE_SAMPLING_PATTERN=1 still pins Filter Glossy off", _setting(FILTER_GLOSSY), 0.0)
+
 	if _failures.is_empty():
 		print("PASS: all %d placement checks passed." % _checks)
 		quit(0)

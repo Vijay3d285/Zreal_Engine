@@ -19,10 +19,13 @@ const RESET_SETTLE_FRAMES := 3
 ## gate, tests/filter_glossy/fg_energy_gate.py; spec 2026-10-14-pt-filter-glossy-design.md) and
 ## with the classic sampling pattern (spec 2026-10-15-pt-blue-noise-sampling-design.md), so the
 ## gates pin both. A notification, not _ready, so no gate has to call super().
+## ZR_GATE_SAMPLING_PATTERN=1 runs a gate on blue noise instead, the pattern production stills
+## and OIDN video use: unbiased gates (the gate-1 analytic rho*L) must pass on it too.
 func _notification(p_what: int) -> void:
 	if p_what == NOTIFICATION_ENTER_TREE:
 		ProjectSettings.set_setting("rendering/pathtracer/filter_glossy", 0.0)
-		ProjectSettings.set_setting("rendering/pathtracer/sampling_pattern", 0)
+		var blue := OS.get_environment("ZR_GATE_SAMPLING_PATTERN") == "1"
+		ProjectSettings.set_setting("rendering/pathtracer/sampling_pattern", 1 if blue else 0)
 
 
 ## Root-mean-square error between two same-size linear images (RGB only).

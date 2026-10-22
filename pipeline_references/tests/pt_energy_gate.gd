@@ -12,6 +12,8 @@ extends "res://tests/pt_validation.gd"
 ## Env vars:
 ##   ZR_GATE_MODE    "constant" | "directional" | "both"  (default "both")
 ##   ZR_GATE_FRAMES  accumulated frames per measurement   (default 256)
+##   ZR_GATE_SAMPLING_PATTERN  "1" = blue noise, the pattern production stills and OIDN
+##                   video use (default classic; see pt_validation.gd _notification)
 ##
 ## ---------------------------------------------------------------------------
 ## GATE 1 - constant sky. Absolute, analytic.
@@ -229,6 +231,7 @@ func _ready() -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
 	print("viewport render size: %s" % str(get_viewport().get_visible_rect().size))
+	print("sampling pattern: %s" % ("blue noise" if int(ProjectSettings.get_setting("rendering/pathtracer/sampling_pattern", 0)) == 1 else "classic"))
 
 	var frames := 256
 	var f_env := OS.get_environment("ZR_GATE_FRAMES")
