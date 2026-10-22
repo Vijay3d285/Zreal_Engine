@@ -40,6 +40,15 @@ const EXPOSURE_MIN := 0.05
 ## needed 253 and rendered near-black at the old cap; normal rooms sit at 3-25, so they never
 ## reach it. No fill light is involved -- the image is exposed from the scene's own light.
 const EXPOSURE_MAX := 256.0
+## Sun patches (owner, 2026-10-22, job 217). An interior day sun lights what the camera sees
+## -- and what mirrors, glossy floors and glass show, i.e. every vertex before a diffuse
+## bounce -- at this fraction of its energy, while its bounce light stays at full strength:
+## apply_sun_direct_scale() gives it light_energy * k and light_indirect_energy 1 / k, and the
+## tracer applies indirect_energy after a diffuse bounce (raytracing_lights_inc.glsl). Job
+## 217's rug patch went from 16.7x the room's mid-grey to 4.0x (0.5 / 0.3 measured 9.2x /
+## 6.2x); the rest of the room moved 2-4% (sun patches seen in glossy reflections) and the
+## probe's exposure 15.29 -> 15.44. ZR_SUN_DIRECT_SCALE overrides it (tests; 1.0 = off).
+const SUN_DIRECT_SCALE := 0.15
 ## The fill may supply at most this share of the occupied median.
 const FILL_SHARE_CAP := 0.5
 const FILL_SCAN_START := 0.01
@@ -156,6 +165,23 @@ static func _percentile(p_sorted: PackedFloat32Array, p_q: float) -> float:
 		return 0.0
 	var idx := int(floor(p_q * float(p_sorted.size() - 1)))
 	return p_sorted[clampi(idx, 0, p_sorted.size() - 1)]
+
+
+## SUN_DIRECT_SCALE, or ZR_SUN_DIRECT_SCALE when set (clamped to 0.01..1).
+static func sun_direct_scale() -> float:
+	var e := OS.get_environment("ZR_SUN_DIRECT_SCALE")
+	if e.is_valid_float():
+		return clampf(e.to_float(), 0.01, 1.0)
+	return SUN_DIRECT_SCALE
+
+
+## Applies sun_direct_scale() to an interior day sun whose light_energy is already final.
+static func apply_sun_direct_scale(p_sun: DirectionalLight3D) -> void:
+	var k := sun_direct_scale()
+	p_sun.light_energy *= k
+	p_sun.light_indirect_energy = 1.0 / k
+	print("[Sun] direct scale %.2f: light_energy %.4f, light_indirect_energy %.3f (bounce light unchanged)" % [
+			k, p_sun.light_energy, p_sun.light_indirect_energy])
 
 
 ## Occupancy mask + exposure from a probe's luminance samples.

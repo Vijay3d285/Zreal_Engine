@@ -1209,6 +1209,11 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 
 	# CRITICAL: add_child BEFORE setting position/look_at, otherwise look_at fails
 	# because the node has no coordinate space.
+	# Sun patches: an interior day sun at Daylight.SUN_DIRECT_SCALE on what the camera sees, full
+	# strength in its bounce light (daylight.gd), as the still route.
+	if day_render and not (typeof(data) == TYPE_DICTIONARY and typeof(data.get("exterior_light", null)) == TYPE_DICTIONARY):
+		Daylight.apply_sun_direct_scale(dir_light)
+
 	_dir_light = dir_light
 	add_child(dir_light)
 

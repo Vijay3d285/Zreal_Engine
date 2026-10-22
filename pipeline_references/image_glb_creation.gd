@@ -814,6 +814,11 @@ func setup_lighting(data, geom_data = {}):
 		print("[Sun] Exterior light level: sun : sky %.2f (interior design %.1f) -> light_energy %.4f" % [
 			ratio, Daylight.SUN_TO_SKY, dir_light.light_energy])
 	
+	# Sun patches: an interior day sun at Daylight.SUN_DIRECT_SCALE on what the camera sees, full
+	# strength in its bounce light (daylight.gd). Exteriors keep their own light level above.
+	if day_render and not (typeof(data) == TYPE_DICTIONARY and typeof(data.get("exterior_light", null)) == TYPE_DICTIONARY):
+		Daylight.apply_sun_direct_scale(dir_light)
+
 	# Force sun energy to 0 if night render
 	if not day_render:
 		dir_light.light_energy = 0.0
