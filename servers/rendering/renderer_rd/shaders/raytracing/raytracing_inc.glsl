@@ -526,6 +526,14 @@ RNGState rng_next_bounce(RNGState p_rng) {
 /// 1D draw from dimension `p_dim` of the current block. Does not mutate state.
 float rng_1d(RNGState p_rng, uint p_dim) {
 #ifdef RT_BLUE_NOISE
+	// Past N (accumulation that keeps going past the target: editor previews, the OIDN video probe's
+	// settle frames) the shared sequence would hand this pixel its NEIGHBOUR's samples, so both
+	// pixels converge on one sample set. Continue on the pixel's own scrambled sequence from index
+	// 0 instead -- classic per-pixel Sobol-Burley, seeded from the (unique) offset. Mirrored as
+	// bn_draw_1d in test_pt_sobol.cpp.
+	if (p_rng.sample_index >= g_rt_blue_noise_length) {
+		return sobol_burley_sample_1D(p_rng.sample_index - g_rt_blue_noise_length, p_rng.offset + p_dim, sb_hash_hp(p_rng.pixel), 0xffffffffu);
+	}
 	// Cycles BLUE_NOISE_PURE (pattern.h:42-47, :79-80): one sequence, seed 0, this pixel's section.
 	return sobol_burley_sample_1D(p_rng.sample_index + p_rng.pixel * g_rt_blue_noise_length, p_rng.offset + p_dim, 0u, 0xffffffffu);
 #else
@@ -542,6 +550,9 @@ float rng_1d(RNGState p_rng, uint p_dim) {
 /// 2D draw from dimension set `p_dim` of the current block. Does not mutate state.
 vec2 rng_2d(RNGState p_rng, uint p_dim) {
 #ifdef RT_BLUE_NOISE
+	if (p_rng.sample_index >= g_rt_blue_noise_length) { // past N: see rng_1d
+		return sobol_burley_sample_2D(p_rng.sample_index - g_rt_blue_noise_length, p_rng.offset + p_dim, sb_hash_hp(p_rng.pixel), 0xffffffffu);
+	}
 	return sobol_burley_sample_2D(p_rng.sample_index + p_rng.pixel * g_rt_blue_noise_length, p_rng.offset + p_dim, 0u, 0xffffffffu);
 #else
 	return sobol_burley_sample_2D(p_rng.sample_index, p_rng.offset + p_dim, p_rng.pixel, 0xffffffffu);

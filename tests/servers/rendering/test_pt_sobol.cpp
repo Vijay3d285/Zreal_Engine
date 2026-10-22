@@ -298,6 +298,14 @@ static double bn_low_share(const double *p_err) {
 	return low / total;
 }
 
+// Mirror of rng_1d's RT_BLUE_NOISE branch (raytracing_inc.glsl): pixel offset p_offset, N = p_n.
+static float bn_draw_1d(uint32_t p_sample, uint32_t p_offset, uint32_t p_n, uint32_t p_dim) {
+	if (p_sample >= p_n) {
+		return sobol_burley_sample_1D(p_sample - p_n, p_dim, sb_hash_hp(p_offset), 0xffffffffu);
+	}
+	return sobol_burley_sample_1D(p_sample + p_offset * p_n, p_dim, 0u, 0xffffffffu);
+}
+
 static double bn_ratio(uint32_t p_n, bool p_disc) {
 	static double blue[64 * 64];
 	static double classic[64 * 64];
@@ -538,6 +546,29 @@ TEST_CASE("[PathTracer][Sobol] the classic per-pixel scramble leaves white-noise
 			CHECK(share < 1.3);
 		}
 	}
+}
+
+TEST_CASE("[PathTracer][Sobol] blue-noise samples below N are the shared sequence's") {
+	const uint32_t n = 24;
+	for (uint32_t off : { 0u, 7u, 1000u, 0x8000001u }) {
+		for (uint32_t k = 0; k < n; k++) {
+			CHECK(bn_draw_1d(k, off, n, BN_DIM) == sobol_burley_sample_1D(k + off * n, BN_DIM, 0u, 0xffffffffu));
+		}
+	}
+}
+
+TEST_CASE("[PathTracer][Sobol] past N a blue-noise pixel does not draw its neighbour's samples") {
+	// Accumulating past the target (editor previews, the OIDN video probe's settle frames): with the
+	// shared-sequence index alone, sample N + k of the pixel at offset o IS sample k of the pixel at
+	// offset o + 1, so neighbouring pixels converge on the same sample sets.
+	const uint32_t n = 16;
+	int reused = 0;
+	for (uint32_t off : { 3u, 4096u, 77777u }) {
+		for (uint32_t k = 0; k < n; k++) {
+			reused += (bn_draw_1d(n + k, off, n, BN_DIM) == bn_draw_1d(k, off + 1, n, BN_DIM)) ? 1 : 0;
+		}
+	}
+	CHECK(reused == 0);
 }
 
 } // namespace TestPTSobol
