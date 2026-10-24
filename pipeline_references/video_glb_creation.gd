@@ -173,6 +173,27 @@ const GLB_KEEP_ALPHA_KEYWORDS = [
 	"cloud", "dust", "spray", "bubble", "foam", "caustic", "glow",
 	"screen", "display", "hologram", "flame", "fire", "particle",
 ]
+# Leaf subsurface, ported from image_glb_creation.gd (2026-10-23): the still route's
+# GLB_SUBSURFACE_PRESETS with the LEAF ROW ONLY -- marble / wax / lampshade translucency stays
+# still-only. Same keywords, exclusions, strength 0.5 and green-colour rule as stills; keep the
+# two in step (tests/leaf_sss_unit.gd runs every leaf check against both scripts).
+const GLB_SUBSURFACE_PRESETS = [
+	# Leaves (2026-10-23): "leaf" alone missed the two commonest library plants -- the Areca
+	# palm's material is "plant", IndoorPlant's are "Material.001/.002" (the latter is caught by
+	# colour, _glb_is_leaf_green). "not" keeps pots, soil and grasscloth weave opaque. Strength
+	# 0.5, the owner's pick from 0.3 / 0.5 on job 209 (0.3 read too subtle beside a window).
+	{"keywords": ["leaf", "leaves", "foliage", "frond", "fern", "grass", "plant"],
+		"not": ["planter", "pot", "vase", "soil", "grasscloth"],
+		"strength": 0.5, "radius": Color(1, 1, 1), "depth": 0.0},
+]
+# Plant-named assets (the GLB file name), for the green-leaf rule: a material no keyword names
+# gets the leaf row when its average colour is green (_glb_is_leaf_green). Pictures, lights and
+# tanks OF plants are not plants. Measured on all 44 plant-like library assets, 2026-10-23.
+const GLB_PLANT_ASSET_KEYWORDS = [
+	"plant", "palm", "fern", "tree", "ficus", "monstera", "bonsai", "foliage", "grass", "bamboo",
+	"orchid", "ivy", "bush", "shrub", "hedge", "agave", "flower",
+]
+const GLB_PLANT_ASSET_NOT = ["frame", "artwork", "painting", "canvas", "light", "lamp", "aquarium", "metallic"]
 # Refractive index for converted surfaces. DELIBERATELY UNPHYSICAL: soda-lime
 # glass is 1.5 and water is 1.33; both are set to 1.2 here.
 #
@@ -2070,6 +2091,137 @@ func _autosmooth_converted_surfaces(m: MeshInstance3D, surface_ids: Array) -> Ar
 	_autosmooth_mesh_cache[mid] = {"mesh": rebuilt if changed else null, "report": report}
 	return report
 
+# Returns the first keyword of the preset that applied, or "" when none did.
+# `context_text` is the same material-plus-surface name the glass classifier
+# reads, so the two rules can never disagree about who owns a surface.
+# `p_plant_asset` (_glb_is_plant_asset): a material no keyword names still gets
+# the leaf row when its average colour is green -- after the same exclusions.
+func _apply_glb_subsurface_preset(mat: BaseMaterial3D, context_text: String, p_plant_asset: bool = false) -> String:
+	var t = context_text.to_lower()
+	if t.strip_edges() == "":
+		return ""
+	for kw in GLB_KEEP_ALPHA_KEYWORDS:
+		if kw in t:
+			return ""
+	if _classify_glb_alpha_material(context_text) != "":
+		return "" # glass and water are handled by their own rules
+	for preset in GLB_SUBSURFACE_PRESETS:
+		var excluded := false
+		for kw in preset.get("not", []):
+			if kw in t:
+				excluded = true
+		if excluded:
+			continue
+		for kw in preset["keywords"]:
+			if kw in t:
+				_set_glb_subsurface(mat, preset)
+				return str(kw)
+	if p_plant_asset and _glb_is_leaf_green(_glb_material_avg_color(mat)):
+		for preset in GLB_SUBSURFACE_PRESETS:
+			if "leaf" in preset["keywords"]:
+				_set_glb_subsurface(mat, preset)
+				return "leaf by colour"
+	return ""
+
+static func _set_glb_subsurface(mat: BaseMaterial3D, preset: Dictionary) -> void:
+	mat.subsurf_scatter_enabled = true
+	mat.subsurf_scatter_strength = float(preset["strength"])
+	mat.subsurf_scatter_transmittance_enabled = true
+	# The engine reads this colour through srgb_to_linear, the same
+	# way it reads albedo, so store the linear preset as sRGB.
+	mat.subsurf_scatter_transmittance_color = (preset["radius"] as Color).linear_to_srgb()
+	mat.subsurf_scatter_transmittance_depth = float(preset["depth"])
+
+# A GLB whose file name says it is a plant (GLB_PLANT_ASSET_KEYWORDS) and not a
+# picture, light or tank of one (GLB_PLANT_ASSET_NOT).
+static func _glb_is_plant_asset(p_label: String) -> bool:
+	var t := p_label.to_lower()
+	for kw in GLB_PLANT_ASSET_NOT:
+		if kw in t:
+			return false
+	for kw in GLB_PLANT_ASSET_KEYWORDS:
+		if kw in t:
+			return true
+	return false
+
+# Foliage green: green the largest channel by 10% and the colour at least 15%
+# saturated. Leaves in the library average 0.14-0.73 green; pots, soil, bark,
+# petals and the pale undersides of rubber-plant leaves fail.
+static func _glb_is_leaf_green(p_color: Color) -> bool:
+	var mx := maxf(p_color.r, maxf(p_color.g, p_color.b))
+	var mn := minf(p_color.r, minf(p_color.g, p_color.b))
+	return mx > 0.0 and p_color.g >= 1.1 * p_color.r and p_color.g >= 1.1 * p_color.b and (mx - mn) / mx >= 0.15
+
+# albedo_color times the mean of albedo_texture (8x8 bilinear), in the stored
+# sRGB encoding -- what the material looks like on average.
+static func _glb_material_avg_color(p_mat: BaseMaterial3D) -> Color:
+	var c := p_mat.albedo_color
+	var tex := p_mat.albedo_texture
+	if tex == null:
+		return Color(c.r, c.g, c.b)
+	var img := tex.get_image()
+	if img == null or img.is_empty():
+		return Color(c.r, c.g, c.b)
+	if img.is_compressed() and img.decompress() != OK:
+		return Color(c.r, c.g, c.b)
+	img.convert(Image.FORMAT_RGBA8)
+	img.resize(8, 8, Image.INTERPOLATE_BILINEAR)
+	var acc := Color(0, 0, 0, 0)
+	for y in 8:
+		for x in 8:
+			acc += img.get_pixel(x, y)
+	return Color(c.r * acc.r / 64.0, c.g * acc.g / 64.0, c.b * acc.b / 64.0)
+
+# Walks every surface of every mesh under `root` (opaque ones included -- the
+# glass pass above only looks at alpha-blended surfaces) and applies the first
+# GLB_SUBSURFACE_PRESETS row whose keyword the material/surface name carries.
+# A material_override wins over every surface on its instance, so it is
+# checked on its own and the surfaces under it are skipped, exactly as in
+# _convert_glb_alpha_glass. Always duplicates before mutating: GLB instances
+# share material resources.
+func _apply_glb_subsurface(root: Node, asset_label: String = "") -> void:
+	if GLB_SUBSURFACE_PRESETS.is_empty():
+		return
+	var applied = []
+	var plant := _glb_is_plant_asset(asset_label)
+	for m in _get_all_meshes(root):
+		if not m.mesh:
+			continue
+		var node_name = str(m.name)
+		if m.material_override != null and m.material_override is BaseMaterial3D:
+			var ov = m.material_override
+			var ov_ctx = str(ov.resource_name)
+			if ov_ctx.strip_edges() == "":
+				ov_ctx = node_name
+			var ov_dup = ov.duplicate()
+			var ov_hit = _apply_glb_subsurface_preset(ov_dup, ov_ctx, plant)
+			if ov_hit != "":
+				m.material_override = ov_dup
+				applied.append("%s [override, %s]" % [ov_ctx.strip_edges(), ov_hit])
+			continue
+		for i in range(m.mesh.get_surface_count()):
+			var mat = m.get_surface_override_material(i)
+			if mat == null:
+				mat = m.mesh.surface_get_material(i)
+			if mat == null or not (mat is BaseMaterial3D):
+				continue
+			var ctx = str(mat.resource_name) + " " + str(m.mesh.surface_get_name(i))
+			if ctx.strip_edges() == "":
+				ctx = node_name
+			var dup = mat.duplicate()
+			var hit = _apply_glb_subsurface_preset(dup, ctx, plant)
+			if hit == "":
+				continue
+			m.set_surface_override_material(i, dup)
+			applied.append("%s [%s]" % [ctx.strip_edges(), hit])
+	if applied.is_empty():
+		return
+	var label = asset_label if asset_label != "" else str(root.name)
+	# Read this line when a marble/wax/paper surface renders as plain diffuse:
+	# no entry here means no keyword matched -- add the material's name to
+	# GLB_SUBSURFACE_PRESETS and re-render.
+	print("  [SSS] %s -> subsurface: %s" % [label, ", ".join(applied)])
+
 func _convert_glb_alpha_glass(root: Node, asset_label: String = "") -> void:
 	# DIVERGENCE FROM image_glb_creation.gd: that copy also requires
 	# USE_TRANSMISSIVE_GLASS. This pipeline has no such constant and no glass
@@ -3476,6 +3628,7 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 									add_child(asset_node)
 									_sanitize_glb_lights(asset_node)
 									_convert_glb_alpha_glass(asset_node, model_path.get_file())
+									_apply_glb_subsurface(asset_node, model_path.get_file())
 
 									var aabb = _get_hierarchy_aabb(asset_node)
 									var dims = aabb.size
@@ -5290,6 +5443,7 @@ func _load_layer_items(items, layer_altitude, layer_id = "root"):
 
 					_add_light_fixture_effect(node, item, aabb, final_scale)
 					_convert_glb_alpha_glass(node, used_path.get_file())
+					_apply_glb_subsurface(node, used_path.get_file())
 
 					print("[VideoGLB] Loaded asset: ", used_path, " final scale: ", final_scale)
 				else:
