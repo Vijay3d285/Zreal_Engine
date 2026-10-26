@@ -652,7 +652,10 @@ func _daylight_probe_and_expose(p_env: Environment) -> void:
 			" CLAMPED -- scene is not a lit interior" if st["clamped"] else "",
 			st["p25"], st["p25"] * st["exposure"], Time.get_ticks_msec() - t0, pr["width"], pr["height"]])
 	var exposure: float = st["exposure"]
-	if st["p25"] * exposure < floor_v and not st["clamped"]:
+	if Daylight.fill_trigger(st, exposure, floor_v) and not Daylight.DAYLIGHT_FILL_ENABLED:
+		print("[Daylight] fill: p25 %.4f < %.3f after exposure, but the DaylightFill is switched off (Daylight.DAYLIGHT_FILL_ENABLED): no light added" % [
+				st["p25"] * exposure, floor_v])
+	elif Daylight.fill_trigger(st, exposure, floor_v):
 		var fill := _place_daylight_fill(1.0)
 		var pr1 := await Daylight.probe(self, p_env, vp)
 		if pr1["samples"].is_empty() or pr1["samples"].size() != pr["samples"].size():

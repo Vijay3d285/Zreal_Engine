@@ -27,8 +27,15 @@ const SUN_TO_SKY := 5.0
 const SUN_ENERGY := SUN_TO_SKY / PI # DirectionalLight3D.light_energy: energy E is irradiance pi*E in the tracer
 ## Photographic mid-grey: the occupied frame's median after exposure.
 const TARGET_MEDIAN := 0.18
-## Darkest occupied quarter must reach this after exposure, or a fill is added.
+## Darkest occupied quarter must reach this after exposure, or a fill is added
+## (when DAYLIGHT_FILL_ENABLED).
 const FLOOR := 0.02
+## The DaylightFill rescue -- a shadowless ceiling AreaLight3D sized by solve_fill() -- is OFF
+## (owner, 2026-10-26): no light is ever added to a day render; the sun, the sky and the room's own
+## fixtures are all there is. It never fired on a production job (592 still logs, 93 video logs):
+## the only rooms dark enough were clamped at the old EXPOSURE_MAX 50, which skips it. Both routes
+## still log when a frame trips fill_trigger(). The solver and its tests stay; true re-enables it.
+const DAYLIGHT_FILL_ENABLED := false
 ## Pixels above MASK_RATIO x the raw median are sky seen through windows
 ## (a physical sky is 50-100x the wall) and are excluded from the statistics.
 const MASK_RATIO := 8.0
@@ -250,6 +257,13 @@ static func highlight_relief(p_samples: PackedFloat32Array, p_exposure: float) -
 		"strength": clampf(strength, 0.0, RELIEF_MAX_STRENGTH),
 		"clipped_fraction": fraction,
 	}
+
+
+## The routes' fill trigger (render.gd, video_render.gd), from a stats() result and the exposure
+## the frame will get: the darkest occupied quarter would read under p_floor, and the exposure is
+## not clamped. A fill is placed only when DAYLIGHT_FILL_ENABLED as well.
+static func fill_trigger(p_st: Dictionary, p_exposure: float, p_floor: float) -> bool:
+	return float(p_st["p25"]) * p_exposure < p_floor and not bool(p_st["clamped"])
 
 
 ## Fill energy from two probes: p_s0 without the fill, p_s1 with it at energy

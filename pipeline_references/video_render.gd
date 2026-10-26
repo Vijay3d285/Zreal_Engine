@@ -559,7 +559,10 @@ func _run_daylight_probe() -> void:
 	if not pooled.is_empty():
 		st = Daylight.stats(pooled)
 		exposure = float(st["exposure"])
-		if float(st["p25"]) * exposure < floor_v and not bool(st["clamped"]):
+		if Daylight.fill_trigger(st, exposure, floor_v) and not Daylight.DAYLIGHT_FILL_ENABLED:
+			fill_line = "[Daylight] fill: p25 %.4f < %.3f after exposure, but the DaylightFill is switched off (Daylight.DAYLIGHT_FILL_ENABLED): no light added" % [
+					float(st["p25"]) * exposure, floor_v]
+		elif Daylight.fill_trigger(st, exposure, floor_v):
 			var fill := _place_daylight_path_fill(1.0)
 			var pass2 := _probe_path_pooled(probe_env, probe_rid, probe_cam, main_cam, order)
 			var pooled1: PackedFloat32Array = pass2["pooled"]

@@ -208,6 +208,15 @@ func _init() -> void:
 	_check_true("F2 dark corners not exhausted", not r1["exhausted"])
 	_check_true("F3 capped fill not exhausted", not r2["exhausted"])
 
+	# The routes' trigger (render.gd / video_render.gd) and the owner's switch (2026-10-26): the
+	# fill is OFF, so a frame that trips the trigger gets no light; the trigger itself still says
+	# when a frame would have wanted one, for the log line.
+	_check_true("F7 the DaylightFill rescue is switched off", not Daylight.DAYLIGHT_FILL_ENABLED)
+	var corners := {"p25": 0.0005, "clamped": false}
+	_check_true("F8 near-black corners trip the trigger", Daylight.fill_trigger(corners, 20.0, Daylight.FLOOR), "(p25 0.0005 x 20 = 0.01)")
+	_check_true("F8 corners above the floor do not", not Daylight.fill_trigger({"p25": 0.002, "clamped": false}, 20.0, Daylight.FLOOR), "(0.04)")
+	_check_true("F8 a clamped exposure never trips it", not Daylight.fill_trigger({"p25": 0.0005, "clamped": true}, 20.0, Daylight.FLOOR))
+
 	print("\n=== daylight_unit: highlight_relief ===")
 	# R1: nothing above the knee -> no relief, and strength EXACTLY 0.0.
 	var flat := PackedFloat32Array()
