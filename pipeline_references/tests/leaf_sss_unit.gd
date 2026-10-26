@@ -133,7 +133,7 @@ func _suite(glb, p_label: String, p_all_presets: bool) -> void:
 
 func _init() -> void:
 	_suite(ImageGlb.new(), "stills", true)
-	_suite(VideoGlb.new(), "video", false)
+	_suite(VideoGlb.new(), "video", true) # full table since 2026-10-26 (leaves only before)
 
 	print("")
 	if _failures.is_empty():
