@@ -35,7 +35,6 @@ const USE_EMISSIVE_MESH_LIGHTS = true
 
 var _tracked_assets = []
 var _window_sunlight_data = [] # Collected during hole building, used to place window sunlights
-var _door_hole_data = [] # Collected during hole building, used for subtle door fill lights
 var _exterior_assets = [] # Tracks trees/plants/etc for shadow optimization
 var day_render = true
 var _glb_cache := {}
@@ -780,7 +779,6 @@ func build_scene(data):
 		show_all_floors = geom_data["showAllFloors"]
 
 	_window_sunlight_data.clear()
-	_door_hole_data.clear()
 	build_architecture(geom_data, cam_pose.get("position", Vector3.ZERO), show_all_floors)
 	_build_exterior_decorator_ground(geom_data)
 	build_structures(geom_data)
@@ -1216,13 +1214,13 @@ func setup_lighting(data, geom_data = {}, cam_pose_override = null):
 			dir_color.b * mood_dir_color.b
 		)
 
-	# CRITICAL: add_child BEFORE setting position/look_at, otherwise look_at fails
-	# because the node has no coordinate space.
 	# Sun patches: an interior day sun at Daylight.SUN_DIRECT_SCALE on what the camera sees, full
 	# strength in its bounce light (daylight.gd), as the still route.
 	if day_render and not (typeof(data) == TYPE_DICTIONARY and typeof(data.get("exterior_light", null)) == TYPE_DICTIONARY):
 		Daylight.apply_sun_direct_scale(dir_light)
 
+	# CRITICAL: add_child BEFORE setting position/look_at, otherwise look_at fails
+	# because the node has no coordinate space.
 	_dir_light = dir_light
 	add_child(dir_light)
 
@@ -3747,16 +3745,6 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 
 				# -- 5. Hole type for light collection (hole_type_sun / is_window_for_sun are declared above the asset block) --------
 
-				# Glass detection for door fill lights
-				var hole_has_glass := false
-				if not is_window_for_sun and hole.has("asset_urls"):
-					# Check if the loaded asset contains glass meshes
-					for child in get_children():
-						if child.name.begins_with("WindowPortalSpot_") or child.name.begins_with("DoorFillSpot_"):
-							continue
-						# asset_node was already added as child above
-					pass
-
 				# Collect WINDOW openings for window portal lights
 				if is_window_for_sun:
 					var wall_basis_sun = Basis(Vector3.UP, wall_angle)
@@ -3774,19 +3762,6 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, c
 						"layer_altitude": layer_altitude
 					})
 					print("[VideoGLB] Collected WINDOW opening for sunlight: pos=", h_center_pos, " size=", Vector2(h_width, h_height), " alt=", h_alt)
-				else:
-					# Non-window hole (door, opening, etc.) — collect for door fill SpotLight
-					var wall_basis_d = Basis(Vector3.UP, wall_angle)
-					var wall_normal_d = wall_basis_d * Vector3(0, 0, 1)
-					_door_hole_data.append({
-						"center": h_center_pos,
-						"width": h_width,
-						"height": h_height,
-						"inner_dir": wall_normal_d * inner_sign,
-						"hole_type": hole_type_sun,
-						"has_glass": hole_has_glass
-					})
-					print("[VideoGLB] Collected non-window opening (", hole_type_sun, ") for door fill light: ", hole_name_sun)
 
 		# ── 6. Add Wall Shapes (CustomShapes) ──────────────────────────────────
 		# Build a list of hole rectangles in wall-local 2D space so that we can

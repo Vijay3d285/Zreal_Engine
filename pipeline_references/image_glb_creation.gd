@@ -12,7 +12,6 @@ const LOW_TEXTURE_QUALITY = false
 
 var _tracked_assets = []
 var _window_sunlight_data = [] # Collected during hole building, used to place window sunlights
-var _door_hole_data = [] # Collected during hole building, used for subtle door fill lights
 var _exterior_assets = [] # Tracks trees/plants/etc for shadow optimization
 # Surface scan lines for the light fixtures, flushed to
 # godot_project/logs/emission_scan.txt during scene build. See
@@ -541,7 +540,6 @@ func build_scene(data):
 	setup_lighting(data, geom_data)
 
 	_window_sunlight_data.clear()
-	_door_hole_data.clear()
 	build_architecture(geom_data)
 	_build_exterior_decorator_ground(geom_data)
 	# _create_window_sunlights()  # Place sunlights through detected windows
@@ -4503,9 +4501,6 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 				var hole_type_sun := str(hole.get("type", "")).to_lower()
 				var hole_name_sun := str(hole.get("name", "")).to_lower()
 				var is_window_for_sun := hole_type_sun == "window" or "window" in hole_name_sun
-				# Glass flag: set to true if the loaded hole asset contains glass meshes.
-				# Used to enable shadow_enabled on glass-door fill SpotLights.
-				var hole_has_glass := false
 				# 4. Instantiate door/window asset GLB
 				if _use_textures_assets and hole.has("asset_urls"):
 					var urls = hole["asset_urls"]
@@ -4590,9 +4585,6 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 									# 	_disable_glass_shadow_only(asset_node)
 									# 	print("  [DoorGlass] glass panes: cast_shadow OFF (daylight passes)")
 									print("Loaded hole asset: ", model_path, " final scale: ", asset_node.scale, " (window glass: cast_shadow OFF)" if is_window_for_sun else " (shadows: handled by material)")
-									# Detect glass: enables shadow on glass-door fill SpotLights
-									if not is_window_for_sun:
-										hole_has_glass = _node_has_any_glass(asset_node)
 
 									# Keep the actual window GLB only.
 									# If the imported window is glass-only (or its frame meshes
@@ -4643,20 +4635,6 @@ func _build_layer_geometry(layer_data, layer_altitude, show_all_floors = true, r
 						"layer_altitude": layer_altitude
 					})
 					print("Collected WINDOW opening for sunlight: pos=", h_center_pos, " size=", Vector2(h_width, h_height), " alt=", h_alt)
-				else:
-					# Non-window hole (door, opening, etc.) — collect for a subtle
-					# inward SpotLight that adds gentle fill without incorrect shadows.
-					var wall_basis_d = Basis(Vector3.UP, wall_angle)
-					var wall_normal_d = wall_basis_d * Vector3(0, 0, 1)
-					_door_hole_data.append({
-						"center": h_center_pos,
-						"width": h_width,
-						"height": h_height,
-						"inner_dir": wall_normal_d * inner_sign,
-						"hole_type": hole_type_sun,
-						"has_glass": hole_has_glass
-					})
-					print("Collected non-window opening (", hole_type_sun, ") for door fill light: ", hole_name_sun)
 
 		# ── 6. Add Wall Shapes (CustomShapes) ──────────────────────────────────
 		# Build a list of hole rectangles in wall-local 2D space so that we can
@@ -7469,8 +7447,7 @@ func _disable_shadow_casting_recursive(node: Node) -> void:
 		_disable_shadow_casting_recursive(child)
 
 # Recursively checks if any MeshInstance3D in a subtree looks like glass.
-# Used at hole-collection time to decide if a door fill SpotLight should
-# cast shadows (glass sliding door = yes) or not (solid door = no).
+# Kept for the commented-out [DoorGlass] branch where hole assets load.
 func _node_has_any_glass(node: Node) -> bool:
 	if node is MeshInstance3D and _is_glass_mesh(node as MeshInstance3D):
 		return true
