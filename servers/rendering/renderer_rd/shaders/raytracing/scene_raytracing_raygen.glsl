@@ -155,6 +155,39 @@ void volume_scatter_shade(uvec2 p_pixel, vec3 p_pos, vec3 p_ray_dir, vec3 p_thro
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 }
 
+#ifdef RT_DLSS_PSR
+// PSR (raytracing_inc.glsl). True while this pixel's guides still describe only sample 0's
+// first hit: that hit deferred and no sample has resolved the guide yet. Every sample starts
+// with its guide pending while this is true; the sample that resolves it clears it, so the
+// later samples of the launch do no guide work.
+bool g_psr_open;
+
+// Depth and motion of a deferred guide, at the VIRTUAL point: the camera ray extended by the
+// path length to the surface that resolved it. Through a flat pane that is the surface behind
+// it, to within the pane's lateral shift; through a planar mirror, its mirror image. Motion
+// assumes a static world (this pipeline animates the camera), and a sky resolution reprojects
+// the far point along the camera ray, as the miss stage does for a primary miss. Same depth
+// and motion conventions as write_primary_hit_depth / write_primary_hit_velocity.
+void rt_dlss_psr_write_depth_velocity(vec3 p_origin, vec3 p_dir, float p_len, bool p_sky) {
+	ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+	vec3 p = p_origin + p_dir * (p_sky ? RT_RAY_TMAX : p_len);
+	float ndc_depth = 0.0;
+	if (!p_sky) {
+		mat4 view_mat = transpose(mat4(scene_data_block.data.view_matrix[0],
+				scene_data_block.data.view_matrix[1],
+				scene_data_block.data.view_matrix[2],
+				vec4(0.0, 0.0, 0.0, 1.0)));
+		vec3 view_pos = (view_mat * vec4(p, 1.0)).xyz;
+		vec4 clip_pos = scene_data_block.data.projection_matrix * vec4(view_pos, 1.0);
+		ndc_depth = clip_pos.z / clip_pos.w;
+	}
+	imageStore(rt_depth_image, pixel, vec4(ndc_depth));
+	vec2 curr_uv = project_uv(p, curr_vp_unjittered);
+	vec2 prev_uv = project_uv(p, prev_vp_unjittered);
+	imageStore(rt_velocity_image, pixel, vec4(prev_uv - curr_uv, 0.0, 0.0));
+}
+#endif
+
 vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_zero,
 		uint p_max_bounces, vec3 p_origin, vec3 p_dir) {
 	PathState ps;
@@ -177,6 +210,11 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 	ps.feat_throughput = vec3(1.0);
 	ps.feat_pending = p_is_sample_zero && get_rt_param(RT_PARAM_ACCUM_FLAG) > 0.5;
 	ps.glossy_min_code = 0u; // Filter Glossy: no blurry bounce yet (Cycles' min_ray_pdf = FLT_MAX)
+#endif
+#ifdef RT_DLSS_PSR
+	ps.psr_pending = g_psr_open;
+	ps.psr_abort = false;
+	float psr_len = 0.0; // camera-ray length so far, for the virtual point
 #endif
 
 	vec3 ray_origin = p_origin;
@@ -216,6 +254,9 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 
 	[[dont_unroll]] for (uint bounce = 0u; bounce <= iteration_limit; bounce++) {
 		path_pack(payload, ps);
+#ifdef RT_DLSS_PSR
+		const bool psr_was_pending = ps.psr_pending;
+#endif
 
 		// Roadmap E1: a ray travelling INSIDE a solid must see back faces to find
 		// the far surface. Every other ray traces with byte-identical flags to
@@ -266,6 +307,23 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 #endif
 
 		ps = path_unpack(payload);
+
+#ifdef RT_DLSS_PSR
+		// PSR: the hit or miss stage just resolved this sample's deferred guide on this
+		// segment (pending cleared without an abort). Sample 0 resolving on its camera ray
+		// is the ordinary first-hit write, whose depth and motion the hit/miss stage wrote.
+		// The resolving stage left the resolved point in mis_origin (hit: the surface; fog:
+		// the scatter point); a sky miss sets hit_t = RT_RAY_TMAX. Deferring segments
+		// continue, so their hit_t is the segment length.
+		if (psr_was_pending && !ps.psr_pending && !ps.psr_abort) {
+			if (bounce != 0u || !p_is_sample_zero) {
+				rt_dlss_psr_write_depth_velocity(p_origin, p_dir, psr_len + distance(ray_origin, ps.mis_origin),
+						ps.hit_t >= RT_RAY_TMAX);
+			}
+			g_psr_open = false;
+		}
+		psr_len += ps.hit_t;
+#endif
 
 		if (volume_active() && vol_in_box) {
 			// Where this segment ended inside the box: the surface, the scatter
@@ -419,6 +477,9 @@ void main() {
 	rt_init_blue_noise();
 #endif
 	uvec2 pixel = gl_LaunchIDEXT.xy;
+#ifdef RT_DLSS_PSR
+	g_psr_open = true; // sample 0 starts every pixel's guide pending
+#endif
 
 	// Sample count from specialization constant, frame index from uniform
 	const uint samples_per_pixel = RT_GET_SAMPLE_COUNT();
@@ -629,6 +690,15 @@ void main() {
 			ps.feat_pending = false;
 		}
 #endif
+#ifdef RT_DLSS_PSR
+		// PSR: a deferred guide resolves on a fog scatter point. Depth and motion only: raygen
+		// places the virtual point at the scatter point, which mis_origin carries (the path ends
+		// at it, so nothing else reads the field); the other guides stay the pane's.
+		if (ps.psr_pending) {
+			ps.psr_pending = false;
+			ps.mis_origin = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_RayTmaxEXT;
+		}
+#endif
 		path_pack(payload, ps);
 		return;
 	}
@@ -710,6 +780,20 @@ void main() {
 			rt_accum_guide_sample(ivec2(gl_LaunchIDEXT.xy), sky_color * ps.feat_throughput,
 					-gl_WorldRayDirectionEXT * t_avg);
 			ps.feat_pending = false;
+		}
+#endif
+#ifdef RT_DLSS_PSR
+		// PSR (raytracing_inc.glsl): a deferred guide resolves on the sky -- open sky seen
+		// through a window. Raygen writes depth 0 and the far point's motion; the albedo /
+		// normal / roughness / hit-distance guides stay sample 0's first hit (the pane).
+		// NOT the primary-miss convention (sky radiance as the diffuse albedo): a primary sky
+		// pixel's radiance equals that guide, but through a pane the radiance also carries the
+		// pane's reflection and the path noise, and DLSS-RR demodulates by the guide. On a
+		// dark HDRI tree that amplified them into a crisp saturated block with white specks
+		// (job 216 kf 205-215, 2026-11-12); the pane's flat guide with the far-point motion is
+		// the static hold's configuration, which converges.
+		if (ps.psr_pending) {
+			ps.psr_pending = false;
 		}
 #endif
 	}

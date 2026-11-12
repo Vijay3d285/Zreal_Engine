@@ -111,6 +111,10 @@ struct PathPayload {
 	// traceRayEXT, and a dedicated 4-byte word cost the DLSS-RR one-shot path 2.9% per
 	// frame although the new code never runs there. That path compiles without the define,
 	// i.e. the pre-feature source and layout.
+	//
+	// RT_DLSS_PSR (below: the DLSS-RR one-shot variant only) adds two more small integers to
+	// sss_restart.w -- 4 = psr_pending, 8 = psr_abort -- so the value stays an exact float in
+	// 0..15 and the payload keeps its size.
 #ifdef RT_OIDN_FEATURES
 	vec3 sss_restart;
 	uint sss_bits;
@@ -195,6 +199,35 @@ vec3 sanitize_payload_value(vec3 v) {
 	return clamp(safe, vec3(0.0), vec3(RT_PAYLOAD_VALUE_CLAMP));
 }
 
+// DLSS-RR primary-surface replacement (PSR) for the guide buffers. The DLSS-RR one-shot
+// variant only: the accumulate variant (RT_OIDN_FEATURES) has its own Cycles-style deferral
+// for the OIDN guides, and it is also the variant the DLSS-RR video job's daylight probe runs,
+// so it must stay byte-identical (scene_shader_raytracing.cpp, the RT_OIDN_FEATURES invariant).
+//
+// Without PSR, DLSS-RR's guides (albedo, normal/roughness, depth, motion) describe the camera
+// ray's FIRST hit. Through a window pane that is the glass: a flat diffuse guide and the
+// pane's depth and motion, so under camera motion DLSS reprojects the facade behind the pane
+// with the pane's parallax and smears it (job 216, 2026-11-11; a static camera recovers it).
+// With PSR, sample 0 writes its first-hit guides as before, and if that surface is near-delta
+// and specular-dominant (rt_guide_defers' rule, Cycles' denoising-feature rule) the guide stays
+// pending along the sample's own path to the first surface that does not defer (or the sky, or
+// a fog scatter point). Raygen then overwrites DEPTH AND MOTION ONLY, at the VIRTUAL point
+// (camera origin + primary direction * path length). If the sample leaves the dominant lobe
+// (e.g. the 4-8% Fresnel reflection off a pane) or ends while pending, the next sample of the
+// same launch retries. Guide-only: radiance and the RNG are untouched.
+//
+// The albedo / normal / roughness / hit-distance guides stay the pane's, always. DLSS-RR
+// demodulates the WHOLE pixel by the albedo guide, and a pixel seen through glass also holds
+// the pane's reflection, which the surface behind it does not describe. Replacing the albedo
+// with that surface's (2026-11-12) gave false colours wherever the reflection dominates: a dark
+// aquarium behind its front glass went red / pink (blue with the water as a dielectric) while
+// the old flat-pane guide stayed true to OIDN; with sky radiance as the albedo, a dark HDRI tree
+// through job 216's window became a saturated block. Job 216's window gain (facade delta-E
+// 20.9 -> 8.5 vs OIDN) is all depth and motion: every path behind its panes ends on the sky.
+#if defined(DLSS_RR_ENABLED) && !defined(RT_OIDN_FEATURES)
+#define RT_DLSS_PSR
+#endif
+
 /// Unpacked working copy of the payload.
 struct PathState {
 	vec3 radiance;
@@ -215,6 +248,10 @@ struct PathState {
 	vec3 feat_throughput; // OIDN guide: product of the specular albedos deferred through
 	bool feat_pending; // OIDN guide: this sample has not written its guide yet
 	uint glossy_min_code; // Filter Glossy: running minimum pdf code, 0..31 (bits 3-7 of sss_bits)
+#endif
+#ifdef RT_DLSS_PSR
+	bool psr_pending; // DLSS-RR guide: deferred past a near-delta surface, not written yet
+	bool psr_abort; // DLSS-RR guide: this sample left the dominant lobe; a later sample retries
 #endif
 };
 
@@ -245,6 +282,10 @@ PathState path_unpack(PathPayload p) {
 	uint sss_bits = uint(p.sss_restart.w + 0.5);
 	s.sss_exit = (sss_bits & 1u) != 0u;
 	s.guide_record = (sss_bits & 2u) != 0u;
+#ifdef RT_DLSS_PSR
+	s.psr_pending = (sss_bits & 4u) != 0u;
+	s.psr_abort = (sss_bits & 8u) != 0u;
+#endif
 #endif
 	s.mis_origin = p.mis_origin;
 	return s;
@@ -267,6 +308,9 @@ void path_pack(inout PathPayload p, PathState s) {
 	// drops the empty w byte. Same quantisation as the old dedicated word.
 	p.sss_bits = (s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u) | (s.feat_pending ? 4u : 0u) |
 			((s.glossy_min_code & 31u) << 3u) | (packUnorm4x8(vec4(s.feat_throughput, 0.0)) << 8u);
+#elif defined(RT_DLSS_PSR)
+	p.sss_restart = vec4(s.sss_restart, float((s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u) |
+												(s.psr_pending ? 4u : 0u) | (s.psr_abort ? 8u : 0u)));
 #else
 	p.sss_restart = vec4(s.sss_restart, float((s.sss_exit ? 1u : 0u) | (s.guide_record ? 2u : 0u)));
 #endif

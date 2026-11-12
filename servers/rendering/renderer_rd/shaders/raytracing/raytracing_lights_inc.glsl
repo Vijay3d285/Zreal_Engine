@@ -328,6 +328,10 @@ vec3 lights_trace_shadow_ray_geometry(vec3 origin, vec3 direction, float max_dis
 	shadow_ps.feat_throughput = vec3(1.0);
 	shadow_ps.feat_pending = false;
 #endif
+#ifdef RT_DLSS_PSR
+	shadow_ps.psr_pending = false;
+	shadow_ps.psr_abort = false;
+#endif
 	path_pack(payload, shadow_ps);
 
 	traceRayEXT(tlas,

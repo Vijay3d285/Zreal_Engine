@@ -1395,7 +1395,8 @@ bool rt_guide_defers(MaterialProperties p_mat, float p_NdotV, out vec3 r_spec_al
 	// tint (see evalFresnelBase). Dielectric share: the exact remap dielectricFresnelSplit
 	// performs for the transmissive lobe; transmissivness 0 gives T = 0 (an opaque
 	// dielectric's specular layer), and total internal reflection gives R = 1, T = 0.
-	// NOT DLSSRR_computeSpecularAlbedo: DLSSRR_envBRDFApprox is Karis' fit x 2.0.
+	// NOT DLSSRR_computeSpecularAlbedo: DLSSRR_envBRDFApprox is Karis' roughness-averaged fit
+	// (it was x 2.0 until 2026-11-11), not the smooth lobes' Fresnel.
 	vec3 refl;
 	vec3 trans;
 	float cos_theta_t = 0.0;
@@ -1436,6 +1437,40 @@ void rt_guide_features_surface(inout PathState p_ps, MaterialProperties p_mat, v
 	float t_avg = (p_ps.feat_throughput.r + p_ps.feat_throughput.g + p_ps.feat_throughput.b) / 3.0;
 	rt_accum_guide_sample(pixel, p_diffuse_albedo * p_ps.feat_throughput, p_N * t_avg);
 	p_ps.feat_pending = false;
+}
+#endif
+
+#ifdef RT_DLSS_PSR
+// DLSS-RR primary-surface replacement (see raytracing_inc.glsl). The deferral rule is
+// rt_guide_defers' weight test (Cycles' denoising-feature rule: diffuse-like closures hold at
+// most a quarter of the weight), but only for NEAR-DELTA surfaces, roughness below
+// RT_MIS_DELTA_ROUGHNESS -- not Cycles' alpha <= 0.075. OIDN averages many guide samples and
+// DLSS-RR gets one per frame; a glossy surface (job 216's lacquered door at a grazing angle)
+// is DLSS-RR's own specular case, and deferring it would move its depth and motion off the
+// wood grain to the blurred room it reflects. Window glass (GlassFix: roughness 0) and mirrors
+// defer.
+// r_refl / r_trans: the mean albedos of the reflected and transmitted smooth lobes, from the
+// same Fresnel sources rt_guide_defers uses (restated here: that function exists only in the
+// accumulate variant, which must stay byte-identical).
+bool rt_dlss_psr_defers(MaterialProperties p_mat, float p_NdotV, out float r_refl, out float r_trans) {
+	r_refl = 0.0;
+	r_trans = 0.0;
+	if (p_mat.roughness >= RT_MIS_DELTA_ROUGHNESS) {
+		return false;
+	}
+	vec3 refl;
+	vec3 trans;
+	float cos_theta_t = 0.0;
+	dielectricFresnelSplit(p_NdotV, p_mat.eta, p_mat.dielectricF0, p_mat.transmissivness, refl, trans, cos_theta_t);
+	vec3 metal = evalFresnelSchlick(p_mat.baseColor, 1.0, p_NdotV);
+	vec3 spec_r = p_mat.metalness * metal + (1.0 - p_mat.metalness) * refl;
+	vec3 spec_t = (1.0 - p_mat.metalness) * trans;
+	vec3 d = baseColorToDiffuseReflectance(p_mat.baseColor, p_mat.metalness, p_mat.transmissivness) * (vec3(1.0) - refl);
+	r_refl = (spec_r.r + spec_r.g + spec_r.b) / 3.0;
+	r_trans = (spec_t.r + spec_t.g + spec_t.b) / 3.0;
+	float w_diff = (d.r + d.g + d.b) / 3.0;
+	float w_spec = r_refl + r_trans;
+	return (w_diff + w_spec > 0.0) && !(w_diff * 4.0 > w_diff + w_spec);
 }
 #endif
 
@@ -1958,6 +1993,30 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	}
 #ifdef RT_OIDN_FEATURES
 	rt_guide_features_surface(ps, brdf_mat, DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness), N, NdotV);
+#endif
+#ifdef RT_DLSS_PSR
+	// PSR (raytracing_inc.glsl): resolve this sample's pending guide here, or keep deferring.
+	// Whether it keeps deferring past this surface depends on the lobe the sample takes, which
+	// the end of this function decides (psr_deferring).
+	bool psr_deferring = false;
+	float psr_refl = 0.0;
+	float psr_trans = 0.0;
+	if (ps.psr_pending) {
+		if (rt_dlss_psr_defers(brdf_mat, NdotV, psr_refl, psr_trans)) {
+			psr_deferring = true;
+		} else {
+			// Depth and motion only (raygen, at the virtual point). The albedo / normal /
+			// roughness / hit-distance guides stay sample 0's first hit -- the pane -- as on a
+			// sky resolution: see the PSR note in raytracing_inc.glsl for why this surface's
+			// albedo must not replace them.
+			ps.psr_pending = false;
+			// Raygen places the virtual point from this. Not hit_t: a path that ends at this
+			// hit returns early without setting it. mis_origin is read only by the NEXT
+			// segment's miss stage, and a path that continues sets it to this same value at
+			// the end of this function, so radiance cannot see the early write.
+			ps.mis_origin = h.hit_pos;
+		}
+	}
 #endif
 #endif
 
@@ -2536,6 +2595,14 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		ps.mis_ray_pdf = RT_MIS_PDF_NONE;
 		ps.mis_origin = h.hit_pos;
 		ps.rng_packed = rng_pack(rng_next_bounce(rng));
+#ifdef RT_DLSS_PSR
+		// A subsurface draw is a diffuse-class lobe: never the dominant one at a deferring
+		// surface (see the PSR lobe test at the end of this function).
+		if (psr_deferring) {
+			ps.psr_pending = false;
+			ps.psr_abort = true;
+		}
+#endif
 		path_pack(payload, ps);
 		return;
 	}
@@ -2794,6 +2861,20 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	// Light portals: the sky pdf the miss stage weighs this ray against is
 	// evaluated from the same point the env NEE above used (h.hit_pos).
 	ps.mis_origin = h.hit_pos;
+
+#ifdef RT_DLSS_PSR
+	// PSR: the guide keeps deferring only along the surface's DOMINANT lobe. A sample that took
+	// the minority lobe -- the 4-8% Fresnel reflection off a window pane, or any diffuse-class
+	// draw -- reached a surface the pixel mostly does not show. It stops here, leaves sample 0's
+	// first-hit guides in place, and the next sample of this launch retries (raygen).
+	if (psr_deferring) {
+		const bool psr_dominant = took_transmissive_lobe
+				? (psr_trans >= psr_refl)
+				: ((brdfType == SPECULAR_TYPE || brdfType == COAT_TYPE) && psr_refl > psr_trans);
+		ps.psr_pending = psr_dominant;
+		ps.psr_abort = !psr_dominant;
+	}
+#endif
 
 	path_pack(payload, ps);
 }
