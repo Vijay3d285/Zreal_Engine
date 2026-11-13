@@ -162,6 +162,21 @@ void volume_scatter_shade(uvec2 p_pixel, vec3 p_pos, vec3 p_ray_dir, vec3 p_thro
 // later samples of the launch do no guide work.
 bool g_psr_open;
 
+// Guide owner hand-over. The "sample-zero" flag a sample traces with (p_is_sample_zero) marks
+// the guide OWNER: the one sample whose camera ray writes the primary guides, depth and motion
+// in the hit / miss stages. Sample 0 owns them -- unless its camera ray scatters in the fog box
+// before reaching anything (F2 free flight). Its guides would then be the haze's (volume albedo,
+// a camera-facing normal, depth 0, no motion write at all), at a different handful of pixels
+// every frame, which DLSS-RR keeps as white dots wherever the surface behind is dark: job 216's
+// window frames, 28 dots per frame on the mullions, 0 with the fog off (2026-11-12). The owner
+// then hands over: the next sample of the launch traces as the owner and overwrites the guides
+// with whatever its own camera ray reaches. Only the last sample keeps the haze's guides (all
+// of a pixel's camera rays scattering is vanishingly rare at production densities). Guide-only:
+// every sample keeps its own camera ray, RNG point and radiance, so the haze is rendered exactly
+// as before; a handed-over guide sits at that sample's pixel-filter offset, not the centre.
+bool g_guide_open; // the next sample traces as the guide owner
+bool g_guide_handover; // the current owner is not the launch's last sample, so it may hand over
+
 // Depth and motion of a deferred guide, at the VIRTUAL point: the camera ray extended by the
 // path length to the surface that resolved it. Through a flat pane that is the surface behind
 // it, to within the pane's lateral shift; through a planar mirror, its mirror image. Motion
@@ -343,6 +358,15 @@ vec3 trace_one_sample(uvec2 p_pixel, uint p_rng_sample_index, bool p_is_sample_z
 				ps.radiance += throughput_before * E * max(t_end - vol_t_in, 0.0);
 			}
 			if (scattered) {
+#ifdef RT_DLSS_PSR
+				// Guide owner hand-over (g_guide_open): the owner's camera ray ended in the haze.
+				// The miss stage wrote the haze's guides and the PSR block above closed the
+				// pixel's PSR on this scatter; reopen both so the next sample redoes the guides.
+				if (bounce == 0u && p_is_sample_zero && g_guide_handover) {
+					g_guide_open = true;
+					g_psr_open = true;
+				}
+#endif
 				const vec3 scatter_pos = ray_origin + ray_dir * t_max_this;
 				volume_scatter_shade(p_pixel, scatter_pos, ray_dir, throughput_before, ps);
 				break;
@@ -479,6 +503,8 @@ void main() {
 	uvec2 pixel = gl_LaunchIDEXT.xy;
 #ifdef RT_DLSS_PSR
 	g_psr_open = true; // sample 0 starts every pixel's guide pending
+	g_guide_open = true; // sample 0 is the first guide owner
+	g_guide_handover = false; // only the one-shot loop below allows a hand-over
 #endif
 
 	// Sample count from specialization constant, frame index from uniform
@@ -608,6 +634,13 @@ void main() {
 		uint one_shot_stride = rt_next_pow2_ge(samples_per_pixel);
 		[[dont_unroll]] for (uint sample_idx = 0u; sample_idx < samples_per_pixel; sample_idx++) {
 			bool sz = (sample_idx == 0u);
+#ifdef RT_DLSS_PSR
+			// Guide owner hand-over (g_guide_open): this sample owns the guides if no earlier one
+			// kept them; it hands them on only from its camera ray's fog scatter, and not if last.
+			sz = g_guide_open;
+			g_guide_open = false;
+			g_guide_handover = sz && (sample_idx + 1u < samples_per_pixel);
+#endif
 			vec3 origin, direction;
 			camera_ray(pixel, camera_filter_jitter(pixel, sample_idx), sample_idx, origin, direction);
 			// frame_index is the session-lifetime dispatch counter (never resets in
@@ -665,7 +698,9 @@ void main() {
 	// reached its bound is a SCATTER event inside the fog box, not the sky. Mark
 	// it and hand it back; raygen shades it. Primary sample-zero rays still feed
 	// the denoiser guides, as a miss does, with the fog's albedo and the ray
-	// direction (depth stays 0 -- haze reads as "far").
+	// direction (depth stays 0 -- haze reads as "far"). In the DLSS-RR one-shot
+	// variant that is only the fallback: raygen hands the guides to the next
+	// sample (g_guide_open), which overwrites these unless it is the last one.
 	if (volume_active() && gl_RayTmaxEXT < RT_RAY_TMAX) {
 		ps.mis_ray_pdf = RT_MIS_PDF_VOLUME_SCATTER;
 		ps.hit_t = gl_RayTmaxEXT;
