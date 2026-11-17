@@ -3864,6 +3864,12 @@ void RenderingServer::init() {
 	// 3.0 is the value measured on job 201 (2026-09-29 knee sweep; see the comment
 	// on RELIEF_KNEE in daylight.gd for the numbers).
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracer/highlight_relief_knee", PROPERTY_HINT_RANGE, "0.5,32.0,0.1"), 3.0);
+	// Capability marker for the pipeline scripts (ProjectSettings.has_setting): this binary's
+	// denoised write-back keeps values below 2^-14 (_oidn_half_keep_denormals in
+	// render_forward_clustered.cpp), so a dim still can be exposed above 256 without its dark
+	// floor collapsing to black. Scripts shipped ahead of the binary see no setting and keep the
+	// old exposure cap. Never read by the engine.
+	GLOBAL_DEF("rendering/pathtracer/dim_values_survive_denoise", true);
 	// OIDN device for the path tracer's final denoise (spec
 	// docs/superpowers/specs/2026-10-01-video-oidn-design.md). 0 = CPU: the original path,
 	// which the still route uses unchanged. 1 = CUDA: one device, buffer set and filter set for

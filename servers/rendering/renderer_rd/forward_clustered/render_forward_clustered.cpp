@@ -1958,6 +1958,19 @@ static bool _oidn_diag_take(int &r_count, int p_max) {
 	return true;
 }
 
+// Half-float encode for the denoised write-back, KEEPING denormals. Math::make_half_float() turns
+// every value below 2^-14 (6.1e-5) into zero ("denormals do not work for 3D"). The denoised colour
+// is PRE-exposure radiance, and a dim day interior is exposed at 250-750x, so that cut landed at
+// post-exposure 0.016-0.046: a dark floor went to flat black with a hard, posterised edge
+// (jobs 247 / 252, 2026-11-16: 12% and 10% of the frame). A half denormal is mantissa * 2^-24, and
+// the GPU expands R16G16B16A16_SFLOAT to 32-bit floats on read, where 2^-24 is an ordinary number.
+static inline uint16_t _oidn_half_keep_denormals(float p_value) {
+	if (p_value > 0.0f && p_value < 6.103515625e-05f) {
+		return uint16_t(p_value * 16777216.0f + 0.5f); // 1023.5 and up rounds to 0x0400 = 2^-14, the first normal.
+	}
+	return Math::make_half_float(p_value);
+}
+
 // The PFM writer behind ZR_OIDN_DUMP: ONE definition for the input dump (oidn_color / oidn_albedo /
 // oidn_normal) and the denoised-output dump (oidn_output), because oidnDenoise.exe and compare_pfm.py
 // read those files as pairs -- two copies of the layout could drift apart without anything failing.
@@ -2187,9 +2200,9 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 			uint16_t *dst16 = reinterpret_cast<uint16_t *>(out_bytes.ptrw());
 			const float *src = color_f.ptr();
 			for (size_t i = 0; i < pixel_count; i++) {
-				dst16[i * 4 + 0] = Math::make_half_float(src[i * 3 + 0]);
-				dst16[i * 4 + 1] = Math::make_half_float(src[i * 3 + 1]);
-				dst16[i * 4 + 2] = Math::make_half_float(src[i * 3 + 2]);
+				dst16[i * 4 + 0] = _oidn_half_keep_denormals(src[i * 3 + 0]);
+				dst16[i * 4 + 1] = _oidn_half_keep_denormals(src[i * 3 + 1]);
+				dst16[i * 4 + 2] = _oidn_half_keep_denormals(src[i * 3 + 2]);
 				dst16[i * 4 + 3] = Math::make_half_float(accum_src[i * 4 + 3]); // keep original alpha.
 			}
 		}
