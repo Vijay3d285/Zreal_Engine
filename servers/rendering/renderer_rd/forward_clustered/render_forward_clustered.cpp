@@ -2199,10 +2199,17 @@ static void _oidn_final_denoise_accumulator(RenderForwardClustered::RenderBuffer
 			const float *accum_src = reinterpret_cast<const float *>(accum_bytes.ptr());
 			uint16_t *dst16 = reinterpret_cast<uint16_t *>(out_bytes.ptrw());
 			const float *src = color_f.ptr();
+			// White balance (rendering/pathtracer/white_balance): a per-channel gain on the denoised
+			// colour. It comes after the ZR_OIDN_DUMP output dump, which stays unbalanced. White
+			// multiplies by exactly 1.0f, which leaves every value bit-identical.
+			const Color wb = GLOBAL_GET("rendering/pathtracer/white_balance");
+			const float wb_r = CLAMP(wb.r, 0.25f, 4.0f);
+			const float wb_g = CLAMP(wb.g, 0.25f, 4.0f);
+			const float wb_b = CLAMP(wb.b, 0.25f, 4.0f);
 			for (size_t i = 0; i < pixel_count; i++) {
-				dst16[i * 4 + 0] = _oidn_half_keep_denormals(src[i * 3 + 0]);
-				dst16[i * 4 + 1] = _oidn_half_keep_denormals(src[i * 3 + 1]);
-				dst16[i * 4 + 2] = _oidn_half_keep_denormals(src[i * 3 + 2]);
+				dst16[i * 4 + 0] = _oidn_half_keep_denormals(src[i * 3 + 0] * wb_r);
+				dst16[i * 4 + 1] = _oidn_half_keep_denormals(src[i * 3 + 1] * wb_g);
+				dst16[i * 4 + 2] = _oidn_half_keep_denormals(src[i * 3 + 2] * wb_b);
 				dst16[i * 4 + 3] = Math::make_half_float(accum_src[i * 4 + 3]); // keep original alpha.
 			}
 		}
@@ -5412,6 +5419,32 @@ Ref<Image> RenderForwardClustered::get_pathtracing_depth_image(Ref<RenderSceneBu
 	ERR_FAIL_COND_V_MSG(bytes.size() != expected, Ref<Image>(),
 			vformat("Path-tracer depth readback size mismatch: got %d, expected %d.", (int)bytes.size(), (int)expected));
 	return Image::create_from_data(size.width, size.height, false, Image::FORMAT_RF, bytes);
+}
+
+// The accumulated primary albedo (rt_accum_albedo, RGBA16F): the running mean the denoiser uses
+// as its guide. With the radiance from get_pathtracing_accum_image it gives a script the light
+// falling on each surface (radiance / albedo): grey-card metering and white balance. Through
+// glass and mirrors it holds what is seen through them; a sky pixel holds the sky's radiance,
+// not a reflectance, so callers mask windows before dividing.
+Ref<Image> RenderForwardClustered::get_pathtracing_albedo_image(Ref<RenderSceneBuffers> p_render_buffers) {
+	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
+	ERR_FAIL_COND_V(rb.is_null(), Ref<Image>());
+	Ref<RenderBufferDataForwardClustered> rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
+	ERR_FAIL_COND_V(rb_data.is_null(), Ref<Image>());
+	if (!rb_data->rt_has_accum_albedo_texture()) {
+		return Ref<Image>();
+	}
+	const RID albedo_rid = rb_data->rt_get_accum_albedo_texture();
+	if (!RD::get_singleton()->texture_is_valid(albedo_rid)) {
+		return Ref<Image>();
+	}
+	const Size2i size = rb->get_internal_size();
+	ERR_FAIL_COND_V(size.width <= 0 || size.height <= 0, Ref<Image>());
+	Vector<uint8_t> bytes = RD::get_singleton()->texture_get_data(albedo_rid, 0);
+	const int64_t expected = (int64_t)size.width * size.height * 8; // RGBA16F
+	ERR_FAIL_COND_V_MSG(bytes.size() != expected, Ref<Image>(),
+			vformat("Path-tracer albedo readback size mismatch: got %d, expected %d.", (int)bytes.size(), (int)expected));
+	return Image::create_from_data(size.width, size.height, false, Image::FORMAT_RGBAH, bytes);
 }
 
 void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {

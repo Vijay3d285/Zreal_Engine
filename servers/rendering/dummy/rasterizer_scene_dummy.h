@@ -174,6 +174,7 @@ public:
 
 	Ref<Image> get_pathtracing_accum_image(Ref<RenderSceneBuffers> p_render_buffers) override { return Ref<Image>(); }
 	Ref<Image> get_pathtracing_depth_image(Ref<RenderSceneBuffers> p_render_buffers) override { return Ref<Image>(); }
+	Ref<Image> get_pathtracing_albedo_image(Ref<RenderSceneBuffers> p_render_buffers) override { return Ref<Image>(); }
 
 	void screen_space_roughness_limiter_set_active(bool p_enable, float p_amount, float p_curve) override {}
 	bool screen_space_roughness_limiter_is_active() const override { return false; }

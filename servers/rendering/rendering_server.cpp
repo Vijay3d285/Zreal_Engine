@@ -2883,6 +2883,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("viewport_get_texture", "viewport"), &RenderingServer::viewport_get_texture);
 	ClassDB::bind_method(D_METHOD("viewport_get_pathtracing_accum_image", "viewport"), &RenderingServer::viewport_get_pathtracing_accum_image);
 	ClassDB::bind_method(D_METHOD("viewport_get_pathtracing_depth_image", "viewport"), &RenderingServer::viewport_get_pathtracing_depth_image);
+	ClassDB::bind_method(D_METHOD("viewport_get_pathtracing_albedo_image", "viewport"), &RenderingServer::viewport_get_pathtracing_albedo_image);
 	ClassDB::bind_method(D_METHOD("viewport_set_disable_3d", "viewport", "disable"), &RenderingServer::viewport_set_disable_3d);
 	ClassDB::bind_method(D_METHOD("viewport_set_disable_2d", "viewport", "disable"), &RenderingServer::viewport_set_disable_2d);
 	ClassDB::bind_method(D_METHOD("viewport_set_environment_mode", "viewport", "mode"), &RenderingServer::viewport_set_environment_mode);
@@ -3870,6 +3871,12 @@ void RenderingServer::init() {
 	// floor collapsing to black. Scripts shipped ahead of the binary see no setting and keep the
 	// old exposure cap. Never read by the engine.
 	GLOBAL_DEF("rendering/pathtracer/dim_values_survive_denoise", true);
+	// White balance for stills: a per-channel gain on the denoised, pre-exposure colour, applied
+	// once at the OIDN write-back (_oidn_final_denoise_accumulator), so glow, highlight relief and
+	// the tone curve all see the balanced image. White = off: every value is multiplied by exactly
+	// 1.0f and stays bit-identical. The pipeline sets it per job from the daylight probe
+	// (Daylight.white_balance). Routes that do not end in that write-back (DLSS-RR video) ignore it.
+	GLOBAL_DEF(PropertyInfo(Variant::COLOR, "rendering/pathtracer/white_balance", PROPERTY_HINT_COLOR_NO_ALPHA), Color(1, 1, 1));
 	// OIDN device for the path tracer's final denoise (spec
 	// docs/superpowers/specs/2026-10-01-video-oidn-design.md). 0 = CPU: the original path,
 	// which the still route uses unchanged. 1 = CUDA: one device, buffer set and filter set for

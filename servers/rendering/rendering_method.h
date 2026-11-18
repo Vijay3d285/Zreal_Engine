@@ -353,6 +353,7 @@ public:
 	// no accumulation has run).
 	virtual Ref<Image> get_pathtracing_accum_image(Ref<RenderSceneBuffers> p_render_buffers) = 0;
 	virtual Ref<Image> get_pathtracing_depth_image(Ref<RenderSceneBuffers> p_render_buffers) = 0;
+	virtual Ref<Image> get_pathtracing_albedo_image(Ref<RenderSceneBuffers> p_render_buffers) = 0;
 
 	virtual void set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_draw) = 0;
 
