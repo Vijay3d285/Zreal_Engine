@@ -3871,12 +3871,19 @@ void RenderingServer::init() {
 	// floor collapsing to black. Scripts shipped ahead of the binary see no setting and keep the
 	// old exposure cap. Never read by the engine.
 	GLOBAL_DEF("rendering/pathtracer/dim_values_survive_denoise", true);
-	// White balance for stills: a per-channel gain on the denoised, pre-exposure colour, applied
-	// once at the OIDN write-back (_oidn_final_denoise_accumulator), so glow, highlight relief and
-	// the tone curve all see the balanced image. White = off: every value is multiplied by exactly
-	// 1.0f and stays bit-identical. The pipeline sets it per job from the daylight probe
-	// (Daylight.white_balance). Routes that do not end in that write-back (DLSS-RR video) ignore it.
+	// White balance: a per-channel gain on the path-traced, pre-exposure colour, applied once per
+	// image. An image the OIDN write-back denoises (_oidn_final_denoise_accumulator: stills, OIDN
+	// video) gets it there, so glow, highlight relief and the tone curve all see the balanced
+	// image; every other path-traced frame (DLSS-RR video) gets it in the tone-mapping pass, on the
+	// colour and the glow. White = off: the write-back multiplies by exactly 1.0f and the tonemap
+	// skips it, so nothing changes. The pipeline sets it per job from the daylight probe
+	// (Daylight.white_balance).
 	GLOBAL_DEF(PropertyInfo(Variant::COLOR, "rendering/pathtracer/white_balance", PROPERTY_HINT_COLOR_NO_ALPHA), Color(1, 1, 1));
+	// Capability marker for the pipeline scripts (ProjectSettings.has_setting): this binary applies
+	// rendering/pathtracer/white_balance to DLSS-RR video too (in the tone-mapping pass). A video
+	// script shipped ahead of the binary sees no setting and leaves the video's light unmetered,
+	// so exposure and colour never change separately. Never read by the engine.
+	GLOBAL_DEF("rendering/pathtracer/white_balance_reaches_video", true);
 	// OIDN device for the path tracer's final denoise (spec
 	// docs/superpowers/specs/2026-10-01-video-oidn-design.md). 0 = CPU: the original path,
 	// which the still route uses unchanged. 1 = CUDA: one device, buffer set and filter set for

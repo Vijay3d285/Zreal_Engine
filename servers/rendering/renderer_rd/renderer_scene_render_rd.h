@@ -118,6 +118,12 @@ protected:
 	void _post_process_subpass(RID p_source_texture, RID p_framebuffer, const RenderDataRD *p_render_data);
 	void _disable_clear_request(const RenderDataRD *p_render_data);
 
+	// White balance the tone-mapping pass owes the frame being post-processed. The Forward+
+	// renderer sets it around _render_buffers_post_process_and_tonemap for a path-traced frame
+	// that skipped the OIDN write-back (which applies rendering/pathtracer/white_balance itself);
+	// it stays white for every other frame.
+	Color tonemap_white_balance = Color(1, 1, 1);
+
 	// needed for a single argument calls (material and uv2)
 	PagedArrayPool<RenderGeometryInstance *> cull_argument_pool;
 	PagedArray<RenderGeometryInstance *> cull_argument; //need this to exist

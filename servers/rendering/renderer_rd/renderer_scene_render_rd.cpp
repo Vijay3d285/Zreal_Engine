@@ -805,6 +805,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 		}
 
 		tonemap.luminance_multiplier = rb->get_luminance_multiplier();
+		tonemap.white_balance = tonemap_white_balance;
 		tonemap.view_count = rb->get_view_count();
 
 		RID dest_fb;

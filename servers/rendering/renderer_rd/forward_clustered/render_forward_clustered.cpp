@@ -3763,7 +3763,17 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 		RENDER_TIMESTAMP("Tonemap");
 
+		// White balance (rendering/pathtracer/white_balance), once per path-traced image: the OIDN
+		// write-back applies it to the image it denoises (stills, OIDN video), so the tonemap applies
+		// it only to path-traced frames that skip that write-back -- DLSS-RR video. Its output is
+		// what the tonemap reads; DLSS-RR's own inputs are unchanged.
+		tonemap_white_balance = Color(1, 1, 1);
+		if (scene_features.rt && raytracing && raytracing->get_shader() && !rt_oidn_active) {
+			const Color wb = GLOBAL_GET("rendering/pathtracer/white_balance");
+			tonemap_white_balance = Color(CLAMP(wb.r, 0.25f, 4.0f), CLAMP(wb.g, 0.25f, 4.0f), CLAMP(wb.b, 0.25f, 4.0f));
+		}
 		_render_buffers_post_process_and_tonemap(p_render_data);
+		tonemap_white_balance = Color(1, 1, 1);
 	}
 
 	if (rb_data.is_valid()) {

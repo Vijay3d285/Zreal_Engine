@@ -62,6 +62,7 @@ layout(set = 3, binding = 0) uniform sampler3D source_color_correction;
 #define FLAG_USE_FXAA (1 << 4)
 #define FLAG_USE_8_BIT_DEBANDING (1 << 5)
 #define FLAG_CONVERT_TO_SRGB (1 << 6)
+#define FLAG_USE_WHITE_BALANCE (1 << 7)
 
 layout(push_constant, std430) uniform Params {
 	vec3 bcs;
@@ -84,6 +85,8 @@ layout(push_constant, std430) uniform Params {
 	float luminance_multiplier;
 
 	vec4 tonemapper_params;
+
+	vec4 white_balance; // rgb: per-channel gain, under FLAG_USE_WHITE_BALANCE
 }
 params;
 
@@ -875,8 +878,19 @@ void main() {
 		color.rgb = do_fxaa(color.rgb, exposure, uv_interp);
 	}
 
+	// White balance (rendering/pathtracer/white_balance) for a path-traced frame that did not go
+	// through the OIDN write-back, which applies it itself: DLSS-RR video. After FXAA, which
+	// rebuilds the colour from the unbalanced source; the glow, built from the same source, gets
+	// the same gain below. Off (flag clear) everywhere else, so those frames run no extra math.
+	if (bool(params.flags & FLAG_USE_WHITE_BALANCE)) {
+		color.rgb *= params.white_balance.rgb;
+	}
+
 	if (bool(params.flags & FLAG_USE_GLOW) && params.glow_mode != GLOW_MODE_SOFTLIGHT) {
 		vec3 glow = gather_glow(source_glow, uv_interp) * params.glow_intensity;
+		if (bool(params.flags & FLAG_USE_WHITE_BALANCE)) {
+			glow *= params.white_balance.rgb;
+		}
 		if (params.glow_map_strength > 0.001) {
 			glow = mix(glow, texture(glow_map, uv_interp).rgb * glow, params.glow_map_strength);
 		}
@@ -899,6 +913,9 @@ void main() {
 		// at 1.0 and higher. This makes the issue only appear with HDR output that
 		// can exceed a 1.0 output value.
 		vec3 glow = gather_glow(source_glow, uv_interp) * params.glow_intensity;
+		if (bool(params.flags & FLAG_USE_WHITE_BALANCE)) {
+			glow *= params.white_balance.rgb;
+		}
 		if (params.glow_map_strength > 0.001) {
 			glow = mix(glow, texture(glow_map, uv_interp).rgb * glow, params.glow_map_strength);
 		}

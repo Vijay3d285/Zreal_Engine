@@ -75,6 +75,7 @@ private:
 		TONEMAP_FLAG_USE_FXAA = (1 << 4),
 		TONEMAP_FLAG_USE_8_BIT_DEBANDING = (1 << 5),
 		TONEMAP_FLAG_CONVERT_TO_SRGB = (1 << 6),
+		TONEMAP_FLAG_USE_WHITE_BALANCE = (1 << 7),
 	};
 
 	enum FlagsMobile {
@@ -122,6 +123,8 @@ private:
 		float luminance_multiplier; //  4 - 96
 
 		float tonemapper_params[4]; //  16 - 112
+
+		float white_balance[4]; //  16 - 128
 	};
 
 	struct TonemapPushConstantMobile {
@@ -184,6 +187,9 @@ public:
 		float auto_exposure_scale = 0.5;
 		RID exposure_texture;
 		float luminance_multiplier = 1.0;
+		// Per-channel gain on the exposed colour and the glow (rendering/pathtracer/white_balance).
+		// White = off: the shader skips it.
+		Color white_balance = Color(1, 1, 1);
 
 		bool use_bcs = false;
 		float brightness = 1.0;
